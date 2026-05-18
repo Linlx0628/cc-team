@@ -1,9 +1,32 @@
 {
   "port": 6789,
   "dashboardPassword": "change-me",
-  "upstream": "https://open.bigmodel.cn/api/anthropic",
-  "users": {
-    "example-api-key": "示例成员"
+  "activeProfile": "glm",
+  "profiles": {
+    "glm": {
+      "upstream": "https://open.bigmodel.cn/api/anthropic",
+      "allowedModels": null,
+      "users": {
+        "example-api-key": {
+          "username": "示例成员",
+          "key": "example-api-key"
+        }
+      }
+    },
+    "aliyun": {
+      "upstream": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+      "allowedModels": ["qwen-plus", "qwen-max"],
+      "users": {
+        "user-vk-1": {
+          "username": "张三",
+          "key": "sk-shared-real-key"
+        },
+        "user-vk-2": {
+          "username": "李四",
+          "key": "sk-shared-real-key"
+        }
+      }
+    }
   },
   "proxy": {
     "timeout": 180000,

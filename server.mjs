@@ -22,14 +22,54 @@ const { port } = config;
 const dashboardPassword = config.dashboardPassword || "";
 const dataPath = path.join(__dirname, "data.json");
 
+// ─── Profile System ──────────────────────────────────────────────────────────
+// Auto-migrate old config format to profile-based
+if (!config.profiles) {
+  config.profiles = {
+    "default": {
+      upstream: config.upstream,
+      allowedModels: config.allowedModels || null,
+      users: config.users || {},
+    },
+  };
+  config.activeProfile = "default";
+  delete config.upstream;
+  delete config.allowedModels;
+  delete config.users;
+  saveConfig(config);
+}
+
+function getActiveProfile() {
+  const p = config.profiles[config.activeProfile];
+  if (!p) {
+    // Fallback: use first profile
+    config.activeProfile = Object.keys(config.profiles)[0] || "default";
+    if (!config.profiles[config.activeProfile]) {
+      config.profiles[config.activeProfile] = { upstream: "https://open.bigmodel.cn/api/anthropic", allowedModels: null, users: {} };
+    }
+    return config.profiles[config.activeProfile];
+  }
+  return p;
+}
+
+function listProfiles() {
+  return Object.keys(config.profiles).map(name => ({
+    name,
+    upstream: config.profiles[name].upstream,
+    userCount: Object.keys(config.profiles[name].users || {}).length,
+    isActive: name === config.activeProfile,
+  }));
+}
+
 // Runtime mutable settings (hot-reloadable without restart)
+const activeProfile = getActiveProfile();
 const runtime = {
-  upstream: config.upstream,
-  upstreamUrl: new URL(config.upstream),
+  upstream: activeProfile.upstream,
+  upstreamUrl: new URL(activeProfile.upstream),
   proxy: { ...(config.proxy || {}) },
-  users: { ...(config.users || {}) },
+  users: { ...(activeProfile.users || {}) },
 };
-const rt = runtime; // shorthand alias
+const rt = runtime;
 
 // Default proxy settings
 rt.proxy.timeout = rt.proxy.timeout || 180000;
@@ -39,6 +79,7 @@ rt.proxy.retryDelay = rt.proxy.retryDelay || 1000;
 rt.proxy.retryableStatusCodes = rt.proxy.retryableStatusCodes || [429, 502, 503, 504];
 rt.proxy.maxConcurrentPerUser = rt.proxy.maxConcurrentPerUser || 5;
 rt.proxy.rateLimitPerMinute = rt.proxy.rateLimitPerMinute || 60;
+rt.allowedModels = activeProfile.allowedModels || null;
 
 // ─── Circuit Breaker ─────────────────────────────────────────────────────────
 class CircuitBreaker {
@@ -142,6 +183,18 @@ function reloadAgent() {
   console.log(`[CONFIG] Upstream reloaded: ${rt.upstream}`);
 }
 
+function switchProfile(profileName) {
+  const profile = config.profiles[profileName];
+  if (!profile) throw new Error(`Profile "${profileName}" not found`);
+  config.activeProfile = profileName;
+  rt.upstream = profile.upstream;
+  rt.users = { ...(profile.users || {}) };
+  rt.allowedModels = profile.allowedModels || null;
+  reloadAgent();
+  saveConfig(config);
+  console.log(`[PROFILE] Switched to "${profileName}" — upstream: ${profile.upstream}, users: ${Object.keys(rt.users).length}`);
+}
+
 // ─── Concurrency & Rate Limit ────────────────────────────────────────────────
 const userConcurrent = {};
 const userRateBucket = {};
@@ -207,8 +260,17 @@ let store = { users: {}, daily: {}, models: {}, hourly: {}, errors: [] };
 
 function loadStore() {
   try {
-    if (fs.existsSync(dataPath)) store = JSON.parse(fs.readFileSync(dataPath, "utf-8"));
-  } catch { store = { users: {}, daily: {}, errors: [] }; }
+    if (fs.existsSync(dataPath)) {
+      const raw = JSON.parse(fs.readFileSync(dataPath, "utf-8"));
+      store = {
+        users: raw.users || {},
+        daily: raw.daily || {},
+        models: raw.models || {},
+        hourly: raw.hourly || {},
+        errors: Array.isArray(raw.errors) ? raw.errors : [],
+      };
+    }
+  } catch { store = { users: {}, daily: {}, models: {}, hourly: {}, errors: [] }; }
 }
 
 function saveStore() {
@@ -222,6 +284,24 @@ loadStore();
 setInterval(saveStore, 30_000);
 
 // ─── User Helpers ─────────────────────────────────────────────────────────────
+// Normalize user config to { username, key, allowedModels }
+// Supports backward compat: old format "username" → new format object
+function getUserConfig(apiKey) {
+  const raw = rt.users[apiKey];
+  if (raw) {
+    if (typeof raw === "string") return { username: raw, key: apiKey };
+    return { username: raw.username || raw.name || `未知`, key: raw.key || apiKey };
+  }
+  for (const ck of Object.keys(rt.users)) {
+    if (apiKey.startsWith(ck) || ck.startsWith(apiKey)) {
+      const r = rt.users[ck];
+      if (typeof r === "string") return { username: r, key: ck };
+      return { username: r.username || r.name || `未知`, key: r.key || ck };
+    }
+  }
+  return { username: `未知(${apiKey.slice(0, 8)})`, key: apiKey };
+}
+
 function resolveUserKey(apiKey) {
   if (rt.users[apiKey]) return apiKey;
   for (const ck of Object.keys(rt.users)) {
@@ -231,8 +311,22 @@ function resolveUserKey(apiKey) {
 }
 
 function getUserName(apiKey) {
-  const r = resolveUserKey(apiKey);
-  return rt.users[r] || `未知(${r.slice(0, 8)})`;
+  const cfg = getUserConfig(apiKey);
+  return cfg.username;
+}
+
+function getRealKey(apiKey) {
+  const cfg = getUserConfig(apiKey);
+  return cfg.key;
+}
+
+function checkModelAllowed(model) {
+  // Skip check when model can't be determined (body parse failed or not JSON)
+  if (!model || model === "unknown") return true;
+  const allowed = rt.allowedModels;
+  if (!allowed || allowed.length === 0) return true;
+  if (allowed.includes("*")) return true;
+  return allowed.includes(model);
 }
 
 // ─── Timezone Helpers (UTC+8 北京时间) ────────────────────────────────────────
@@ -252,7 +346,7 @@ function recordUsage(apiKey, usage, model) {
   const out = usage.output_tokens || 0;
   const m = model || "unknown";
 
-  if (!store.users[key]) store.users[key] = { name: rt.users[key] || `未知(${key.slice(0, 8)})`, totalInputTokens: 0, totalOutputTokens: 0, totalRequests: 0, lastActive: null };
+  if (!store.users[key]) store.users[key] = { name: getUserName(apiKey), totalInputTokens: 0, totalOutputTokens: 0, totalRequests: 0, lastActive: null };
   const u = store.users[key];
   u.totalInputTokens += inp;
   u.totalOutputTokens += out;
@@ -349,6 +443,14 @@ function sendUpstream(body, reqUrl, reqMethod, reqHeaders, timeout) {
 
 function proxyRequest(req, res) {
   const apiKey = getApiKey(req);
+
+  // Reject non-API requests (browser favicon, Chrome DevTools, etc.)
+  if (apiKey === "unknown") {
+    res.writeHead(404, { "Content-Type": "text/plain" });
+    res.end("Not found");
+    return;
+  }
+
   const userKey = resolveUserKey(apiKey);
   const chunks = [];
 
@@ -357,6 +459,14 @@ function proxyRequest(req, res) {
     const body = Buffer.concat(chunks);
     let reqModel = "unknown";
     try { reqModel = JSON.parse(body.toString()).model || "unknown"; } catch {}
+
+    // Model access restriction
+    if (!checkModelAllowed(reqModel)) {
+      res.writeHead(403, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: `Model "${reqModel}" is not allowed for this user.` }));
+      console.log(`[BLOCK] ${getUserName(apiKey)} model=${reqModel} denied`);
+      return;
+    }
 
     // Circuit breaker check
     if (!upstreamBreaker.allowRequest()) {
@@ -384,7 +494,13 @@ function proxyRequest(req, res) {
     recordRate(userKey);
 
     try {
+      const realKey = getRealKey(apiKey);
       const reqHeaders = { ...req.headers, host: rt.upstreamUrl.host, "content-length": body.length };
+      // Replace virtual key with real upstream key
+      if (realKey !== apiKey) {
+        reqHeaders["authorization"] = `Bearer ${realKey}`;
+        console.log(`[KEY] ${getUserName(apiKey)} virtual → real key mapping`);
+      }
       delete reqHeaders["connection"];
       delete reqHeaders["transfer-encoding"];
       delete reqHeaders["accept-encoding"];
@@ -436,7 +552,7 @@ async function handleJsonProxy(req, res, body, reqHeaders, apiKey, reqModel, tim
       }
 
       // Retryable status codes
-      if (rt.proxy.retryableStatusCodes.has(upRes.statusCode) && attempt < rt.proxy.maxRetries) {
+      if (rt.proxy.retryableStatusCodes.includes(upRes.statusCode) && attempt < rt.proxy.maxRetries) {
         const baseDelay = Math.min(rt.proxy.retryDelay * Math.pow(2, attempt), 10000);
         const delay = Math.round(jitter(baseDelay));
         console.log(`[RETRY] ${getUserName(apiKey)} ${upRes.statusCode} attempt ${attempt + 1}/${rt.proxy.maxRetries} retrying in ${delay}ms`);
@@ -451,14 +567,22 @@ async function handleJsonProxy(req, res, body, reqHeaders, apiKey, reqModel, tim
         if (upRes.statusCode >= 400) {
           recordError(apiKey, upRes.statusCode, json.error?.message || json.message || text.slice(0, 200), req.url, reqModel);
           if (upRes.statusCode >= 500) upstreamBreaker.recordFailure();
-        } else if (json.usage) {
-          recordUsage(apiKey, json.usage, json.model);
-          console.log(`[TOKEN] ${getUserName(apiKey)} in=${json.usage.input_tokens || 0} out=${json.usage.output_tokens || 0}`);
+        } else {
+          // Try multiple possible usage field names
+          const usage = json.usage || json.token_usage || json.usage_info;
+          if (usage) {
+            recordUsage(apiKey, usage, json.model);
+            console.log(`[TOKEN] ${getUserName(apiKey)} in=${usage.input_tokens || usage.prompt_tokens || 0} out=${usage.output_tokens || usage.completion_tokens || 0}`);
+          } else {
+            console.log(`[RESP] ${getUserName(apiKey)} 200 OK but no usage field. body[0:300]=${text.slice(0, 300).replace(/\n/g, "\\n")}`);
+          }
         }
       } catch {
         if (upRes.statusCode >= 400) {
           recordError(apiKey, upRes.statusCode, text.slice(0, 200), req.url, reqModel);
           if (upRes.statusCode >= 500) upstreamBreaker.recordFailure();
+        } else {
+          console.log(`[RESP] ${getUserName(apiKey)} ${upRes.statusCode} non-JSON body[0:300]=${text.slice(0, 300).replace(/\n/g, "\\n")}`);
         }
       }
 
@@ -514,7 +638,9 @@ async function handleStreamingProxy(req, res, body, reqHeaders, apiKey, reqModel
       h["connection"] = "keep-alive";
       res.writeHead(upRes.statusCode, h);
 
-      let buf = "", usage = { input_tokens: 0, output_tokens: 0 }, model = "unknown";
+      let buf = "", usage = { input_tokens: 0, output_tokens: 0 }, model = reqModel;
+      let sseDataLines = 0;
+      let rawSample = "";
 
       if (upRes.statusCode >= 400) {
         let errBuf = "";
@@ -533,19 +659,45 @@ async function handleStreamingProxy(req, res, body, reqHeaders, apiKey, reqModel
 
       upRes.on("data", (chunk) => {
         res.write(chunk);
-        buf += chunk.toString();
+        const text = chunk.toString();
+        buf += text;
+        // Save sample of raw response for debug
+        if (rawSample.length < 500) rawSample += text;
+
         const lines = buf.split("\n");
         buf = lines.pop() || "";
         for (const line of lines) {
-          if (!line.startsWith("data: ")) continue;
+          if (!line.trim()) continue;
+          // Try data: prefix first, then event: line, then raw JSON
+          // Handle both "data: " and "data:" (Kimi etc. omit the space)
+          let jsonStr = "";
+          if (line.startsWith("data:")) {
+            jsonStr = line.slice(5).trim();
+          } else if (line.startsWith("event:")) {
+            continue;
+          } else if (line.startsWith("{")) {
+            jsonStr = line;
+          } else {
+            continue;
+          }
+          sseDataLines++;
           try {
-            const d = JSON.parse(line.slice(6));
+            const d = JSON.parse(jsonStr);
+            if (sseDataLines <= 3) console.log(`[SSE] ${getUserName(apiKey)} #${sseDataLines} type=${d.type} keys=${Object.keys(d).join(",")}`);
             if (d.type === "message_start") {
-              if (d.message && d.message.model) model = d.message.model;
+              if (d.message) {
+                model = d.message.model || model;
+                if (d.message.usage) usage.input_tokens = d.message.usage.input_tokens || 0;
+              }
+              model = d.model || model;
             } else if (d.type === "message_delta") {
               usage.output_tokens = d.usage?.output_tokens || 0;
-              usage.input_tokens = d.usage?.input_tokens || 0;
             }
+            if (d.usage) {
+              if (d.usage.input_tokens) usage.input_tokens = d.usage.input_tokens;
+              if (d.usage.output_tokens) usage.output_tokens = d.usage.output_tokens;
+            }
+            if (d.model && model === "unknown") model = d.model;
           } catch {}
         }
       });
@@ -557,6 +709,8 @@ async function handleStreamingProxy(req, res, body, reqHeaders, apiKey, reqModel
         if (usage.input_tokens > 0 || usage.output_tokens > 0) {
           recordUsage(apiKey, usage, model);
           console.log(`[TOKEN] ${getUserName(apiKey)} in=${usage.input_tokens} out=${usage.output_tokens}`);
+        } else {
+          console.log(`[RESP] ${getUserName(apiKey)} stream ended, no usage. model=${model} sseLines=${sseDataLines} raw[0:200]=${rawSample.slice(0, 200).replace(/\n/g, "\\n")}`);
         }
         res.end();
         resolve();
@@ -587,12 +741,25 @@ async function handleStreamingProxy(req, res, body, reqHeaders, apiKey, reqModel
 
 // ─── Settings API Helpers ─────────────────────────────────────────────────────
 function getPublicSettings() {
+  const safeUsers = {};
+  for (const [k, v] of Object.entries(rt.users)) {
+    const maskedK = k.slice(0, 12) + "****";
+    if (typeof v === "string") {
+      safeUsers[maskedK] = { username: v, key: k.slice(0, 12) + "****" };
+    } else {
+      safeUsers[maskedK] = {
+        username: v.username || v.name || "",
+        key: (v.key || "").slice(0, 12) + "****",
+      };
+    }
+  }
   return {
     upstream: rt.upstream,
     proxy: { ...rt.proxy },
-    users: Object.fromEntries(
-      Object.entries(rt.users).map(([k, v]) => [k.slice(0, 12) + "****", v])
-    ),
+    allowedModels: rt.allowedModels,
+    users: safeUsers,
+    activeProfile: config.activeProfile,
+    profiles: listProfiles(),
     circuitBreaker: upstreamBreaker.status(),
     port: port,
     hasPassword: !!dashboardPassword,
@@ -603,9 +770,23 @@ function getPublicSettings() {
 function settingsHtml(errorMsg) {
   const s = getPublicSettings();
   const errDiv = errorMsg ? `<div style="background:rgba(248,113,113,.12);color:var(--red);padding:10px 14px;border-radius:6px;margin-bottom:16px;font-size:13px">${errorMsg}</div>` : "";
-  const userRows = Object.entries(rt.users).map(([k, v]) =>
-    `<tr><td><input type="text" name="uk_${k}" value="${k}" style="width:100%;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:4px 8px;border-radius:4px;font-size:12px;font-family:monospace"></td><td><input type="text" name="un_${k}" value="${v}" style="width:100%;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:4px 8px;border-radius:4px;font-size:12px"></td><td><button type="button" onclick="this.closest('tr').remove()" style="background:rgba(248,113,113,.15);color:var(--red);border:none;padding:2px 8px;border-radius:4px;cursor:pointer;font-size:11px">删除</button></td></tr>`
-  ).join("");
+  const userRows = Object.entries(rt.users).map(([k, v]) => {
+    const username = typeof v === "string" ? v : (v.username || "");
+    const realKey = typeof v === "string" ? k : (v.key || "");
+    return `<tr>
+<td><input type="text" name="uk_${k}" value="${k}" style="width:100%;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:4px 8px;border-radius:4px;font-size:12px;font-family:monospace" placeholder="虚拟Key"></td>
+<td><input type="text" name="un_${k}" value="${username}" style="width:100%;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:4px 8px;border-radius:4px;font-size:12px" placeholder="用户名"></td>
+<td><input type="text" name="rk_${k}" value="${realKey}" style="width:100%;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:4px 8px;border-radius:4px;font-size:12px;font-family:monospace" placeholder="真实Key"></td>
+<td><button type="button" onclick="this.closest('tr').remove()" style="background:rgba(248,113,113,.15);color:var(--red);border:none;padding:2px 8px;border-radius:4px;cursor:pointer;font-size:11px">删除</button></td></tr>`;
+  }).join("");
+
+  const profileBtns = s.profiles.map(p => {
+    let html = '<button type="button" class="profile-btn' + (p.isActive ? ' active' : '') + '" onclick="switchToProfile(\'' + p.name + '\')" title="' + p.upstream + ' — ' + p.userCount + '个用户">' + p.name + (p.isActive ? ' ✓' : '') + '</button>';
+    if (!p.isActive) {
+      html += '<button type="button" onclick="deleteProfile(\'' + p.name + '\')" style="background:none;border:none;color:var(--dim);cursor:pointer;font-size:14px;padding:0 2px" title="删除 ' + p.name + '">×</button>';
+    }
+    return html;
+  }).join("\n  ");
 
   return `<!DOCTYPE html>
 <html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
@@ -644,14 +825,28 @@ td{padding:6px 8px;border-bottom:1px solid var(--border);font-size:12px}
 .provider-presets{display:flex;gap:6px;flex-wrap:wrap;margin-top:6px}
 .provider-preset{font-size:11px;padding:4px 10px;border-radius:4px;border:1px solid var(--border);background:var(--bg);color:var(--dim);cursor:pointer;font-family:monospace}
 .provider-preset:hover{border-color:var(--accent);color:var(--text)}
+.profile-bar{display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin-bottom:16px}
+.profile-btn{padding:6px 14px;border:1px solid var(--border);border-radius:6px;background:var(--card);color:var(--text);cursor:pointer;font-size:12px}
+.profile-btn.active{border-color:var(--accent);background:rgba(124,110,240,.12);color:var(--accent)}
+.profile-btn:hover{border-color:var(--accent)}
+.profile-actions{display:flex;gap:6px;margin-left:auto}
 </style></head><body>
 <h1>代理设置 <a href="/dashboard">← 返回监控面板</a></h1>
 ${errDiv}
-<form method="post" action="/api/settings-save">
+<div class="profile-bar">
+  <span style="font-size:12px;color:var(--dim);margin-right:4px">配置方案:</span>
+	  ${profileBtns}
+	  <span class="profile-actions">
+	    <button type="button" class="btn btn-outline btn-sm" onclick="saveAsProfile()">另存为新方案</button>
+	  </span>
+</div>
+<form method="post" action="/api/settings-save" id="settingsForm">
 <div class="section">
 <h2>上游代理 <span class="status ${s.circuitBreaker.state === 'CLOSED' ? 'status-ok' : s.circuitBreaker.state === 'HALF_OPEN' ? 'status-warn' : 'status-err'}">${s.circuitBreaker.state === 'CLOSED' ? '正常' : s.circuitBreaker.state === 'HALF_OPEN' ? '探测中' : '熔断中'}</span></h2>
 <label>上游 API 地址</label>
 <input type="text" name="upstream" value="${s.upstream}" placeholder="https://open.bigmodel.cn/api/anthropic">
+<label>允许模型 (逗号分隔，留空=不限制)</label>
+<input type="text" name="allowedModels" value="${(s.allowedModels || []).join(",")}" placeholder="留空表示不限制，填写则只允许指定模型" style="font-family:monospace">
 <div class="provider-presets">
   <span style="font-size:11px;color:var(--dim);line-height:24px">快速切换：</span>
   <button type="button" class="provider-preset" onclick="document.querySelector('[name=upstream]').value='https://open.bigmodel.cn/api/anthropic'">智谱 GLM</button>
@@ -659,6 +854,7 @@ ${errDiv}
   <button type="button" class="provider-preset" onclick="document.querySelector('[name=upstream]').value='https://api.openai.com/v1'">OpenAI</button>
   <button type="button" class="provider-preset" onclick="document.querySelector('[name=upstream]').value='https://api.deepseek.com/v1'">DeepSeek</button>
   <button type="button" class="provider-preset" onclick="document.querySelector('[name=upstream]').value='https://api.moonshot.cn/v1'">Moonshot</button>
+	  <button type="button" class="provider-preset" onclick="document.querySelector('[name=upstream]').value='https://dashscope.aliyuncs.com/compatible-mode/v1'">阿里百炼</button>
 </div>
 <label>当前状态：${s.circuitBreaker.state === 'CLOSED' ? '正常运行' : s.circuitBreaker.state === 'HALF_OPEN' ? '正在探测上游恢复情况...' : `熔断中 (${Math.ceil(s.circuitBreaker.cooldownRemaining / 1000)}秒后恢复)`}</label>
 <div class="note">失败次数: ${s.circuitBreaker.failureCount} | 总成功: ${s.circuitBreaker.totalSuccesses} | 总失败: ${s.circuitBreaker.totalFailures}</div>
@@ -694,10 +890,10 @@ ${errDiv}
 <div class="section">
 <h2>用户 API Key 管理 <button type="button" class="btn btn-outline btn-sm" onclick="addUserRow()" style="float:right">+ 添加用户</button></h2>
 <table id="usersTable">
-<thead><tr><th>API Key</th><th>用户名称</th><th style="width:60px">操作</th></tr></thead>
+<thead><tr><th>虚拟 Key</th><th>用户名称</th><th>真实 Key</th><th style="width:60px">操作</th></tr></thead>
 <tbody>${userRows}</tbody>
 </table>
-<div class="note">修改 API Key 或用户名后保存即可生效，无需重启服务。Key 简写匹配规则仍然有效。</div>
+<div class="note">GLM模式：虚拟Key=真实Key。阿里共享模式：多人同一真实Key，各自虚拟Key。</div>
 </div>
 
 <div class="actions">
@@ -706,10 +902,29 @@ ${errDiv}
 </div>
 </form>
 <script>
+async function switchToProfile(name){
+  if(!confirm('切换到配置方案 "'+name+'"？当前未保存的修改将丢失。'))return;
+  const r=await fetch('/api/profile/switch',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({profile:name})});
+  if(r.ok)location.reload();
+  else{const e=await r.json();alert('切换失败: '+e.error)}
+}
+async function saveAsProfile(){
+  const name=prompt('请输入新方案名称（例如：阿里百炼、GLM）');
+  if(!name)return;
+  const r=await fetch('/api/profile/save',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({profile:name,upstream:document.querySelector('[name=upstream]').value,allowedModels:document.querySelector('[name=allowedModels]').value})});
+  if(r.ok)location.reload();
+  else{const e=await r.json();alert('保存失败: '+e.error)}
+}
+async function deleteProfile(name){
+  if(!confirm('确定删除配置方案 "'+name+'"？此操作不可恢复。'))return;
+  const r=await fetch('/api/profile/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({profile:name})});
+  if(r.ok)location.reload();
+  else{const e=await r.json();alert('删除失败: '+e.error)}
+}
 function addUserRow(){
   const tbody=document.querySelector("#usersTable tbody");
   const tr=document.createElement("tr");
-  tr.innerHTML='<td><input type="text" name="uk_new_'+Date.now()+'" placeholder="输入 API Key" style="width:100%;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:4px 8px;border-radius:4px;font-size:12px;font-family:monospace"></td><td><input type="text" name="un_new_'+Date.now()+'" placeholder="输入用户名称" style="width:100%;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:4px 8px;border-radius:4px;font-size:12px"></td><td><button type="button" onclick="this.closest('tr').remove()" style="background:rgba(248,113,113,.15);color:var(--red);border:none;padding:2px 8px;border-radius:4px;cursor:pointer;font-size:11px">删除</button></td>';
+  tr.innerHTML='<td><input type="text" name="uk_new_'+Date.now()+'" placeholder="虚拟 Key" style="width:100%;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:4px 8px;border-radius:4px;font-size:12px;font-family:monospace"></td><td><input type="text" name="un_new_'+Date.now()+'" placeholder="用户名称" style="width:100%;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:4px 8px;border-radius:4px;font-size:12px"></td><td><input type="text" name="rk_new_'+Date.now()+'" placeholder="真实 Key" style="width:100%;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:4px 8px;border-radius:4px;font-size:12px;font-family:monospace"></td><td><button type="button" onclick="this.closest(\\'tr\\').remove()" style="background:rgba(248,113,113,.15);color:var(--red);border:none;padding:2px 8px;border-radius:4px;cursor:pointer;font-size:11px">删除</button></td>';
   tbody.appendChild(tr);
 }
 document.addEventListener("keydown",e=>{if(e.key==="Enter"&&e.target.tagName!=="TEXTAREA")e.preventDefault()});
@@ -792,7 +1007,7 @@ function render(){
   const td=new Date(Date.now()+8*36e5).toISOString().slice(0,10),tdd=(D.daily||{})[td]||{};
   const tIn=Object.values(tdd).reduce((s,d)=>s+d.inputTokens,0),tOut=Object.values(tdd).reduce((s,d)=>s+d.outputTokens,0),tR=Object.values(tdd).reduce((s,d)=>s+d.requests,0);
   document.getElementById("cards").innerHTML=c("今日用量",fmtT(tIn+tOut),"var(--accent)")+c("今日请求",fmtT(tR),"var(--blue)")+c("总用量",fmtT(ti+to),"var(--green)")+c("总请求",fmtT(tr),"var(--orange)")+c("今日错误",fmtT((Array.isArray(D.errors)?D.errors:[]).filter(e=>e.time&&e.time.startsWith(td)).length),"var(--red)");
-  document.getElementById("meta").textContent="更新于 "+(function(){const d=new Date();const utc=d.getTime()+d.getTimezoneOffset()*60000;return new Date(utc+8*3600000).toLocaleTimeString("zh-CN")})()+" (北京时间) | 每30秒刷新";
+  document.getElementById("meta").innerHTML='<span style="color:var(--accent);font-weight:600">方案: '+(D.activeProfile||"-")+'</span> &nbsp;|&nbsp; 上游: '+(D.upstream||"-").replace("https://","").replace("http://","")+' &nbsp;|&nbsp; 更新于 '+(function(){const d=new Date();const utc=d.getTime()+d.getTimezoneOffset()*60000;return new Date(utc+8*3600000).toLocaleTimeString("zh-CN")})()+" (北京时间) | 每30秒刷新";
 
   // Charts
   const g=grp(D.daily||{},P),keys=Object.keys(g).sort(),uks=Object.keys(D.users);
@@ -911,39 +1126,50 @@ function applySettings(formData) {
       .filter(n => !isNaN(n));
   }
 
+  // Update allowed models (global)
+  if (formData.allowedModels !== undefined) {
+    const raw = formData.allowedModels.trim();
+    rt.allowedModels = raw ? raw.split(",").map(s => s.trim()).filter(Boolean) : null;
+  }
+
   // Update circuit breaker thresholds
   upstreamBreaker.failureThreshold = rt.proxy.circuitBreakerFailures || 5;
   upstreamBreaker.cooldownMs = rt.proxy.circuitBreakerCooldown || 30000;
 
   // Update users
   const newUsers = {};
+  function collectUser(virtualKey, suffix, prefix) {
+    if (!virtualKey || !virtualKey.trim()) return;
+    const vk = virtualKey.trim();
+    const username = formData[prefix + "un_" + suffix] || vk.slice(0, 8);
+    const realKey = formData[prefix + "rk_" + suffix] || vk;
+    newUsers[vk] = { username, key: realKey.trim() };
+  }
   for (const [k, v] of Object.entries(formData)) {
-    if (k.startsWith("uk_") && v.trim()) {
-      const suffix = k.slice(3);
-      const nameKey = "un_" + suffix;
-      const name = formData[nameKey] || v.trim().slice(0, 8);
-      newUsers[v.trim()] = name;
+    if (k.startsWith("uk_") && !k.startsWith("uk_new_")) {
+      collectUser(v, k.slice(3), "");
     }
-    // New users
     if (k.startsWith("uk_new_") && v.trim()) {
-      const suffix = k.slice(7);
-      const nameKey = "un_new_" + suffix;
-      const name = formData[nameKey] || v.trim().slice(0, 8);
-      newUsers[v.trim()] = name;
+      collectUser(v, k.slice(7), "new_");
     }
   }
   if (Object.keys(newUsers).length > 0) {
     rt.users = newUsers;
   }
 
-  // Persist to config.json
+  // Persist to config.json — save to active profile
   const cfg = loadConfig();
-  cfg.upstream = rt.upstream;
   cfg.proxy = { ...rt.proxy };
-  cfg.users = { ...rt.users };
+  // Update active profile
+  const ap = cfg.profiles[cfg.activeProfile];
+  if (ap) {
+    ap.upstream = rt.upstream;
+    ap.allowedModels = rt.allowedModels;
+    ap.users = { ...rt.users };
+  }
   saveConfig(cfg);
 
-  console.log("[CONFIG] Settings saved and applied");
+  console.log(`[CONFIG] Settings saved to profile "${cfg.activeProfile}"`);
 }
 
 const server = http.createServer((req, res) => {
@@ -1025,6 +1251,77 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+  // Profile: switch
+  if (req.method === "POST" && req.url === "/api/profile/switch") {
+    if (!checkAuth(req)) { res.writeHead(401); res.end("Unauthorized"); return; }
+    const chunks = [];
+    req.on("data", (c) => chunks.push(c));
+    req.on("end", () => {
+      try {
+        const { profile } = JSON.parse(Buffer.concat(chunks).toString());
+        switchProfile(profile);
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: true, activeProfile: config.activeProfile }));
+      } catch (err) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: err.message }));
+      }
+    });
+    return;
+  }
+
+  // Profile: save as new
+  if (req.method === "POST" && req.url === "/api/profile/save") {
+    if (!checkAuth(req)) { res.writeHead(401); res.end("Unauthorized"); return; }
+    const chunks = [];
+    req.on("data", (c) => chunks.push(c));
+    req.on("end", () => {
+      try {
+        const { profile, upstream, allowedModels } = JSON.parse(Buffer.concat(chunks).toString());
+        const name = (profile || "").trim();
+        if (!name) throw new Error("Profile name required");
+        // Save current runtime state to new profile
+        config.profiles[name] = {
+          upstream: upstream || rt.upstream,
+          allowedModels: allowedModels ? allowedModels.split(",").map(s => s.trim()).filter(Boolean) : rt.allowedModels,
+          users: { ...rt.users },
+        };
+        config.activeProfile = name;
+        saveConfig(config);
+        console.log(`[PROFILE] Created new profile "${name}"`);
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: true, profile: name }));
+      } catch (err) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: err.message }));
+      }
+    });
+    return;
+  }
+
+  // Profile: delete
+  if (req.method === "POST" && req.url === "/api/profile/delete") {
+    if (!checkAuth(req)) { res.writeHead(401); res.end("Unauthorized"); return; }
+    const chunks = [];
+    req.on("data", (c) => chunks.push(c));
+    req.on("end", () => {
+      try {
+        const { profile } = JSON.parse(Buffer.concat(chunks).toString());
+        if (Object.keys(config.profiles).length <= 1) throw new Error("Cannot delete last profile");
+        if (profile === config.activeProfile) throw new Error("Cannot delete active profile. Switch first.");
+        delete config.profiles[profile];
+        saveConfig(config);
+        console.log(`[PROFILE] Deleted profile "${profile}"`);
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: true }));
+      } catch (err) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: err.message }));
+      }
+    });
+    return;
+  }
+
   // Settings JSON API for programmatic updates
   if (req.method === "POST" && req.url === "/api/settings") {
     if (!checkAuth(req)) { res.writeHead(401); res.end("Unauthorized"); return; }
@@ -1048,10 +1345,19 @@ const server = http.createServer((req, res) => {
             circuitBreakerCooldown: updates.proxy.circuitBreakerCooldown,
           });
         }
+        if (updates.allowedModels) {
+          formData.allowedModels = Array.isArray(updates.allowedModels) ? updates.allowedModels.join(",") : updates.allowedModels;
+        }
         if (updates.users) {
           for (const [k, v] of Object.entries(updates.users)) {
             formData["uk_" + k] = k;
-            formData["un_" + k] = v;
+            if (typeof v === "string") {
+              formData["un_" + k] = v;
+              formData["rk_" + k] = k;
+            } else {
+              formData["un_" + k] = v.username || v.name || "";
+              formData["rk_" + k] = v.key || k;
+            }
           }
         }
         applySettings(formData);
@@ -1089,8 +1395,11 @@ const server = http.createServer((req, res) => {
   // Protected API: stats
   if (req.method === "GET" && req.url === "/api/stats") {
     if (!checkAuth(req)) { res.writeHead(401); res.end("Unauthorized"); return; }
+    const data = sanitizeStore(store);
+    data.activeProfile = config.activeProfile;
+    data.upstream = rt.upstream;
     res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify(sanitizeStore(store)));
+    res.end(JSON.stringify(data));
     return;
   }
 
@@ -1130,9 +1439,9 @@ const server = http.createServer((req, res) => {
 
 server.listen(port, "0.0.0.0", () => {
   console.log(`[团队AI Coding监控] http://0.0.0.0:${port}  Dashboard: http://localhost:${port}/dashboard`);
-  console.log(`[团队AI Coding监控] Upstream: ${rt.upstream}`);
+  console.log(`[团队AI Coding监控] Profile: "${config.activeProfile}" → ${rt.upstream}`);
   console.log(`[团队AI Coding监控] Settings: http://localhost:${port}/settings`);
-  console.log(`[团队AI Coding监控] Users: ${Object.values(rt.users).join(", ")}`);
+  console.log(`[团队AI Coding监控] Users: ${Object.values(rt.users).map(u => typeof u === "string" ? u : u.username).join(", ")}`);
 });
 
 // Server timeouts

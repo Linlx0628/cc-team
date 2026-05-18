@@ -1,0 +1,11 @@
+.DS_Store
+node_modules/
+npm-debug.log*
+
+# Local runtime secrets and usage data.
+config.json
+data.json
+
+# Worktree temporary directories
+.claude/worktrees/
+

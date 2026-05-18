@@ -1,0 +1,19 @@
+{
+  "port": 6789,
+  "dashboardPassword": "change-me",
+  "upstream": "https://open.bigmodel.cn/api/anthropic",
+  "users": {
+    "example-api-key": "示例成员"
+  },
+  "proxy": {
+    "timeout": 180000,
+    "streamTimeout": 600000,
+    "maxRetries": 3,
+    "retryDelay": 1000,
+    "retryableStatusCodes": [429, 502, 503, 504],
+    "maxConcurrentPerUser": 5,
+    "rateLimitPerMinute": 60,
+    "circuitBreakerFailures": 5,
+    "circuitBreakerCooldown": 30000
+  }
+}

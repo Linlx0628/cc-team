@@ -343,32 +343,40 @@ function recordUsage(apiKey, usage, model) {
   const key = resolveUserKey(apiKey);
   const today = cnDate();
   const hour = cnHour();
-  const inp = usage.input_tokens || 0;
-  const out = usage.output_tokens || 0;
+  const inp = usage.input_tokens || usage.prompt_tokens || 0;
+  const out = usage.output_tokens || usage.completion_tokens || 0;
+  const cacheC = usage.cache_creation_input_tokens || 0;
+  const cacheR = usage.cache_read_input_tokens || 0;
   const m = model || "unknown";
 
-  if (!store.users[key]) store.users[key] = { name: getUserName(apiKey), totalInputTokens: 0, totalOutputTokens: 0, totalRequests: 0, lastActive: null };
+  if (!store.users[key]) store.users[key] = { name: getUserName(apiKey), totalInputTokens: 0, totalOutputTokens: 0, totalRequests: 0, lastActive: null, cacheCreationTokens: 0, cacheReadTokens: 0 };
   const u = store.users[key];
   u.totalInputTokens += inp;
   u.totalOutputTokens += out;
   u.totalRequests += 1;
+  u.cacheCreationTokens = (u.cacheCreationTokens || 0) + cacheC;
+  u.cacheReadTokens = (u.cacheReadTokens || 0) + cacheR;
   u.lastActive = new Date().toISOString();
 
   if (!store.daily[today]) store.daily[today] = {};
-  if (!store.daily[today][key]) store.daily[today][key] = { inputTokens: 0, outputTokens: 0, requests: 0 };
+  if (!store.daily[today][key]) store.daily[today][key] = { inputTokens: 0, outputTokens: 0, requests: 0, cacheCreationTokens: 0, cacheReadTokens: 0 };
   store.daily[today][key].inputTokens += inp;
   store.daily[today][key].outputTokens += out;
   store.daily[today][key].requests += 1;
+  store.daily[today][key].cacheCreationTokens = (store.daily[today][key].cacheCreationTokens || 0) + cacheC;
+  store.daily[today][key].cacheReadTokens = (store.daily[today][key].cacheReadTokens || 0) + cacheR;
 
   if (!store.models[m]) store.models[m] = { tokens: 0, requests: 0 };
   store.models[m].tokens += inp + out;
   store.models[m].requests += 1;
 
   if (!store.hourly[today]) store.hourly[today] = {};
-  if (!store.hourly[today][hour]) store.hourly[today][hour] = { requests: 0, inputTokens: 0, outputTokens: 0 };
+  if (!store.hourly[today][hour]) store.hourly[today][hour] = { requests: 0, inputTokens: 0, outputTokens: 0, cacheCreationTokens: 0, cacheReadTokens: 0 };
   store.hourly[today][hour].requests += 1;
   store.hourly[today][hour].inputTokens += inp;
   store.hourly[today][hour].outputTokens += out;
+  store.hourly[today][hour].cacheCreationTokens = (store.hourly[today][hour].cacheCreationTokens || 0) + cacheC;
+  store.hourly[today][hour].cacheReadTokens = (store.hourly[today][hour].cacheReadTokens || 0) + cacheR;
 }
 
 // ─── Error Recording ──────────────────────────────────────────────────────────
@@ -500,7 +508,7 @@ function proxyRequest(req, res) {
       // Replace virtual key with real upstream key
       if (realKey !== apiKey) {
         reqHeaders["authorization"] = `Bearer ${realKey}`;
-        console.log(`[KEY] ${getUserName(apiKey)} virtual → real key mapping`);
+        console.log(`[KEY] ${getUserName(apiKey)} virtual → real key mapping model=${reqModel}`);
       }
       delete reqHeaders["connection"];
       delete reqHeaders["transfer-encoding"];
@@ -556,7 +564,7 @@ async function handleJsonProxy(req, res, body, reqHeaders, apiKey, reqModel, tim
       if (rt.proxy.retryableStatusCodes.includes(upRes.statusCode) && attempt < rt.proxy.maxRetries) {
         const baseDelay = Math.min(rt.proxy.retryDelay * Math.pow(2, attempt), 10000);
         const delay = Math.round(jitter(baseDelay));
-        console.log(`[RETRY] ${getUserName(apiKey)} ${upRes.statusCode} attempt ${attempt + 1}/${rt.proxy.maxRetries} retrying in ${delay}ms`);
+        console.log(`[RETRY] ${getUserName(apiKey)} ${upRes.statusCode} model=${reqModel} attempt ${attempt + 1}/${rt.proxy.maxRetries} retrying in ${delay}ms`);
         recordError(apiKey, upRes.statusCode, `Retryable error (attempt ${attempt + 1}/${rt.proxy.maxRetries})`, req.url, reqModel);
         await sleep(delay);
         continue;
@@ -573,9 +581,10 @@ async function handleJsonProxy(req, res, body, reqHeaders, apiKey, reqModel, tim
           const usage = json.usage || json.token_usage || json.usage_info;
           if (usage) {
             recordUsage(apiKey, usage, json.model);
-            console.log(`[TOKEN] ${getUserName(apiKey)} in=${usage.input_tokens || usage.prompt_tokens || 0} out=${usage.output_tokens || usage.completion_tokens || 0}`);
+            const modelName = json.model || reqModel;
+            console.log(`[TOKEN] ${getUserName(apiKey)} model=${modelName} in=${usage.input_tokens || usage.prompt_tokens || 0} out=${usage.output_tokens || usage.completion_tokens || 0} cache_w=${usage.cache_creation_input_tokens || 0} cache_r=${usage.cache_read_input_tokens || 0}`);
           } else {
-            console.log(`[RESP] ${getUserName(apiKey)} 200 OK but no usage field. body[0:300]=${text.slice(0, 300).replace(/\n/g, "\\n")}`);
+            console.log(`[RESP] ${getUserName(apiKey)} 200 OK but no usage field. model=${reqModel} body[0:300]=${text.slice(0, 300).replace(/\n/g, "\\n")}`);
           }
         }
       } catch {
@@ -600,7 +609,7 @@ async function handleJsonProxy(req, res, body, reqHeaders, apiKey, reqModel, tim
       if (attempt < rt.proxy.maxRetries) {
         const baseDelay = Math.min(rt.proxy.retryDelay * Math.pow(2, attempt), 10000);
         const delay = Math.round(jitter(baseDelay));
-        console.log(`[RETRY] ${getUserName(apiKey)} network error attempt ${attempt + 1}/${rt.proxy.maxRetries} retrying in ${delay}ms`);
+        console.log(`[RETRY] ${getUserName(apiKey)} network error model=${reqModel} attempt ${attempt + 1}/${rt.proxy.maxRetries} retrying in ${delay}ms`);
         await sleep(delay);
       }
     }
@@ -688,7 +697,11 @@ async function handleStreamingProxy(req, res, body, reqHeaders, apiKey, reqModel
             if (d.type === "message_start") {
               if (d.message) {
                 model = d.message.model || model;
-                if (d.message.usage) usage.input_tokens = d.message.usage.input_tokens || 0;
+                if (d.message.usage) {
+                  usage.input_tokens = d.message.usage.input_tokens || 0;
+                  usage.cache_creation_input_tokens = d.message.usage.cache_creation_input_tokens || 0;
+                  usage.cache_read_input_tokens = d.message.usage.cache_read_input_tokens || 0;
+                }
               }
               model = d.model || model;
             } else if (d.type === "message_delta") {
@@ -697,6 +710,8 @@ async function handleStreamingProxy(req, res, body, reqHeaders, apiKey, reqModel
             if (d.usage) {
               if (d.usage.input_tokens) usage.input_tokens = d.usage.input_tokens;
               if (d.usage.output_tokens) usage.output_tokens = d.usage.output_tokens;
+              if (d.usage.cache_creation_input_tokens) usage.cache_creation_input_tokens = d.usage.cache_creation_input_tokens;
+              if (d.usage.cache_read_input_tokens) usage.cache_read_input_tokens = d.usage.cache_read_input_tokens;
             }
             if (d.model && model === "unknown") model = d.model;
           } catch {}
@@ -705,11 +720,11 @@ async function handleStreamingProxy(req, res, body, reqHeaders, apiKey, reqModel
 
       upRes.on("end", () => {
         if (buf.startsWith("data: ")) {
-          try { const d = JSON.parse(buf.slice(6)); if (d.usage) usage.output_tokens = d.usage.output_tokens || 0; } catch {}
+          try { const d = JSON.parse(buf.slice(6)); if (d.usage) { usage.output_tokens = d.usage.output_tokens || usage.output_tokens || 0; usage.cache_creation_input_tokens = d.usage.cache_creation_input_tokens || usage.cache_creation_input_tokens || 0; usage.cache_read_input_tokens = d.usage.cache_read_input_tokens || usage.cache_read_input_tokens || 0; } } catch {}
         }
         if (usage.input_tokens > 0 || usage.output_tokens > 0) {
           recordUsage(apiKey, usage, model);
-          console.log(`[TOKEN] ${getUserName(apiKey)} in=${usage.input_tokens} out=${usage.output_tokens}`);
+          console.log(`[TOKEN] ${getUserName(apiKey)} model=${model} in=${usage.input_tokens} out=${usage.output_tokens} cache_w=${usage.cache_creation_input_tokens || 0} cache_r=${usage.cache_read_input_tokens || 0}`);
         } else {
           console.log(`[RESP] ${getUserName(apiKey)} stream ended, no usage. model=${model} sseLines=${sseDataLines} raw[0:200]=${rawSample.slice(0, 200).replace(/\n/g, "\\n")}`);
         }
@@ -990,10 +1005,10 @@ tr:last-child td{border-bottom:none}tr:hover td{background:rgba(255,255,255,.02)
   <div class="box"><h3>24 小时使用趋势 (今日)</h3><canvas id="hourChart"></canvas></div>
 </div>
 <div class="sec"><h3>用户用量明细</h3><table id="uTable"><thead>
-<tr><th>用户</th><th>状态</th><th class="n">请求数</th><th class="n">输入</th><th class="n">输出</th><th class="n">合计</th><th>最后活跃</th></tr>
+<tr><th>用户</th><th>状态</th><th class="n">请求数</th><th class="n">输入</th><th class="n">输出</th><th class="n">缓存写入</th><th class="n">缓存命中</th><th class="n">合计</th><th>最后活跃</th></tr>
 </thead><tbody></tbody></table></div>
 <div class="sec sec-collapsible" id="detailSec"><h3 onclick="toggleSec('detailSec')"><span class="sec-toggle" id="detailSecIcon">▶</span>明细记录<span class="sec-hint" id="detailHint"></span></h3><div class="sec-body" id="detailSecBody"><table id="dTable"><thead>
-<tr><th>时间</th><th>用户</th><th class="n">请求数</th><th class="n">输入</th><th class="n">输出</th><th class="n">合计</th></tr>
+<tr><th>时间</th><th>用户</th><th class="n">请求数</th><th class="n">输入</th><th class="n">输出</th><th class="n">缓存写入</th><th class="n">缓存命中</th><th class="n">合计</th></tr>
 </thead><tbody></tbody></table></div></div>
 <div class="sec sec-collapsible" id="errorSec"><h3 onclick="toggleSec('errorSec')"><span class="sec-toggle" id="errorSecIcon">▶</span>错误记录<span id="errorCount" style="font-size:11px;color:var(--red);font-weight:400;margin-left:4px"></span><span class="sec-hint" id="errorHint" style="margin-left:auto"></span><button id="clearErrors" onclick="event.stopPropagation()" style="font-size:11px;background:rgba(248,113,113,.15);color:var(--red);border:none;padding:2px 10px;border-radius:4px;cursor:pointer;margin-left:8px">清除</button></h3><div class="sec-body" id="errorSecBody"><table id="eTable"><thead>
 <tr><th>时间</th><th>用户</th><th class="n">状态码</th><th>模型</th><th>路径</th><th>错误信息</th></tr>
@@ -1041,11 +1056,11 @@ function render(){
   // User table
   const ut=document.querySelector("#uTable tbody");
   const ul=Object.entries(D.users).sort((a,b)=>(b[1].totalInputTokens+b[1].totalOutputTokens)-(a[1].totalInputTokens+a[1].totalOutputTokens));
-  if(!ul.length){ut.innerHTML='<tr><td colspan="7" class="empty">暂无数据</td></tr>'}else{ut.innerHTML=ul.map(([,u])=>{const on=u.lastActive&&Date.now()-new Date(u.lastActive).getTime()<36e5;return'<tr><td>'+u.name+'</td><td><span style="padding:2px 8px;border-radius:4px;font-size:11px;background:'+(on?'rgba(52,211,153,.15)':'rgba(255,255,255,.05)')+';color:'+(on?'var(--green)':'var(--dim)')+'">'+(on?'在线':'离线')+'</span></td><td class="n">'+fmtT(u.totalRequests)+'</td><td class="n">'+fmtT(u.totalInputTokens)+'</td><td class="n">'+fmtT(u.totalOutputTokens)+'</td><td class="n hl">'+fmtT(u.totalInputTokens+u.totalOutputTokens)+'</td><td>'+ago(u.lastActive)+'</td></tr>'}).join("")}
+  if(!ul.length){ut.innerHTML='<tr><td colspan="9" class="empty">暂无数据</td></tr>'}else{ut.innerHTML=ul.map(([,u])=>{const on=u.lastActive&&Date.now()-new Date(u.lastActive).getTime()<36e5;return'<tr><td>'+u.name+'</td><td><span style="padding:2px 8px;border-radius:4px;font-size:11px;background:'+(on?'rgba(52,211,153,.15)':'rgba(255,255,255,.05)')+';color:'+(on?'var(--green)':'var(--dim)')+'">'+(on?'在线':'离线')+'</span></td><td class="n">'+fmtT(u.totalRequests)+'</td><td class="n">'+fmtT(u.totalInputTokens)+'</td><td class="n">'+fmtT(u.totalOutputTokens)+'</td><td class="n">'+fmtT(u.cacheCreationTokens || 0)+'</td><td class="n">'+fmtT(u.cacheReadTokens || 0)+'</td><td class="n hl">'+fmtT(u.totalInputTokens+u.totalOutputTokens)+'</td><td>'+ago(u.lastActive)+'</td></tr>'}).join("")}
 
   // Detail table
   const dt=document.querySelector("#dTable tbody");
-  if(!keys.length){dt.innerHTML='<tr><td colspan="6" class="empty">暂无数据</td></tr>'}else{let rows=[];for(const k of keys.sort().reverse()){const us2=Object.entries(g[k]).sort((a,b)=>(b[1].inputTokens+b[1].outputTokens)-(a[1].inputTokens+a[1].outputTokens));for(const[u,d]of us2){const n=(D.users[u]||{}).name||u.slice(0,8);rows.push('<tr><td>'+lbl(P,k)+'</td><td>'+n+'</td><td class="n">'+fmtT(d.requests)+'</td><td class="n">'+fmtT(d.inputTokens)+'</td><td class="n">'+fmtT(d.outputTokens)+'</td><td class="n hl">'+fmtT(d.inputTokens+d.outputTokens)+'</td></tr>')}}dt.innerHTML=rows.join("");document.getElementById("detailHint").textContent=rows.length+"条记录"}
+  if(!keys.length){dt.innerHTML='<tr><td colspan="8" class="empty">暂无数据</td></tr>'}else{let rows=[];for(const k of keys.sort().reverse()){const us2=Object.entries(g[k]).sort((a,b)=>(b[1].inputTokens+b[1].outputTokens)-(a[1].inputTokens+a[1].outputTokens));for(const[u,d]of us2){const n=(D.users[u]||{}).name||u.slice(0,8);rows.push('<tr><td>'+lbl(P,k)+'</td><td>'+n+'</td><td class="n">'+fmtT(d.requests)+'</td><td class="n">'+fmtT(d.inputTokens)+'</td><td class="n">'+fmtT(d.outputTokens)+'</td><td class="n">'+fmtT(d.cacheCreationTokens || 0)+'</td><td class="n">'+fmtT(d.cacheReadTokens || 0)+'</td><td class="n hl">'+fmtT(d.inputTokens+d.outputTokens)+'</td></tr>')}}dt.innerHTML=rows.join("");document.getElementById("detailHint").textContent=rows.length+"条记录"}
 
   // Error table with pagination
   const allErrs=Array.isArray(D.errors)?D.errors:[];

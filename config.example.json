@@ -5,7 +5,12 @@
   "profiles": {
     "glm": {
       "upstream": "https://open.bigmodel.cn/api/anthropic",
-      "allowedModels": null,
+      "allowedModels": ["glm-5.1"],
+      "defaultModels": {
+        "sonnet": "glm-5.1",
+        "opus": "glm-5.1",
+        "haiku": "glm-5.1"
+      },
       "users": {
         "example-api-key": {
           "username": "示例成员",
@@ -16,6 +21,11 @@
     "aliyun": {
       "upstream": "https://dashscope.aliyuncs.com/compatible-mode/v1",
       "allowedModels": ["qwen-plus", "qwen-max"],
+      "defaultModels": {
+        "sonnet": "qwen-max",
+        "opus": "qwen-max",
+        "haiku": "qwen-plus"
+      },
       "users": {
         "user-vk-1": {
           "username": "张三",

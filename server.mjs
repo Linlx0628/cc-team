@@ -39,6 +39,33 @@ if (!config.profiles) {
   saveConfig(config);
 }
 
+// Auto-migrate: ensure every profile has defaultModels and non-empty allowedModels
+(function migrateDefaultModels() {
+  let migrated = false;
+  for (const pname of Object.keys(config.profiles)) {
+    const p = config.profiles[pname];
+    if (!p.defaultModels) {
+      const firstModel = (Array.isArray(p.allowedModels) && p.allowedModels.length > 0)
+        ? p.allowedModels[0] : null;
+      p.defaultModels = {
+        sonnet: firstModel || "claude-sonnet-4-6",
+        opus: firstModel || "claude-opus-4-5",
+        haiku: firstModel || "claude-haiku-4-5",
+      };
+      migrated = true;
+    }
+    if (!Array.isArray(p.allowedModels) || p.allowedModels.length === 0) {
+      p.allowedModels = [
+        p.defaultModels.sonnet,
+        p.defaultModels.opus,
+        p.defaultModels.haiku,
+      ];
+      migrated = true;
+    }
+  }
+  if (migrated) { saveConfig(config); console.log("[MIGRATE] Added defaultModels to existing profiles"); }
+})();
+
 function getActiveProfile() {
   const p = config.profiles[config.activeProfile];
   if (!p) {
@@ -79,7 +106,8 @@ rt.proxy.retryDelay = rt.proxy.retryDelay || 1000;
 rt.proxy.retryableStatusCodes = rt.proxy.retryableStatusCodes || [429, 502, 503, 504];
 rt.proxy.maxConcurrentPerUser = rt.proxy.maxConcurrentPerUser || 5;
 rt.proxy.rateLimitPerMinute = rt.proxy.rateLimitPerMinute || 60;
-rt.allowedModels = activeProfile.allowedModels || null;
+rt.allowedModels = activeProfile.allowedModels || [];
+rt.defaultModels = activeProfile.defaultModels || { sonnet: "claude-sonnet-4-6", opus: "claude-opus-4-5", haiku: "claude-haiku-4-5" };
 
 // ─── Circuit Breaker ─────────────────────────────────────────────────────────
 class CircuitBreaker {
@@ -189,7 +217,8 @@ function switchProfile(profileName) {
   config.activeProfile = profileName;
   rt.upstream = profile.upstream;
   rt.users = { ...(profile.users || {}) };
-  rt.allowedModels = profile.allowedModels || null;
+  rt.allowedModels = profile.allowedModels || [];
+  rt.defaultModels = profile.defaultModels || { sonnet: "claude-sonnet-4-6", opus: "claude-opus-4-5", haiku: "claude-haiku-4-5" };
   reloadAgent();
   saveConfig(config);
   console.log(`[PROFILE] Switched to "${profileName}" — upstream: ${profile.upstream}, users: ${Object.keys(rt.users).length}`);
@@ -330,6 +359,16 @@ function checkModelAllowed(model) {
   return allowed.includes(model);
 }
 
+function resolveModel(model) {
+  if (!model) return model;
+  const alias = model.toLowerCase();
+  const dm = rt.defaultModels || {};
+  if (alias === "jx-sonnet") return dm.sonnet || model;
+  if (alias === "jx-opus")   return dm.opus   || model;
+  if (alias === "jx-haiku")  return dm.haiku  || model;
+  return model;
+}
+
 // ─── Timezone Helpers (UTC+8 北京时间) ────────────────────────────────────────
 function cnNow() {
   const d = new Date();
@@ -465,14 +504,24 @@ function proxyRequest(req, res) {
 
   req.on("data", (c) => chunks.push(c));
   req.on("end", async () => {
-    const body = Buffer.concat(chunks);
+    let body = Buffer.concat(chunks);
     let reqModel = "unknown";
-    try { reqModel = JSON.parse(body.toString()).model || "unknown"; } catch {}
+    try {
+      const parsed = JSON.parse(body.toString());
+      reqModel = parsed.model || "unknown";
+      const resolved = resolveModel(reqModel);
+      if (resolved !== reqModel) {
+        parsed.model = resolved;
+        body = Buffer.from(JSON.stringify(parsed));
+        console.log(`[ALIAS] ${getUserName(apiKey)} ${reqModel} → ${resolved}`);
+        reqModel = resolved;
+      }
+    } catch {}
 
     // Model access restriction
     if (!checkModelAllowed(reqModel)) {
       res.writeHead(403, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: `Model "${reqModel}" is not allowed for this user.` }));
+      res.end(JSON.stringify({ error: `Model "${reqModel}" is not allowed. Use jx-sonnet/jx-opus/jx-haiku or a model from the allowed list.` }));
       console.log(`[BLOCK] ${getUserName(apiKey)} model=${reqModel} denied`);
       return;
     }
@@ -773,6 +822,7 @@ function getPublicSettings() {
     upstream: rt.upstream,
     proxy: { ...rt.proxy },
     allowedModels: rt.allowedModels,
+    defaultModels: { ...rt.defaultModels },
     users: safeUsers,
     activeProfile: config.activeProfile,
     profiles: listProfiles(),
@@ -796,13 +846,20 @@ function settingsHtml(errorMsg) {
 <td><button type="button" onclick="this.closest('tr').remove()" style="background:rgba(248,113,113,.15);color:var(--red);border:none;padding:2px 8px;border-radius:4px;cursor:pointer;font-size:11px">删除</button></td></tr>`;
   }).join("");
 
-  const profileBtns = s.profiles.map(p => {
-    let html = '<button type="button" class="profile-btn' + (p.isActive ? ' active' : '') + '" onclick="switchToProfile(\'' + p.name + '\')" title="' + p.upstream + ' — ' + p.userCount + '个用户">' + p.name + (p.isActive ? ' ✓' : '') + '</button>';
-    if (!p.isActive) {
-      html += '<button type="button" onclick="deleteProfile(\'' + p.name + '\')" style="background:none;border:none;color:var(--dim);cursor:pointer;font-size:14px;padding:0 2px" title="删除 ' + p.name + '">×</button>';
-    }
-    return html;
-  }).join("\n  ");
+  const profileItems = s.profiles.map(p => {
+    const isActive = p.isActive;
+    const host = p.upstream.replace(/^https?:\/\//, "").replace(/\/.*/, "");
+    return `<div class="pl-item${isActive ? " active" : ""}" id="pl-${p.name}">
+<div class="pl-name">${p.name}</div>
+<div class="pl-host">${host}</div>
+<div class="pl-users">${p.userCount}位用户</div>
+<div class="pl-actions">
+  ${!isActive ? '<button class="pl-activate" onclick="switchToProfile(\'' + p.name + '\')" title="设为当前方案">✓ 启用</button>' : '<span class="pl-badge">当前</span>'}
+  ${!isActive ? '<button class="pl-delete" onclick="deleteProfile(\'' + p.name + '\')" title="删除">×</button>' : ''}
+</div></div>`;
+  }).join("");
+
+  const dm = s.defaultModels || {};
 
   return `<!DOCTYPE html>
 <html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
@@ -810,17 +867,43 @@ function settingsHtml(errorMsg) {
 <style>
 :root{--bg:#0a0a0a;--card:#141414;--border:#2a2a2a;--text:#e5e5e5;--dim:#999;--accent:#7c6ef0;--blue:#5ba3f5;--green:#34d399;--orange:#fbbf24;--red:#f87171}
 *{margin:0;padding:0;box-sizing:border-box}
-body{font-family:-apple-system,BlinkMacSystemFont,sans-serif;background:var(--bg);color:var(--text);padding:20px 24px;max-width:900px;margin:0 auto}
-h1{font-size:20px;margin-bottom:4px}
-h1 a{color:var(--dim);font-size:13px;text-decoration:none;margin-left:12px}
-h1 a:hover{color:var(--accent)}
-h2{font-size:15px;margin:24px 0 12px;padding-bottom:8px;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between}
+body{font-family:-apple-system,BlinkMacSystemFont,sans-serif;background:var(--bg);color:var(--text);padding:0;overflow:hidden;height:100vh}
+.layout{display:flex;height:100vh}
+.sidebar{width:240px;min-width:240px;background:var(--card);border-right:1px solid var(--border);display:flex;flex-direction:column;overflow:hidden}
+.sidebar-hd{padding:16px 14px 10px;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between}
+.sidebar-hd h1{font-size:16px;margin:0;white-space:nowrap}
+.sidebar-hd a{color:var(--dim);font-size:11px;text-decoration:none}
+.sidebar-hd a:hover{color:var(--accent)}
+.sidebar-list{flex:1;overflow-y:auto;padding:8px}
+.sidebar-list::-webkit-scrollbar{width:4px}
+.sidebar-list::-webkit-scrollbar-thumb{background:var(--border);border-radius:2px}
+.sidebar-ft{padding:10px;border-top:1px solid var(--border)}
+.pl-item{background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:10px 12px;margin-bottom:8px;position:relative;transition:border-color .15s}
+.pl-item:hover{border-color:var(--dim)}
+.pl-item.active{border-color:var(--accent);background:rgba(124,110,240,.08)}
+.pl-name{font-size:14px;font-weight:600;margin-bottom:2px}
+.pl-host{font-size:11px;color:var(--dim);font-family:monospace;word-break:break-all;margin-bottom:2px}
+.pl-users{font-size:11px;color:var(--dim)}
+.pl-actions{display:none;position:absolute;top:8px;right:8px;gap:4px}
+.pl-item:hover .pl-actions{display:flex}
+.pl-item.active .pl-actions{display:flex}
+.pl-activate{font-size:10px;padding:2px 8px;border-radius:4px;border:1px solid var(--accent);background:rgba(124,110,240,.15);color:var(--accent);cursor:pointer;white-space:nowrap}
+.pl-activate:hover{background:var(--accent);color:#fff}
+.pl-delete{font-size:12px;padding:1px 6px;border:none;background:none;color:var(--dim);cursor:pointer;border-radius:3px}
+.pl-delete:hover{background:rgba(248,113,113,.15);color:var(--red)}
+.pl-badge{font-size:10px;padding:2px 8px;border-radius:4px;background:rgba(124,110,240,.2);color:var(--accent);white-space:nowrap}
+.main{flex:1;overflow-y:auto;padding:20px 28px}
+.main::-webkit-scrollbar{width:6px}
+.main::-webkit-scrollbar-thumb{background:var(--border);border-radius:3px}
+.main h2{font-size:14px;margin:20px 0 10px;padding-bottom:8px;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between}
+.main h2:first-of-type{margin-top:0}
 .section{background:var(--card);border:1px solid var(--border);border-radius:8px;padding:16px;margin-bottom:12px}
 label{display:block;font-size:12px;color:var(--dim);margin-bottom:4px;margin-top:10px}
 label:first-child{margin-top:0}
 input,select,textarea{width:100%;padding:8px 12px;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:13px;font-family:monospace;outline:none}
 input:focus,select:focus,textarea:focus{border-color:var(--accent)}
 .row{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+.row3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px}
 .btn{padding:8px 20px;border:none;border-radius:6px;font-size:13px;cursor:pointer;font-weight:600}
 .btn-primary{background:var(--accent);color:#fff}
 .btn-primary:hover{opacity:.9}
@@ -829,7 +912,7 @@ input:focus,select:focus,textarea:focus{border-color:var(--accent)}
 .btn-outline{background:transparent;border:1px solid var(--border);color:var(--text)}
 .btn-outline:hover{background:rgba(255,255,255,.04)}
 .btn-sm{padding:4px 12px;font-size:11px}
-.actions{margin-top:16px;display:flex;gap:8px;justify-content:flex-end}
+.actions{margin-top:16px;display:flex;gap:8px;justify-content:flex-end;padding-bottom:40px}
 table{width:100%;border-collapse:collapse;margin-top:8px}
 th{text-align:left;padding:6px 8px;font-size:11px;color:var(--dim);border-bottom:1px solid var(--border)}
 td{padding:6px 8px;border-bottom:1px solid var(--border);font-size:12px}
@@ -838,46 +921,63 @@ td{padding:6px 8px;border-bottom:1px solid var(--border);font-size:12px}
 .status-warn{background:rgba(251,191,36,.15);color:var(--orange)}
 .status-err{background:rgba(248,113,113,.15);color:var(--red)}
 .note{font-size:11px;color:var(--dim);margin-top:6px}
-.provider-presets{display:flex;gap:6px;flex-wrap:wrap;margin-top:6px}
-.provider-preset{font-size:11px;padding:4px 10px;border-radius:4px;border:1px solid var(--border);background:var(--bg);color:var(--dim);cursor:pointer;font-family:monospace}
-.provider-preset:hover{border-color:var(--accent);color:var(--text)}
-.profile-bar{display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin-bottom:16px}
-.profile-btn{padding:6px 14px;border:1px solid var(--border);border-radius:6px;background:var(--card);color:var(--text);cursor:pointer;font-size:12px}
-.profile-btn.active{border-color:var(--accent);background:rgba(124,110,240,.12);color:var(--accent)}
-.profile-btn:hover{border-color:var(--accent)}
-.profile-actions{display:flex;gap:6px;margin-left:auto}
+.presets{display:flex;gap:6px;flex-wrap:wrap;margin-top:6px}
+.preset{font-size:11px;padding:4px 10px;border-radius:4px;border:1px solid var(--border);background:var(--bg);color:var(--dim);cursor:pointer;font-family:monospace}
+.preset:hover{border-color:var(--accent);color:var(--text)}
+.req{color:var(--red);font-size:10px;margin-left:4px}
+@media(max-width:768px){.layout{flex-direction:column}.sidebar{width:100%;min-width:0;max-height:200px}.row3{grid-template-columns:1fr 1fr}}
 </style></head><body>
-<h1>代理设置 <a href="/dashboard">← 返回监控面板</a></h1>
-${errDiv}
-<div class="profile-bar">
-  <span style="font-size:12px;color:var(--dim);margin-right:4px">配置方案:</span>
-	  ${profileBtns}
-	  <span class="profile-actions">
-	    <button type="button" class="btn btn-outline btn-sm" onclick="saveAsProfile()">另存为新方案</button>
-	  </span>
+<div class="layout">
+<div class="sidebar">
+<div class="sidebar-hd"><h1>配置方案</h1><a href="/dashboard">← 面板</a></div>
+<div class="sidebar-list">${profileItems}</div>
+<div class="sidebar-ft"><button class="btn btn-outline btn-sm" onclick="addProfile()" style="width:100%">+ 新增方案</button></div>
 </div>
+<div class="main">
+${errDiv}
 <form method="post" action="/api/settings-save" id="settingsForm">
-<div class="section">
 <h2>上游代理 <span class="status ${s.circuitBreaker.state === 'CLOSED' ? 'status-ok' : s.circuitBreaker.state === 'HALF_OPEN' ? 'status-warn' : 'status-err'}">${s.circuitBreaker.state === 'CLOSED' ? '正常' : s.circuitBreaker.state === 'HALF_OPEN' ? '探测中' : '熔断中'}</span></h2>
+<div class="section">
 <label>上游 API 地址</label>
 <input type="text" name="upstream" value="${s.upstream}" placeholder="https://open.bigmodel.cn/api/anthropic">
-<label>允许模型 (逗号分隔，留空=不限制)</label>
-<input type="text" name="allowedModels" value="${(s.allowedModels || []).join(",")}" placeholder="留空表示不限制，填写则只允许指定模型" style="font-family:monospace">
-<div class="provider-presets">
-  <span style="font-size:11px;color:var(--dim);line-height:24px">快速切换：</span>
-  <button type="button" class="provider-preset" onclick="document.querySelector('[name=upstream]').value='https://open.bigmodel.cn/api/anthropic'">智谱 GLM</button>
-  <button type="button" class="provider-preset" onclick="document.querySelector('[name=upstream]').value='https://api.anthropic.com'">Anthropic</button>
-  <button type="button" class="provider-preset" onclick="document.querySelector('[name=upstream]').value='https://api.openai.com/v1'">OpenAI</button>
-  <button type="button" class="provider-preset" onclick="document.querySelector('[name=upstream]').value='https://api.deepseek.com/v1'">DeepSeek</button>
-  <button type="button" class="provider-preset" onclick="document.querySelector('[name=upstream]').value='https://api.moonshot.cn/v1'">Moonshot</button>
-	  <button type="button" class="provider-preset" onclick="document.querySelector('[name=upstream]').value='https://dashscope.aliyuncs.com/compatible-mode/v1'">阿里百炼</button>
+<div class="presets">
+  <span style="font-size:11px;color:var(--dim);line-height:24px">快速填充：</span>
+  <button type="button" class="preset" onclick="document.querySelector('[name=upstream]').value='https://open.bigmodel.cn/api/anthropic'">智谱 GLM</button>
+  <button type="button" class="preset" onclick="document.querySelector('[name=upstream]').value='https://api.anthropic.com'">Anthropic</button>
+  <button type="button" class="preset" onclick="document.querySelector('[name=upstream]').value='https://api.openai.com/v1'">OpenAI</button>
+  <button type="button" class="preset" onclick="document.querySelector('[name=upstream]').value='https://api.deepseek.com/anthropic'">DeepSeek</button>
+  <button type="button" class="preset" onclick="document.querySelector('[name=upstream]').value='https://api.moonshot.cn/v1'">Moonshot</button>
+  <button type="button" class="preset" onclick="document.querySelector('[name=upstream]').value='https://dashscope.aliyuncs.com/compatible-mode/v1'">阿里百炼</button>
+  <button type="button" class="preset" onclick="document.querySelector('[name=upstream]').value='https://token-plan.cn-beijing.maas.aliyuncs.com/apps/anthropic'">阿里Token Plan</button>
 </div>
-<label>当前状态：${s.circuitBreaker.state === 'CLOSED' ? '正常运行' : s.circuitBreaker.state === 'HALF_OPEN' ? '正在探测上游恢复情况...' : `熔断中 (${Math.ceil(s.circuitBreaker.cooldownRemaining / 1000)}秒后恢复)`}</label>
-<div class="note">失败次数: ${s.circuitBreaker.failureCount} | 总成功: ${s.circuitBreaker.totalSuccesses} | 总失败: ${s.circuitBreaker.totalFailures}</div>
+<div class="note" style="margin-top:8px">状态：${s.circuitBreaker.state === 'CLOSED' ? '正常运行' : s.circuitBreaker.state === 'HALF_OPEN' ? '探测恢复中...' : '熔断中(' + Math.ceil(s.circuitBreaker.cooldownRemaining / 1000) + 's)'} | 失败 ${s.circuitBreaker.failureCount} | 成功 ${s.circuitBreaker.totalSuccesses} | 失败 ${s.circuitBreaker.totalFailures}</div>
 </div>
 
+<h2>默认模型映射 <span style="font-size:11px;color:var(--dim);font-weight:400">客户端使用 jx-sonnet / jx-opus / jx-haiku 别名时自动映射</span></h2>
 <div class="section">
+<div class="row3">
+<div><label>jx-sonnet → 实际模型<span class="req">*</span></label><input type="text" name="defaultModels_sonnet" value="${dm.sonnet || ''}" placeholder="如: deepseek-v4-pro" style="font-family:monospace"></div>
+<div><label>jx-opus → 实际模型<span class="req">*</span></label><input type="text" name="defaultModels_opus" value="${dm.opus || ''}" placeholder="如: deepseek-v4-pro" style="font-family:monospace"></div>
+<div><label>jx-haiku → 实际模型<span class="req">*</span></label><input type="text" name="defaultModels_haiku" value="${dm.haiku || ''}" placeholder="如: deepseek-v4-flash" style="font-family:monospace"></div>
+</div>
+<div class="presets">
+  <span style="font-size:11px;color:var(--dim);line-height:24px">快速填充：</span>
+  <button type="button" class="preset" onclick="fillDefaults('deepseek-v4-pro','deepseek-v4-pro','deepseek-v4-flash')">DeepSeek</button>
+  <button type="button" class="preset" onclick="fillDefaults('claude-sonnet-4-6','claude-opus-4-5','claude-haiku-4-5')">Anthropic Claude</button>
+  <button type="button" class="preset" onclick="fillDefaults('glm-5.1','glm-5.1','glm-5.1')">智谱 GLM</button>
+  <button type="button" class="preset" onclick="fillDefaults('qwen-max','qwen-max','qwen-plus')">通义千问</button>
+</div>
+</div>
+
+<h2>允许模型<span class="req">*必填</span></h2>
+<div class="section">
+<label>可用模型列表 (逗号分隔，至少1个)<span class="req">*必填</span></label>
+<input type="text" name="allowedModels" value="${(s.allowedModels || []).join(",")}" placeholder="必填，如: deepseek-v4-pro, deepseek-v4-flash" style="font-family:monospace" required>
+<div class="note">不在列表中的模型请求将被拦截返回 403。默认模型映射的值应包含在此列表中。</div>
+</div>
+
 <h2>超时 & 重试设置</h2>
+<div class="section">
 <div class="row">
 <div><label>JSON 请求超时 (ms)</label><input type="number" name="timeout" value="${s.proxy.timeout}" min="10000" max="600000"></div>
 <div><label>流式请求超时 (ms)</label><input type="number" name="streamTimeout" value="${s.proxy.streamTimeout}" min="30000" max="1200000"></div>
@@ -892,24 +992,25 @@ ${errDiv}
 </div>
 <div class="row">
 <div><label>熔断冷却时间 (ms)</label><input type="number" name="circuitBreakerCooldown" value="${s.proxy.circuitBreakerCooldown || 30000}" min="5000" max="300000"></div>
+<div></div>
 </div>
 </div>
 
-<div class="section">
 <h2>流量控制</h2>
+<div class="section">
 <div class="row">
 <div><label>每用户最大并发数</label><input type="number" name="maxConcurrentPerUser" value="${s.proxy.maxConcurrentPerUser}" min="1" max="100"></div>
 <div><label>每用户每分钟最大请求数</label><input type="number" name="rateLimitPerMinute" value="${s.proxy.rateLimitPerMinute}" min="1" max="600"></div>
 </div>
 </div>
 
+<h2>用户 API Key 管理 <button type="button" class="btn btn-outline btn-sm" onclick="addUserRow()">+ 添加用户</button></h2>
 <div class="section">
-<h2>用户 API Key 管理 <button type="button" class="btn btn-outline btn-sm" onclick="addUserRow()" style="float:right">+ 添加用户</button></h2>
 <table id="usersTable">
 <thead><tr><th>虚拟 Key</th><th>用户名称</th><th>真实 Key</th><th style="width:60px">操作</th></tr></thead>
 <tbody>${userRows}</tbody>
 </table>
-<div class="note">GLM模式：虚拟Key=真实Key。阿里共享模式：多人同一真实Key，各自虚拟Key。</div>
+<div class="note">虚拟Key用于识别用户和统计用量。真实Key是发送给上游的实际Key。多人可共享同一真实Key（阿里云方案）。</div>
 </div>
 
 <div class="actions">
@@ -917,6 +1018,8 @@ ${errDiv}
 <button type="submit" class="btn btn-primary">保存设置</button>
 </div>
 </form>
+</div>
+</div>
 <script>
 async function switchToProfile(name){
   if(!confirm('切换到配置方案 "'+name+'"？当前未保存的修改将丢失。'))return;
@@ -924,12 +1027,22 @@ async function switchToProfile(name){
   if(r.ok)location.reload();
   else{const e=await r.json();alert('切换失败: '+e.error)}
 }
-async function saveAsProfile(){
+async function addProfile(){
   const name=prompt('请输入新方案名称（例如：阿里百炼、GLM）');
   if(!name)return;
-  const r=await fetch('/api/profile/save',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({profile:name,upstream:document.querySelector('[name=upstream]').value,allowedModels:document.querySelector('[name=allowedModels]').value})});
+  const fm=document.forms.settingsForm;
+  const r=await fetch('/api/profile/save',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({
+    profile:name,
+    upstream:fm.upstream.value,
+    allowedModels:fm.allowedModels.value,
+    defaultModels:{
+      sonnet:fm.defaultModels_sonnet.value,
+      opus:fm.defaultModels_opus.value,
+      haiku:fm.defaultModels_haiku.value
+    }
+  })});
   if(r.ok)location.reload();
-  else{const e=await r.json();alert('保存失败: '+e.error)}
+  else{const e=await r.json();alert('创建失败: '+e.error)}
 }
 async function deleteProfile(name){
   if(!confirm('确定删除配置方案 "'+name+'"？此操作不可恢复。'))return;
@@ -937,13 +1050,18 @@ async function deleteProfile(name){
   if(r.ok)location.reload();
   else{const e=await r.json();alert('删除失败: '+e.error)}
 }
+function fillDefaults(s,o,h){
+  document.querySelector('[name=defaultModels_sonnet]').value=s;
+  document.querySelector('[name=defaultModels_opus]').value=o;
+  document.querySelector('[name=defaultModels_haiku]').value=h;
+}
 function addUserRow(){
   const tbody=document.querySelector("#usersTable tbody");
   const tr=document.createElement("tr");
   tr.innerHTML='<td><input type="text" name="uk_new_'+Date.now()+'" placeholder="虚拟 Key" style="width:100%;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:4px 8px;border-radius:4px;font-size:12px;font-family:monospace"></td><td><input type="text" name="un_new_'+Date.now()+'" placeholder="用户名称" style="width:100%;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:4px 8px;border-radius:4px;font-size:12px"></td><td><input type="text" name="rk_new_'+Date.now()+'" placeholder="真实 Key" style="width:100%;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:4px 8px;border-radius:4px;font-size:12px;font-family:monospace"></td><td><button type="button" onclick="this.closest(\\'tr\\').remove()" style="background:rgba(248,113,113,.15);color:var(--red);border:none;padding:2px 8px;border-radius:4px;cursor:pointer;font-size:11px">删除</button></td>';
   tbody.appendChild(tr);
 }
-document.addEventListener("keydown",e=>{if(e.key==="Enter"&&e.target.tagName!=="TEXTAREA")e.preventDefault()});
+document.addEventListener("keydown",e=>{if(e.key==="Enter"&&e.target.tagName!=="TEXTAREA"&&e.target.tagName!=="INPUT")e.preventDefault()});
 </script>
 </body></html>`;
 }
@@ -1154,11 +1272,18 @@ function applySettings(formData) {
       .filter(n => !isNaN(n));
   }
 
-  // Update allowed models (global)
+  // Update allowed models (mandatory — at least 1 model required)
   if (formData.allowedModels !== undefined) {
     const raw = formData.allowedModels.trim();
-    rt.allowedModels = raw ? raw.split(",").map(s => s.trim()).filter(Boolean) : null;
+    if (!raw) throw new Error("至少需要设置 1 个允许模型");
+    rt.allowedModels = raw.split(",").map(s => s.trim()).filter(Boolean);
+    if (rt.allowedModels.length === 0) throw new Error("至少需要设置 1 个允许模型");
   }
+
+  // Update default model mappings (jx-* aliases)
+  if (formData.defaultModels_sonnet) rt.defaultModels.sonnet = formData.defaultModels_sonnet.trim();
+  if (formData.defaultModels_opus)   rt.defaultModels.opus   = formData.defaultModels_opus.trim();
+  if (formData.defaultModels_haiku)  rt.defaultModels.haiku  = formData.defaultModels_haiku.trim();
 
   // Update circuit breaker thresholds
   upstreamBreaker.failureThreshold = rt.proxy.circuitBreakerFailures || 5;
@@ -1193,6 +1318,7 @@ function applySettings(formData) {
   if (ap) {
     ap.upstream = rt.upstream;
     ap.allowedModels = rt.allowedModels;
+    ap.defaultModels = { ...rt.defaultModels };
     ap.users = { ...rt.users };
   }
   saveConfig(cfg);
@@ -1305,13 +1431,14 @@ const server = http.createServer((req, res) => {
     req.on("data", (c) => chunks.push(c));
     req.on("end", () => {
       try {
-        const { profile, upstream, allowedModels } = JSON.parse(Buffer.concat(chunks).toString());
+        const { profile, upstream, allowedModels, defaultModels } = JSON.parse(Buffer.concat(chunks).toString());
         const name = (profile || "").trim();
         if (!name) throw new Error("Profile name required");
         // Save current runtime state to new profile
         config.profiles[name] = {
           upstream: upstream || rt.upstream,
           allowedModels: allowedModels ? allowedModels.split(",").map(s => s.trim()).filter(Boolean) : rt.allowedModels,
+          defaultModels: defaultModels || { ...rt.defaultModels },
           users: { ...rt.users },
         };
         config.activeProfile = name;
@@ -1375,6 +1502,11 @@ const server = http.createServer((req, res) => {
         }
         if (updates.allowedModels) {
           formData.allowedModels = Array.isArray(updates.allowedModels) ? updates.allowedModels.join(",") : updates.allowedModels;
+        }
+        if (updates.defaultModels) {
+          if (updates.defaultModels.sonnet) formData.defaultModels_sonnet = updates.defaultModels.sonnet;
+          if (updates.defaultModels.opus)   formData.defaultModels_opus   = updates.defaultModels.opus;
+          if (updates.defaultModels.haiku)  formData.defaultModels_haiku  = updates.defaultModels.haiku;
         }
         if (updates.users) {
           for (const [k, v] of Object.entries(updates.users)) {

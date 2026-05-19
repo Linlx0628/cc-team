@@ -7,5 +7,7 @@ config.json
 data.json
 
 # Worktree temporary directories
-.claude/worktrees/
+.claude/*
+.spec-workflow/*
+
 

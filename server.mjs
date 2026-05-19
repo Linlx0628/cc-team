@@ -274,10 +274,11 @@ function loadStore() {
 }
 
 function saveStore() {
-  const data = JSON.stringify(store, null, 2);
-  fs.writeFile(dataPath, data, (err) => {
-    if (err) console.error("[STORE] Save failed:", err.message);
-  });
+  try {
+    fs.writeFileSync(dataPath, JSON.stringify(store, null, 2), "utf-8");
+  } catch (err) {
+    console.error("[STORE] Save failed:", err.message);
+  }
 }
 
 loadStore();
@@ -954,7 +955,16 @@ h1{font-size:20px;margin-bottom:4px}.meta{font-size:12px;color:var(--dim);margin
 .box h3{font-size:12px;color:var(--dim);margin-bottom:10px}
 .box canvas{max-height:260px}
 .sec{background:var(--card);border:1px solid var(--border);border-radius:8px;overflow:hidden;margin-bottom:20px}
-.sec h3{font-size:12px;color:var(--dim);padding:12px 16px 0}
+.sec h3{font-size:12px;color:var(--dim);padding:12px 16px 0;margin:0}
+.sec-collapsible h3{display:flex;align-items:center;gap:6px;cursor:pointer;user-select:none;padding:12px 16px}
+.sec-collapsible h3:hover{color:var(--text)}
+.sec-toggle{display:inline-block;width:16px;font-size:10px;transition:transform .2s;flex-shrink:0;color:var(--dim)}
+.sec-toggle.open{transform:rotate(90deg)}
+.sec-hint{font-size:11px;color:var(--dim);font-weight:400;margin-left:auto}
+.sec-body{display:none;padding:0 16px 12px}
+.sec-body.open{display:block}
+.sec-body table{margin-top:0}
+.sec-body .empty{padding:16px 0}
 table{width:100%;border-collapse:collapse}
 th{text-align:left;padding:8px 16px;font-size:11px;color:var(--dim);border-bottom:1px solid var(--border)}
 td{padding:8px 16px;font-size:13px;border-bottom:1px solid var(--border)}
@@ -982,13 +992,13 @@ tr:last-child td{border-bottom:none}tr:hover td{background:rgba(255,255,255,.02)
 <div class="sec"><h3>用户用量明细</h3><table id="uTable"><thead>
 <tr><th>用户</th><th>状态</th><th class="n">请求数</th><th class="n">输入</th><th class="n">输出</th><th class="n">合计</th><th>最后活跃</th></tr>
 </thead><tbody></tbody></table></div>
-<div class="sec"><h3>明细记录</h3><table id="dTable"><thead>
+<div class="sec sec-collapsible" id="detailSec"><h3 onclick="toggleSec('detailSec')"><span class="sec-toggle" id="detailSecIcon">▶</span>明细记录<span class="sec-hint" id="detailHint"></span></h3><div class="sec-body" id="detailSecBody"><table id="dTable"><thead>
 <tr><th>时间</th><th>用户</th><th class="n">请求数</th><th class="n">输入</th><th class="n">输出</th><th class="n">合计</th></tr>
-</thead><tbody></tbody></table></div>
-<div class="sec"><h3>错误记录 <button id="clearErrors" style="float:right;font-size:11px;background:rgba(248,113,113,.15);color:var(--red);border:none;padding:2px 10px;border-radius:4px;cursor:pointer;margin-right:16px">清除</button></h3><table id="eTable"><thead>
+</thead><tbody></tbody></table></div></div>
+<div class="sec sec-collapsible" id="errorSec"><h3 onclick="toggleSec('errorSec')"><span class="sec-toggle" id="errorSecIcon">▶</span>错误记录<span id="errorCount" style="font-size:11px;color:var(--red);font-weight:400;margin-left:4px"></span><span class="sec-hint" id="errorHint" style="margin-left:auto"></span><button id="clearErrors" onclick="event.stopPropagation()" style="font-size:11px;background:rgba(248,113,113,.15);color:var(--red);border:none;padding:2px 10px;border-radius:4px;cursor:pointer;margin-left:8px">清除</button></h3><div class="sec-body" id="errorSecBody"><table id="eTable"><thead>
 <tr><th>时间</th><th>用户</th><th class="n">状态码</th><th>模型</th><th>路径</th><th>错误信息</th></tr>
 </thead><tbody></tbody></table>
-<div id="errPages" style="padding:8px 16px;text-align:right"></div></div>
+<div id="errPages" style="padding:8px 0;text-align:right"></div></div></div>
 <script>
 let D=null,P="day",C={t:null,p:null,m:null,h:null},errPage=1,autoRefresh=true,refreshTimer=null;
 const ERR_PAGE_SIZE=20;
@@ -1035,7 +1045,7 @@ function render(){
 
   // Detail table
   const dt=document.querySelector("#dTable tbody");
-  if(!keys.length){dt.innerHTML='<tr><td colspan="6" class="empty">暂无数据</td></tr>'}else{let rows=[];for(const k of keys.sort().reverse()){const us2=Object.entries(g[k]).sort((a,b)=>(b[1].inputTokens+b[1].outputTokens)-(a[1].inputTokens+a[1].outputTokens));for(const[u,d]of us2){const n=(D.users[u]||{}).name||u.slice(0,8);rows.push('<tr><td>'+lbl(P,k)+'</td><td>'+n+'</td><td class="n">'+fmtT(d.requests)+'</td><td class="n">'+fmtT(d.inputTokens)+'</td><td class="n">'+fmtT(d.outputTokens)+'</td><td class="n hl">'+fmtT(d.inputTokens+d.outputTokens)+'</td></tr>')}}dt.innerHTML=rows.join("")}
+  if(!keys.length){dt.innerHTML='<tr><td colspan="6" class="empty">暂无数据</td></tr>'}else{let rows=[];for(const k of keys.sort().reverse()){const us2=Object.entries(g[k]).sort((a,b)=>(b[1].inputTokens+b[1].outputTokens)-(a[1].inputTokens+a[1].outputTokens));for(const[u,d]of us2){const n=(D.users[u]||{}).name||u.slice(0,8);rows.push('<tr><td>'+lbl(P,k)+'</td><td>'+n+'</td><td class="n">'+fmtT(d.requests)+'</td><td class="n">'+fmtT(d.inputTokens)+'</td><td class="n">'+fmtT(d.outputTokens)+'</td><td class="n hl">'+fmtT(d.inputTokens+d.outputTokens)+'</td></tr>')}}dt.innerHTML=rows.join("");document.getElementById("detailHint").textContent=rows.length+"条记录"}
 
   // Error table with pagination
   const allErrs=Array.isArray(D.errors)?D.errors:[];
@@ -1046,8 +1056,11 @@ function render(){
   if(!errs.length){et.innerHTML='<tr><td colspan="6" class="empty">暂无错误记录</td></tr>'}else{et.innerHTML=errs.map(e=>{const sc=e.statusCode||"-";const col=sc>=500?"var(--red)":sc>=400?"var(--orange)":"var(--dim)";return'<tr><td style="font-size:12px;white-space:nowrap">'+(e.time?fmtBJ(e.time):"-")+'</td><td>'+(e.user||"-")+'</td><td class="n" style="color:'+col+';font-weight:600">'+sc+'</td><td style="font-size:12px;color:var(--blue)">'+(e.model||"-")+'</td><td style="font-size:12px;color:var(--dim);max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+(e.path||"-")+'</td><td style="font-size:12px;color:var(--red);max-width:400px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="'+(e.error||"").replace(/"/g,'&quot;')+'">'+(e.error||"-")+'</td></tr>'}).join("")}
   const pg=document.getElementById("errPages");
   pg.innerHTML='<span style="font-size:12px;color:var(--dim)">第 '+errPage+"/"+totalErrPages+' 页 (共 '+allErrs.length+' 条)</span> '+(errPage>1?'<button onclick="errPage--;render()" style="font-size:11px;background:var(--card);color:var(--text);border:1px solid var(--border);padding:2px 10px;border-radius:4px;cursor:pointer">上一页</button> ':'')+(errPage<totalErrPages?'<button onclick="errPage++;render()" style="font-size:11px;background:var(--card);color:var(--text);border:1px solid var(--border);padding:2px 10px;border-radius:4px;cursor:pointer">下一页</button>':'');
+  document.getElementById("errorCount").textContent=allErrs.length>0?'('+allErrs.length+')':'';
+  document.getElementById("errorHint").textContent=allErrs.length>0?(allErrs.length+'条错误'):'暂无错误';
 }
 async function load(){try{const r=await fetch("/api/stats");D=await r.json();render()}catch(e){document.getElementById("meta").textContent="Error: "+e.message}}
+function toggleSec(id){const body=document.getElementById(id+"Body");const icon=document.getElementById(id+"Icon");const open=body.classList.toggle("open");icon.classList.toggle("open",open)}
 document.querySelectorAll(".tab").forEach(b=>b.addEventListener("click",()=>{document.querySelectorAll(".tab").forEach(x=>x.classList.remove("on"));b.classList.add("on");P=b.dataset.p;render()}));
 document.getElementById("clearErrors").addEventListener("click",async()=>{if(confirm("确定清除所有错误记录？")){await fetch("/api/clear-errors",{method:"POST"});errPage=1;load()}});
 function startAutoRefresh(){if(refreshTimer)clearInterval(refreshTimer);refreshTimer=setInterval(()=>{if(autoRefresh)load()},30000)}

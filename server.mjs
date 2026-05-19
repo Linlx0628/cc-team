@@ -779,13 +779,16 @@ async function handleStreamingProxy(req, res, body, reqHeaders, apiKey, reqModel
       h["connection"] = "keep-alive";
       res.writeHead(upRes.statusCode, h);
 
+      let clientGone = false;
+      res.on("error", () => { clientGone = true; upReq.destroy(); });
+
       let buf = "", usage = { input_tokens: 0, output_tokens: 0 }, model = reqModel;
       let sseDataLines = 0;
       let rawSample = "";
 
       if (upRes.statusCode >= 400) {
         let errBuf = "";
-        upRes.on("data", (c) => { errBuf += c.toString(); res.write(c); });
+        upRes.on("data", (c) => { if (clientGone) return; errBuf += c.toString(); res.write(c); });
         upRes.on("end", () => {
           recordError(apiKey, upRes.statusCode, errBuf.slice(0, 200), req.url, reqModel);
           if (upRes.statusCode >= 500) upstreamBreaker.recordFailure();
@@ -799,6 +802,7 @@ async function handleStreamingProxy(req, res, body, reqHeaders, apiKey, reqModel
       upstreamBreaker.recordSuccess();
 
       upRes.on("data", (chunk) => {
+        if (clientGone) return;
         res.write(chunk);
         const text = chunk.toString();
         buf += text;

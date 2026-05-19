@@ -66,6 +66,35 @@ if (!config.profiles) {
   if (migrated) { saveConfig(config); console.log("[MIGRATE] Added defaultModels to existing profiles"); }
 })();
 
+// Auto-migrate: separate global users from profile-specific keys
+(function migrateGlobalUsers() {
+  if (config.users && Object.keys(config.users).length > 0) return; // already migrated
+  const globalUsers = {};
+  const seen = new Set();
+  for (const pname of Object.keys(config.profiles)) {
+    const p = config.profiles[pname];
+    if (!p.users) continue;
+    const newPU = {};
+    for (const [vk, raw] of Object.entries(p.users)) {
+      const isObj = typeof raw === "object" && raw !== null;
+      const username = isObj ? (raw.username || raw.name || "") : (typeof raw === "string" ? raw : "");
+      const realKey = isObj ? (raw.key || vk) : vk;
+      const expiresAt = isObj ? (raw.expiresAt || null) : null;
+      if (!seen.has(vk)) {
+        seen.add(vk);
+        globalUsers[vk] = { username, expiresAt, disabled: false };
+      }
+      newPU[vk] = { key: realKey, disabled: false };
+    }
+    p.users = newPU;
+  }
+  if (Object.keys(globalUsers).length > 0) {
+    config.users = globalUsers;
+    saveConfig(config);
+    console.log("[MIGRATE] Extracted global users:", Object.keys(globalUsers).length);
+  }
+})();
+
 function getActiveProfile() {
   const p = config.profiles[config.activeProfile];
   if (!p) {
@@ -95,6 +124,7 @@ const runtime = {
   upstreamUrl: new URL(activeProfile.upstream),
   proxy: { ...(config.proxy || {}) },
   users: { ...(activeProfile.users || {}) },
+  globalUsers: { ...(config.users || {}) },
 };
 const rt = runtime;
 
@@ -219,6 +249,7 @@ function switchProfile(profileName) {
   rt.users = { ...(profile.users || {}) };
   rt.allowedModels = profile.allowedModels || [];
   rt.defaultModels = profile.defaultModels || { sonnet: "claude-sonnet-4-6", opus: "claude-opus-4-5", haiku: "claude-haiku-4-5" };
+  rt.globalUsers = { ...(config.users || {}) };
   reloadAgent();
   saveConfig(config);
   console.log(`[PROFILE] Switched to "${profileName}" — upstream: ${profile.upstream}, users: ${Object.keys(rt.users).length}`);
@@ -316,20 +347,24 @@ setInterval(saveStore, 30_000);
 // ─── User Helpers ─────────────────────────────────────────────────────────────
 // Normalize user config to { username, key, allowedModels }
 // Supports backward compat: old format "username" → new format object
+// Get global user info (username, expiresAt, disabled) from config.users
+function getGlobalUser(apiKey) {
+  const gu = rt.globalUsers[apiKey];
+  if (gu) return gu;
+  for (const ck of Object.keys(rt.globalUsers)) {
+    if (apiKey.startsWith(ck) || ck.startsWith(apiKey)) return rt.globalUsers[ck];
+  }
+  return null;
+}
+
 function getUserConfig(apiKey) {
-  const raw = rt.users[apiKey];
-  if (raw) {
-    if (typeof raw === "string") return { username: raw, key: apiKey };
-    return { username: raw.username || raw.name || `未知`, key: raw.key || apiKey };
-  }
-  for (const ck of Object.keys(rt.users)) {
-    if (apiKey.startsWith(ck) || ck.startsWith(apiKey)) {
-      const r = rt.users[ck];
-      if (typeof r === "string") return { username: r, key: ck };
-      return { username: r.username || r.name || `未知`, key: r.key || ck };
-    }
-  }
-  return { username: `未知(${apiKey.slice(0, 8)})`, key: apiKey };
+  const key = resolveUserKey(apiKey);
+  const pu = rt.users[key]; // profile user: { key, disabled }
+  const gu = getGlobalUser(apiKey); // global user: { username, expiresAt, disabled }
+  const realKey = pu ? (typeof pu === "string" ? pu : (pu.key || key)) : key;
+  const username = gu ? (gu.username || `未知`) : `未知(${key.slice(0, 8)})`;
+  const expiresAt = gu ? (gu.expiresAt || null) : null;
+  return { username, key: realKey, expiresAt };
 }
 
 function resolveUserKey(apiKey) {
@@ -341,22 +376,51 @@ function resolveUserKey(apiKey) {
 }
 
 function getUserName(apiKey) {
-  const cfg = getUserConfig(apiKey);
-  return cfg.username;
+  const gu = getGlobalUser(apiKey);
+  return gu ? (gu.username || `未知`) : `未知(${apiKey.slice(0, 8)})`;
 }
 
 function getRealKey(apiKey) {
-  const cfg = getUserConfig(apiKey);
-  return cfg.key;
+  const key = resolveUserKey(apiKey);
+  const pu = rt.users[key];
+  if (!pu) return apiKey;
+  if (typeof pu === "string") return pu;
+  return pu.key || apiKey;
 }
 
 function checkModelAllowed(model) {
-  // Skip check when model can't be determined (body parse failed or not JSON)
   if (!model || model === "unknown") return true;
   const allowed = rt.allowedModels;
   if (!allowed || allowed.length === 0) return true;
   if (allowed.includes("*")) return true;
   return allowed.includes(model);
+}
+
+function generateVirtualKey() {
+  const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+  let code;
+  do {
+    code = "jx-";
+    for (let i = 0; i < 24; i++) code += chars[Math.floor(Math.random() * chars.length)];
+  } while (rt.globalUsers[code] || rt.users[code]);
+  return code;
+}
+
+function checkKeyExpired(apiKey) {
+  const gu = getGlobalUser(apiKey);
+  if (!gu || !gu.expiresAt) return false;
+  return new Date(gu.expiresAt).getTime() < Date.now();
+}
+
+function checkUserDisabled(apiKey) {
+  const key = resolveUserKey(apiKey);
+  // Global disable
+  const gu = getGlobalUser(apiKey);
+  if (gu && gu.disabled) return true;
+  // Profile disable
+  const pu = rt.users[key];
+  if (pu && typeof pu === "object" && pu.disabled) return true;
+  return false;
 }
 
 function resolveModel(model) {
@@ -550,6 +614,24 @@ function proxyRequest(req, res) {
 
     userConcurrent[userKey] = (userConcurrent[userKey] || 0) + 1;
     recordRate(userKey);
+
+    // User disabled check (global or profile-level)
+    if (checkUserDisabled(apiKey)) {
+      userConcurrent[userKey] = Math.max(0, (userConcurrent[userKey] || 1) - 1);
+      res.writeHead(403, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "User is disabled." }));
+      console.log(`[DISABLED] ${getUserName(apiKey)} user disabled`);
+      return;
+    }
+
+    // Key expiration check
+    if (checkKeyExpired(apiKey)) {
+      userConcurrent[userKey] = Math.max(0, (userConcurrent[userKey] || 1) - 1);
+      res.writeHead(403, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "API key has expired. Please contact your administrator." }));
+      console.log(`[EXPIRED] ${getUserName(apiKey)} key expired`);
+      return;
+    }
 
     try {
       const realKey = getRealKey(apiKey);
@@ -806,24 +888,29 @@ async function handleStreamingProxy(req, res, body, reqHeaders, apiKey, reqModel
 
 // ─── Settings API Helpers ─────────────────────────────────────────────────────
 function getPublicSettings() {
-  const safeUsers = {};
+  const safeProfileUsers = {};
   for (const [k, v] of Object.entries(rt.users)) {
-    const maskedK = k.slice(0, 12) + "****";
-    if (typeof v === "string") {
-      safeUsers[maskedK] = { username: v, key: k.slice(0, 12) + "****" };
-    } else {
-      safeUsers[maskedK] = {
-        username: v.username || v.name || "",
-        key: (v.key || "").slice(0, 12) + "****",
-      };
-    }
+    const isObj = typeof v === "object" && v !== null;
+    safeProfileUsers[k] = {
+      key: isObj ? ((v.key || "").slice(0, 12) + "****") : (typeof v === "string" ? v.slice(0, 12) + "****" : ""),
+      disabled: isObj ? !!v.disabled : false,
+    };
+  }
+  const safeGlobalUsers = {};
+  for (const [k, v] of Object.entries(rt.globalUsers)) {
+    safeGlobalUsers[k] = {
+      username: v.username || "",
+      expiresAt: v.expiresAt || "",
+      disabled: !!v.disabled,
+    };
   }
   return {
     upstream: rt.upstream,
     proxy: { ...rt.proxy },
     allowedModels: rt.allowedModels,
     defaultModels: { ...rt.defaultModels },
-    users: safeUsers,
+    profileUsers: safeProfileUsers,
+    globalUsers: safeGlobalUsers,
     activeProfile: config.activeProfile,
     profiles: listProfiles(),
     circuitBreaker: upstreamBreaker.status(),
@@ -836,27 +923,35 @@ function getPublicSettings() {
 function settingsHtml(errorMsg) {
   const s = getPublicSettings();
   const errDiv = errorMsg ? `<div style="background:rgba(248,113,113,.12);color:var(--red);padding:10px 14px;border-radius:6px;margin-bottom:16px;font-size:13px">${errorMsg}</div>` : "";
-  const userRows = Object.entries(rt.users).map(([k, v]) => {
-    const username = typeof v === "string" ? v : (v.username || "");
-    const realKey = typeof v === "string" ? k : (v.key || "");
+
+  // Global users table rows
+  const globalUserRows = Object.entries(rt.globalUsers).map(([k, v]) => {
+    const isObj = typeof v === "object" && v !== null;
+    const username = isObj ? (v.username || "") : (typeof v === "string" ? v : "");
+    const expiresAt = isObj ? (v.expiresAt || "") : "";
+    const disabled = isObj ? !!v.disabled : false;
     return `<tr>
-<td><input type="text" name="uk_${k}" value="${k}" style="width:100%;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:4px 8px;border-radius:4px;font-size:12px;font-family:monospace" placeholder="虚拟Key"></td>
-<td><input type="text" name="un_${k}" value="${username}" style="width:100%;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:4px 8px;border-radius:4px;font-size:12px" placeholder="用户名"></td>
-<td><input type="text" name="rk_${k}" value="${realKey}" style="width:100%;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:4px 8px;border-radius:4px;font-size:12px;font-family:monospace" placeholder="真实Key"></td>
-<td><button type="button" onclick="this.closest('tr').remove()" style="background:rgba(248,113,113,.15);color:var(--red);border:none;padding:2px 8px;border-radius:4px;cursor:pointer;font-size:11px">删除</button></td></tr>`;
+<td><code style="font-size:11px;color:var(--accent);user-select:all;cursor:pointer" title="点击复制" onclick="navigator.clipboard.writeText('${k}')">${k}</code></td>
+<td><input type="text" name="gu_un_${k}" value="${username}" style="width:100%;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:4px 8px;border-radius:4px;font-size:12px" placeholder="用户名"></td>
+<td><input type="datetime-local" name="gu_ex_${k}" value="${expiresAt}" style="width:100%;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:3px 6px;border-radius:4px;font-size:11px;font-family:monospace;color-scheme:dark" title="留空=永不过期"></td>
+<td><label style="display:inline-flex;align-items:center;gap:4px;margin:0;cursor:pointer"><input type="checkbox" name="gu_dis_${k}" ${disabled ? "checked" : ""} style="width:auto;accent-color:var(--red)"><span style="font-size:11px;color:${disabled ? "var(--red)" : "var(--dim)"}">${disabled ? "已禁用" : "正常"}</span></label></td>
+<td><button type="button" onclick="deleteGlobalUser('${k}')" style="background:rgba(248,113,113,.15);color:var(--red);border:none;padding:2px 8px;border-radius:4px;cursor:pointer;font-size:11px">删除</button></td></tr>`;
   }).join("");
 
-  const profileItems = s.profiles.map(p => {
-    const isActive = p.isActive;
-    const host = p.upstream.replace(/^https?:\/\//, "").replace(/\/.*/, "");
-    return `<div class="pl-item${isActive ? " active" : ""}" id="pl-${p.name}">
-<div class="pl-name">${p.name}</div>
-<div class="pl-host">${host}</div>
-<div class="pl-users">${p.userCount}位用户</div>
-<div class="pl-actions">
-  ${!isActive ? '<button class="pl-activate" onclick="switchToProfile(\'' + p.name + '\')" title="设为当前方案">✓ 启用</button>' : '<span class="pl-badge">当前</span>'}
-  ${!isActive ? '<button class="pl-delete" onclick="deleteProfile(\'' + p.name + '\')" title="删除">×</button>' : ''}
-</div></div>`;
+  // Profile user rows (key assignment)
+  const profileUserRows = Object.entries(rt.globalUsers).map(([k, v]) => {
+    const isObj = typeof v === "object" && v !== null;
+    const username = isObj ? (v.username || "") : (typeof v === "string" ? v : "");
+    const globalDisabled = isObj ? !!v.disabled : false;
+    const pu = rt.users[k];
+    const realKey = pu ? (typeof pu === "string" ? pu : (pu.key || "")) : "";
+    const profileDisabled = pu ? (typeof pu === "object" ? !!pu.disabled : false) : false;
+    const rowStyle = globalDisabled ? "opacity:0.4" : "";
+    return `<tr style="${rowStyle}">
+<td><code style="font-size:11px;color:var(--accent)">${k}</code></td>
+<td>${username}</td>
+<td><input type="text" name="pu_rk_${k}" value="${realKey}" style="width:100%;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:4px 8px;border-radius:4px;font-size:12px;font-family:monospace" placeholder="真实Key (必填)"></td>
+<td><label style="display:inline-flex;align-items:center;gap:4px;margin:0;cursor:pointer"><input type="checkbox" name="pu_dis_${k}" ${profileDisabled ? "checked" : ""} style="width:auto;accent-color:var(--orange)"><span style="font-size:11px;color:${profileDisabled ? "var(--orange)" : "var(--dim)"}">${profileDisabled ? "已禁用" : "正常"}</span></label></td></tr>`;
   }).join("");
 
   const dm = s.defaultModels || {};
@@ -930,12 +1025,33 @@ td{padding:6px 8px;border-bottom:1px solid var(--border);font-size:12px}
 <div class="layout">
 <div class="sidebar">
 <div class="sidebar-hd"><h1>配置方案</h1><a href="/dashboard">← 面板</a></div>
-<div class="sidebar-list">${profileItems}</div>
+<div class="sidebar-list">${s.profiles.map(p => {
+    const isActive = p.isActive;
+    const host = p.upstream.replace(/^https?:\/\//, "").replace(/\/.*/, "");
+    return `<div class="pl-item${isActive ? " active" : ""}" id="pl-${p.name}">
+<div class="pl-name">${p.name}</div>
+<div class="pl-host">${host}</div>
+<div class="pl-users">${p.userCount}位用户</div>
+<div class="pl-actions">
+  ${!isActive ? '<button class="pl-activate" onclick="switchToProfile(\'' + p.name + '\')">✓ 启用</button>' : '<span class="pl-badge">当前</span>'}
+  ${!isActive ? '<button class="pl-delete" onclick="deleteProfile(\'' + p.name + '\')">×</button>' : ''}
+</div></div>`;
+  }).join("")}</div>
 <div class="sidebar-ft"><button class="btn btn-outline btn-sm" onclick="addProfile()" style="width:100%">+ 新增方案</button></div>
 </div>
 <div class="main">
 ${errDiv}
 <form method="post" action="/api/settings-save" id="settingsForm">
+
+<h2>用户管理 <button type="button" class="btn btn-outline btn-sm" onclick="addGlobalUser()">+ 添加用户</button></h2>
+<div class="section">
+<table id="globalUsersTable">
+<thead><tr><th>虚拟 Key</th><th>用户名称</th><th style="width:160px">失效时间</th><th style="width:80px">全局禁用</th><th style="width:60px">操作</th></tr></thead>
+<tbody>${globalUserRows}</tbody>
+</table>
+<div class="note">虚拟Key自动生成（jx-开头24位随机码），点击可复制。失效时间留空=永不过期。全局禁用=所有方案不可用。</div>
+</div>
+
 <h2>上游代理 <span class="status ${s.circuitBreaker.state === 'CLOSED' ? 'status-ok' : s.circuitBreaker.state === 'HALF_OPEN' ? 'status-warn' : 'status-err'}">${s.circuitBreaker.state === 'CLOSED' ? '正常' : s.circuitBreaker.state === 'HALF_OPEN' ? '探测中' : '熔断中'}</span></h2>
 <div class="section">
 <label>上游 API 地址</label>
@@ -953,12 +1069,12 @@ ${errDiv}
 <div class="note" style="margin-top:8px">状态：${s.circuitBreaker.state === 'CLOSED' ? '正常运行' : s.circuitBreaker.state === 'HALF_OPEN' ? '探测恢复中...' : '熔断中(' + Math.ceil(s.circuitBreaker.cooldownRemaining / 1000) + 's)'} | 失败 ${s.circuitBreaker.failureCount} | 成功 ${s.circuitBreaker.totalSuccesses} | 失败 ${s.circuitBreaker.totalFailures}</div>
 </div>
 
-<h2>默认模型映射 <span style="font-size:11px;color:var(--dim);font-weight:400">客户端使用 jx-sonnet / jx-opus / jx-haiku 别名时自动映射</span></h2>
+<h2>默认模型映射 <span style="font-size:11px;color:var(--dim);font-weight:400">jx-sonnet / jx-opus / jx-haiku 别名映射</span></h2>
 <div class="section">
 <div class="row3">
-<div><label>jx-sonnet → 实际模型<span class="req">*</span></label><input type="text" name="defaultModels_sonnet" value="${dm.sonnet || ''}" placeholder="如: deepseek-v4-pro" style="font-family:monospace"></div>
-<div><label>jx-opus → 实际模型<span class="req">*</span></label><input type="text" name="defaultModels_opus" value="${dm.opus || ''}" placeholder="如: deepseek-v4-pro" style="font-family:monospace"></div>
-<div><label>jx-haiku → 实际模型<span class="req">*</span></label><input type="text" name="defaultModels_haiku" value="${dm.haiku || ''}" placeholder="如: deepseek-v4-flash" style="font-family:monospace"></div>
+<div><label>jx-sonnet → 实际模型<span class="req">*</span></label><input type="text" name="defaultModels_sonnet" value="${dm.sonnet || ''}" placeholder="如: deepseek-v4-pro"></div>
+<div><label>jx-opus → 实际模型<span class="req">*</span></label><input type="text" name="defaultModels_opus" value="${dm.opus || ''}" placeholder="如: deepseek-v4-pro"></div>
+<div><label>jx-haiku → 实际模型<span class="req">*</span></label><input type="text" name="defaultModels_haiku" value="${dm.haiku || ''}" placeholder="如: deepseek-v4-flash"></div>
 </div>
 <div class="presets">
   <span style="font-size:11px;color:var(--dim);line-height:24px">快速填充：</span>
@@ -972,11 +1088,20 @@ ${errDiv}
 <h2>允许模型<span class="req">*必填</span></h2>
 <div class="section">
 <label>可用模型列表 (逗号分隔，至少1个)<span class="req">*必填</span></label>
-<input type="text" name="allowedModels" value="${(s.allowedModels || []).join(",")}" placeholder="必填，如: deepseek-v4-pro, deepseek-v4-flash" style="font-family:monospace" required>
-<div class="note">不在列表中的模型请求将被拦截返回 403。默认模型映射的值应包含在此列表中。</div>
+<input type="text" name="allowedModels" value="${(s.allowedModels || []).join(",")}" placeholder="必填，如: deepseek-v4-pro, deepseek-v4-flash" required>
+<div class="note">不在列表中的模型请求将被拦截返回403。默认模型映射的值会自动添加到此列表。</div>
 </div>
 
-<h2>超时 & 重试设置</h2>
+<h2>方案用户分配 <span style="font-size:11px;color:var(--dim);font-weight:400">给每个用户分配此方案的真实Key</span></h2>
+<div class="section">
+<table id="profileUsersTable">
+<thead><tr><th>虚拟 Key</th><th>用户名称</th><th>真实 Key</th><th style="width:80px">方案禁用</th></tr></thead>
+<tbody>${profileUserRows}</tbody>
+</table>
+<div class="note">全局禁用的用户灰色显示。真实Key必填才能使用此方案。</div>
+</div>
+
+<h2>超时 & 重试</h2>
 <div class="section">
 <div class="row">
 <div><label>JSON 请求超时 (ms)</label><input type="number" name="timeout" value="${s.proxy.timeout}" min="10000" max="600000"></div>
@@ -987,7 +1112,7 @@ ${errDiv}
 <div><label>重试基础延迟 (ms)</label><input type="number" name="retryDelay" value="${s.proxy.retryDelay}" min="100" max="30000"></div>
 </div>
 <div class="row">
-<div><label>可重试状态码 (逗号分隔)</label><input type="text" name="retryableStatusCodes" value="${(s.proxy.retryableStatusCodes || []).join(",")}"></div>
+<div><label>可重试状态码</label><input type="text" name="retryableStatusCodes" value="${(s.proxy.retryableStatusCodes || []).join(",")}"></div>
 <div><label>熔断失败阈值</label><input type="number" name="circuitBreakerFailures" value="${s.proxy.circuitBreakerFailures || 5}" min="1" max="50"></div>
 </div>
 <div class="row">
@@ -1004,15 +1129,6 @@ ${errDiv}
 </div>
 </div>
 
-<h2>用户 API Key 管理 <button type="button" class="btn btn-outline btn-sm" onclick="addUserRow()">+ 添加用户</button></h2>
-<div class="section">
-<table id="usersTable">
-<thead><tr><th>虚拟 Key</th><th>用户名称</th><th>真实 Key</th><th style="width:60px">操作</th></tr></thead>
-<tbody>${userRows}</tbody>
-</table>
-<div class="note">虚拟Key用于识别用户和统计用量。真实Key是发送给上游的实际Key。多人可共享同一真实Key（阿里云方案）。</div>
-</div>
-
 <div class="actions">
 <button type="button" class="btn btn-outline" onclick="location.href='/dashboard'">取消</button>
 <button type="submit" class="btn btn-primary">保存设置</button>
@@ -1021,45 +1137,47 @@ ${errDiv}
 </div>
 </div>
 <script>
-async function switchToProfile(name){
-  if(!confirm('切换到配置方案 "'+name+'"？当前未保存的修改将丢失。'))return;
-  const r=await fetch('/api/profile/switch',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({profile:name})});
-  if(r.ok)location.reload();
-  else{const e=await r.json();alert('切换失败: '+e.error)}
+async function switchToProfile(n){
+  if(!confirm('切换到方案 "'+n+'"？未保存的修改将丢失。'))return;
+  const r=await fetch('/api/profile/switch',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({profile:n})});
+  if(r.ok)location.reload();else{const e=await r.json();alert('切换失败: '+e.error)}
 }
 async function addProfile(){
-  const name=prompt('请输入新方案名称（例如：阿里百炼、GLM）');
+  const name=prompt('请输入新方案名称');
   if(!name)return;
   const fm=document.forms.settingsForm;
   const r=await fetch('/api/profile/save',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({
-    profile:name,
-    upstream:fm.upstream.value,
-    allowedModels:fm.allowedModels.value,
-    defaultModels:{
-      sonnet:fm.defaultModels_sonnet.value,
-      opus:fm.defaultModels_opus.value,
-      haiku:fm.defaultModels_haiku.value
-    }
+    profile:name,upstream:fm.upstream.value,allowedModels:fm.allowedModels.value,
+    defaultModels:{sonnet:fm.defaultModels_sonnet.value,opus:fm.defaultModels_opus.value,haiku:fm.defaultModels_haiku.value}
   })});
-  if(r.ok)location.reload();
-  else{const e=await r.json();alert('创建失败: '+e.error)}
+  if(r.ok)location.reload();else{const e=await r.json();alert('创建失败: '+e.error)}
 }
-async function deleteProfile(name){
-  if(!confirm('确定删除配置方案 "'+name+'"？此操作不可恢复。'))return;
-  const r=await fetch('/api/profile/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({profile:name})});
-  if(r.ok)location.reload();
-  else{const e=await r.json();alert('删除失败: '+e.error)}
+async function deleteProfile(n){
+  if(!confirm('确定删除方案 "'+n+'"？'))return;
+  const r=await fetch('/api/profile/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({profile:n})});
+  if(r.ok)location.reload();else{const e=await r.json();alert('删除失败: '+e.error)}
+}
+async function deleteGlobalUser(k){
+  if(!confirm('确定删除用户？该用户将从所有方案中移除。'))return;
+  const r=await fetch('/api/global-user/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({key:k})});
+  if(r.ok)location.reload();else{const e=await r.json();alert('删除失败: '+e.error)}
+}
+function genVK(){const c="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";let k="jx-";for(let i=0;i<24;i++)k+=c[Math.floor(Math.random()*c.length)];return k}
+function addGlobalUser(){
+  const tbody=document.querySelector("#globalUsersTable tbody");
+  const tr=document.createElement("tr");
+  const vk=genVK();
+  tr.innerHTML='<td><code style="font-size:11px;color:var(--accent);user-select:all">'+vk+'</code><input type="hidden" name="gu_new_'+vk+'" value="'+vk+'"></td>'
+    +'<td><input type="text" name="gu_un_new_'+vk+'" placeholder="用户名" style="width:100%;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:4px 8px;border-radius:4px;font-size:12px"></td>'
+    +'<td><input type="datetime-local" name="gu_ex_new_'+vk+'" style="width:100%;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:3px 6px;border-radius:4px;font-size:11px;color-scheme:dark"></td>'
+    +'<td><label style="display:inline-flex;align-items:center;gap:4px;margin:0;cursor:pointer"><input type="checkbox" name="gu_dis_new_'+vk+'" style="width:auto;accent-color:var(--red)"><span style="font-size:11px;color:var(--dim)">正常</span></label></td>'
+    +'<td><button type="button" onclick="this.closest(\\'tr\\').remove()" style="background:rgba(248,113,113,.15);color:var(--red);border:none;padding:2px 8px;border-radius:4px;cursor:pointer;font-size:11px">删除</button></td>';
+  tbody.appendChild(tr);
 }
 function fillDefaults(s,o,h){
   document.querySelector('[name=defaultModels_sonnet]').value=s;
   document.querySelector('[name=defaultModels_opus]').value=o;
   document.querySelector('[name=defaultModels_haiku]').value=h;
-}
-function addUserRow(){
-  const tbody=document.querySelector("#usersTable tbody");
-  const tr=document.createElement("tr");
-  tr.innerHTML='<td><input type="text" name="uk_new_'+Date.now()+'" placeholder="虚拟 Key" style="width:100%;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:4px 8px;border-radius:4px;font-size:12px;font-family:monospace"></td><td><input type="text" name="un_new_'+Date.now()+'" placeholder="用户名称" style="width:100%;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:4px 8px;border-radius:4px;font-size:12px"></td><td><input type="text" name="rk_new_'+Date.now()+'" placeholder="真实 Key" style="width:100%;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:4px 8px;border-radius:4px;font-size:12px;font-family:monospace"></td><td><button type="button" onclick="this.closest(\\'tr\\').remove()" style="background:rgba(248,113,113,.15);color:var(--red);border:none;padding:2px 8px;border-radius:4px;cursor:pointer;font-size:11px">删除</button></td>';
-  tbody.appendChild(tr);
 }
 document.addEventListener("keydown",e=>{if(e.key==="Enter"&&e.target.tagName!=="TEXTAREA"&&e.target.tagName!=="INPUT")e.preventDefault()});
 </script>
@@ -1285,34 +1403,64 @@ function applySettings(formData) {
   if (formData.defaultModels_opus)   rt.defaultModels.opus   = formData.defaultModels_opus.trim();
   if (formData.defaultModels_haiku)  rt.defaultModels.haiku  = formData.defaultModels_haiku.trim();
 
+  // Ensure defaultModels values are always in allowedModels
+  for (const m of Object.values(rt.defaultModels)) {
+    if (m && !rt.allowedModels.includes(m)) {
+      rt.allowedModels.push(m);
+    }
+  }
+
   // Update circuit breaker thresholds
   upstreamBreaker.failureThreshold = rt.proxy.circuitBreakerFailures || 5;
   upstreamBreaker.cooldownMs = rt.proxy.circuitBreakerCooldown || 30000;
 
-  // Update users
-  const newUsers = {};
-  function collectUser(virtualKey, suffix, prefix) {
-    if (!virtualKey || !virtualKey.trim()) return;
-    const vk = virtualKey.trim();
-    const username = formData[prefix + "un_" + suffix] || vk.slice(0, 8);
-    const realKey = formData[prefix + "rk_" + suffix] || vk;
-    newUsers[vk] = { username, key: realKey.trim() };
-  }
+  // Update global users
+  const newGlobalUsers = {};
   for (const [k, v] of Object.entries(formData)) {
-    if (k.startsWith("uk_") && !k.startsWith("uk_new_")) {
-      collectUser(v, k.slice(3), "");
+    // Existing global users: gu_un_<vk>, gu_ex_<vk>, gu_dis_<vk>
+    if (k.startsWith("gu_un_") && !k.startsWith("gu_un_new_")) {
+      const vk = k.slice(6);
+      newGlobalUsers[vk] = {
+        username: v || vk.slice(0, 8),
+        expiresAt: formData["gu_ex_" + vk] || null,
+        disabled: formData["gu_dis_" + vk] === "on",
+      };
     }
-    if (k.startsWith("uk_new_") && v.trim()) {
-      collectUser(v, k.slice(7), "new_");
+    // New global users: gu_new_<vk> (hidden input with vk value)
+    if (k.startsWith("gu_new_") && v.trim()) {
+      const vk = v.trim();
+      newGlobalUsers[vk] = {
+        username: formData["gu_un_new_" + vk] || vk.slice(0, 8),
+        expiresAt: formData["gu_ex_new_" + vk] || null,
+        disabled: formData["gu_dis_new_" + vk] === "on",
+      };
     }
   }
-  if (Object.keys(newUsers).length > 0) {
-    rt.users = newUsers;
+  if (Object.keys(newGlobalUsers).length > 0) {
+    rt.globalUsers = newGlobalUsers;
   }
 
-  // Persist to config.json — save to active profile
+  // Update profile users (key assignment + profile disable)
+  const newProfileUsers = {};
+  for (const [k, v] of Object.entries(formData)) {
+    if (k.startsWith("pu_rk_")) {
+      const vk = k.slice(6);
+      const realKey = v.trim();
+      if (!realKey) continue; // skip users without real key
+      newProfileUsers[vk] = {
+        key: realKey,
+        disabled: formData["pu_dis_" + vk] === "on",
+      };
+    }
+  }
+  if (Object.keys(newProfileUsers).length > 0) {
+    rt.users = newProfileUsers;
+  }
+
+  // Persist to config.json
   const cfg = loadConfig();
   cfg.proxy = { ...rt.proxy };
+  cfg.users = { ...rt.globalUsers };
   // Update active profile
   const ap = cfg.profiles[cfg.activeProfile];
   if (ap) {
@@ -1517,6 +1665,7 @@ const server = http.createServer((req, res) => {
             } else {
               formData["un_" + k] = v.username || v.name || "";
               formData["rk_" + k] = v.key || k;
+              if (v.expiresAt) formData["ex_" + k] = v.expiresAt;
             }
           }
         }
@@ -1573,6 +1722,34 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+  // Delete global user
+  if (req.method === "POST" && req.url === "/api/global-user/delete") {
+    if (!checkAuth(req)) { res.writeHead(401); res.end("Unauthorized"); return; }
+    const chunks = [];
+    req.on("data", (c) => chunks.push(c));
+    req.on("end", () => {
+      try {
+        const { key } = JSON.parse(Buffer.concat(chunks).toString());
+        if (!key) throw new Error("Key required");
+        delete rt.globalUsers[key];
+        // Remove from all profiles
+        for (const pname of Object.keys(config.profiles)) {
+          delete config.profiles[pname].users[key];
+        }
+        delete rt.users[key];
+        config.users = { ...rt.globalUsers };
+        saveConfig(config);
+        console.log(`[USER] Deleted global user: ${key}`);
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: true }));
+      } catch (err) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: err.message }));
+      }
+    });
+    return;
+  }
+
   // Health check (no auth required)
   if (req.method === "GET" && req.url === "/health") {
     const activeConns = Object.values(userConcurrent).reduce((s, v) => s + v, 0);
@@ -1601,7 +1778,7 @@ server.listen(port, "0.0.0.0", () => {
   console.log(`[团队AI Coding监控] http://0.0.0.0:${port}  Dashboard: http://localhost:${port}/dashboard`);
   console.log(`[团队AI Coding监控] Profile: "${config.activeProfile}" → ${rt.upstream}`);
   console.log(`[团队AI Coding监控] Settings: http://localhost:${port}/settings`);
-  console.log(`[团队AI Coding监控] Users: ${Object.values(rt.users).map(u => typeof u === "string" ? u : u.username).join(", ")}`);
+  console.log(`[团队AI Coding监控] Users: ${Object.values(rt.globalUsers).map(u => u.username || "").join(", ")}`);
 });
 
 // Server timeouts

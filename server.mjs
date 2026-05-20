@@ -587,10 +587,10 @@ function proxyRequest(req, res) {
           if (hasToolResult && !hasText) reqSource = "工具调用";
           else if (hasToolResult && hasText) reqSource = "用户+工具";
         }
-        // Check for subagent: system prompt contains "subagent" or "Subagent"
+        // Check for subagent: only match <SUBAGENT-STOP> tag (not generic "subagent" word)
         const sys = typeof parsed.system === "string" ? parsed.system :
           Array.isArray(parsed.system) ? parsed.system.map(b => b.text || "").join(" ") : "";
-        if (sys.includes("subagent") || sys.includes("Subagent") || sys.includes("SUBAGENT_STOP")) {
+        if (sys.includes("SUBAGENT_STOP")) {
           reqSource = "子代理";
         }
       }
@@ -664,6 +664,7 @@ function proxyRequest(req, res) {
     try {
       const realKey = getRealKey(apiKey);
       const reqHeaders = { ...req.headers, host: rt.upstreamUrl.host, "content-length": body.length };
+      console.log(`── 请求开始 ── ${getUserName(apiKey)} [${reqSource}] 模型=${originalModel}${originalModel !== reqModel ? "→" + reqModel : ""} ──`);
       // Replace virtual key with real upstream key
       if (realKey !== apiKey) {
         reqHeaders["authorization"] = `Bearer ${realKey}`;
@@ -693,6 +694,7 @@ function proxyRequest(req, res) {
       }
     } finally {
       userConcurrent[userKey] = Math.max(0, (userConcurrent[userKey] || 1) - 1);
+      console.log(`── 请求结束 ── ${getUserName(apiKey)} ──`);
     }
   });
 }

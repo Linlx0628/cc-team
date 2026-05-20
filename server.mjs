@@ -570,9 +570,28 @@ function proxyRequest(req, res) {
   req.on("end", async () => {
     let body = Buffer.concat(chunks);
     let reqModel = "unknown";
+    let reqSource = "用户请求";
     try {
       const parsed = JSON.parse(body.toString());
       reqModel = parsed.model || "unknown";
+      // Detect request source: user input vs tool result vs subagent
+      const msgs = parsed.messages || [];
+      const lastMsg = msgs[msgs.length - 1];
+      if (lastMsg && lastMsg.role === "user") {
+        const content = lastMsg.content;
+        if (Array.isArray(content)) {
+          const hasToolResult = content.some(b => b.type === "tool_result");
+          const hasText = content.some(b => b.type === "text");
+          if (hasToolResult && !hasText) reqSource = "工具调用";
+          else if (hasToolResult && hasText) reqSource = "用户+工具";
+        }
+        // Check for subagent: system prompt contains "subagent" or "Subagent"
+        const sys = typeof parsed.system === "string" ? parsed.system :
+          Array.isArray(parsed.system) ? parsed.system.map(b => b.text || "").join(" ") : "";
+        if (sys.includes("subagent") || sys.includes("Subagent") || sys.includes("SUBAGENT_STOP")) {
+          reqSource = "子代理";
+        }
+      }
       const resolved = resolveModel(reqModel);
       if (resolved !== reqModel) {
         parsed.model = resolved;
@@ -659,9 +678,9 @@ function proxyRequest(req, res) {
       const timeout = isStreamRequest ? rt.proxy.streamTimeout : rt.proxy.timeout;
 
       if (isStreamRequest) {
-        await handleStreamingProxy(req, res, body, reqHeaders, apiKey, reqModel, timeout);
+        await handleStreamingProxy(req, res, body, reqHeaders, apiKey, reqModel, timeout, reqSource);
       } else {
-        await handleJsonProxy(req, res, body, reqHeaders, apiKey, reqModel, timeout);
+        await handleJsonProxy(req, res, body, reqHeaders, apiKey, reqModel, timeout, reqSource);
       }
     } catch (err) {
       const status = err.isTimeout ? 504 : 502;
@@ -677,7 +696,7 @@ function proxyRequest(req, res) {
   });
 }
 
-async function handleJsonProxy(req, res, body, reqHeaders, apiKey, reqModel, timeout) {
+async function handleJsonProxy(req, res, body, reqHeaders, apiKey, reqModel, timeout, reqSource) {
   let lastError = null;
 
   for (let attempt = 0; attempt <= rt.proxy.maxRetries; attempt++) {
@@ -721,7 +740,7 @@ async function handleJsonProxy(req, res, body, reqHeaders, apiKey, reqModel, tim
           if (usage) {
             recordUsage(apiKey, usage, json.model);
             const modelName = json.model || reqModel;
-            console.log(`[Token] ${getUserName(apiKey)} model=${modelName} 输入=${usage.input_tokens || usage.prompt_tokens || 0} 输出=${usage.output_tokens || usage.completion_tokens || 0} 缓存写=${usage.cache_creation_input_tokens || 0} 缓存读=${usage.cache_read_input_tokens || 0}`);
+            console.log(`[Token] ${getUserName(apiKey)} [${reqSource}] model=${modelName} 输入=${usage.input_tokens || usage.prompt_tokens || 0} 输出=${usage.output_tokens || usage.completion_tokens || 0} 缓存写=${usage.cache_creation_input_tokens || 0} 缓存读=${usage.cache_read_input_tokens || 0}`);
           } else {
             console.log(`[响应] ${getUserName(apiKey)} 200 OK 但无usage字段 model=${reqModel} body[0:300]=${text.slice(0, 300).replace(/\n/g, "\\n")}`);
           }
@@ -764,7 +783,7 @@ async function handleJsonProxy(req, res, body, reqHeaders, apiKey, reqModel, tim
   }
 }
 
-async function handleStreamingProxy(req, res, body, reqHeaders, apiKey, reqModel, timeout) {
+async function handleStreamingProxy(req, res, body, reqHeaders, apiKey, reqModel, timeout, reqSource) {
   const opts = {
     hostname: rt.upstreamUrl.hostname,
     port: rt.upstreamUrl.port || (rt.upstreamUrl.protocol === "https:" ? 443 : 80),
@@ -869,7 +888,7 @@ async function handleStreamingProxy(req, res, body, reqHeaders, apiKey, reqModel
         }
         if (usage.input_tokens > 0 || usage.output_tokens > 0) {
           recordUsage(apiKey, usage, model);
-          console.log(`[Token] ${getUserName(apiKey)} model=${model} 输入=${usage.input_tokens} 输出=${usage.output_tokens} 缓存写=${usage.cache_creation_input_tokens || 0} 缓存读=${usage.cache_read_input_tokens || 0}`);
+          console.log(`[Token] ${getUserName(apiKey)} [${reqSource}] model=${model} 输入=${usage.input_tokens} 输出=${usage.output_tokens} 缓存写=${usage.cache_creation_input_tokens || 0} 缓存读=${usage.cache_read_input_tokens || 0}`);
         } else {
           console.log(`[响应] ${getUserName(apiKey)} 流结束 无usage数据 model=${model} sse行数=${sseDataLines} 原始数据[0:200]=${rawSample.slice(0, 200).replace(/\n/g, "\\n")}`);
         }

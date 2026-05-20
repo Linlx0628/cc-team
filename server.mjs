@@ -647,7 +647,7 @@ function proxyRequest(req, res) {
       // Replace virtual key with real upstream key
       if (realKey !== apiKey) {
         reqHeaders["authorization"] = `Bearer ${realKey}`;
-        console.log(`[映射] ${getUserName(apiKey)} 虚拟key → 真实key model=${reqModel}`);
+        console.log(`[映射] ${getUserName(apiKey)} 虚拟key=${apiKey.slice(0,12)}... → 真实key=${realKey.slice(0,12)}... model=${reqModel}`);
       }
       delete reqHeaders["connection"];
       delete reqHeaders["transfer-encoding"];

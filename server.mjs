@@ -498,7 +498,7 @@ function recordError(apiKey, statusCode, errorMessage, path, model) {
   const cutoff = new Date(Date.now() - 7 * 24 * 3600 * 1000).toISOString();
   store.errors = store.errors.filter(e => e.time >= cutoff);
   if (store.errors.length > 200) store.errors.length = 200;
-  console.log(`[ERROR] ${getUserName(apiKey)} ${statusCode} ${errorMessage} ${path} model=${model || "unknown"}`);
+  console.log(`[错误] ${getUserName(apiKey)} ${statusCode} ${errorMessage} ${path} model=${model || "unknown"}`);
 }
 
 // ─── API Proxy ───────────────────────────────────────────────────────────────
@@ -577,7 +577,7 @@ function proxyRequest(req, res) {
       if (resolved !== reqModel) {
         parsed.model = resolved;
         body = Buffer.from(JSON.stringify(parsed));
-        console.log(`[ALIAS] ${getUserName(apiKey)} ${reqModel} → ${resolved}`);
+        console.log(`[别名] ${getUserName(apiKey)} ${reqModel} → ${resolved}`);
         reqModel = resolved;
       }
     } catch {}
@@ -586,7 +586,15 @@ function proxyRequest(req, res) {
     if (!checkModelAllowed(reqModel)) {
       res.writeHead(403, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ error: `Model "${reqModel}" is not allowed. Use jx-sonnet/jx-opus/jx-haiku or a model from the allowed list.` }));
-      console.log(`[BLOCK] ${getUserName(apiKey)} model=${reqModel} denied`);
+      console.log(`[拦截] ${getUserName(apiKey)} model=${reqModel} 被拒绝`);
+      return;
+    }
+
+    // Reject unknown API keys (not in configured user list)
+    if (!rt.users[userKey] && !rt.globalUsers[userKey]) {
+      res.writeHead(403, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Unknown API key. Please use your assigned virtual key (jx-*)." }));
+      console.log(`[拦截] 未知key=${apiKey.slice(0, 12)} model=${reqModel} 拒绝访问`);
       return;
     }
 
@@ -620,7 +628,7 @@ function proxyRequest(req, res) {
       userConcurrent[userKey] = Math.max(0, (userConcurrent[userKey] || 1) - 1);
       res.writeHead(403, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ error: "User is disabled." }));
-      console.log(`[DISABLED] ${getUserName(apiKey)} user disabled`);
+      console.log(`[禁用] ${getUserName(apiKey)} 用户已禁用`);
       return;
     }
 
@@ -629,7 +637,7 @@ function proxyRequest(req, res) {
       userConcurrent[userKey] = Math.max(0, (userConcurrent[userKey] || 1) - 1);
       res.writeHead(403, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ error: "API key has expired. Please contact your administrator." }));
-      console.log(`[EXPIRED] ${getUserName(apiKey)} key expired`);
+      console.log(`[过期] ${getUserName(apiKey)} key已过期`);
       return;
     }
 
@@ -639,7 +647,7 @@ function proxyRequest(req, res) {
       // Replace virtual key with real upstream key
       if (realKey !== apiKey) {
         reqHeaders["authorization"] = `Bearer ${realKey}`;
-        console.log(`[KEY] ${getUserName(apiKey)} virtual → real key mapping model=${reqModel}`);
+        console.log(`[映射] ${getUserName(apiKey)} 虚拟key → 真实key model=${reqModel}`);
       }
       delete reqHeaders["connection"];
       delete reqHeaders["transfer-encoding"];
@@ -687,7 +695,7 @@ async function handleJsonProxy(req, res, body, reqHeaders, apiKey, reqModel, tim
         const isPaymentIssue = text.includes("quota") || text.includes("balance") ||
           text.includes("insufficient") || text.includes("exhausted") || text.includes("billing");
         if (isPaymentIssue) {
-          console.log(`[PLAN] Upstream plan exhausted or payment required. Status: ${upRes.statusCode}`);
+          console.log(`[套餐] 上游套餐已耗尽或需要付款 状态码: ${upRes.statusCode}`);
         }
       }
 
@@ -695,7 +703,7 @@ async function handleJsonProxy(req, res, body, reqHeaders, apiKey, reqModel, tim
       if (rt.proxy.retryableStatusCodes.includes(upRes.statusCode) && attempt < rt.proxy.maxRetries) {
         const baseDelay = Math.min(rt.proxy.retryDelay * Math.pow(2, attempt), 10000);
         const delay = Math.round(jitter(baseDelay));
-        console.log(`[RETRY] ${getUserName(apiKey)} ${upRes.statusCode} model=${reqModel} attempt ${attempt + 1}/${rt.proxy.maxRetries} retrying in ${delay}ms`);
+        console.log(`[重试] ${getUserName(apiKey)} ${upRes.statusCode} model=${reqModel} 第${attempt + 1}/${rt.proxy.maxRetries}次 ${delay}ms后重试`);
         recordError(apiKey, upRes.statusCode, `Retryable error (attempt ${attempt + 1}/${rt.proxy.maxRetries})`, req.url, reqModel);
         await sleep(delay);
         continue;
@@ -713,9 +721,9 @@ async function handleJsonProxy(req, res, body, reqHeaders, apiKey, reqModel, tim
           if (usage) {
             recordUsage(apiKey, usage, json.model);
             const modelName = json.model || reqModel;
-            console.log(`[TOKEN] ${getUserName(apiKey)} model=${modelName} in=${usage.input_tokens || usage.prompt_tokens || 0} out=${usage.output_tokens || usage.completion_tokens || 0} cache_w=${usage.cache_creation_input_tokens || 0} cache_r=${usage.cache_read_input_tokens || 0}`);
+            console.log(`[Token] ${getUserName(apiKey)} model=${modelName} 输入=${usage.input_tokens || usage.prompt_tokens || 0} 输出=${usage.output_tokens || usage.completion_tokens || 0} 缓存写=${usage.cache_creation_input_tokens || 0} 缓存读=${usage.cache_read_input_tokens || 0}`);
           } else {
-            console.log(`[RESP] ${getUserName(apiKey)} 200 OK but no usage field. model=${reqModel} body[0:300]=${text.slice(0, 300).replace(/\n/g, "\\n")}`);
+            console.log(`[响应] ${getUserName(apiKey)} 200 OK 但无usage字段 model=${reqModel} body[0:300]=${text.slice(0, 300).replace(/\n/g, "\\n")}`);
           }
         }
       } catch {
@@ -723,7 +731,7 @@ async function handleJsonProxy(req, res, body, reqHeaders, apiKey, reqModel, tim
           recordError(apiKey, upRes.statusCode, text.slice(0, 200), req.url, reqModel);
           if (upRes.statusCode >= 500) upstreamBreaker.recordFailure();
         } else {
-          console.log(`[RESP] ${getUserName(apiKey)} ${upRes.statusCode} non-JSON body[0:300]=${text.slice(0, 300).replace(/\n/g, "\\n")}`);
+          console.log(`[响应] ${getUserName(apiKey)} ${upRes.statusCode} 非JSON响应 body[0:300]=${text.slice(0, 300).replace(/\n/g, "\\n")}`);
         }
       }
 
@@ -740,7 +748,7 @@ async function handleJsonProxy(req, res, body, reqHeaders, apiKey, reqModel, tim
       if (attempt < rt.proxy.maxRetries) {
         const baseDelay = Math.min(rt.proxy.retryDelay * Math.pow(2, attempt), 10000);
         const delay = Math.round(jitter(baseDelay));
-        console.log(`[RETRY] ${getUserName(apiKey)} network error model=${reqModel} attempt ${attempt + 1}/${rt.proxy.maxRetries} retrying in ${delay}ms`);
+        console.log(`[重试] ${getUserName(apiKey)} 网络错误 model=${reqModel} 第${attempt + 1}/${rt.proxy.maxRetries}次 ${delay}ms后重试`);
         await sleep(delay);
       }
     }
@@ -830,7 +838,7 @@ async function handleStreamingProxy(req, res, body, reqHeaders, apiKey, reqModel
           sseDataLines++;
           try {
             const d = JSON.parse(jsonStr);
-            if (sseDataLines <= 3) console.log(`[SSE] ${getUserName(apiKey)} #${sseDataLines} type=${d.type} keys=${Object.keys(d).join(",")}`);
+            if (sseDataLines <= 3) console.log(`[SSE] ${getUserName(apiKey)} 第${sseDataLines}条 类型=${d.type} 字段=${Object.keys(d).join(",")}`);
             if (d.type === "message_start") {
               if (d.message) {
                 model = d.message.model || model;
@@ -861,9 +869,9 @@ async function handleStreamingProxy(req, res, body, reqHeaders, apiKey, reqModel
         }
         if (usage.input_tokens > 0 || usage.output_tokens > 0) {
           recordUsage(apiKey, usage, model);
-          console.log(`[TOKEN] ${getUserName(apiKey)} model=${model} in=${usage.input_tokens} out=${usage.output_tokens} cache_w=${usage.cache_creation_input_tokens || 0} cache_r=${usage.cache_read_input_tokens || 0}`);
+          console.log(`[Token] ${getUserName(apiKey)} model=${model} 输入=${usage.input_tokens} 输出=${usage.output_tokens} 缓存写=${usage.cache_creation_input_tokens || 0} 缓存读=${usage.cache_read_input_tokens || 0}`);
         } else {
-          console.log(`[RESP] ${getUserName(apiKey)} stream ended, no usage. model=${model} sseLines=${sseDataLines} raw[0:200]=${rawSample.slice(0, 200).replace(/\n/g, "\\n")}`);
+          console.log(`[响应] ${getUserName(apiKey)} 流结束 无usage数据 model=${model} sse行数=${sseDataLines} 原始数据[0:200]=${rawSample.slice(0, 200).replace(/\n/g, "\\n")}`);
         }
         if (!clientGone) res.end();
         safeResolve();

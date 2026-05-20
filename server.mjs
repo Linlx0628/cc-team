@@ -780,7 +780,9 @@ async function handleStreamingProxy(req, res, body, reqHeaders, apiKey, reqModel
       res.writeHead(upRes.statusCode, h);
 
       let clientGone = false;
-      res.on("error", () => { clientGone = true; upReq.destroy(); });
+      let resolved = false;
+      function safeResolve() { if (!resolved) { resolved = true; resolve(); } }
+      res.on("error", () => { clientGone = true; upReq.destroy(); safeResolve(); });
 
       let buf = "", usage = { input_tokens: 0, output_tokens: 0 }, model = reqModel;
       let sseDataLines = 0;
@@ -793,8 +795,8 @@ async function handleStreamingProxy(req, res, body, reqHeaders, apiKey, reqModel
           recordError(apiKey, upRes.statusCode, errBuf.slice(0, 200), req.url, reqModel);
           if (upRes.statusCode >= 500) upstreamBreaker.recordFailure();
           else if (upRes.statusCode < 500) upstreamBreaker.recordSuccess();
-          res.end();
-          resolve();
+          if (!clientGone) res.end();
+          safeResolve();
         });
         return;
       }
@@ -863,8 +865,8 @@ async function handleStreamingProxy(req, res, body, reqHeaders, apiKey, reqModel
         } else {
           console.log(`[RESP] ${getUserName(apiKey)} stream ended, no usage. model=${model} sseLines=${sseDataLines} raw[0:200]=${rawSample.slice(0, 200).replace(/\n/g, "\\n")}`);
         }
-        res.end();
-        resolve();
+        if (!clientGone) res.end();
+        safeResolve();
       });
     });
 
@@ -878,11 +880,11 @@ async function handleStreamingProxy(req, res, body, reqHeaders, apiKey, reqModel
       const status = isTimeout ? 504 : 502;
       const label = isTimeout ? "Gateway Timeout" : "Bad Gateway";
       recordError(apiKey, status, `${label}: ${err.message}`, req.url, reqModel);
-      if (!res.headersSent) {
+      if (!res.headersSent && !clientGone) {
         res.writeHead(status, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ error: `Proxy ${label}: ${err.message}` }));
       }
-      resolve();
+      safeResolve();
     });
 
     upReq.write(body);
@@ -1024,6 +1026,16 @@ td{padding:6px 8px;border-bottom:1px solid var(--border);font-size:12px}
 .preset{font-size:11px;padding:4px 10px;border-radius:4px;border:1px solid var(--border);background:var(--bg);color:var(--dim);cursor:pointer;font-family:monospace}
 .preset:hover{border-color:var(--accent);color:var(--text)}
 .req{color:var(--red);font-size:10px;margin-left:4px}
+.modal-overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:100;justify-content:center;align-items:center}
+.modal-overlay.open{display:flex}
+.modal{background:var(--card);border:1px solid var(--border);border-radius:12px;width:90%;max-width:1100px;max-height:80vh;display:flex;flex-direction:column;box-shadow:0 20px 60px rgba(0,0,0,.5)}
+.modal-hd{padding:16px 20px;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between}
+.modal-hd h3{font-size:15px;margin:0}
+.modal-close{background:none;border:none;color:var(--dim);font-size:20px;cursor:pointer;padding:0 4px;line-height:1}
+.modal-close:hover{color:var(--text)}
+.modal-body{padding:16px 20px;overflow-y:auto;flex:1}
+.modal-body::-webkit-scrollbar{width:4px}
+.modal-body::-webkit-scrollbar-thumb{background:var(--border);border-radius:2px}
 @media(max-width:768px){.layout{flex-direction:column}.sidebar{width:100%;min-width:0;max-height:200px}.row3{grid-template-columns:1fr 1fr}}
 </style></head><body>
 <div class="layout">
@@ -1041,20 +1053,11 @@ td{padding:6px 8px;border-bottom:1px solid var(--border);font-size:12px}
   ${!isActive ? '<button class="pl-delete" onclick="deleteProfile(\'' + p.name + '\')">×</button>' : ''}
 </div></div>`;
   }).join("")}</div>
-<div class="sidebar-ft"><button class="btn btn-outline btn-sm" onclick="addProfile()" style="width:100%">+ 新增方案</button></div>
+<div class="sidebar-ft" style="display:flex;gap:6px"><button class="btn btn-outline btn-sm" onclick="openUserModal()" style="flex:1">用户管理</button><button class="btn btn-outline btn-sm" onclick="addProfile()" style="flex:1">+ 新增方案</button></div>
 </div>
 <div class="main">
 ${errDiv}
 <form method="post" action="/api/settings-save" id="settingsForm">
-
-<h2>用户管理 <button type="button" class="btn btn-outline btn-sm" onclick="addGlobalUser()">+ 添加用户</button></h2>
-<div class="section">
-<table id="globalUsersTable">
-<thead><tr><th>虚拟 Key</th><th>用户名称</th><th style="width:160px">失效时间</th><th style="width:80px">全局禁用</th><th style="width:60px">操作</th></tr></thead>
-<tbody>${globalUserRows}</tbody>
-</table>
-<div class="note">虚拟Key自动生成（jx-开头24位随机码），点击可复制。失效时间留空=永不过期。全局禁用=所有方案不可用。</div>
-</div>
 
 <h2>上游代理 <span class="status ${s.circuitBreaker.state === 'CLOSED' ? 'status-ok' : s.circuitBreaker.state === 'HALF_OPEN' ? 'status-warn' : 'status-err'}">${s.circuitBreaker.state === 'CLOSED' ? '正常' : s.circuitBreaker.state === 'HALF_OPEN' ? '探测中' : '熔断中'}</span></h2>
 <div class="section">
@@ -1096,15 +1099,6 @@ ${errDiv}
 <div class="note">不在列表中的模型请求将被拦截返回403。默认模型映射的值会自动添加到此列表。</div>
 </div>
 
-<h2>方案用户分配 <span style="font-size:11px;color:var(--dim);font-weight:400">给每个用户分配此方案的真实Key</span></h2>
-<div class="section">
-<table id="profileUsersTable">
-<thead><tr><th>虚拟 Key</th><th>用户名称</th><th>真实 Key</th><th style="width:80px">方案禁用</th></tr></thead>
-<tbody>${profileUserRows}</tbody>
-</table>
-<div class="note">全局禁用的用户灰色显示。真实Key必填才能使用此方案。</div>
-</div>
-
 <h2>超时 & 重试</h2>
 <div class="section">
 <div class="row">
@@ -1140,7 +1134,36 @@ ${errDiv}
 </form>
 </div>
 </div>
+<div class="modal-overlay" id="userModal">
+<div class="modal">
+<div class="modal-hd"><h3>用户管理</h3><button class="modal-close" onclick="closeUserModal()">&times;</button></div>
+<div class="modal-body">
+<h4 style="font-size:13px;color:var(--accent);margin:0 0 8px">全局用户信息</h4>
+<table id="globalUsersTable">
+<thead><tr><th>虚拟 Key</th><th>用户名称</th><th style="width:160px">失效时间</th><th style="width:80px">全局禁用</th><th style="width:60px">操作</th></tr></thead>
+<tbody>${globalUserRows}</tbody>
+</table>
+<div style="margin:12px 0 4px;display:flex;gap:8px;align-items:center">
+<button type="button" class="btn btn-outline btn-sm" onclick="addGlobalUser()">+ 添加用户</button>
+<span class="note">虚拟Key自动生成（jx-开头24位随机码），点击可复制。失效时间留空=永不过期。</span>
+</div>
+<h4 style="font-size:13px;color:var(--accent);margin:16px 0 8px">方案真实Key分配 <span style="font-size:11px;color:var(--dim);font-weight:400">（当前方案：${config.activeProfile}）</span></h4>
+<table id="profileUsersTable">
+<thead><tr><th>虚拟 Key</th><th>用户名称</th><th>真实 Key</th><th style="width:80px">方案禁用</th></tr></thead>
+<tbody>${profileUserRows}</tbody>
+</table>
+<div class="note" style="margin-top:6px">全局禁用的用户灰色显示。真实Key必填才能使用此方案。</div>
+<div style="margin-top:16px;display:flex;justify-content:flex-end;gap:8px;padding-bottom:8px">
+<button type="button" class="btn btn-outline btn-sm" onclick="closeUserModal()">取消</button>
+<button type="button" class="btn btn-primary btn-sm" onclick="saveUsers()">保存全部</button>
+</div>
+</div>
+</div>
+</div>
 <script>
+function openUserModal(){document.getElementById('userModal').classList.add('open')}
+function closeUserModal(){document.getElementById('userModal').classList.remove('open')}
+document.getElementById('userModal').addEventListener('click',function(e){if(e.target===this)closeUserModal()});
 async function switchToProfile(n){
   if(!confirm('切换到方案 "'+n+'"？未保存的修改将丢失。'))return;
   const r=await fetch('/api/profile/switch',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({profile:n})});
@@ -1165,6 +1188,32 @@ async function deleteGlobalUser(k){
   if(!confirm('确定删除用户？该用户将从所有方案中移除。'))return;
   const r=await fetch('/api/global-user/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({key:k})});
   if(r.ok)location.reload();else{const e=await r.json();alert('删除失败: '+e.error)}
+}
+async function saveUsers(){
+  const tbody=document.querySelector("#globalUsersTable tbody");
+  const rows=tbody.querySelectorAll("tr");
+  const users=[];
+  rows.forEach(tr=>{
+    const hidden=tr.querySelector('input[type=hidden]');
+    const vk=hidden?hidden.value:tr.querySelector('code')?.textContent?.trim()||'';
+    const unInput=tr.querySelector('input[name^="gu_un_"]');
+    const exInput=tr.querySelector('input[name^="gu_ex_"]');
+    const disInput=tr.querySelector('input[name^="gu_dis_"]');
+    if(!vk||!unInput)return;
+    users.push({key:vk,username:unInput.value||vk.slice(0,8),expiresAt:exInput?exInput.value:'',disabled:disInput?disInput.checked:false});
+  });
+  const ptbody=document.querySelector("#profileUsersTable tbody");
+  const prows=ptbody.querySelectorAll("tr");
+  const profileUsers=[];
+  prows.forEach(tr=>{
+    const vk=tr.querySelector('code')?.textContent?.trim()||'';
+    const rkInput=tr.querySelector('input[name^="pu_rk_"]');
+    const disInput=tr.querySelector('input[name^="pu_dis_"]');
+    if(!vk)return;
+    profileUsers.push({key:vk,realKey:rkInput?rkInput.value.trim():'',disabled:disInput?disInput.checked:false});
+  });
+  const r=await fetch('/api/global-user/save',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({users,profileUsers})});
+  if(r.ok){alert('保存成功');location.reload()}else{const e=await r.json();alert('保存失败: '+e.error)}
 }
 function genVK(){const c="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";let k="jx-";for(let i=0;i<24;i++)k+=c[Math.floor(Math.random()*c.length)];return k}
 function addGlobalUser(){
@@ -1754,6 +1803,55 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+  // Save all global users
+  if (req.method === "POST" && req.url === "/api/global-user/save") {
+    if (!checkAuth(req)) { res.writeHead(401); res.end("Unauthorized"); return; }
+    const chunks = [];
+    req.on("data", (c) => chunks.push(c));
+    req.on("end", () => {
+      try {
+        const { users, profileUsers } = JSON.parse(Buffer.concat(chunks).toString());
+        if (!Array.isArray(users) || users.length === 0) throw new Error("No users provided");
+        const newGlobalUsers = {};
+        for (const u of users) {
+          if (!u.key) continue;
+          newGlobalUsers[u.key] = { username: u.username || u.key.slice(0, 8), expiresAt: u.expiresAt || null, disabled: !!u.disabled };
+        }
+        rt.globalUsers = newGlobalUsers;
+        config.users = { ...rt.globalUsers };
+        // Update profile users (real keys + profile disable)
+        if (Array.isArray(profileUsers)) {
+          const newPU = {};
+          for (const pu of profileUsers) {
+            if (!pu.key) continue;
+            newPU[pu.key] = { key: pu.realKey || "", disabled: !!pu.disabled };
+          }
+          const ap = config.profiles[config.activeProfile];
+          if (ap) {
+            ap.users = newPU;
+            rt.users = { ...newPU };
+          }
+        } else {
+          // Ensure profile users entries exist for new keys
+          const ap = config.profiles[config.activeProfile];
+          if (ap) {
+            for (const k of Object.keys(newGlobalUsers)) {
+              if (!ap.users[k]) ap.users[k] = { key: "", disabled: false };
+            }
+          }
+        }
+        saveConfig(config);
+        console.log(`[USER] Saved ${Object.keys(newGlobalUsers).length} global users`);
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: true }));
+      } catch (err) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: err.message }));
+      }
+    });
+    return;
+  }
+
   // Health check (no auth required)
   if (req.method === "GET" && req.url === "/health") {
     const activeConns = Object.values(userConcurrent).reduce((s, v) => s + v, 0);
@@ -1794,3 +1892,12 @@ server.keepAliveTimeout = 30000;
 
 process.on("SIGINT", () => { saveStore(); process.exit(0); });
 process.on("SIGTERM", () => { saveStore(); process.exit(0); });
+process.on("uncaughtException", (err) => {
+  if (err.code === "EPIPE" || err.code === "ECONNRESET") {
+    console.error(`[WARN] ${err.code} ignored, client disconnected`);
+    return;
+  }
+  console.error("[FATAL] Uncaught exception:", err);
+  saveStore();
+  process.exit(1);
+});

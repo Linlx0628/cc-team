@@ -571,9 +571,11 @@ function proxyRequest(req, res) {
     let body = Buffer.concat(chunks);
     let reqModel = "unknown";
     let reqSource = "用户请求";
+    let originalModel = "unknown";
     try {
       const parsed = JSON.parse(body.toString());
       reqModel = parsed.model || "unknown";
+      originalModel = reqModel;
       // Detect request source: user input vs tool result vs subagent
       const msgs = parsed.messages || [];
       const lastMsg = msgs[msgs.length - 1];
@@ -596,7 +598,6 @@ function proxyRequest(req, res) {
       if (resolved !== reqModel) {
         parsed.model = resolved;
         body = Buffer.from(JSON.stringify(parsed));
-        console.log(`[别名] ${getUserName(apiKey)} ${reqModel} → ${resolved}`);
         reqModel = resolved;
       }
     } catch {}
@@ -666,7 +667,7 @@ function proxyRequest(req, res) {
       // Replace virtual key with real upstream key
       if (realKey !== apiKey) {
         reqHeaders["authorization"] = `Bearer ${realKey}`;
-        console.log(`[映射] ${getUserName(apiKey)} 虚拟key=${apiKey.slice(0,12)}... → 真实key=${realKey.slice(0,12)}... model=${reqModel}`);
+        console.log(`[映射] ${getUserName(apiKey)} 虚拟key=${apiKey.slice(0,12)}... → 真实key=${realKey.slice(0,12)}... 请求模型=${originalModel}${originalModel !== reqModel ? " → 实际=" + reqModel : ""}`);
       }
       delete reqHeaders["connection"];
       delete reqHeaders["transfer-encoding"];

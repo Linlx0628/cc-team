@@ -95,6 +95,21 @@ if (!config.profiles) {
   }
 })();
 
+// Auto-migrate: ensure quota fields exist
+(function migrateQuotaConfig() {
+  let migrated = false;
+  for (const pname of Object.keys(config.profiles)) {
+    const p = config.profiles[pname];
+    if (p.dailyTokenLimit === undefined) { p.dailyTokenLimit = null; migrated = true; }
+    if (p.users) {
+      for (const [vk, u] of Object.entries(p.users)) {
+        if (typeof u === "object" && u.dailyTokenLimit === undefined) { u.dailyTokenLimit = null; migrated = true; }
+      }
+    }
+  }
+  if (migrated) { saveConfig(config); console.log("[MIGRATE] Added dailyTokenLimit fields"); }
+})();
+
 function getActiveProfile() {
   const p = config.profiles[config.activeProfile];
   if (!p) {
@@ -316,7 +331,7 @@ function sanitizeStore(raw) {
 }
 
 // ─── Data Store ──────────────────────────────────────────────────────────────
-let store = { users: {}, daily: {}, models: {}, hourly: {}, errors: [] };
+let store = { users: {}, daily: {}, dailyModels: {}, dailyHourly: {}, models: {}, hourly: {}, errors: [] };
 
 function loadStore() {
   try {
@@ -325,16 +340,22 @@ function loadStore() {
       store = {
         users: raw.users || {},
         daily: raw.daily || {},
+        dailyModels: raw.dailyModels || {},
+        dailyHourly: raw.dailyHourly || {},
         models: raw.models || {},
         hourly: raw.hourly || {},
         errors: Array.isArray(raw.errors) ? raw.errors : [],
       };
     }
-  } catch { store = { users: {}, daily: {}, models: {}, hourly: {}, errors: [] }; }
+  } catch { store = { users: {}, daily: {}, dailyModels: {}, dailyHourly: {}, models: {}, hourly: {}, errors: [] }; }
 }
 
 function saveStore() {
   try {
+    // Prune old dailyModels/dailyHourly (>7 days)
+    const cutoff = new Date(Date.now() - 7 * 24 * 3600 * 1000 + 8 * 3600 * 1000).toISOString().slice(0, 10);
+    for (const d of Object.keys(store.dailyModels)) { if (d < cutoff) delete store.dailyModels[d]; }
+    for (const d of Object.keys(store.dailyHourly)) { if (d < cutoff) delete store.dailyHourly[d]; }
     fs.writeFileSync(dataPath, JSON.stringify(store, null, 2), "utf-8");
   } catch (err) {
     console.error("[STORE] Save failed:", err.message);
@@ -480,6 +501,58 @@ function recordUsage(apiKey, usage, model) {
   store.hourly[today][hour].outputTokens += out;
   store.hourly[today][hour].cacheCreationTokens = (store.hourly[today][hour].cacheCreationTokens || 0) + cacheC;
   store.hourly[today][hour].cacheReadTokens = (store.hourly[today][hour].cacheReadTokens || 0) + cacheR;
+
+  // Per-user-per-model-daily tracking
+  if (!store.dailyModels[today]) store.dailyModels[today] = {};
+  if (!store.dailyModels[today][key]) store.dailyModels[today][key] = {};
+  if (!store.dailyModels[today][key][m]) store.dailyModels[today][key][m] = { inputTokens: 0, outputTokens: 0, requests: 0 };
+  store.dailyModels[today][key][m].inputTokens += inp;
+  store.dailyModels[today][key][m].outputTokens += out;
+  store.dailyModels[today][key][m].requests += 1;
+
+  // Per-user-hourly tracking
+  if (!store.dailyHourly[today]) store.dailyHourly[today] = {};
+  if (!store.dailyHourly[today][key]) store.dailyHourly[today][key] = {};
+  if (!store.dailyHourly[today][key][hour]) store.dailyHourly[today][key][hour] = { requests: 0, inputTokens: 0, outputTokens: 0 };
+  store.dailyHourly[today][key][hour].requests += 1;
+  store.dailyHourly[today][key][hour].inputTokens += inp;
+  store.dailyHourly[today][key][hour].outputTokens += out;
+}
+
+// ─── Token Quota ──────────────────────────────────────────────────────────────
+function getProfileQuota() {
+  const profile = config.profiles[config.activeProfile];
+  if (!profile || !profile.dailyTokenLimit) return 0;
+  return profile.dailyTokenLimit;
+}
+
+function getUserQuota(apiKey) {
+  const key = resolveUserKey(apiKey);
+  const pu = rt.users[key];
+  if (!pu || typeof pu !== "object" || !pu.dailyTokenLimit) return 0;
+  return pu.dailyTokenLimit;
+}
+
+function checkTokenQuota(apiKey) {
+  const key = resolveUserKey(apiKey);
+  const today = cnDate();
+  const todayUsage = (store.daily[today] || {})[key] || { inputTokens: 0, outputTokens: 0 };
+  const used = todayUsage.inputTokens + todayUsage.outputTokens;
+
+  // User quota overrides profile quota
+  const userQuota = getUserQuota(apiKey);
+  const profileQuota = getProfileQuota();
+  const limit = userQuota > 0 ? userQuota : profileQuota;
+
+  if (limit <= 0) return { allowed: true, limit: 0, used, remaining: Infinity, source: "无限制" };
+
+  return {
+    allowed: used < limit,
+    limit,
+    used,
+    remaining: Math.max(0, limit - used),
+    source: userQuota > 0 ? "个人配额" : "方案配额",
+  };
 }
 
 // ─── Error Recording ──────────────────────────────────────────────────────────
@@ -499,6 +572,50 @@ function recordError(apiKey, statusCode, errorMessage, path, model) {
   store.errors = store.errors.filter(e => e.time >= cutoff);
   if (store.errors.length > 200) store.errors.length = 200;
   console.log(`[错误] ${getUserName(apiKey)} ${statusCode} ${errorMessage} ${path} model=${model || "unknown"}`);
+}
+
+// ─── Personal Usage ───────────────────────────────────────────────────────────
+function getPersonalUsageData(apiKey) {
+  const key = resolveUserKey(apiKey);
+  const today = cnDate();
+  const username = getUserName(apiKey);
+  const quota = checkTokenQuota(apiKey);
+
+  const todayUsage = (store.daily[today] || {})[key] || { inputTokens: 0, outputTokens: 0, requests: 0, cacheCreationTokens: 0, cacheReadTokens: 0 };
+
+  // Per-model breakdown for today
+  const todayModels = {};
+  const dm = (store.dailyModels[today] || {})[key] || {};
+  for (const [model, data] of Object.entries(dm)) {
+    todayModels[model] = { ...data };
+  }
+
+  // Per-hour breakdown for today
+  const todayHourly = {};
+  const dh = (store.dailyHourly[today] || {})[key] || {};
+  for (const [h, data] of Object.entries(dh)) {
+    todayHourly[h] = { ...data };
+  }
+
+  // 7-day trend
+  const trend = [];
+  for (let i = 6; i >= 0; i--) {
+    const d = new Date(Date.now() + 8 * 3600 * 1000);
+    d.setDate(d.getDate() - i);
+    const dateStr = d.toISOString().slice(0, 10);
+    const dayUsage = (store.daily[dateStr] || {})[key] || { inputTokens: 0, outputTokens: 0, requests: 0 };
+    trend.push({ date: dateStr, input: dayUsage.inputTokens, output: dayUsage.outputTokens, requests: dayUsage.requests, total: dayUsage.inputTokens + dayUsage.outputTokens });
+  }
+
+  return {
+    username,
+    profile: config.activeProfile,
+    quota: { type: quota.source, limit: quota.limit, used: quota.used, remaining: quota.remaining },
+    today: { input: todayUsage.inputTokens, output: todayUsage.outputTokens, requests: todayUsage.requests, cacheWrite: todayUsage.cacheCreationTokens || 0, cacheRead: todayUsage.cacheReadTokens || 0, total: todayUsage.inputTokens + todayUsage.outputTokens },
+    models: todayModels,
+    hourly: todayHourly,
+    trend,
+  };
 }
 
 // ─── API Proxy ───────────────────────────────────────────────────────────────
@@ -637,6 +754,19 @@ function proxyRequest(req, res) {
     if (!checkRateLimit(userKey)) {
       res.writeHead(429, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ error: "Rate limit exceeded. Please slow down." }));
+      return;
+    }
+
+    // Token quota check
+    const quota = checkTokenQuota(apiKey);
+    if (!quota.allowed) {
+      res.writeHead(429, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({
+        error: `今日Token额度已用完。已用: ${quota.used.toLocaleString()}, 限额: ${quota.limit.toLocaleString()}。额度将于北京时间次日凌晨重置。`,
+        type: "quota_exceeded",
+        quota: { used: quota.used, limit: quota.limit, remaining: quota.remaining, source: quota.source },
+      }));
+      console.log(`[配额] ${getUserName(apiKey)} 今日额度已用完 [${quota.source}] (已用: ${quota.used.toLocaleString()} / 限额: ${quota.limit.toLocaleString()})`);
       return;
     }
 
@@ -930,6 +1060,7 @@ function getPublicSettings() {
     safeProfileUsers[k] = {
       key: isObj ? ((v.key || "").slice(0, 12) + "****") : (typeof v === "string" ? v.slice(0, 12) + "****" : ""),
       disabled: isObj ? !!v.disabled : false,
+      dailyTokenLimit: isObj ? (v.dailyTokenLimit || 0) : 0,
     };
   }
   const safeGlobalUsers = {};
@@ -952,6 +1083,7 @@ function getPublicSettings() {
     circuitBreaker: upstreamBreaker.status(),
     port: port,
     hasPassword: !!dashboardPassword,
+    profileQuota: getProfileQuota(),
   };
 }
 
@@ -982,11 +1114,13 @@ function settingsHtml(errorMsg) {
     const pu = rt.users[k];
     const realKey = pu ? (typeof pu === "string" ? pu : (pu.key || "")) : "";
     const profileDisabled = pu ? (typeof pu === "object" ? !!pu.disabled : false) : false;
+    const userQuota = (pu && typeof pu === "object") ? (pu.dailyTokenLimit || 0) : 0;
     const rowStyle = globalDisabled ? "opacity:0.4" : "";
     return `<tr style="${rowStyle}">
 <td><code style="font-size:11px;color:var(--accent)">${k}</code></td>
 <td>${username}</td>
 <td><input type="text" name="pu_rk_${k}" value="${realKey}" style="width:100%;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:4px 8px;border-radius:4px;font-size:12px;font-family:monospace" placeholder="真实Key (必填)"></td>
+<td><input type="number" name="pu_quota_${k}" value="${userQuota}" style="width:100%;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:4px 8px;border-radius:4px;font-size:12px" min="0" step="100000" placeholder="0=不限"></td>
 <td><label style="display:inline-flex;align-items:center;gap:4px;margin:0;cursor:pointer"><input type="checkbox" name="pu_dis_${k}" ${profileDisabled ? "checked" : ""} style="width:auto;accent-color:var(--orange)"><span style="font-size:11px;color:${profileDisabled ? "var(--orange)" : "var(--dim)"}">${profileDisabled ? "已禁用" : "正常"}</span></label></td></tr>`;
   }).join("");
 
@@ -1157,6 +1291,13 @@ ${errDiv}
 </div>
 </div>
 
+<h2>每日Token配额 <span style="font-size:11px;color:var(--dim);font-weight:400">总Token=输入+输出，0=不限制，北京时间每日0点重置</span></h2>
+<div class="section">
+<label>方案每日总Token上限 (0=不限制)</label>
+<input type="number" name="profileQuota" value="${s.profileQuota || 0}" min="0" step="100000" placeholder="0 = 不限制">
+<div class="note">方案配额适用于该方案下所有用户。每个用户可以在用户管理弹窗中单独设置。</div>
+</div>
+
 <div class="actions">
 <button type="button" class="btn btn-outline" onclick="location.href='/dashboard'">取消</button>
 <button type="submit" class="btn btn-primary">保存设置</button>
@@ -1179,7 +1320,7 @@ ${errDiv}
 </div>
 <h4 style="font-size:13px;color:var(--accent);margin:16px 0 8px">方案真实Key分配 <span style="font-size:11px;color:var(--dim);font-weight:400">（当前方案：${config.activeProfile}）</span></h4>
 <table id="profileUsersTable">
-<thead><tr><th>虚拟 Key</th><th>用户名称</th><th>真实 Key</th><th style="width:80px">方案禁用</th></tr></thead>
+<thead><tr><th>虚拟 Key</th><th>用户名称</th><th>真实 Key</th><th style="width:120px">每日配额</th><th style="width:80px">方案禁用</th></tr></thead>
 <tbody>${profileUserRows}</tbody>
 </table>
 <div class="note" style="margin-top:6px">全局禁用的用户灰色显示。真实Key必填才能使用此方案。</div>
@@ -1240,7 +1381,9 @@ async function saveUsers(){
     const rkInput=tr.querySelector('input[name^="pu_rk_"]');
     const disInput=tr.querySelector('input[name^="pu_dis_"]');
     if(!vk)return;
-    profileUsers.push({key:vk,realKey:rkInput?rkInput.value.trim():'',disabled:disInput?disInput.checked:false});
+    const qInput=tr.querySelector('input[name^="pu_quota_"]');
+    const qv=parseInt(qInput?qInput.value:'0',10)||0;
+    profileUsers.push({key:vk,realKey:rkInput?rkInput.value.trim():'',disabled:disInput?disInput.checked:false,dailyTokenLimit:qv>0?qv:null});
   });
   const r=await fetch('/api/global-user/save',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({users,profileUsers})});
   if(r.ok){alert('保存成功');location.reload()}else{const e=await r.json();alert('保存失败: '+e.error)}
@@ -1324,7 +1467,7 @@ tr:last-child td{border-bottom:none}tr:hover td{background:rgba(255,255,255,.02)
   <div class="box"><h3>24 小时使用趋势 (今日)</h3><canvas id="hourChart"></canvas></div>
 </div>
 <div class="sec"><h3>用户用量明细</h3><table id="uTable"><thead>
-<tr><th>用户</th><th>状态</th><th class="n">请求数</th><th class="n">输入</th><th class="n">输出</th><th class="n">缓存写入</th><th class="n">缓存命中</th><th class="n">合计</th><th>最后活跃</th></tr>
+<tr><th>用户</th><th>状态</th><th class="n">请求数</th><th class="n">输入</th><th class="n">输出</th><th class="n">缓存写入</th><th class="n">缓存命中</th><th class="n">合计</th><th class="n">配额</th><th>最后活跃</th></tr>
 </thead><tbody></tbody></table></div>
 <div class="sec sec-collapsible" id="detailSec"><h3 onclick="toggleSec('detailSec')"><span class="sec-toggle" id="detailSecIcon">▶</span>明细记录<span class="sec-hint" id="detailHint"></span></h3><div class="sec-body" id="detailSecBody"><table id="dTable"><thead>
 <tr><th>时间</th><th>用户</th><th class="n">请求数</th><th class="n">输入</th><th class="n">输出</th><th class="n">缓存写入</th><th class="n">缓存命中</th><th class="n">合计</th></tr>
@@ -1375,7 +1518,7 @@ function render(){
   // User table
   const ut=document.querySelector("#uTable tbody");
   const ul=Object.entries(D.users).sort((a,b)=>(b[1].totalInputTokens+b[1].totalOutputTokens)-(a[1].totalInputTokens+a[1].totalOutputTokens));
-  if(!ul.length){ut.innerHTML='<tr><td colspan="9" class="empty">暂无数据</td></tr>'}else{ut.innerHTML=ul.map(([,u])=>{const on=u.lastActive&&Date.now()-new Date(u.lastActive).getTime()<36e5;return'<tr><td>'+u.name+'</td><td><span style="padding:2px 8px;border-radius:4px;font-size:11px;background:'+(on?'rgba(52,211,153,.15)':'rgba(255,255,255,.05)')+';color:'+(on?'var(--green)':'var(--dim)')+'">'+(on?'在线':'离线')+'</span></td><td class="n">'+fmtT(u.totalRequests)+'</td><td class="n">'+fmtT(u.totalInputTokens)+'</td><td class="n">'+fmtT(u.totalOutputTokens)+'</td><td class="n">'+fmtT(u.cacheCreationTokens || 0)+'</td><td class="n">'+fmtT(u.cacheReadTokens || 0)+'</td><td class="n hl">'+fmtT(u.totalInputTokens+u.totalOutputTokens)+'</td><td>'+ago(u.lastActive)+'</td></tr>'}).join("")}
+  if(!ul.length){ut.innerHTML='<tr><td colspan="10" class="empty">暂无数据</td></tr>'}else{ut.innerHTML=ul.map(([uk,u])=>{const on=u.lastActive&&Date.now()-new Date(u.lastActive).getTime()<36e5;const uq=(D.userQuotas||{})[uk]||D.profileQuota||0;const td2=(D.daily||{})[td]||{};const tdu=td2[uk]||{inputTokens:0,outputTokens:0};const used=tdu.inputTokens+tdu.outputTokens;const qPct=uq>0?Math.min(100,Math.round(used/uq*100)):0;const qCol=qPct>90?'var(--red)':qPct>70?'var(--orange)':'var(--green)';const qLabel=uq>0?'<span style="color:'+qCol+'">'+qPct+'%</span>':'<span style="color:var(--dim)">-</span>';return'<tr><td>'+u.name+'</td><td><span style="padding:2px 8px;border-radius:4px;font-size:11px;background:'+(on?'rgba(52,211,153,.15)':'rgba(255,255,255,.05)')+';color:'+(on?'var(--green)':'var(--dim)')+'">'+(on?'在线':'离线')+'</span></td><td class="n">'+fmtT(u.totalRequests)+'</td><td class="n">'+fmtT(u.totalInputTokens)+'</td><td class="n">'+fmtT(u.totalOutputTokens)+'</td><td class="n">'+fmtT(u.cacheCreationTokens || 0)+'</td><td class="n">'+fmtT(u.cacheReadTokens || 0)+'</td><td class="n hl">'+fmtT(u.totalInputTokens+u.totalOutputTokens)+'</td><td class="n">'+qLabel+'</td><td>'+ago(u.lastActive)+'</td></tr>'}).join("")}
 
   // Detail table
   const dt=document.querySelector("#dTable tbody");
@@ -1432,6 +1575,102 @@ async function doLogin(){const pw=document.getElementById("pw").value;const r=aw
 <\/script></body></html>`;
 }
 
+// ─── Personal Usage Page HTML ─────────────────────────────────────────────────
+function personalUsageLandingHtml() {
+  return `<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>我的用量</title><style>
+:root{--bg:#0a0a0a;--card:#141414;--border:#2a2a2a;--text:#e5e5e5;--dim:#999;--accent:#7c6ef0}
+body{font-family:-apple-system,BlinkMacSystemFont,sans-serif;background:var(--bg);color:var(--text);display:flex;justify-content:center;align-items:center;height:100vh;margin:0}
+.box{background:var(--card);border:1px solid var(--border);border-radius:10px;padding:32px;width:400px}
+h2{font-size:18px;margin-bottom:16px;text-align:center}
+input{width:100%;padding:10px 14px;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:13px;font-family:monospace;outline:none;margin-bottom:12px}
+input:focus{border-color:var(--accent)}
+button{width:100%;padding:10px;background:var(--accent);color:#fff;border:none;border-radius:6px;font-size:14px;cursor:pointer}
+button:hover{opacity:.9}
+.note{font-size:11px;color:var(--dim);text-align:center;margin-top:12px}
+</style></head><body>
+<div class="box"><h2>我的用量</h2>
+<input type="text" id="key" placeholder="输入你的虚拟Key (jx-...)" autofocus>
+<button onclick="go()">查看</button>
+<div class="note">也可以直接访问 /usage/你的虚拟Key</div>
+</div>
+<script>
+document.getElementById('key').addEventListener('keydown',e=>{if(e.key==='Enter')go()});
+function go(){const k=document.getElementById('key').value.trim();if(k)location.href='/my-usage?key='+encodeURIComponent(k)}
+</script></body></html>`;
+}
+
+function personalUsageHtml(virtualKey) {
+  return `<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>我的用量 - 团队AI Coding监控</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js"><\/script>
+<style>
+:root{--bg:#0a0a0a;--card:#141414;--border:#2a2a2a;--text:#e5e5e5;--dim:#999;--accent:#7c6ef0;--blue:#5ba3f5;--green:#34d399;--orange:#fbbf24;--red:#f87171}
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:-apple-system,BlinkMacSystemFont,sans-serif;background:var(--bg);color:var(--text);padding:20px 24px}
+h1{font-size:18px;margin-bottom:4px}.meta{font-size:12px;color:var(--dim);margin-bottom:20px}
+.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:10px;margin-bottom:20px}
+.card{background:var(--card);border:1px solid var(--border);border-radius:8px;padding:14px 16px}
+.card .l{font-size:12px;color:var(--dim);margin-bottom:4px}.card .v{font-size:22px;font-weight:700;font-variant-numeric:tabular-nums}
+.box{background:var(--card);border:1px solid var(--border);border-radius:8px;padding:16px;margin-bottom:14px}
+.box h3{font-size:12px;color:var(--dim);margin-bottom:10px}
+.box canvas{max-height:220px}
+table{width:100%;border-collapse:collapse}
+th{text-align:left;padding:6px 12px;font-size:11px;color:var(--dim);border-bottom:1px solid var(--border)}
+td{padding:6px 12px;font-size:13px;border-bottom:1px solid var(--border)}.n{text-align:right;font-variant-numeric:tabular-nums}
+.progress{width:100%;height:8px;background:var(--border);border-radius:4px;overflow:hidden;margin-top:6px}
+.progress-bar{height:100%;border-radius:4px;transition:width .3s}
+</style></head><body>
+<h1>我的用量统计</h1>
+<div class="meta" id="meta">加载中...</div>
+<div class="cards" id="cards"></div>
+<div class="box"><h3>今日24小时趋势</h3><canvas id="hourChart"></canvas></div>
+<div class="box"><h3>近7天趋势</h3><canvas id="trendChart"></canvas></div>
+<div class="box"><h3>今日模型用量</h3><table id="modelTable"><thead><tr><th>模型</th><th class="n">请求数</th><th class="n">输入</th><th class="n">输出</th><th class="n">合计</th></tr></thead><tbody></tbody></table></div>
+<script>
+const VK='${virtualKey}';
+let D=null,C={h:null,t:null};
+const fmtT=n=>n.toLocaleString("zh-CN");
+const fmtTk=n=>{if(n>=1e6)return(n/1e6).toFixed(1)+"M";if(n>=1e3)return(n/1e3).toFixed(1)+"k";return n.toString()};
+async function load(){
+  try{
+    const r=await fetch('/api/my-usage',{headers:{'Authorization':'Bearer '+VK}});
+    if(!r.ok){document.getElementById('meta').textContent='认证失败';return}
+    D=await r.json();render();
+  }catch(e){document.getElementById('meta').textContent='Error: '+e.message}
+}
+function render(){
+  if(!D)return;
+  const q=D.quota,t=D.today;
+  const pct=q.limit>0?Math.min(100,Math.round(q.used/q.limit*100)):0;
+  const color=pct>90?'var(--red)':pct>70?'var(--orange)':'var(--green)';
+  document.getElementById('meta').innerHTML=D.username+' | 方案: '+D.profile+(q.limit>0?' | <span style="color:'+color+';font-weight:600">'+pct+'% 已用</span>':' | 无配额限制');
+  document.getElementById('cards').innerHTML=
+    '<div class="card"><div class="l">今日用量</div><div class="v" style="color:var(--accent)">'+fmtT(t.total)+'</div></div>'+
+    '<div class="card"><div class="l">今日请求</div><div class="v" style="color:var(--blue)">'+fmtT(t.requests)+'</div></div>'+
+    '<div class="card"><div class="l">今日输入</div><div class="v" style="color:var(--green)">'+fmtT(t.input)+'</div></div>'+
+    '<div class="card"><div class="l">今日输出</div><div class="v" style="color:var(--orange)">'+fmtT(t.output)+'</div></div>'+
+    (q.limit>0?'<div class="card"><div class="l">剩余额度</div><div class="v" style="color:'+color+'">'+fmtT(q.remaining)+'</div><div class="progress"><div class="progress-bar" style="width:'+pct+'%;background:'+color+'"></div></div></div>'+
+    '<div class="card"><div class="l">每日限额</div><div class="v" style="color:var(--dim)">'+fmtT(q.limit)+'</div></div>':'');
+  // Hourly chart
+  const hrs=[];for(let i=0;i<24;i++)hrs.push(i.toString().padStart(2,"0")+":00");
+  const hData=hrs.map((_,i)=>{const h=D.hourly[i.toString().padStart(2,"0")]||{};return{req:h.requests||0,tokens:(h.inputTokens||0)+(h.outputTokens||0)}});
+  if(C.h)C.h.destroy();
+  C.h=new Chart(document.getElementById("hourChart"),{type:"bar",data:{labels:hrs,datasets:[{label:"Token",data:hData.map(d=>d.tokens),backgroundColor:"#7c6ef0cc",borderRadius:3},{label:"请求数",data:hData.map(d=>d.req),backgroundColor:"#5ba3f5cc",borderRadius:3}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{labels:{color:"#999",font:{size:10}}}},scales:{x:{ticks:{color:"#666",font:{size:9},maxRotation:0,autoSkip:true,maxTicksLimit:12},grid:{display:false}},y:{ticks:{color:"#666",callback:v=>fmtTk(v)},grid:{color:"#1a1a1a"}}}}});
+  // Trend chart
+  if(C.t)C.t.destroy();
+  C.t=new Chart(document.getElementById("trendChart"),{type:"line",data:{labels:D.trend.map(d=>d.date.slice(5)),datasets:[{label:"输入",data:D.trend.map(d=>d.input),borderColor:"#34d399",backgroundColor:"rgba(52,211,153,.12)",fill:true,tension:.4,pointRadius:3,borderWidth:2},{label:"输出",data:D.trend.map(d=>d.output),borderColor:"#f87171",backgroundColor:"rgba(248,113,113,.12)",fill:true,tension:.4,pointRadius:3,borderWidth:2}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{labels:{color:"#999",font:{size:10}}}},scales:{x:{ticks:{color:"#666"},grid:{display:false}},y:{ticks:{color:"#666",callback:v=>fmtTk(v)},grid:{color:"#1a1a1a"}}}}});
+  // Model table
+  const mt=document.querySelector("#modelTable tbody");
+  const models=Object.entries(D.models||{}).sort((a,b)=>(b[1].inputTokens+b[1].outputTokens)-(a[1].inputTokens+a[1].outputTokens));
+  if(!models.length){mt.innerHTML='<tr><td colspan="5" style="text-align:center;color:var(--dim)">暂无数据</td></tr>'}else{
+    mt.innerHTML=models.map(([m,d])=>'<tr><td style="color:var(--blue)">'+m+'</td><td class="n">'+fmtT(d.requests)+'</td><td class="n">'+fmtT(d.inputTokens)+'</td><td class="n">'+fmtT(d.outputTokens)+'</td><td class="n" style="color:var(--accent);font-weight:600">'+fmtT(d.inputTokens+d.outputTokens)+'</td></tr>').join("");
+  }
+}
+load();setInterval(load,30000);
+<\/script></body></html>`;
+}
+
 // ─── HTTP Server ─────────────────────────────────────────────────────────────
 function parseFormBody(body) {
   const params = new URLSearchParams(body);
@@ -1464,6 +1703,15 @@ function applySettings(formData) {
   if (formData.rateLimitPerMinute) rt.proxy.rateLimitPerMinute = parseInt(formData.rateLimitPerMinute, 10) || 60;
   if (formData.circuitBreakerFailures) rt.proxy.circuitBreakerFailures = parseInt(formData.circuitBreakerFailures, 10) || 5;
   if (formData.circuitBreakerCooldown) rt.proxy.circuitBreakerCooldown = parseInt(formData.circuitBreakerCooldown, 10) || 30000;
+
+  // Update profile quota
+  if (formData.profileQuota !== undefined) {
+    const ap = config.profiles[config.activeProfile];
+    if (ap) {
+      const q = parseInt(formData.profileQuota, 10) || 0;
+      ap.dailyTokenLimit = q > 0 ? q : null;
+    }
+  }
 
   // Update retryable status codes
   if (formData.retryableStatusCodes) {
@@ -1530,9 +1778,11 @@ function applySettings(formData) {
       const vk = k.slice(6);
       const realKey = v.trim();
       if (!realKey) continue; // skip users without real key
+      const quotaVal = parseInt(formData["pu_quota_" + vk], 10) || 0;
       newProfileUsers[vk] = {
         key: realKey,
         disabled: formData["pu_dis_" + vk] === "on",
+        dailyTokenLimit: quotaVal > 0 ? quotaVal : null,
       };
     }
   }
@@ -1790,6 +2040,12 @@ const server = http.createServer((req, res) => {
     const data = sanitizeStore(store);
     data.activeProfile = config.activeProfile;
     data.upstream = rt.upstream;
+    data.profileQuota = getProfileQuota();
+    data.userQuotas = {};
+    for (const k of Object.keys(rt.users)) {
+      const q = getUserQuota(k);
+      if (q > 0) data.userQuotas[k.slice(0, 8) + "****"] = q;
+    }
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify(data));
     return;
@@ -1854,7 +2110,7 @@ const server = http.createServer((req, res) => {
           const newPU = {};
           for (const pu of profileUsers) {
             if (!pu.key) continue;
-            newPU[pu.key] = { key: pu.realKey || "", disabled: !!pu.disabled };
+            newPU[pu.key] = { key: pu.realKey || "", disabled: !!pu.disabled, dailyTokenLimit: pu.dailyTokenLimit || null };
           }
           const ap = config.profiles[config.activeProfile];
           if (ap) {
@@ -1879,6 +2135,45 @@ const server = http.createServer((req, res) => {
         res.end(JSON.stringify({ error: err.message }));
       }
     });
+    return;
+  }
+
+  // Personal usage page
+  if (req.method === "GET" && req.url.startsWith("/usage/")) {
+    const vk = decodeURIComponent(req.url.slice(7).split("?")[0]);
+    if (!vk || (!rt.users[vk] && !rt.globalUsers[vk])) {
+      res.writeHead(404, { "Content-Type": "text/html; charset=utf-8" });
+      res.end("<h1>Key不存在</h1><p>请检查你的虚拟Key是否正确。</p>");
+      return;
+    }
+    res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+    res.end(personalUsageHtml(vk));
+    return;
+  }
+  if (req.method === "GET" && req.url.startsWith("/my-usage")) {
+    const url = new URL(req.url, `http://${req.headers.host}`);
+    const vk = url.searchParams.get("key");
+    if (!vk || (!rt.users[vk] && !rt.globalUsers[vk])) {
+      res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+      res.end(personalUsageLandingHtml());
+      return;
+    }
+    res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+    res.end(personalUsageHtml(vk));
+    return;
+  }
+
+  // Personal usage API (authenticated by API key)
+  if (req.method === "GET" && req.url === "/api/my-usage") {
+    const apiKey = getApiKey(req);
+    const userKey = resolveUserKey(apiKey);
+    if (!rt.users[userKey] && !rt.globalUsers[userKey]) {
+      res.writeHead(401, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "认证失败：请提供有效的虚拟Key (Authorization: Bearer jx-...)" }));
+      return;
+    }
+    res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+    res.end(JSON.stringify(getPersonalUsageData(apiKey), null, 2));
     return;
   }
 

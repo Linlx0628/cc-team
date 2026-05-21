@@ -513,10 +513,12 @@ function recordUsage(apiKey, usage, model) {
   // Per-user-hourly tracking
   if (!store.dailyHourly[today]) store.dailyHourly[today] = {};
   if (!store.dailyHourly[today][key]) store.dailyHourly[today][key] = {};
-  if (!store.dailyHourly[today][key][hour]) store.dailyHourly[today][key][hour] = { requests: 0, inputTokens: 0, outputTokens: 0 };
+  if (!store.dailyHourly[today][key][hour]) store.dailyHourly[today][key][hour] = { requests: 0, inputTokens: 0, outputTokens: 0, cacheCreationTokens: 0, cacheReadTokens: 0 };
   store.dailyHourly[today][key][hour].requests += 1;
   store.dailyHourly[today][key][hour].inputTokens += inp;
   store.dailyHourly[today][key][hour].outputTokens += out;
+  store.dailyHourly[today][key][hour].cacheCreationTokens = (store.dailyHourly[today][key][hour].cacheCreationTokens || 0) + cacheC;
+  store.dailyHourly[today][key][hour].cacheReadTokens = (store.dailyHourly[today][key][hour].cacheReadTokens || 0) + cacheR;
 }
 
 // ─── Token Quota ──────────────────────────────────────────────────────────────
@@ -1488,7 +1490,7 @@ const fmtTk=n=>{if(n>=1e6)return(n/1e6).toFixed(1)+"M";if(n>=1e3)return(n/1e3).t
 function fmtBJ(iso){if(!iso)return"-";const d=new Date(iso);const utc=d.getTime()+d.getTimezoneOffset()*60000;return new Date(utc+8*3600000).toLocaleString("zh-CN")};
 function ago(iso){if(!iso)return"-";const d=Date.now()-new Date(iso).getTime();const m=Math.floor(d/6e4);if(m<1)return"刚刚";if(m<60)return m+"分钟前";const h=Math.floor(m/60);if(h<24)return h+"小时前";return Math.floor(h/24)+"天前"}
 function wk(s){const d=new Date(s),day=d.getDay()||7,mon=new Date(d);mon.setDate(d.getDate()-day+1);return mon.toISOString().slice(0,10)}
-function grp(daily,p){const g={};for(const[day,ud]of Object.entries(daily)){const k=p==="week"?wk(day):p==="month"?day.slice(0,7):p==="year"?day.slice(0,4):day;if(!g[k])g[k]={};for(const[u,s]of Object.entries(ud)){if(!g[k][u])g[k][u]={inputTokens:0,outputTokens:0,requests:0};g[k][u].inputTokens+=s.inputTokens;g[k][u].outputTokens+=s.outputTokens;g[k][u].requests+=s.requests}}return g}
+function grp(daily,p){const g={};for(const[day,ud]of Object.entries(daily)){const k=p==="week"?wk(day):p==="month"?day.slice(0,7):p==="year"?day.slice(0,4):day;if(!g[k])g[k]={};for(const[u,s]of Object.entries(ud)){if(!g[k][u])g[k][u]={inputTokens:0,outputTokens:0,requests:0,cacheCreationTokens:0,cacheReadTokens:0};g[k][u].inputTokens+=s.inputTokens;g[k][u].outputTokens+=s.outputTokens;g[k][u].requests+=s.requests;g[k][u].cacheCreationTokens+=(s.cacheCreationTokens||0);g[k][u].cacheReadTokens+=(s.cacheReadTokens||0)}}return g}
 function lbl(p,k){if(p==="day")return k.slice(5);if(p==="week")return k.slice(5)+" 周";if(p==="month")return k;return k+"年"}
 function c(l,v,c){return'<div class="card"><div class="l">'+l+'</div><div class="v" style="color:'+c+'">'+v+'</div></div>'}
 function render(){

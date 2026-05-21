@@ -183,11 +183,11 @@ curl -H "Authorization: Bearer jx-your-key" http://localhost:6789/api/my-usage
 所有日志为中文，每个请求有开始/结束分割线：
 
 ```
-── 请求开始 ── 冯梓豪 [用户请求] 模型=jx-opus→glm-5.1 ──
-[映射] 冯梓豪 虚拟key=jx-usbb1IWHX... → 真实key=cf0b2ff0ac0... 请求模型=jx-opus → 实际=glm-5.1
-[SSE] 冯梓豪 第1条 类型=message_start
-[Token] 冯梓豪 [用户请求] model=glm-5.1 输入=526 输出=1099 缓存写=0 缓存读=59226
-── 请求结束 ── 冯梓豪 ──
+── 请求开始 ── 张三 [用户请求] 模型=jx-opus→glm-5.1 ──
+[映射] 张三 虚拟key=jx-usbb1IWHX... → 真实key=cf0b2ff0ac0... 请求模型=jx-opus → 实际=glm-5.1
+[SSE] 张三 第1条 类型=message_start
+[Token] 张三 [用户请求] model=glm-5.1 输入=526 输出=1099 缓存写=0 缓存读=59226
+── 请求结束 ── 张三 ──
 ```
 
 **请求分类**：`[用户请求]` 手动输入、`[工具调用]` Claude 自动执行、`[子代理]` 子任务

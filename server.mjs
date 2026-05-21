@@ -760,12 +760,14 @@ function proxyRequest(req, res) {
     // Token quota check
     const quota = checkTokenQuota(apiKey);
     if (!quota.allowed) {
+      const reqHost = req.headers.host || `localhost:${port}`;
+      const usageUrl = `http://${reqHost}/usage/${apiKey}`;
       res.writeHead(429, { "Content-Type": "application/json" });
       res.end(JSON.stringify({
-        error: `今日Token额度已用完。已用: ${quota.used.toLocaleString()}, 限额: ${quota.limit.toLocaleString()}。额度将于北京时间次日凌晨重置。查看用量详情: http://localhost:${port}/usage/${apiKey}`,
+        error: `今日Token额度已用完。已用: ${quota.used.toLocaleString()}, 限额: ${quota.limit.toLocaleString()}。额度将于北京时间次日凌晨重置。查看用量详情: ${usageUrl}`,
         type: "quota_exceeded",
         quota: { used: quota.used, limit: quota.limit, remaining: quota.remaining, source: quota.source },
-        usageUrl: `http://localhost:${port}/usage/${apiKey}`,
+        usageUrl,
       }));
       console.log(`[配额] ${getUserName(apiKey)} 今日额度已用完 [${quota.source}] (已用: ${quota.used.toLocaleString()} / 限额: ${quota.limit.toLocaleString()})`);
       return;

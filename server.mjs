@@ -762,7 +762,7 @@ function proxyRequest(req, res) {
     if (!quota.allowed) {
       const reqHost = req.headers.host || `localhost:${port}`;
       const usageUrl = `http://${reqHost}/usage/${apiKey}`;
-      res.writeHead(429, { "Content-Type": "application/json" });
+      res.writeHead(429, { "Content-Type": "application/json", "Retry-After": "86400" });
       res.end(JSON.stringify({
         error: `今日Token额度已用完。已用: ${quota.used.toLocaleString()}, 限额: ${quota.limit.toLocaleString()}。额度将于北京时间次日凌晨重置。查看用量详情: ${usageUrl}`,
         type: "quota_exceeded",

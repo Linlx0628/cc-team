@@ -110,6 +110,22 @@ if (!config.profiles) {
   if (migrated) { saveConfig(config); console.log("[MIGRATE] Added dailyTokenLimit fields"); }
 })();
 
+// Auto-migrate: ensure autoQuotaAdjust config exists
+(function migrateAutoQuotaConfig() {
+  const defaults = { enabled: false, evaluationPeriodDays: 5, hitThreshold: 0.9, triggerRate: 0.9, increaseFactor: 1.15, safetyFactor: 1.3, maxIncreaseFactor: 2.0, maxAutoQuota: 10000000, cooldownDays: 3 };
+  if (!config.autoQuotaAdjust) {
+    config.autoQuotaAdjust = { ...defaults };
+    saveConfig(config);
+    console.log("[MIGRATE] Added autoQuotaAdjust config");
+  } else {
+    let patched = false;
+    for (const [k, v] of Object.entries(defaults)) {
+      if (config.autoQuotaAdjust[k] === undefined) { config.autoQuotaAdjust[k] = v; patched = true; }
+    }
+    if (patched) { saveConfig(config); console.log("[MIGRATE] Patched autoQuotaAdjust config"); }
+  }
+})();
+
 function getActiveProfile() {
   const p = config.profiles[config.activeProfile];
   if (!p) {
@@ -331,7 +347,7 @@ function sanitizeStore(raw) {
 }
 
 // ─── Data Store ──────────────────────────────────────────────────────────────
-let store = { users: {}, daily: {}, dailyModels: {}, dailyHourly: {}, models: {}, hourly: {}, errors: [] };
+let store = { users: {}, daily: {}, dailyModels: {}, dailyHourly: {}, models: {}, hourly: {}, errors: [], quotaAdjustHistory: [], _lastQuotaEval: null };
 
 function loadStore() {
   try {
@@ -345,6 +361,8 @@ function loadStore() {
         models: raw.models || {},
         hourly: raw.hourly || {},
         errors: Array.isArray(raw.errors) ? raw.errors : [],
+        quotaAdjustHistory: Array.isArray(raw.quotaAdjustHistory) ? raw.quotaAdjustHistory : [],
+        _lastQuotaEval: raw._lastQuotaEval || null,
       };
     }
   } catch { store = { users: {}, daily: {}, dailyModels: {}, dailyHourly: {}, models: {}, hourly: {}, errors: [] }; }
@@ -557,6 +575,104 @@ function checkTokenQuota(apiKey) {
   };
 }
 
+// ─── Auto Quota Adjustment ─────────────────────────────────────────────────
+function evaluateAutoQuotaAdjustments() {
+  const cfg = config.autoQuotaAdjust;
+  if (!cfg || !cfg.enabled) return;
+
+  const today = cnDate();
+  if (store._lastQuotaEval === today) return;
+  store._lastQuotaEval = today;
+
+  const period = cfg.evaluationPeriodDays || 5;
+  const hitThreshold = cfg.hitThreshold || 0.9;
+  const triggerRate = cfg.triggerRate || 0.9;
+  const increaseFactor = cfg.increaseFactor || 1.15;
+  const safetyFactor = cfg.safetyFactor || 1.3;
+  const maxIncreaseFactor = cfg.maxIncreaseFactor || 2.0;
+  const maxAutoQuota = cfg.maxAutoQuota || 10000000;
+  const cooldownDays = cfg.cooldownDays || 3;
+
+  // Collect last P dates (excluding today)
+  const dates = [];
+  for (let i = 1; i <= period; i++) {
+    const d = new Date(cnNow().getTime() - i * 86400000);
+    const utc = d.getTime() + d.getTimezoneOffset() * 60000;
+    dates.push(new Date(utc + 8 * 3600000).toISOString().slice(0, 10));
+  }
+
+  const profile = config.profiles[config.activeProfile];
+  if (!profile || !profile.users) return;
+
+  for (const [vk, pu] of Object.entries(profile.users)) {
+    if (typeof pu !== "object") continue;
+    const userQuota = pu.dailyTokenLimit;
+    if (!userQuota || userQuota <= 0) continue; // skip users without quota
+
+    // Check cooldown
+    const lastAdjust = (store.quotaAdjustHistory || []).findLast(h => h.user === vk);
+    if (lastAdjust) {
+      const lastDate = new Date(lastAdjust.date);
+      const nowDate = new Date(today);
+      const diffDays = Math.floor((nowDate - lastDate) / 86400000);
+      if (diffDays < cooldownDays) continue;
+    }
+
+    // Count hit days and calculate average usage
+    let hitCount = 0;
+    let totalUsage = 0;
+    let usageDays = 0;
+    for (const date of dates) {
+      const dayData = (store.daily[date] || {})[vk];
+      if (!dayData) continue;
+      const dayUsage = (dayData.inputTokens || 0) + (dayData.outputTokens || 0);
+      if (dayUsage > 0) {
+        usageDays++;
+        totalUsage += dayUsage;
+        if (dayUsage >= userQuota * hitThreshold) hitCount++;
+      }
+    }
+
+    if (usageDays === 0) continue;
+    const actualHitRate = hitCount / period;
+    if (actualHitRate < triggerRate) continue;
+
+    const avgDaily = totalUsage / usageDays;
+    const methodA = userQuota * increaseFactor;
+    const methodB = avgDaily * safetyFactor;
+    let newQuota = Math.max(methodA, methodB);
+
+    // Apply constraints
+    newQuota = Math.min(newQuota, userQuota * maxIncreaseFactor);
+    newQuota = Math.min(newQuota, maxAutoQuota);
+    newQuota = Math.round(newQuota);
+
+    if (newQuota <= userQuota) continue;
+
+    // Execute adjustment
+    pu.dailyTokenLimit = newQuota;
+
+    const record = {
+      user: vk,
+      username: getUserName(vk),
+      date: today,
+      oldQuota: userQuota,
+      newQuota,
+      hitRate: Math.round(actualHitRate * 100) / 100,
+      avgDailyUsage: Math.round(avgDaily),
+      auto: true,
+    };
+    if (!store.quotaAdjustHistory) store.quotaAdjustHistory = [];
+    store.quotaAdjustHistory.push(record);
+    // Keep only last 100 records
+    if (store.quotaAdjustHistory.length > 100) store.quotaAdjustHistory = store.quotaAdjustHistory.slice(-100);
+
+    saveConfig(config);
+    saveStore();
+    console.log(`[配额调整] ${getUserName(vk)} ${userQuota.toLocaleString()} → ${newQuota.toLocaleString()} (命中率${Math.round(actualHitRate * 100)}%, 均值${Math.round(avgDaily).toLocaleString()})`);
+  }
+}
+
 // ─── Error Recording ──────────────────────────────────────────────────────────
 function recordError(apiKey, statusCode, errorMessage, path, model) {
   const key = resolveUserKey(apiKey);
@@ -609,10 +725,14 @@ function getPersonalUsageData(apiKey) {
     trend.push({ date: dateStr, input: dayUsage.inputTokens, output: dayUsage.outputTokens, requests: dayUsage.requests, total: dayUsage.inputTokens + dayUsage.outputTokens });
   }
 
+  // Check if quota was auto-adjusted
+  const lastAdjust = (store.quotaAdjustHistory || []).findLast(h => h.user === key);
+  const quotaAutoAdjusted = lastAdjust ? lastAdjust.auto : false;
+
   return {
     username,
     profile: config.activeProfile,
-    quota: { type: quota.source, limit: quota.limit, used: quota.used, remaining: quota.remaining },
+    quota: { type: quota.source, limit: quota.limit, used: quota.used, remaining: quota.remaining, autoAdjusted: quotaAutoAdjusted },
     today: { input: todayUsage.inputTokens, output: todayUsage.outputTokens, requests: todayUsage.requests, cacheWrite: todayUsage.cacheCreationTokens || 0, cacheRead: todayUsage.cacheReadTokens || 0, total: todayUsage.inputTokens + todayUsage.outputTokens },
     models: todayModels,
     hourly: todayHourly,
@@ -1089,6 +1209,7 @@ function getPublicSettings() {
     port: port,
     hasPassword: !!dashboardPassword,
     profileQuota: getProfileQuota(),
+    autoQuotaAdjust: config.autoQuotaAdjust || {},
   };
 }
 
@@ -1301,6 +1422,25 @@ ${errDiv}
 <label>方案每日总Token上限 (0=不限制)</label>
 <input type="number" name="profileQuota" value="${s.profileQuota || 0}" min="0" step="100000" placeholder="0 = 不限制">
 <div class="note">方案配额适用于该方案下所有用户。每个用户可以在用户管理弹窗中单独设置。</div>
+</div>
+
+<h2>自动配额调整 <span style="font-size:11px;color:var(--dim);font-weight:400">用户持续用满配额时自动上调限额</span></h2>
+<div class="section">
+<div style="display:flex;align-items:center;gap:12px;margin-bottom:12px">
+<label style="display:flex;align-items:center;gap:6px;cursor:pointer"><input type="checkbox" name="autoQuotaEnabled" ${s.autoQuotaAdjust?.enabled ? "checked" : ""} style="width:auto"> 启用自动调整</label>
+<span class="note">启用后，系统每日评估一次，符合条件自动上调配额</span>
+</div>
+<div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px">
+<div><label>评估周期（天）</label><input type="number" name="aqPeriod" value="${s.autoQuotaAdjust?.evaluationPeriodDays ?? 5}" min="3" max="30"></div>
+<div><label>命中阈值</label><input type="number" name="aqHitThreshold" value="${(s.autoQuotaAdjust?.hitThreshold ?? 0.9) * 100}" min="50" max="100" step="5"><span class="note">% · 用量达到配额多少算命中</span></div>
+<div><label>触发命中率</label><input type="number" name="aqTriggerRate" value="${(s.autoQuotaAdjust?.triggerRate ?? 0.9) * 100}" min="30" max="100" step="10"><span class="note">% · 命中天数占周期多少才触发</span></div>
+<div><label>增长率</label><input type="number" name="aqIncreaseFactor" value="${((s.autoQuotaAdjust?.increaseFactor ?? 1.15) - 1) * 100}" min="5" max="100" step="5"><span class="note">% · 每次上调比例</span></div>
+<div><label>安全系数</label><input type="number" name="aqSafetyFactor" value="${(s.autoQuotaAdjust?.safetyFactor ?? 1.3) * 100}" min="100" max="200" step="5"><span class="note">% · 按均值计算时的余量</span></div>
+<div><label>单次最大增幅</label><input type="number" name="aqMaxIncrease" value="${(s.autoQuotaAdjust?.maxIncreaseFactor ?? 2.0)}" min="1.1" max="5" step="0.1"><span class="note">x · 单次调整不超过几倍</span></div>
+<div><label>配额上限</label><input type="number" name="aqMaxQuota" value="${s.autoQuotaAdjust?.maxAutoQuota ?? 10000000}" min="0" step="100000"><span class="note">自动调整不超过此值</span></div>
+<div><label>冷却天数</label><input type="number" name="aqCooldown" value="${s.autoQuotaAdjust?.cooldownDays ?? 3}" min="1" max="30"><span class="note">两次调整最小间隔</span></div>
+</div>
+${(store.quotaAdjustHistory && store.quotaAdjustHistory.length > 0) ? `<h4 style="font-size:13px;color:var(--accent);margin:16px 0 8px">调整历史</h4><table style="width:100%;border-collapse:collapse;font-size:12px"><thead><tr><th style="text-align:left;padding:4px 8px;border-bottom:1px solid var(--border)">时间</th><th style="text-align:left;padding:4px 8px;border-bottom:1px solid var(--border)">用户</th><th style="text-align:right;padding:4px 8px;border-bottom:1px solid var(--border)">旧配额</th><th style="text-align:right;padding:4px 8px;border-bottom:1px solid var(--border)">新配额</th><th style="text-align:right;padding:4px 8px;border-bottom:1px solid var(--border)">命中率</th><th style="text-align:right;padding:4px 8px;border-bottom:1px solid var(--border)">日均用量</th></tr></thead><tbody>${store.quotaAdjustHistory.slice(-20).reverse().map(h => `<tr><td style="padding:4px 8px">${h.date}</td><td style="padding:4px 8px">${h.username || h.user.slice(0, 8)}</td><td style="text-align:right;padding:4px 8px">${(h.oldQuota || 0).toLocaleString()}</td><td style="text-align:right;padding:4px 8px;color:var(--green)">${(h.newQuota || 0).toLocaleString()}</td><td style="text-align:right;padding:4px 8px">${Math.round((h.hitRate || 0) * 100)}%</td><td style="text-align:right;padding:4px 8px">${(h.avgDailyUsage || 0).toLocaleString()}</td></tr>`).join("")}</tbody></table>` : '<div class="note" style="margin-top:8px">暂无自动调整记录</div>'}
 </div>
 
 <div class="actions">
@@ -1649,7 +1789,7 @@ function render(){
   const q=D.quota,t=D.today;
   const pct=q.limit>0?Math.min(100,Math.round(q.used/q.limit*100)):0;
   const color=pct>90?'var(--red)':pct>70?'var(--orange)':'var(--green)';
-  document.getElementById('meta').innerHTML=D.username+' | 方案: '+D.profile+(q.limit>0?' | <span style="color:'+color+';font-weight:600">'+pct+'% 已用</span>':' | 无配额限制');
+  document.getElementById('meta').innerHTML=D.username+' | 方案: '+D.profile+(q.limit>0?' | <span style="color:'+color+';font-weight:600">'+pct+'% 已用</span>'+(q.autoAdjusted?' <span style="font-size:10px;background:rgba(124,110,240,.15);color:var(--accent);padding:1px 6px;border-radius:3px">自动调整</span>':''):' | 无配额限制');
   document.getElementById('cards').innerHTML=
     '<div class="card"><div class="l">今日用量</div><div class="v" style="color:var(--accent)">'+fmtT(t.total)+'</div></div>'+
     '<div class="card"><div class="l">今日请求</div><div class="v" style="color:var(--blue)">'+fmtT(t.requests)+'</div></div>'+
@@ -1717,6 +1857,19 @@ function applySettings(formData) {
       ap.dailyTokenLimit = q > 0 ? q : null;
     }
   }
+
+  // Update auto quota adjustment settings
+  if (!config.autoQuotaAdjust) config.autoQuotaAdjust = {};
+  config.autoQuotaAdjust.enabled = formData.autoQuotaEnabled === "on";
+  if (formData.aqPeriod) config.autoQuotaAdjust.evaluationPeriodDays = Math.max(3, parseInt(formData.aqPeriod, 10) || 5);
+  if (formData.aqHitThreshold) config.autoQuotaAdjust.hitThreshold = Math.min(1, Math.max(0.5, (parseInt(formData.aqHitThreshold, 10) || 90) / 100));
+  if (formData.aqTriggerRate) config.autoQuotaAdjust.triggerRate = Math.min(1, Math.max(0.3, (parseInt(formData.aqTriggerRate, 10) || 90) / 100));
+  if (formData.aqIncreaseFactor) config.autoQuotaAdjust.increaseFactor = 1 + (parseInt(formData.aqIncreaseFactor, 10) || 15) / 100;
+  if (formData.aqSafetyFactor) config.autoQuotaAdjust.safetyFactor = (parseInt(formData.aqSafetyFactor, 10) || 130) / 100;
+  if (formData.aqMaxIncrease) config.autoQuotaAdjust.maxIncreaseFactor = Math.max(1.1, parseFloat(formData.aqMaxIncrease) || 2.0);
+  if (formData.aqMaxQuota) config.autoQuotaAdjust.maxAutoQuota = parseInt(formData.aqMaxQuota, 10) || 10000000;
+  if (formData.aqCooldown) config.autoQuotaAdjust.cooldownDays = Math.max(1, parseInt(formData.aqCooldown, 10) || 3);
+  store._lastQuotaEval = null; // Reset eval date so new config takes effect immediately
 
   // Update retryable status codes
   if (formData.retryableStatusCodes) {
@@ -1813,6 +1966,9 @@ function applySettings(formData) {
 }
 
 const server = http.createServer((req, res) => {
+  // Auto quota evaluation (once per day)
+  try { evaluateAutoQuotaAdjustments(); } catch (e) { console.error("[配额评估] 错误:", e.message); }
+
   // Login (no auth required)
   if (req.method === "POST" && req.url === "/api/login") {
     const chunks = [];

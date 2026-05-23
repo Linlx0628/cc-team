@@ -295,17 +295,27 @@ function checkConcurrency(key) {
   return userConcurrent[key] < rt.proxy.maxConcurrentPerUser;
 }
 
-function checkRateLimit(key) {
-  const now = Date.now();
-  userRateBucket[key] = userRateBucket[key] || [];
-  const windowMs = 60000;
-  userRateBucket[key] = userRateBucket[key].filter(t => now - t < windowMs);
-  return userRateBucket[key].length < rt.proxy.rateLimitPerMinute;
+function tryAcquireConcurrency(key) {
+  userConcurrent[key] = (userConcurrent[key] || 0) + 1;
+  if (userConcurrent[key] > rt.proxy.maxConcurrentPerUser) {
+    userConcurrent[key]--;
+    return false;
+  }
+  return true;
 }
 
-function recordRate(key) {
+function releaseConcurrency(key) {
+  userConcurrent[key] = Math.max(0, (userConcurrent[key] || 1) - 1);
+}
+
+function checkAndRecordRate(key) {
+  const now = Date.now();
+  const windowMs = 60000;
   userRateBucket[key] = userRateBucket[key] || [];
-  userRateBucket[key].push(Date.now());
+  userRateBucket[key] = userRateBucket[key].filter(t => now - t < windowMs);
+  if (userRateBucket[key].length >= rt.proxy.rateLimitPerMinute) return false;
+  userRateBucket[key].push(now);
+  return true;
 }
 
 // ─── Auth & Sanitize ────────────────────────────────────────────────────────
@@ -315,10 +325,17 @@ function hashPassword(pw) {
 }
 const AUTH_TOKEN = dashboardPassword ? hashPassword(dashboardPassword) : "";
 
+function timingSafeEqual(a, b) {
+  const ba = Buffer.from(String(a));
+  const bb = Buffer.from(String(b));
+  if (ba.length !== bb.length) return false;
+  return crypto.timingSafeEqual(ba, bb);
+}
+
 function checkAuth(req) {
   if (!dashboardPassword) return true;
   const cookies = (req.headers.cookie || "").split(";").map(s => s.trim());
-  return cookies.some(c => c === `${AUTH_COOKIE}=${AUTH_TOKEN}`);
+  return cookies.some(c => timingSafeEqual(c, `${AUTH_COOKIE}=${AUTH_TOKEN}`));
 }
 
 function sanitizeStore(raw) {
@@ -436,11 +453,9 @@ function checkModelAllowed(model) {
 }
 
 function generateVirtualKey() {
-  const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
   let code;
   do {
-    code = "jx-";
-    for (let i = 0; i < 24; i++) code += chars[Math.floor(Math.random() * chars.length)];
+    code = "jx-" + crypto.randomBytes(18).toString("base64url");
   } while (rt.globalUsers[code] || rt.users[code]);
   return code;
 }
@@ -853,7 +868,7 @@ function proxyRequest(req, res) {
     if (!rt.users[userKey] && !rt.globalUsers[userKey]) {
       res.writeHead(403, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ error: "Unknown API key. Please use your assigned virtual key (jx-*)." }));
-      console.log(`[拦截] 未知key=${apiKey.slice(0, 12)} model=${reqModel} 拒绝访问`);
+      console.log(`[拦截] 未知key=${apiKey.slice(0, 8)}**** model=${reqModel} 拒绝访问`);
       return;
     }
 
@@ -867,13 +882,14 @@ function proxyRequest(req, res) {
     }
 
     // Concurrency check
-    if (!checkConcurrency(userKey)) {
+    if (!tryAcquireConcurrency(userKey)) {
       res.writeHead(429, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ error: "Too many concurrent requests. Please try again later." }));
       return;
     }
     // Rate limit check
-    if (!checkRateLimit(userKey)) {
+    if (!checkAndRecordRate(userKey)) {
+      releaseConcurrency(userKey);
       res.writeHead(429, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ error: "Rate limit exceeded. Please slow down." }));
       return;
@@ -895,12 +911,9 @@ function proxyRequest(req, res) {
       return;
     }
 
-    userConcurrent[userKey] = (userConcurrent[userKey] || 0) + 1;
-    recordRate(userKey);
-
     // User disabled check (global or profile-level)
     if (checkUserDisabled(apiKey)) {
-      userConcurrent[userKey] = Math.max(0, (userConcurrent[userKey] || 1) - 1);
+      releaseConcurrency(userKey);
       res.writeHead(403, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ error: "User is disabled." }));
       console.log(`[禁用] ${getUserName(apiKey)} 用户已禁用`);
@@ -909,7 +922,7 @@ function proxyRequest(req, res) {
 
     // Key expiration check
     if (checkKeyExpired(apiKey)) {
-      userConcurrent[userKey] = Math.max(0, (userConcurrent[userKey] || 1) - 1);
+      releaseConcurrency(userKey);
       res.writeHead(403, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ error: "API key has expired. Please contact your administrator." }));
       console.log(`[过期] ${getUserName(apiKey)} key已过期`);
@@ -923,7 +936,7 @@ function proxyRequest(req, res) {
       // Replace virtual key with real upstream key
       if (realKey !== apiKey) {
         reqHeaders["authorization"] = `Bearer ${realKey}`;
-        console.log(`[映射] ${getUserName(apiKey)} 虚拟key=${apiKey.slice(0,12)}... → 真实key=${realKey.slice(0,12)}... 请求模型=${originalModel}${originalModel !== reqModel ? " → 实际=" + reqModel : ""}`);
+        console.log(`[映射] ${getUserName(apiKey)} 虚拟key=${apiKey.slice(0,8)}**** 请求模型=${originalModel}${originalModel !== reqModel ? " → 实际=" + reqModel : ""}`);
       }
       delete reqHeaders["connection"];
       delete reqHeaders["transfer-encoding"];
@@ -945,10 +958,10 @@ function proxyRequest(req, res) {
       recordError(apiKey, status, `${label}: ${err.message}`, req.url, reqModel);
       if (!res.headersSent) {
         res.writeHead(status, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: `Proxy ${label}: ${err.message}` }));
+        res.end(JSON.stringify({ error: `Proxy ${label}. Please try again later.` }));
       }
     } finally {
-      userConcurrent[userKey] = Math.max(0, (userConcurrent[userKey] || 1) - 1);
+      releaseConcurrency(userKey);
       console.log(`── 请求结束 ── ${getUserName(apiKey)} ──`);
     }
   });
@@ -1037,7 +1050,7 @@ async function handleJsonProxy(req, res, body, reqHeaders, apiKey, reqModel, tim
   recordError(apiKey, finalStatus, `${finalLabel} after ${rt.proxy.maxRetries} retries: ${lastError?.message}`, req.url, reqModel);
   if (!res.headersSent) {
     res.writeHead(finalStatus, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ error: `Proxy ${finalLabel} after ${rt.proxy.maxRetries} retries: ${lastError?.message}` }));
+    res.end(JSON.stringify({ error: `Proxy ${finalLabel} after ${rt.proxy.maxRetries} retries. Please try again later.` }));
   }
 }
 
@@ -1167,7 +1180,7 @@ async function handleStreamingProxy(req, res, body, reqHeaders, apiKey, reqModel
       recordError(apiKey, status, `${label}: ${err.message}`, req.url, reqModel);
       if (!res.headersSent && !clientGone) {
         res.writeHead(status, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: `Proxy ${label}: ${err.message}` }));
+        res.end(JSON.stringify({ error: `Proxy ${label}. Please try again later.` }));
       }
       safeResolve();
     });
@@ -1178,6 +1191,13 @@ async function handleStreamingProxy(req, res, body, reqHeaders, apiKey, reqModel
 }
 
 // ─── Settings API Helpers ─────────────────────────────────────────────────────
+function escHtml(s) {
+  return String(s).replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/'/g, "&#39;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+function escJs(s) {
+  return String(s).replace(/\\/g, "\\\\").replace(/'/g, "\\'").replace(/"/g, '\\"').replace(/</g, "\\x3c").replace(/>/g, "\\x3e").replace(/\n/g, "\\n").replace(/\r/g, "\\r");
+}
+
 function getPublicSettings() {
   const safeProfileUsers = {};
   for (const [k, v] of Object.entries(rt.users)) {
@@ -1225,11 +1245,11 @@ function settingsHtml(errorMsg) {
     const expiresAt = isObj ? (v.expiresAt || "") : "";
     const disabled = isObj ? !!v.disabled : false;
     return `<tr>
-<td><code style="font-size:11px;color:var(--accent);user-select:all;cursor:pointer" title="点击复制" onclick="navigator.clipboard.writeText('${k}')">${k}</code></td>
-<td><input type="text" name="gu_un_${k}" value="${username}" style="width:100%;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:4px 8px;border-radius:4px;font-size:12px" placeholder="用户名"></td>
-<td><input type="datetime-local" name="gu_ex_${k}" value="${expiresAt}" style="width:100%;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:3px 6px;border-radius:4px;font-size:11px;font-family:monospace;color-scheme:dark" title="留空=永不过期"></td>
-<td><label style="display:inline-flex;align-items:center;gap:4px;margin:0;cursor:pointer"><input type="checkbox" name="gu_dis_${k}" ${disabled ? "checked" : ""} style="width:auto;accent-color:var(--red)"><span style="font-size:11px;color:${disabled ? "var(--red)" : "var(--dim)"}">${disabled ? "已禁用" : "正常"}</span></label></td>
-<td><button type="button" onclick="deleteGlobalUser('${k}')" style="background:rgba(248,113,113,.15);color:var(--red);border:none;padding:2px 8px;border-radius:4px;cursor:pointer;font-size:11px">删除</button></td></tr>`;
+<td><code style="font-size:11px;color:var(--accent);user-select:all;cursor:pointer" title="点击复制" onclick="navigator.clipboard.writeText('${escJs(k)}')">${escHtml(k)}</code></td>
+<td><input type="text" name="gu_un_${escHtml(k)}" value="${escHtml(username)}" style="width:100%;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:4px 8px;border-radius:4px;font-size:12px" placeholder="用户名"></td>
+<td><input type="datetime-local" name="gu_ex_${escHtml(k)}" value="${escHtml(expiresAt)}" style="width:100%;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:3px 6px;border-radius:4px;font-size:11px;font-family:monospace;color-scheme:dark" title="留空=永不过期"></td>
+<td><label style="display:inline-flex;align-items:center;gap:4px;margin:0;cursor:pointer"><input type="checkbox" name="gu_dis_${escHtml(k)}" ${disabled ? "checked" : ""} style="width:auto;accent-color:var(--red)"><span style="font-size:11px;color:${disabled ? "var(--red)" : "var(--dim)"}">${disabled ? "已禁用" : "正常"}</span></label></td>
+<td><button type="button" onclick="deleteGlobalUser('${escJs(k)}')" style="background:rgba(248,113,113,.15);color:var(--red);border:none;padding:2px 8px;border-radius:4px;cursor:pointer;font-size:11px">删除</button></td></tr>`;
   }).join("");
 
   // Profile user rows (key assignment)
@@ -1243,11 +1263,11 @@ function settingsHtml(errorMsg) {
     const userQuota = (pu && typeof pu === "object") ? (pu.dailyTokenLimit || 0) : 0;
     const rowStyle = globalDisabled ? "opacity:0.4" : "";
     return `<tr style="${rowStyle}">
-<td><code style="font-size:11px;color:var(--accent)">${k}</code></td>
-<td>${username}</td>
-<td><input type="text" name="pu_rk_${k}" value="${realKey}" style="width:100%;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:4px 8px;border-radius:4px;font-size:12px;font-family:monospace" placeholder="真实Key (必填)"></td>
-<td><input type="number" name="pu_quota_${k}" value="${userQuota}" style="width:100%;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:4px 8px;border-radius:4px;font-size:12px" min="0" step="100000" placeholder="0=不限"></td>
-<td><label style="display:inline-flex;align-items:center;gap:4px;margin:0;cursor:pointer"><input type="checkbox" name="pu_dis_${k}" ${profileDisabled ? "checked" : ""} style="width:auto;accent-color:var(--orange)"><span style="font-size:11px;color:${profileDisabled ? "var(--orange)" : "var(--dim)"}">${profileDisabled ? "已禁用" : "正常"}</span></label></td></tr>`;
+<td><code style="font-size:11px;color:var(--accent)">${escHtml(k)}</code></td>
+<td>${escHtml(username)}</td>
+<td><input type="text" name="pu_rk_${escHtml(k)}" value="${escHtml(realKey)}" style="width:100%;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:4px 8px;border-radius:4px;font-size:12px;font-family:monospace" placeholder="真实Key (必填)"></td>
+<td><input type="number" name="pu_quota_${escHtml(k)}" value="${userQuota}" style="width:100%;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:4px 8px;border-radius:4px;font-size:12px" min="0" step="100000" placeholder="0=不限"></td>
+<td><label style="display:inline-flex;align-items:center;gap:4px;margin:0;cursor:pointer"><input type="checkbox" name="pu_dis_${escHtml(k)}" ${profileDisabled ? "checked" : ""} style="width:auto;accent-color:var(--orange)"><span style="font-size:11px;color:${profileDisabled ? "var(--orange)" : "var(--dim)"}">${profileDisabled ? "已禁用" : "正常"}</span></label></td></tr>`;
   }).join("");
 
   const dm = s.defaultModels || {};
@@ -1334,13 +1354,13 @@ td{padding:6px 8px;border-bottom:1px solid var(--border);font-size:12px}
 <div class="sidebar-list">${s.profiles.map(p => {
     const isActive = p.isActive;
     const host = p.upstream.replace(/^https?:\/\//, "").replace(/\/.*/, "");
-    return `<div class="pl-item${isActive ? " active" : ""}" id="pl-${p.name}">
-<div class="pl-name">${p.name}</div>
-<div class="pl-host">${host}</div>
+    return `<div class="pl-item${isActive ? " active" : ""}" id="pl-${escHtml(p.name)}">
+<div class="pl-name">${escHtml(p.name)}</div>
+<div class="pl-host">${escHtml(host)}</div>
 <div class="pl-users">${p.userCount}位用户</div>
 <div class="pl-actions">
-  ${!isActive ? '<button class="pl-activate" onclick="switchToProfile(\'' + p.name + '\')">✓ 启用</button>' : '<span class="pl-badge">当前</span>'}
-  ${!isActive ? '<button class="pl-delete" onclick="deleteProfile(\'' + p.name + '\')">×</button>' : ''}
+  ${!isActive ? '<button class="pl-activate" onclick="switchToProfile(\'' + escJs(p.name) + '\')">✓ 启用</button>' : '<span class="pl-badge">当前</span>'}
+  ${!isActive ? '<button class="pl-delete" onclick="deleteProfile(\'' + escJs(p.name) + '\')">×</button>' : ''}
 </div></div>`;
   }).join("")}</div>
 <div class="sidebar-ft" style="display:flex;gap:6px"><button class="btn btn-outline btn-sm" onclick="openUserModal()" style="flex:1">用户管理</button><button class="btn btn-outline btn-sm" onclick="addProfile()" style="flex:1">+ 新增方案</button></div>
@@ -1533,7 +1553,7 @@ async function saveUsers(){
   const r=await fetch('/api/global-user/save',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({users,profileUsers})});
   if(r.ok){alert('保存成功');location.reload()}else{const e=await r.json();alert('保存失败: '+e.error)}
 }
-function genVK(){const c="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";let k="jx-";for(let i=0;i<24;i++)k+=c[Math.floor(Math.random()*c.length)];return k}
+function genVK(){const c="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";const a=new Uint8Array(24);crypto.getRandomValues(a);let k="jx-";for(let i=0;i<24;i++)k+=c[a[i]%c.length];return k}
 function addGlobalUser(){
   const tbody=document.querySelector("#globalUsersTable tbody");
   const tr=document.createElement("tr");
@@ -1773,7 +1793,7 @@ td{padding:6px 12px;font-size:13px;border-bottom:1px solid var(--border)}.n{text
 <div class="box"><h3>近7天趋势</h3><canvas id="trendChart"></canvas></div>
 <div class="box"><h3>今日模型用量</h3><table id="modelTable"><thead><tr><th>模型</th><th class="n">请求数</th><th class="n">输入</th><th class="n">输出</th><th class="n">合计</th></tr></thead><tbody></tbody></table></div>
 <script>
-const VK='${virtualKey}';
+const VK='${escJs(virtualKey)}';
 let D=null,C={h:null,t:null};
 const fmtT=n=>n.toLocaleString("zh-CN");
 const fmtTk=n=>{if(n>=1e6)return(n/1e6).toFixed(1)+"M";if(n>=1e3)return(n/1e3).toFixed(1)+"k";return n.toString()};
@@ -1966,6 +1986,12 @@ function applySettings(formData) {
 }
 
 const server = http.createServer((req, res) => {
+  // Security headers for all responses
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  res.setHeader("X-Frame-Options", "DENY");
+  res.setHeader("Referrer-Policy", "strict-origin-when-cross-origin");
+  res.setHeader("X-XSS-Protection", "0");
+
   // Auto quota evaluation (once per day)
   try { evaluateAutoQuotaAdjustments(); } catch (e) { console.error("[配额评估] 错误:", e.message); }
 
@@ -1976,7 +2002,7 @@ const server = http.createServer((req, res) => {
     req.on("end", () => {
       try {
         const { password } = JSON.parse(Buffer.concat(chunks).toString());
-        if (dashboardPassword && password === dashboardPassword) {
+        if (dashboardPassword && timingSafeEqual(password, dashboardPassword)) {
           res.writeHead(200, {
             "Content-Type": "application/json",
             "Set-Cookie": `${AUTH_COOKIE}=${AUTH_TOKEN}; Path=/; HttpOnly; SameSite=Strict; Max-Age=86400`,

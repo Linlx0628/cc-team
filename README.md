@@ -27,7 +27,24 @@
 
 ## 快速开始
 
-### 方式一：Docker（推荐）
+### 方式一：脚本启动（推荐）
+
+自动检测环境、安装 Node.js、生成配置并引导填写，双击即用。
+
+```bash
+git clone https://github.com/Linlx0628/cc-team.git
+cd cc-team
+
+# macOS / Linux
+./start.sh
+
+# Windows
+start.bat
+```
+
+> 首次运行自动检测 Node.js（没有则自动安装）、自动生成 `config.json` 并引导你完成配置。
+
+### 方式二：Docker
 
 ```bash
 docker pull linlx/cc-team:latest
@@ -56,21 +73,6 @@ cd cc-team
 cp config.example.json config.json
 # 编辑 config.json 填入真实配置
 docker compose up -d
-```
-
-### 方式二：脚本启动
-
-需要 Node.js >= 18。
-
-```bash
-git clone https://github.com/Linlx0628/cc-team.git
-cd cc-team
-
-# macOS / Linux
-./start.sh
-
-# Windows
-start.bat
 ```
 
 首次运行会自动从模板创建 `config.json`，编辑后重新启动即可。

@@ -31,15 +31,24 @@
 
 ```bash
 docker pull linlx/cc-team:latest
+
+# 首次启动 — 自动生成默认配置
 docker run -d \
   -p 6789:6789 \
-  -v ./config.json:/app/config.json \
-  -v ./data.json:/app/data.json \
+  -v cc-team-config:/app \
   --name cc-team \
   linlx/cc-team:latest
+
+# 编辑配置（填入你的上游地址、API Key、用户等）
+docker exec -it cc-team vi /app/config.json
+
+# 重启生效
+docker restart cc-team
 ```
 
-或者用 docker compose：
+> 首次启动会自动从模板生成 `config.json`，编辑后重启即可。
+
+或者用 docker compose（适合 clone 仓库后使用）：
 
 ```bash
 git clone https://github.com/Linlx0628/cc-team.git

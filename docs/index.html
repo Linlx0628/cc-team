@@ -153,12 +153,17 @@
           </div>
           <div class="terminal-body">
             <code>docker pull linlx/cc-team:latest</code>
+            <code></code>
+            <code class="comment"># 首次启动 — 自动生成默认配置</code>
             <code>docker run -d \</code>
             <code>  -p 6789:6789 \</code>
-            <code>  -v ./config.json:/app/config.json \</code>
-            <code>  -v ./data.json:/app/data.json \</code>
+            <code>  -v cc-team-config:/app \</code>
             <code>  --name cc-team \</code>
             <code>  linlx/cc-team:latest</code>
+            <code></code>
+            <code class="comment"># 编辑配置后重启</code>
+            <code>docker exec -it cc-team vi /app/config.json</code>
+            <code>docker restart cc-team</code>
           </div>
         </div>
         <p class="deploy-note">或者用 docker compose：<code>docker compose up -d</code></p>

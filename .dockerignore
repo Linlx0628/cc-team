@@ -1,0 +1,11 @@
+node_modules
+.git
+.claude
+.spec-workflow
+docs
+*.md
+.DS_Store
+data.json
+config.json
+start.sh
+start.bat

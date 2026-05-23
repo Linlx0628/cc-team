@@ -1,8 +1,10 @@
-# Claude Code Team AI Coding Token Monitor
+# CC-TEAM
 
-团队 AI Coding 代理网关 + Token 用量监控面板。
+团队 AI 编码用量监控网关。
 
 透明代理请求到多个上游 AI API，记录每个成员的 token 消耗量，提供可视化监控面板、个人用量页面和热加载配置管理。
+
+> 单文件 · 零依赖 · Docker 就绪
 
 ## 功能
 
@@ -12,6 +14,7 @@
 - **模型别名**：`jx-sonnet` / `jx-opus` / `jx-haiku` 自动映射到实际模型
 - **模型准入**：按方案限制可用模型，拦截未知 Key
 - **Token 配额**：方案级 + 用户级每日 token 限额，超限自动拦截
+- **自动增长额度**：高强度用户自动增长配额
 - **个人用量页**：用户通过虚拟 Key 查看自己的配额、模型明细、趋势图表
 - **Token 统计**：按人、按日、按模型、按小时记录 token 消耗
 - **Dashboard**：Chart.js 可视化图表（趋势、分布、24小时热力），自动刷新
@@ -24,11 +27,54 @@
 
 ## 快速开始
 
-### 1. 配置
+### 方式一：Docker（推荐）
+
+```bash
+docker pull linlx/cc-team:latest
+docker run -d \
+  -p 6789:6789 \
+  -v ./config.json:/app/config.json \
+  -v ./data.json:/app/data.json \
+  --name cc-team \
+  linlx/cc-team:latest
+```
+
+或者用 docker compose：
+
+```bash
+git clone https://github.com/Linlx0628/cc-team.git
+cd cc-team
+cp config.example.json config.json
+# 编辑 config.json 填入真实配置
+docker compose up -d
+```
+
+### 方式二：脚本启动
+
+需要 Node.js >= 18。
+
+```bash
+git clone https://github.com/Linlx0628/cc-team.git
+cd cc-team
+
+# macOS / Linux
+./start.sh
+
+# Windows
+start.bat
+```
+
+首次运行会自动从模板创建 `config.json`，编辑后重新启动即可。
+
+### 方式三：直接运行
 
 ```bash
 cp config.example.json config.json
+# 编辑 config.json
+node server.mjs
 ```
+
+## 配置
 
 编辑 `config.json`：
 
@@ -65,13 +111,14 @@ cp config.example.json config.json
 }
 ```
 
-### 2. 启动
+## 接入 Claude Code
 
 ```bash
-node server.mjs
+export ANTHROPIC_BASE_URL="http://localhost:6789/v1"
+export ANTHROPIC_API_KEY="jx-your-virtual-key"
 ```
 
-### 3. 访问
+## 页面
 
 | 页面 | 地址 | 说明 |
 |------|------|------|
@@ -80,13 +127,6 @@ node server.mjs
 | 个人用量 | `http://localhost:6789/usage/你的虚拟Key` | 用户查看自己的用量，无需登录 |
 | 用量输入 | `http://localhost:6789/my-usage` | 输入虚拟 Key 跳转个人页面 |
 | 健康检查 | `http://localhost:6789/health` | 服务状态，无需登录 |
-
-### 4. 配置 Claude Code
-
-```bash
-export ANTHROPIC_BASE_URL="http://localhost:6789/v1"
-export ANTHROPIC_API_KEY="jx-your-virtual-key"
-```
 
 ## 用户管理
 

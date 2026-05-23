@@ -1,0 +1,277 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>CC-TEAM — 团队 AI 编码用量网关</title>
+<meta name="description" content="轻量、自由、全能的团队 AI 编码 API 网关。透明代理，用量监控，配额管理，单文件零依赖。">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<!-- Scanline overlay -->
+<div class="scanlines" aria-hidden="true"></div>
+
+<!-- Grid background -->
+<div class="grid-bg" aria-hidden="true"></div>
+
+<!-- Nav -->
+<nav class="nav" id="nav">
+  <div class="nav-inner">
+    <a href="#" class="logo">CC<span class="accent">-</span>TEAM</a>
+    <div class="nav-links">
+      <a href="#features">功能</a>
+      <a href="#deploy">部署</a>
+      <a href="#architecture">架构</a>
+      <a href="https://github.com/Linlx0628/cc-team" target="_blank" class="nav-gh">GitHub</a>
+    </div>
+    <button class="nav-toggle" id="nav-toggle" aria-label="菜单">☰</button>
+  </div>
+</nav>
+
+<!-- Mobile menu -->
+<div class="mobile-menu" id="mobile-menu">
+  <a href="#features">功能</a>
+  <a href="#deploy">部署</a>
+  <a href="#architecture">架构</a>
+  <a href="https://github.com/Linlx0628/cc-team" target="_blank">GitHub</a>
+</div>
+
+<!-- Hero -->
+<section class="hero" id="hero">
+  <div class="container">
+    <div class="hero-badge">v1.0 · 单文件 · 零依赖</div>
+    <h1 class="hero-title">
+      团队 AI 编码用量<br><span class="accent">监控网关</span>
+    </h1>
+    <p class="hero-desc">
+      一个文件，一个进程，搞定团队 AI API 的透明代理、用量追踪和配额管理。<br>
+      不装东西，不改代码，接入即用。
+    </p>
+    <div class="hero-actions">
+      <a href="#deploy" class="btn btn-primary">快速开始</a>
+      <a href="https://github.com/Linlx0628/cc-team" target="_blank" class="btn btn-outline">查看源码</a>
+    </div>
+
+    <div class="hero-stats">
+      <div class="stat">
+        <span class="stat-value">1</span>
+        <span class="stat-label">文件</span>
+      </div>
+      <div class="stat">
+        <span class="stat-value">0</span>
+        <span class="stat-label">依赖</span>
+      </div>
+      <div class="stat">
+        <span class="stat-value">~15MB</span>
+        <span class="stat-label">内存占用</span>
+      </div>
+      <div class="stat">
+        <span class="stat-value">2K+</span>
+        <span class="stat-label">行代码</span>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- Why -->
+<section class="section" id="why">
+  <div class="container">
+    <h2 class="section-title">为什么选 CC-TEAM</h2>
+    <div class="pillars">
+      <div class="pillar">
+        <div class="pillar-icon">◈</div>
+        <h3>轻巧</h3>
+        <p>单文件 Node.js，零外部依赖。Docker 镜像不到 50MB，内存占用约 15MB。不需要数据库，不需要 Redis，文件存储就够了。</p>
+      </div>
+      <div class="pillar">
+        <div class="pillar-icon">⬡</div>
+        <h3>自由</h3>
+        <p>多上游热切换，虚拟密钥映射，模型别名。想接哪个 AI 厂商都可以，配置文件改了立刻生效，不用重启。</p>
+      </div>
+      <div class="pillar">
+        <div class="pillar-icon">⬢</div>
+        <h3>全能</h3>
+        <p>透明代理零侵入、按人用量监控、可视化仪表盘、配额管理自动调节、熔断保护、请求分类统计。一个文件全搞定。</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- Features -->
+<section class="section section-alt" id="features">
+  <div class="container">
+    <h2 class="section-title">功能一览</h2>
+    <div class="features-grid">
+      <div class="feature-card">
+        <div class="feature-tag">代理</div>
+        <h3>透明代理</h3>
+        <p>请求原样转发，响应原样返回。对 LLM 的上下文质量和输出零影响。</p>
+      </div>
+      <div class="feature-card">
+        <div class="feature-tag">密钥</div>
+        <h3>虚拟密钥</h3>
+        <p>每人分配 <code>jx-*</code> 虚拟密钥，真实 API Key 不暴露。支持启用/禁用/过期时间。</p>
+      </div>
+      <div class="feature-card">
+        <div class="feature-tag">监控</div>
+        <h3>用量仪表盘</h3>
+        <p>按人、按模型、按天的 Token 消耗图表。个人用量页面，团队成员自查。</p>
+      </div>
+      <div class="feature-card">
+        <div class="feature-tag">配额</div>
+        <h3>配额管理</h3>
+        <p>按 Profile + 用户设置每日 Token 上限。高强度用户自动增长额度。</p>
+      </div>
+      <div class="feature-card">
+        <div class="feature-tag">模型</div>
+        <h3>模型别名</h3>
+        <p><code>jx-sonnet</code> → 真实模型名。换模型不改客户端配置，一行搞定。</p>
+      </div>
+      <div class="feature-card">
+        <div class="feature-tag">防护</div>
+        <h3>熔断保护</h3>
+        <p>上游故障自动熔断，恢复后自动放行。限速保护，防止异常暴涨。</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- Deploy -->
+<section class="section" id="deploy">
+  <div class="container">
+    <h2 class="section-title">快速部署</h2>
+    <div class="deploy-grid">
+      <div class="deploy-option">
+        <div class="deploy-header">
+          <span class="deploy-method">Docker</span>
+          <span class="deploy-tag">推荐</span>
+        </div>
+        <div class="terminal">
+          <div class="terminal-bar">
+            <span class="dot"></span><span class="dot"></span><span class="dot"></span>
+          </div>
+          <div class="terminal-body">
+            <code>docker pull linlx/cc-team:latest</code>
+            <code>docker run -d \</code>
+            <code>  -p 6789:6789 \</code>
+            <code>  -v ./config.json:/app/config.json \</code>
+            <code>  -v ./data.json:/app/data.json \</code>
+            <code>  --name cc-team \</code>
+            <code>  linlx/cc-team:latest</code>
+          </div>
+        </div>
+        <p class="deploy-note">或者用 docker compose：<code>docker compose up -d</code></p>
+      </div>
+
+      <div class="deploy-option">
+        <div class="deploy-header">
+          <span class="deploy-method">脚本启动</span>
+          <span class="deploy-tag alt">无需 Docker</span>
+        </div>
+        <div class="terminal">
+          <div class="terminal-bar">
+            <span class="dot"></span><span class="dot"></span><span class="dot"></span>
+          </div>
+          <div class="terminal-body">
+            <code class="comment"># 克隆仓库</code>
+            <code>git clone https://github.com/Linlx0628/cc-team.git</code>
+            <code>cd cc-team</code>
+            <code></code>
+            <code class="comment"># macOS / Linux</code>
+            <code>./start.sh</code>
+            <code></code>
+            <code class="comment"># Windows</code>
+            <code>start.bat</code>
+          </div>
+        </div>
+        <p class="deploy-note">需要 Node.js >= 18，首次运行自动创建配置文件</p>
+      </div>
+    </div>
+
+    <div class="deploy-config">
+      <h3>接入方式</h3>
+      <div class="terminal">
+        <div class="terminal-bar">
+          <span class="dot"></span><span class="dot"></span><span class="dot"></span>
+        </div>
+        <div class="terminal-body">
+          <code class="comment"># 设置环境变量即可接入</code>
+          <code>export ANTHROPIC_BASE_URL="http://localhost:6789/v1"</code>
+          <code>export ANTHROPIC_API_KEY="jx-your-virtual-key"</code>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- Architecture -->
+<section class="section section-alt" id="architecture">
+  <div class="container">
+    <h2 class="section-title">架构</h2>
+    <div class="arch">
+      <!-- Left: Clients -->
+      <div class="arch-col arch-clients">
+        <div class="arch-label">客户端</div>
+        <div class="arch-node">Claude Code</div>
+        <div class="arch-node">Cursor</div>
+        <div class="arch-node">Windsurf</div>
+        <div class="arch-node">Copilot</div>
+      </div>
+      <!-- Arrow -->
+      <div class="arch-arrow">▶</div>
+      <!-- Center: Gateway -->
+      <div class="arch-col arch-gateway">
+        <div class="arch-label">CC-TEAM 网关</div>
+        <div class="arch-modules">
+          <div class="arch-mod">路由</div>
+          <div class="arch-mod">监控</div>
+          <div class="arch-mod">配额</div>
+          <div class="arch-mod">别名</div>
+          <div class="arch-mod">熔断</div>
+          <div class="arch-mod">日志</div>
+        </div>
+        <div class="arch-label" style="margin-top:16px">Web 界面</div>
+        <div class="arch-modules">
+          <div class="arch-mod mod-web">Dashboard</div>
+          <div class="arch-mod mod-web">Usage</div>
+          <div class="arch-mod mod-web">Settings</div>
+        </div>
+      </div>
+      <!-- Arrow -->
+      <div class="arch-arrow">▶</div>
+      <!-- Right: Upstreams -->
+      <div class="arch-col arch-upstreams">
+        <div class="arch-label">AI 厂商</div>
+        <div class="arch-node">GLM</div>
+        <div class="arch-node">DeepSeek</div>
+        <div class="arch-node">Qwen</div>
+        <div class="arch-node">Kimi</div>
+        <div class="arch-node arch-more">...</div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- Footer -->
+<footer class="footer">
+  <div class="container">
+    <div class="footer-inner">
+      <div class="footer-left">
+        <span class="logo">CC<span class="accent">-</span>TEAM</span>
+        <span class="footer-desc">团队 AI 编码用量网关</span>
+      </div>
+      <div class="footer-right">
+        <a href="https://github.com/Linlx0628/cc-team" target="_blank">GitHub</a>
+        <a href="https://github.com/Linlx0628/cc-team/issues" target="_blank">Issues</a>
+      </div>
+    </div>
+    <div class="footer-bottom">
+      <span>MIT License · 单文件 · 零依赖</span>
+    </div>
+  </div>
+</footer>
+
+<script src="script.js"></script>
+</body>
+</html>

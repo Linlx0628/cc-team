@@ -1,4 +1,4 @@
-# Team AI Coding Token Monitor
+# Claude Code Team AI Coding Token Monitor
 
 团队 AI Coding 代理网关 + Token 用量监控面板。
 

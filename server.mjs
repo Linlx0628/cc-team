@@ -320,10 +320,13 @@ function checkAndRecordRate(key) {
 
 // ─── Auth & Sanitize ────────────────────────────────────────────────────────
 const AUTH_COOKIE = "tm_token";
+const CSRF_COOKIE = "tm_csrf";
 function hashPassword(pw) {
-  return crypto.createHash("sha256").update(pw + "token-monitor-salt").digest("hex");
+  return crypto.scryptSync(pw, "token-monitor-server-key", 32, { N: 16384, r: 8, p: 1 }).toString("hex");
 }
-const AUTH_TOKEN = dashboardPassword ? hashPassword(dashboardPassword) : "";
+const passwordVersion = config._pwVersion || 0;
+const AUTH_TOKEN = dashboardPassword ? hashPassword(dashboardPassword) + "." + passwordVersion : "";
+const CSRF_TOKEN = crypto.randomBytes(32).toString("hex");
 
 function timingSafeEqual(a, b) {
   const ba = Buffer.from(String(a));
@@ -336,6 +339,40 @@ function checkAuth(req) {
   if (!dashboardPassword) return true;
   const cookies = (req.headers.cookie || "").split(";").map(s => s.trim());
   return cookies.some(c => timingSafeEqual(c, `${AUTH_COOKIE}=${AUTH_TOKEN}`));
+}
+
+function checkCsrf(req, body) {
+  if (!dashboardPassword) return true;
+  const cookies = (req.headers.cookie || "").split(";").map(s => s.trim());
+  const csrfCookie = cookies.find(c => c.startsWith(`${CSRF_COOKIE}=`));
+  if (!csrfCookie) return false;
+  const cookieVal = csrfCookie.slice(CSRF_COOKIE.length + 1);
+  // Check header first (for fetch requests), then form field (for form submissions)
+  const headerVal = req.headers["x-csrf-token"] || "";
+  if (headerVal && timingSafeEqual(cookieVal, headerVal)) return true;
+  if (body && typeof body === "string" && body.includes("_csrf=")) {
+    const match = body.match(/(?:^|&)_csrf=([^&]+)/);
+    if (match && timingSafeEqual(cookieVal, decodeURIComponent(match[1]))) return true;
+  }
+  return false;
+}
+
+function isSecureRequest(req) {
+  return !!(req.socket.encrypted || req.headers["x-forwarded-proto"] === "https");
+}
+
+function readBody(req, maxSize = 1_000_000) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    let size = 0;
+    req.on("data", (c) => {
+      size += c.length;
+      if (size > maxSize) { req.destroy(); reject(new Error("Request body too large")); return; }
+      chunks.push(c);
+    });
+    req.on("end", () => resolve(Buffer.concat(chunks)));
+    req.on("error", reject);
+  });
 }
 
 function sanitizeStore(raw) {
@@ -405,12 +442,7 @@ setInterval(saveStore, 30_000);
 // Supports backward compat: old format "username" → new format object
 // Get global user info (username, expiresAt, disabled) from config.users
 function getGlobalUser(apiKey) {
-  const gu = rt.globalUsers[apiKey];
-  if (gu) return gu;
-  for (const ck of Object.keys(rt.globalUsers)) {
-    if (apiKey.startsWith(ck) || ck.startsWith(apiKey)) return rt.globalUsers[ck];
-  }
-  return null;
+  return rt.globalUsers[apiKey] || null;
 }
 
 function getUserConfig(apiKey) {
@@ -425,9 +457,6 @@ function getUserConfig(apiKey) {
 
 function resolveUserKey(apiKey) {
   if (rt.users[apiKey]) return apiKey;
-  for (const ck of Object.keys(rt.users)) {
-    if (apiKey.startsWith(ck) || ck.startsWith(apiKey)) return ck;
-  }
   return apiKey.slice(0, 12);
 }
 
@@ -818,11 +847,8 @@ function proxyRequest(req, res) {
   }
 
   const userKey = resolveUserKey(apiKey);
-  const chunks = [];
 
-  req.on("data", (c) => chunks.push(c));
-  req.on("end", async () => {
-    let body = Buffer.concat(chunks);
+  readBody(req, 50_000_000).then(async (body) => {
     let reqModel = "unknown";
     let reqSource = "用户请求";
     let originalModel = "unknown";
@@ -963,6 +989,11 @@ function proxyRequest(req, res) {
     } finally {
       releaseConcurrency(userKey);
       console.log(`── 请求结束 ── ${getUserName(apiKey)} ──`);
+    }
+  }).catch(() => {
+    if (!res.headersSent) {
+      res.writeHead(413, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Request body too large" }));
     }
   });
 }
@@ -1368,6 +1399,7 @@ td{padding:6px 8px;border-bottom:1px solid var(--border);font-size:12px}
 <div class="main">
 ${errDiv}
 <form method="post" action="/api/settings-save" id="settingsForm">
+<input type="hidden" name="_csrf" id="csrfToken">
 
 <h2>上游代理 <span class="status ${s.circuitBreaker.state === 'CLOSED' ? 'status-ok' : s.circuitBreaker.state === 'HALF_OPEN' ? 'status-warn' : 'status-err'}">${s.circuitBreaker.state === 'CLOSED' ? '正常' : s.circuitBreaker.state === 'HALF_OPEN' ? '探测中' : '熔断中'}</span></h2>
 <div class="section">
@@ -1497,19 +1529,22 @@ ${(store.quotaAdjustHistory && store.quotaAdjustHistory.length > 0) ? `<h4 style
 </div>
 </div>
 <script>
+function getCsrf(){const m=document.cookie.match(/tm_csrf=([^;]+)/);return m?m[1]:''}
+document.getElementById('csrfToken').value=getCsrf();
+function csrfHeaders(h){h=h||{};h['x-csrf-token']=getCsrf();return h}
 function openUserModal(){document.getElementById('userModal').classList.add('open')}
 function closeUserModal(){document.getElementById('userModal').classList.remove('open')}
 document.getElementById('userModal').addEventListener('click',function(e){if(e.target===this)closeUserModal()});
 async function switchToProfile(n){
   if(!confirm('切换到方案 "'+n+'"？未保存的修改将丢失。'))return;
-  const r=await fetch('/api/profile/switch',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({profile:n})});
+  const r=await fetch('/api/profile/switch',{method:'POST',headers:csrfHeaders({'Content-Type':'application/json'}),body:JSON.stringify({profile:n})});
   if(r.ok)location.reload();else{const e=await r.json();alert('切换失败: '+e.error)}
 }
 async function addProfile(){
   const name=prompt('请输入新方案名称');
   if(!name)return;
   const fm=document.forms.settingsForm;
-  const r=await fetch('/api/profile/save',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({
+  const r=await fetch('/api/profile/save',{method:'POST',headers:csrfHeaders({'Content-Type':'application/json'}),body:JSON.stringify({
     profile:name,upstream:fm.upstream.value,allowedModels:fm.allowedModels.value,
     defaultModels:{sonnet:fm.defaultModels_sonnet.value,opus:fm.defaultModels_opus.value,haiku:fm.defaultModels_haiku.value}
   })});
@@ -1517,12 +1552,12 @@ async function addProfile(){
 }
 async function deleteProfile(n){
   if(!confirm('确定删除方案 "'+n+'"？'))return;
-  const r=await fetch('/api/profile/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({profile:n})});
+  const r=await fetch('/api/profile/delete',{method:'POST',headers:csrfHeaders({'Content-Type':'application/json'}),body:JSON.stringify({profile:n})});
   if(r.ok)location.reload();else{const e=await r.json();alert('删除失败: '+e.error)}
 }
 async function deleteGlobalUser(k){
   if(!confirm('确定删除用户？该用户将从所有方案中移除。'))return;
-  const r=await fetch('/api/global-user/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({key:k})});
+  const r=await fetch('/api/global-user/delete',{method:'POST',headers:csrfHeaders({'Content-Type':'application/json'}),body:JSON.stringify({key:k})});
   if(r.ok)location.reload();else{const e=await r.json();alert('删除失败: '+e.error)}
 }
 async function saveUsers(){
@@ -1550,7 +1585,7 @@ async function saveUsers(){
     const qv=parseInt(qInput?qInput.value:'0',10)||0;
     profileUsers.push({key:vk,realKey:rkInput?rkInput.value.trim():'',disabled:disInput?disInput.checked:false,dailyTokenLimit:qv>0?qv:null});
   });
-  const r=await fetch('/api/global-user/save',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({users,profileUsers})});
+  const r=await fetch('/api/global-user/save',{method:'POST',headers:csrfHeaders({'Content-Type':'application/json'}),body:JSON.stringify({users,profileUsers})});
   if(r.ok){alert('保存成功');location.reload()}else{const e=await r.json();alert('保存失败: '+e.error)}
 }
 function genVK(){const c="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";const a=new Uint8Array(24);crypto.getRandomValues(a);let k="jx-";for(let i=0;i<24;i++)k+=c[a[i]%c.length];return k}
@@ -1616,7 +1651,7 @@ tr:last-child td{border-bottom:none}tr:hover td{background:rgba(255,255,255,.02)
 .empty{color:var(--dim);padding:24px;text-align:center;font-size:13px}
 @media(max-width:768px){.grid{grid-template-columns:1fr}.cards{grid-template-columns:1fr 1fr}}
 </style></head><body>
-<h1>团队AI Coding监控 <span style="float:right;font-size:12px;display:flex;gap:8px;align-items:center"><a href="/settings" style="color:var(--dim);text-decoration:none;font-size:12px;padding:4px 10px;border:1px solid var(--border);border-radius:4px">设置</a><button id="autoRefreshBtn" style="font-size:12px;background:rgba(52,211,153,.15);color:var(--green);border:none;padding:4px 12px;border-radius:4px;cursor:pointer">自动刷新: 开</button><button onclick="fetch('/api/logout',{method:'POST'}).then(()=>location.reload())" style="font-size:12px;background:rgba(255,255,255,.06);color:var(--dim);border:none;padding:4px 12px;border-radius:4px;cursor:pointer">退出</button></span></h1>
+<h1>团队AI Coding监控 <span style="float:right;font-size:12px;display:flex;gap:8px;align-items:center"><a href="/settings" style="color:var(--dim);text-decoration:none;font-size:12px;padding:4px 10px;border:1px solid var(--border);border-radius:4px">设置</a><button id="autoRefreshBtn" style="font-size:12px;background:rgba(52,211,153,.15);color:var(--green);border:none;padding:4px 12px;border-radius:4px;cursor:pointer">自动刷新: 开</button><button onclick="fetch('/api/logout',{method:'POST',headers:{'x-csrf-token':(document.cookie.match(/tm_csrf=([^;]+)/)||[])[1]||''}}).then(()=>location.reload())" style="font-size:12px;background:rgba(255,255,255,.06);color:var(--dim);border:none;padding:4px 12px;border-radius:4px;cursor:pointer">退出</button></span></h1>
 <div class="meta" id="meta">Loading...</div>
 <div class="cards" id="cards"></div>
 <div class="tabs" id="tabs">
@@ -1704,7 +1739,7 @@ function render(){
 async function load(){try{const r=await fetch("/api/stats");D=await r.json();render()}catch(e){document.getElementById("meta").textContent="Error: "+e.message}}
 function toggleSec(id){const body=document.getElementById(id+"Body");const icon=document.getElementById(id+"Icon");const open=body.classList.toggle("open");icon.classList.toggle("open",open)}
 document.querySelectorAll(".tab").forEach(b=>b.addEventListener("click",()=>{document.querySelectorAll(".tab").forEach(x=>x.classList.remove("on"));b.classList.add("on");P=b.dataset.p;render()}));
-document.getElementById("clearErrors").addEventListener("click",async()=>{if(confirm("确定清除所有错误记录？")){await fetch("/api/clear-errors",{method:"POST"});errPage=1;load()}});
+document.getElementById("clearErrors").addEventListener("click",async()=>{if(confirm("确定清除所有错误记录？")){const csrf=(document.cookie.match(/tm_csrf=([^;]+)/)||[])[1]||'';await fetch("/api/clear-errors",{method:"POST",headers:{"x-csrf-token":csrf}});errPage=1;load()}});
 function startAutoRefresh(){if(refreshTimer)clearInterval(refreshTimer);refreshTimer=setInterval(()=>{if(autoRefresh)load()},30000)}
 document.getElementById("autoRefreshBtn").addEventListener("click",()=>{autoRefresh=!autoRefresh;const btn=document.getElementById("autoRefreshBtn");btn.textContent="自动刷新: "+(autoRefresh?"开":"关");btn.style.background=autoRefresh?"rgba(52,211,153,.15)":"rgba(255,255,255,.06)";btn.style.color=autoRefresh?"var(--green)":"var(--dim)"});
 load();startAutoRefresh();
@@ -1997,15 +2032,17 @@ const server = http.createServer((req, res) => {
 
   // Login (no auth required)
   if (req.method === "POST" && req.url === "/api/login") {
-    const chunks = [];
-    req.on("data", (c) => chunks.push(c));
-    req.on("end", () => {
+    readBody(req, 10_000).then(buf => {
       try {
-        const { password } = JSON.parse(Buffer.concat(chunks).toString());
+        const { password } = JSON.parse(buf.toString());
         if (dashboardPassword && timingSafeEqual(password, dashboardPassword)) {
+          const secure = isSecureRequest(req) ? "; Secure" : "";
           res.writeHead(200, {
             "Content-Type": "application/json",
-            "Set-Cookie": `${AUTH_COOKIE}=${AUTH_TOKEN}; Path=/; HttpOnly; SameSite=Strict; Max-Age=86400`,
+            "Set-Cookie": [
+              `${AUTH_COOKIE}=${AUTH_TOKEN}; Path=/; HttpOnly; SameSite=Strict; Max-Age=86400${secure}`,
+              `${CSRF_COOKIE}=${CSRF_TOKEN}; Path=/; SameSite=Strict; Max-Age=86400${secure}`,
+            ],
           });
           res.end(JSON.stringify({ ok: true }));
         } else {
@@ -2016,6 +2053,9 @@ const server = http.createServer((req, res) => {
         res.writeHead(400, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ error: "bad request" }));
       }
+    }).catch(() => {
+      res.writeHead(413, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "request too large" }));
     });
     return;
   }
@@ -2024,7 +2064,10 @@ const server = http.createServer((req, res) => {
   if (req.method === "POST" && req.url === "/api/logout") {
     res.writeHead(200, {
       "Content-Type": "application/json",
-      "Set-Cookie": `${AUTH_COOKIE}=; Path=/; HttpOnly; Max-Age=0`,
+      "Set-Cookie": [
+        `${AUTH_COOKIE}=; Path=/; HttpOnly; Max-Age=0`,
+        `${CSRF_COOKIE}=; Path=/; Max-Age=0`,
+      ],
     });
     res.end(JSON.stringify({ ok: true }));
     return;
@@ -2056,11 +2099,13 @@ const server = http.createServer((req, res) => {
       res.writeHead(401); res.end("Unauthorized");
       return;
     }
-    const chunks = [];
-    req.on("data", (c) => chunks.push(c));
-    req.on("end", () => {
+    readBody(req).then(buf => {
       try {
-        const body = Buffer.concat(chunks).toString();
+        const body = buf.toString();
+        if (!checkCsrf(req, body)) {
+          res.writeHead(403); res.end("CSRF validation failed");
+          return;
+        }
         const formData = parseFormBody(body);
         applySettings(formData);
         res.writeHead(302, { "Location": "/settings" });
@@ -2069,6 +2114,8 @@ const server = http.createServer((req, res) => {
         res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
         res.end(settingsHtml("保存失败: " + err.message));
       }
+    }).catch(() => {
+      res.writeHead(413); res.end("Request too large");
     });
     return;
   }
@@ -2076,11 +2123,10 @@ const server = http.createServer((req, res) => {
   // Profile: switch
   if (req.method === "POST" && req.url === "/api/profile/switch") {
     if (!checkAuth(req)) { res.writeHead(401); res.end("Unauthorized"); return; }
-    const chunks = [];
-    req.on("data", (c) => chunks.push(c));
-    req.on("end", () => {
+    if (!checkCsrf(req)) { res.writeHead(403); res.end("CSRF validation failed"); return; }
+    readBody(req).then(buf => {
       try {
-        const { profile } = JSON.parse(Buffer.concat(chunks).toString());
+        const { profile } = JSON.parse(buf.toString());
         switchProfile(profile);
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ ok: true, activeProfile: config.activeProfile }));
@@ -2088,6 +2134,8 @@ const server = http.createServer((req, res) => {
         res.writeHead(400, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ error: err.message }));
       }
+    }).catch(() => {
+      res.writeHead(413); res.end("Request too large");
     });
     return;
   }
@@ -2095,14 +2143,12 @@ const server = http.createServer((req, res) => {
   // Profile: save as new
   if (req.method === "POST" && req.url === "/api/profile/save") {
     if (!checkAuth(req)) { res.writeHead(401); res.end("Unauthorized"); return; }
-    const chunks = [];
-    req.on("data", (c) => chunks.push(c));
-    req.on("end", () => {
+    if (!checkCsrf(req)) { res.writeHead(403); res.end("CSRF validation failed"); return; }
+    readBody(req).then(buf => {
       try {
-        const { profile, upstream, allowedModels, defaultModels } = JSON.parse(Buffer.concat(chunks).toString());
+        const { profile, upstream, allowedModels, defaultModels } = JSON.parse(buf.toString());
         const name = (profile || "").trim();
         if (!name) throw new Error("Profile name required");
-        // Save current runtime state to new profile
         config.profiles[name] = {
           upstream: upstream || rt.upstream,
           allowedModels: allowedModels ? allowedModels.split(",").map(s => s.trim()).filter(Boolean) : rt.allowedModels,
@@ -2118,6 +2164,8 @@ const server = http.createServer((req, res) => {
         res.writeHead(400, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ error: err.message }));
       }
+    }).catch(() => {
+      res.writeHead(413); res.end("Request too large");
     });
     return;
   }
@@ -2125,11 +2173,10 @@ const server = http.createServer((req, res) => {
   // Profile: delete
   if (req.method === "POST" && req.url === "/api/profile/delete") {
     if (!checkAuth(req)) { res.writeHead(401); res.end("Unauthorized"); return; }
-    const chunks = [];
-    req.on("data", (c) => chunks.push(c));
-    req.on("end", () => {
+    if (!checkCsrf(req)) { res.writeHead(403); res.end("CSRF validation failed"); return; }
+    readBody(req).then(buf => {
       try {
-        const { profile } = JSON.parse(Buffer.concat(chunks).toString());
+        const { profile } = JSON.parse(buf.toString());
         if (Object.keys(config.profiles).length <= 1) throw new Error("Cannot delete last profile");
         if (profile === config.activeProfile) throw new Error("Cannot delete active profile. Switch first.");
         delete config.profiles[profile];
@@ -2141,6 +2188,8 @@ const server = http.createServer((req, res) => {
         res.writeHead(400, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ error: err.message }));
       }
+    }).catch(() => {
+      res.writeHead(413); res.end("Request too large");
     });
     return;
   }
@@ -2148,9 +2197,8 @@ const server = http.createServer((req, res) => {
   // Settings JSON API for programmatic updates
   if (req.method === "POST" && req.url === "/api/settings") {
     if (!checkAuth(req)) { res.writeHead(401); res.end("Unauthorized"); return; }
-    const chunks = [];
-    req.on("data", (c) => chunks.push(c));
-    req.on("end", () => {
+    if (!checkCsrf(req)) { res.writeHead(403); res.end("CSRF validation failed"); return; }
+    readBody(req).then(buf => {
       try {
         const updates = JSON.parse(Buffer.concat(chunks).toString());
         const formData = {};
@@ -2196,6 +2244,8 @@ const server = http.createServer((req, res) => {
         res.writeHead(400, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ error: err.message }));
       }
+    }).catch(() => {
+      res.writeHead(413); res.end("Request too large");
     });
     return;
   }
@@ -2203,6 +2253,7 @@ const server = http.createServer((req, res) => {
   // Reset circuit breaker
   if (req.method === "POST" && req.url === "/api/circuit-breaker-reset") {
     if (!checkAuth(req)) { res.writeHead(401); res.end("Unauthorized"); return; }
+    if (!checkCsrf(req)) { res.writeHead(403); res.end("CSRF validation failed"); return; }
     upstreamBreaker.reset();
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ ok: true, status: upstreamBreaker.status() }));
@@ -2241,6 +2292,7 @@ const server = http.createServer((req, res) => {
   // Clear errors
   if (req.method === "POST" && req.url === "/api/clear-errors") {
     if (!checkAuth(req)) { res.writeHead(401); res.end("Unauthorized"); return; }
+    if (!checkCsrf(req)) { res.writeHead(403); res.end("CSRF validation failed"); return; }
     store.errors = [];
     saveStore();
     res.writeHead(200, { "Content-Type": "application/json" });
@@ -2251,14 +2303,12 @@ const server = http.createServer((req, res) => {
   // Delete global user
   if (req.method === "POST" && req.url === "/api/global-user/delete") {
     if (!checkAuth(req)) { res.writeHead(401); res.end("Unauthorized"); return; }
-    const chunks = [];
-    req.on("data", (c) => chunks.push(c));
-    req.on("end", () => {
+    if (!checkCsrf(req)) { res.writeHead(403); res.end("CSRF validation failed"); return; }
+    readBody(req).then(buf => {
       try {
-        const { key } = JSON.parse(Buffer.concat(chunks).toString());
+        const { key } = JSON.parse(buf.toString());
         if (!key) throw new Error("Key required");
         delete rt.globalUsers[key];
-        // Remove from all profiles
         for (const pname of Object.keys(config.profiles)) {
           delete config.profiles[pname].users[key];
         }
@@ -2272,6 +2322,8 @@ const server = http.createServer((req, res) => {
         res.writeHead(400, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ error: err.message }));
       }
+    }).catch(() => {
+      res.writeHead(413); res.end("Request too large");
     });
     return;
   }
@@ -2279,11 +2331,10 @@ const server = http.createServer((req, res) => {
   // Save all global users
   if (req.method === "POST" && req.url === "/api/global-user/save") {
     if (!checkAuth(req)) { res.writeHead(401); res.end("Unauthorized"); return; }
-    const chunks = [];
-    req.on("data", (c) => chunks.push(c));
-    req.on("end", () => {
+    if (!checkCsrf(req)) { res.writeHead(403); res.end("CSRF validation failed"); return; }
+    readBody(req).then(buf => {
       try {
-        const { users, profileUsers } = JSON.parse(Buffer.concat(chunks).toString());
+        const { users, profileUsers } = JSON.parse(buf.toString());
         if (!Array.isArray(users) || users.length === 0) throw new Error("No users provided");
         const newGlobalUsers = {};
         for (const u of users) {
@@ -2321,6 +2372,8 @@ const server = http.createServer((req, res) => {
         res.writeHead(400, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ error: err.message }));
       }
+    }).catch(() => {
+      res.writeHead(413); res.end("Request too large");
     });
     return;
   }

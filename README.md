@@ -6,6 +6,8 @@
 
 > 单文件 · 零依赖 · Docker 就绪
 
+![CC-TEAM](docs/Introduction.png)
+
 ## 功能
 
 - **透明代理**：请求/响应原样透传，零影响 LLM 上下文和输出质量

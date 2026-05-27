@@ -259,8 +259,8 @@ const upstreamBreaker = new CircuitBreaker({
 // ─── Keep-Alive Agent ─────────────────────────────────────────────────────────
 function createAgent() {
   return rt.upstreamUrl.protocol === "https:"
-    ? new https.Agent({ keepAlive: true, maxSockets: 50, maxFreeSockets: 10, timeout: 30000, scheduling: "fifo" })
-    : new http.Agent({ keepAlive: true, maxSockets: 50, maxFreeSockets: 10, timeout: 30000, scheduling: "fifo" });
+    ? new https.Agent({ keepAlive: true, maxSockets: 50, maxFreeSockets: 10, timeout: 120000, scheduling: "fifo", rejectUnauthorized: true })
+    : new http.Agent({ keepAlive: true, maxSockets: 50, maxFreeSockets: 10, timeout: 120000, scheduling: "fifo" });
 }
 let keepAliveAgent = createAgent();
 
@@ -318,6 +318,20 @@ function checkAndRecordRate(key) {
   return true;
 }
 
+// ─── Global IP Rate Limiting ─────────────────────────────────────────────────
+const ipRateBucket = {};
+const IP_RATE_LIMIT = 120; // requests per minute per IP
+const IP_RATE_WINDOW = 60000;
+
+function checkIpRateLimit(ip) {
+  const now = Date.now();
+  ipRateBucket[ip] = ipRateBucket[ip] || [];
+  ipRateBucket[ip] = ipRateBucket[ip].filter(t => now - t < IP_RATE_WINDOW);
+  if (ipRateBucket[ip].length >= IP_RATE_LIMIT) return false;
+  ipRateBucket[ip].push(now);
+  return true;
+}
+
 // ─── Auth & Sanitize ────────────────────────────────────────────────────────
 const AUTH_COOKIE = "tm_token";
 const CSRF_COOKIE = "tm_csrf";
@@ -359,6 +373,58 @@ function checkCsrf(req, body) {
 
 function isSecureRequest(req) {
   return !!(req.socket.encrypted || req.headers["x-forwarded-proto"] === "https");
+}
+
+// ─── Login Brute-Force Protection ───────────────────────────────────────────
+const loginAttempts = {};
+const LOGIN_MAX_ATTEMPTS = 5;
+const LOGIN_LOCKOUT_MS = 15 * 60 * 1000; // 15 minutes
+
+function getClientIp(req) {
+  return (req.headers["x-forwarded-for"] || "").split(",")[0].trim() || req.socket.remoteAddress || "unknown";
+}
+
+function checkLoginRate(ip) {
+  const now = Date.now();
+  const entry = loginAttempts[ip];
+  if (!entry) return { allowed: true, remaining: LOGIN_MAX_ATTEMPTS };
+  if (entry.lockedUntil && now < entry.lockedUntil) {
+    return { allowed: false, retryAfter: Math.ceil((entry.lockedUntil - now) / 1000) };
+  }
+  if (now - entry.lastAttempt > LOGIN_LOCKOUT_MS) {
+    delete loginAttempts[ip];
+    return { allowed: true, remaining: LOGIN_MAX_ATTEMPTS };
+  }
+  return { allowed: true, remaining: Math.max(0, LOGIN_MAX_ATTEMPTS - entry.count) };
+}
+
+function recordLoginFailure(ip) {
+  const now = Date.now();
+  if (!loginAttempts[ip]) loginAttempts[ip] = { count: 0, lastAttempt: 0, lockedUntil: 0 };
+  const entry = loginAttempts[ip];
+  entry.count++;
+  entry.lastAttempt = now;
+  if (entry.count >= LOGIN_MAX_ATTEMPTS) {
+    entry.lockedUntil = now + LOGIN_LOCKOUT_MS;
+    console.log(`[安全] IP ${ip} 登录失败 ${entry.count} 次，锁定 15 分钟`);
+  }
+}
+
+function recordLoginSuccess(ip) {
+  delete loginAttempts[ip];
+}
+
+// ─── Input Sanitization ──────────────────────────────────────────────────────
+const DANGEROUS_KEYS = new Set(["__proto__", "constructor", "prototype"]);
+function sanitizeJson(obj) {
+  if (obj === null || typeof obj !== "object") return obj;
+  if (Array.isArray(obj)) return obj.map(sanitizeJson);
+  const clean = {};
+  for (const [k, v] of Object.entries(obj)) {
+    if (DANGEROUS_KEYS.has(k)) continue;
+    clean[k] = typeof v === "object" && v !== null ? sanitizeJson(v) : v;
+  }
+  return clean;
 }
 
 function readBody(req, maxSize = 1_000_000) {
@@ -838,6 +904,29 @@ function sendUpstream(body, reqUrl, reqMethod, reqHeaders, timeout) {
 
 function proxyRequest(req, res) {
   const apiKey = getApiKey(req);
+  const proxyStartTime = Date.now();
+  let proxyPhase = "init";
+
+  // Global IP rate limit
+  const clientIp = getClientIp(req);
+  if (!checkIpRateLimit(clientIp)) {
+    res.writeHead(429, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ error: "IP rate limit exceeded. Please slow down." }));
+    console.log(`[限流] IP ${clientIp} 超过全局速率限制`);
+    return;
+  }
+
+  req.on("error", (err) => {
+    console.error(`[Socket] 客户端请求错误 phase=${proxyPhase} elapsed=${Date.now() - proxyStartTime}ms user=${getUserName(apiKey)} err=${err.message}`);
+  });
+  res.on("error", (err) => {
+    console.error(`[Socket] 客户端响应错误 phase=${proxyPhase} elapsed=${Date.now() - proxyStartTime}ms user=${getUserName(apiKey)} err=${err.message}`);
+  });
+  req.on("close", () => {
+    if (!res.writableEnded) {
+      console.log(`[Socket] 客户端提前断开 phase=${proxyPhase} elapsed=${Date.now() - proxyStartTime}ms user=${getUserName(apiKey)}`);
+    }
+  });
 
   // Reject non-API requests (browser favicon, Chrome DevTools, etc.)
   if (apiKey === "unknown") {
@@ -849,11 +938,12 @@ function proxyRequest(req, res) {
   const userKey = resolveUserKey(apiKey);
 
   readBody(req, 50_000_000).then(async (body) => {
+    proxyPhase = "body-read";
     let reqModel = "unknown";
     let reqSource = "用户请求";
     let originalModel = "unknown";
     try {
-      const parsed = JSON.parse(body.toString());
+      const parsed = sanitizeJson(JSON.parse(body.toString()));
       reqModel = parsed.model || "unknown";
       originalModel = reqModel;
       // Detect request source: user input vs tool result vs subagent
@@ -867,7 +957,6 @@ function proxyRequest(req, res) {
           if (hasToolResult && !hasText) reqSource = "工具调用";
           else if (hasToolResult && hasText) reqSource = "用户+工具";
         }
-        // Check for subagent: only match <SUBAGENT-STOP> tag (not generic "subagent" word)
         const sys = typeof parsed.system === "string" ? parsed.system :
           Array.isArray(parsed.system) ? parsed.system.map(b => b.text || "").join(" ") : "";
         if (sys.includes("SUBAGENT_STOP")) {
@@ -956,6 +1045,7 @@ function proxyRequest(req, res) {
     }
 
     try {
+      proxyPhase = "upstream-connect";
       const realKey = getRealKey(apiKey);
       const reqHeaders = { ...req.headers, host: rt.upstreamUrl.host, "content-length": body.length };
       console.log(`── 请求开始 ── ${getUserName(apiKey)} [${reqSource}] 模型=${originalModel}${originalModel !== reqModel ? "→" + reqModel : ""} ──`);
@@ -971,6 +1061,7 @@ function proxyRequest(req, res) {
       const isStreamRequest = (req.headers["accept"] || "").includes("text/event-stream") ||
         (function() { try { return JSON.parse(body.toString()).stream; } catch { return false; } })();
 
+      proxyPhase = isStreamRequest ? "streaming-proxy" : "json-proxy";
       const timeout = isStreamRequest ? rt.proxy.streamTimeout : rt.proxy.timeout;
 
       if (isStreamRequest) {
@@ -1888,21 +1979,22 @@ function parseFormBody(body) {
 }
 
 function applySettings(formData) {
-  // Update upstream
+  // Validate upstream URL
   if (formData.upstream && formData.upstream !== rt.upstream) {
+    if (!/^https?:\/\/[^\s]+/.test(formData.upstream)) throw new Error("Invalid upstream URL");
     rt.upstream = formData.upstream;
     reloadAgent();
   }
 
-  // Update proxy settings
-  if (formData.timeout) rt.proxy.timeout = parseInt(formData.timeout, 10) || 180000;
-  if (formData.streamTimeout) rt.proxy.streamTimeout = parseInt(formData.streamTimeout, 10) || 600000;
-  if (formData.maxRetries !== undefined) rt.proxy.maxRetries = parseInt(formData.maxRetries, 10) || 3;
-  if (formData.retryDelay) rt.proxy.retryDelay = parseInt(formData.retryDelay, 10) || 1000;
-  if (formData.maxConcurrentPerUser) rt.proxy.maxConcurrentPerUser = parseInt(formData.maxConcurrentPerUser, 10) || 5;
-  if (formData.rateLimitPerMinute) rt.proxy.rateLimitPerMinute = parseInt(formData.rateLimitPerMinute, 10) || 60;
-  if (formData.circuitBreakerFailures) rt.proxy.circuitBreakerFailures = parseInt(formData.circuitBreakerFailures, 10) || 5;
-  if (formData.circuitBreakerCooldown) rt.proxy.circuitBreakerCooldown = parseInt(formData.circuitBreakerCooldown, 10) || 30000;
+  // Update proxy settings with range validation
+  if (formData.timeout) rt.proxy.timeout = Math.max(10000, Math.min(600000, parseInt(formData.timeout, 10) || 180000));
+  if (formData.streamTimeout) rt.proxy.streamTimeout = Math.max(60000, Math.min(1800000, parseInt(formData.streamTimeout, 10) || 600000));
+  if (formData.maxRetries !== undefined) rt.proxy.maxRetries = Math.max(0, Math.min(10, parseInt(formData.maxRetries, 10) || 3));
+  if (formData.retryDelay) rt.proxy.retryDelay = Math.max(100, Math.min(30000, parseInt(formData.retryDelay, 10) || 1000));
+  if (formData.maxConcurrentPerUser) rt.proxy.maxConcurrentPerUser = Math.max(1, Math.min(50, parseInt(formData.maxConcurrentPerUser, 10) || 5));
+  if (formData.rateLimitPerMinute) rt.proxy.rateLimitPerMinute = Math.max(1, Math.min(600, parseInt(formData.rateLimitPerMinute, 10) || 60));
+  if (formData.circuitBreakerFailures) rt.proxy.circuitBreakerFailures = Math.max(1, Math.min(50, parseInt(formData.circuitBreakerFailures, 10) || 5));
+  if (formData.circuitBreakerCooldown) rt.proxy.circuitBreakerCooldown = Math.max(1000, Math.min(300000, parseInt(formData.circuitBreakerCooldown, 10) || 30000));
 
   // Update profile quota
   if (formData.profileQuota !== undefined) {
@@ -2026,16 +2118,29 @@ const server = http.createServer((req, res) => {
   res.setHeader("X-Frame-Options", "DENY");
   res.setHeader("Referrer-Policy", "strict-origin-when-cross-origin");
   res.setHeader("X-XSS-Protection", "0");
+  res.setHeader("Content-Security-Policy", "default-src 'self'; script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'");
+  if (isSecureRequest(req)) {
+    res.setHeader("Strict-Transport-Security", "max-age=31536000; includeSubDomains");
+  }
 
   // Auto quota evaluation (once per day)
   try { evaluateAutoQuotaAdjustments(); } catch (e) { console.error("[配额评估] 错误:", e.message); }
 
   // Login (no auth required)
   if (req.method === "POST" && req.url === "/api/login") {
+    const ip = getClientIp(req);
+    const rateCheck = checkLoginRate(ip);
+    if (!rateCheck.allowed) {
+      res.writeHead(429, { "Content-Type": "application/json", "Retry-After": String(rateCheck.retryAfter) });
+      res.end(JSON.stringify({ error: `Too many login attempts. Try again in ${rateCheck.retryAfter}s.`, retryAfter: rateCheck.retryAfter }));
+      console.log(`[安全] IP ${ip} 登录被限流，剩余 ${rateCheck.retryAfter}s`);
+      return;
+    }
     readBody(req, 10_000).then(buf => {
       try {
         const { password } = JSON.parse(buf.toString());
         if (dashboardPassword && timingSafeEqual(password, dashboardPassword)) {
+          recordLoginSuccess(ip);
           const secure = isSecureRequest(req) ? "; Secure" : "";
           res.writeHead(200, {
             "Content-Type": "application/json",
@@ -2046,8 +2151,11 @@ const server = http.createServer((req, res) => {
           });
           res.end(JSON.stringify({ ok: true }));
         } else {
+          recordLoginFailure(ip);
+          const remaining = checkLoginRate(ip).remaining;
           res.writeHead(401, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ error: "wrong password" }));
+          res.end(JSON.stringify({ error: "wrong password", attemptsRemaining: remaining }));
+          console.log(`[安全] IP ${ip} 登录失败，剩余尝试次数: ${remaining}`);
         }
       } catch {
         res.writeHead(400, { "Content-Type": "application/json" });
@@ -2452,8 +2560,8 @@ server.listen(port, "0.0.0.0", () => {
 const serverTimeout = Math.max(rt.proxy.streamTimeout, rt.proxy.timeout) + 60000;
 server.timeout = serverTimeout;
 server.requestTimeout = serverTimeout;
-server.headersTimeout = 65000;
-server.keepAliveTimeout = 30000;
+server.headersTimeout = 120000;
+server.keepAliveTimeout = 65000;
 
 process.on("SIGINT", () => { saveStore(); process.exit(0); });
 process.on("SIGTERM", () => { saveStore(); process.exit(0); });

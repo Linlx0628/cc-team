@@ -1575,10 +1575,10 @@ ${errDiv}
 </div>
 <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px">
 <div><label>评估周期（天）</label><input type="number" name="aqPeriod" value="${s.autoQuotaAdjust?.evaluationPeriodDays ?? 5}" min="3" max="30"></div>
-<div><label>命中阈值</label><input type="number" name="aqHitThreshold" value="${(s.autoQuotaAdjust?.hitThreshold ?? 0.9) * 100}" min="50" max="100" step="5"><span class="note">% · 用量达到配额多少算命中</span></div>
-<div><label>触发命中率</label><input type="number" name="aqTriggerRate" value="${(s.autoQuotaAdjust?.triggerRate ?? 0.9) * 100}" min="30" max="100" step="10"><span class="note">% · 命中天数占周期多少才触发</span></div>
-<div><label>增长率</label><input type="number" name="aqIncreaseFactor" value="${((s.autoQuotaAdjust?.increaseFactor ?? 1.15) - 1) * 100}" min="5" max="100" step="5"><span class="note">% · 每次上调比例</span></div>
-<div><label>安全系数</label><input type="number" name="aqSafetyFactor" value="${(s.autoQuotaAdjust?.safetyFactor ?? 1.3) * 100}" min="100" max="200" step="5"><span class="note">% · 按均值计算时的余量</span></div>
+<div><label>命中阈值</label><input type="number" name="aqHitThreshold" value="${Math.round((s.autoQuotaAdjust?.hitThreshold ?? 0.9) * 100)}" min="50" max="100" step="5"><span class="note">% · 用量达到配额多少算命中</span></div>
+<div><label>触发命中率</label><input type="number" name="aqTriggerRate" value="${Math.round((s.autoQuotaAdjust?.triggerRate ?? 0.9) * 100)}" min="30" max="100" step="10"><span class="note">% · 命中天数占周期多少才触发</span></div>
+<div><label>增长率</label><input type="number" name="aqIncreaseFactor" value="${Math.round(((s.autoQuotaAdjust?.increaseFactor ?? 1.15) - 1) * 100)}" min="5" max="100" step="5"><span class="note">% · 每次上调比例</span></div>
+<div><label>安全系数</label><input type="number" name="aqSafetyFactor" value="${Math.round((s.autoQuotaAdjust?.safetyFactor ?? 1.3) * 100)}" min="100" max="200" step="5"><span class="note">% · 按均值计算时的余量</span></div>
 <div><label>单次最大增幅</label><input type="number" name="aqMaxIncrease" value="${(s.autoQuotaAdjust?.maxIncreaseFactor ?? 2.0)}" min="1.1" max="5" step="0.1"><span class="note">x · 单次调整不超过几倍</span></div>
 <div><label>配额上限</label><input type="number" name="aqMaxQuota" value="${s.autoQuotaAdjust?.maxAutoQuota ?? 10000000}" min="0" step="100000"><span class="note">自动调整不超过此值</span></div>
 <div><label>冷却天数</label><input type="number" name="aqCooldown" value="${s.autoQuotaAdjust?.cooldownDays ?? 3}" min="1" max="30"><span class="note">两次调整最小间隔</span></div>
@@ -2095,21 +2095,20 @@ function applySettings(formData) {
     rt.users = newProfileUsers;
   }
 
-  // Persist to config.json
-  const cfg = loadConfig();
-  cfg.proxy = { ...rt.proxy };
-  cfg.users = { ...rt.globalUsers };
+  // Persist to config.json — use in-memory config directly to avoid stale-data overwrite
+  config.proxy = { ...rt.proxy };
+  config.users = { ...rt.globalUsers };
   // Update active profile
-  const ap = cfg.profiles[cfg.activeProfile];
+  const ap = config.profiles[config.activeProfile];
   if (ap) {
     ap.upstream = rt.upstream;
     ap.allowedModels = rt.allowedModels;
     ap.defaultModels = { ...rt.defaultModels };
     ap.users = { ...rt.users };
   }
-  saveConfig(cfg);
+  saveConfig(config);
 
-  console.log(`[CONFIG] Settings saved to profile "${cfg.activeProfile}"`);
+  console.log(`[CONFIG] Settings saved to profile "${config.activeProfile}"`);
 }
 
 const server = http.createServer((req, res) => {

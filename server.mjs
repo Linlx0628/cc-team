@@ -126,49 +126,64 @@ if (!config.profiles) {
   }
 })();
 
-function getActiveProfile() {
-  const p = config.profiles[config.activeProfile];
-  if (!p) {
-    // Fallback: use first profile
-    config.activeProfile = Object.keys(config.profiles)[0] || "default";
-    if (!config.profiles[config.activeProfile]) {
-      config.profiles[config.activeProfile] = { upstream: "https://open.bigmodel.cn/api/anthropic", allowedModels: null, users: {} };
+// Auto-migrate: add suffix and isDefault to profiles for multi-profile concurrent
+(function migrateProfileSuffix() {
+  let migrated = false;
+  const suffixes = new Set();
+  for (const [pname, p] of Object.entries(config.profiles)) {
+    if (p.suffix === undefined) {
+      // Active profile becomes default (empty suffix)
+      if (pname === config.activeProfile) {
+        p.suffix = "";
+        p.isDefault = true;
+      } else {
+        // Auto-generate suffix from profile name (lowercase, alphanumeric only)
+        let s = pname.toLowerCase().replace(/[^a-z0-9]/g, "").slice(0, 20);
+        if (!s || s.length < 2) s = "p" + (Object.keys(config.profiles).indexOf(pname) + 1);
+        let base = s, i = 2;
+        while (suffixes.has(s)) { s = base + i; i++; }
+        p.suffix = s;
+        p.isDefault = false;
+      }
+      suffixes.add(p.suffix);
+      migrated = true;
+    } else {
+      suffixes.add(p.suffix);
     }
-    return config.profiles[config.activeProfile];
   }
-  return p;
+  // Ensure exactly one default
+  const defaults = Object.entries(config.profiles).filter(([, p]) => p.isDefault);
+  if (defaults.length === 0) {
+    const first = Object.keys(config.profiles)[0];
+    config.profiles[first].isDefault = true;
+    config.profiles[first].suffix = "";
+    migrated = true;
+  } else if (defaults.length > 1) {
+    for (let i = 1; i < defaults.length; i++) defaults[i][1].isDefault = false;
+    migrated = true;
+  }
+  if (migrated) {
+    saveConfig(config);
+    console.log("[MIGRATE] Added suffix/isDefault:", Object.entries(config.profiles).map(([n, p]) => `${n}(${JSON.stringify(p.suffix)})`).join(", "));
+  }
+})();
+
+function getDefaultProfileName() {
+  for (const [name, p] of Object.entries(config.profiles)) {
+    if (p.isDefault) return name;
+  }
+  return Object.keys(config.profiles)[0];
 }
 
 function listProfiles() {
   return Object.keys(config.profiles).map(name => ({
     name,
+    suffix: config.profiles[name].suffix || "",
+    isDefault: !!config.profiles[name].isDefault,
     upstream: config.profiles[name].upstream,
     userCount: Object.keys(config.profiles[name].users || {}).length,
-    isActive: name === config.activeProfile,
   }));
 }
-
-// Runtime mutable settings (hot-reloadable without restart)
-const activeProfile = getActiveProfile();
-const runtime = {
-  upstream: activeProfile.upstream,
-  upstreamUrl: new URL(activeProfile.upstream),
-  proxy: { ...(config.proxy || {}) },
-  users: { ...(activeProfile.users || {}) },
-  globalUsers: { ...(config.users || {}) },
-};
-const rt = runtime;
-
-// Default proxy settings
-rt.proxy.timeout = rt.proxy.timeout || 180000;
-rt.proxy.streamTimeout = rt.proxy.streamTimeout || 600000;
-rt.proxy.maxRetries = rt.proxy.maxRetries || 3;
-rt.proxy.retryDelay = rt.proxy.retryDelay || 1000;
-rt.proxy.retryableStatusCodes = rt.proxy.retryableStatusCodes || [429, 502, 503, 504];
-rt.proxy.maxConcurrentPerUser = rt.proxy.maxConcurrentPerUser || 5;
-rt.proxy.rateLimitPerMinute = rt.proxy.rateLimitPerMinute || 60;
-rt.allowedModels = activeProfile.allowedModels || [];
-rt.defaultModels = activeProfile.defaultModels || { sonnet: "claude-sonnet-4-6", opus: "claude-opus-4-5", haiku: "claude-haiku-4-5" };
 
 // ─── Circuit Breaker ─────────────────────────────────────────────────────────
 class CircuitBreaker {
@@ -251,39 +266,88 @@ class CircuitBreaker {
   }
 }
 
-const upstreamBreaker = new CircuitBreaker({
-  failureThreshold: rt.proxy.circuitBreakerFailures || 5,
-  cooldownMs: rt.proxy.circuitBreakerCooldown || 30000,
-});
+// ─── Per-Profile Runtime Manager ────────────────────────────────────────────
+const runtimes = {}; // suffix → runtime object
 
-// ─── Keep-Alive Agent ─────────────────────────────────────────────────────────
-function createAgent() {
-  return rt.upstreamUrl.protocol === "https:"
+function createUpstreamAgent(upstreamUrl) {
+  return upstreamUrl.protocol === "https:"
     ? new https.Agent({ keepAlive: true, maxSockets: 50, maxFreeSockets: 10, timeout: 120000, scheduling: "fifo", rejectUnauthorized: true })
     : new http.Agent({ keepAlive: true, maxSockets: 50, maxFreeSockets: 10, timeout: 120000, scheduling: "fifo" });
 }
-let keepAliveAgent = createAgent();
 
-function reloadAgent() {
-  rt.upstreamUrl = new URL(rt.upstream);
-  keepAliveAgent.destroy();
-  keepAliveAgent = createAgent();
-  upstreamBreaker.reset();
-  console.log(`[CONFIG] Upstream reloaded: ${rt.upstream}`);
+function createProfileRuntime(profileName, profile) {
+  const upstreamUrl = new URL(profile.upstream);
+  return {
+    profileName,
+    suffix: profile.suffix || "",
+    isDefault: !!profile.isDefault,
+    upstream: profile.upstream,
+    upstreamUrl,
+    users: { ...(profile.users || {}) },
+    allowedModels: profile.allowedModels || [],
+    defaultModels: profile.defaultModels || { sonnet: "claude-sonnet-4-6", opus: "claude-opus-4-5", haiku: "claude-haiku-4-5" },
+    globalUsers: { ...(config.users || {}) },
+    breaker: new CircuitBreaker({
+      failureThreshold: (config.proxy || {}).circuitBreakerFailures || 5,
+      cooldownMs: (config.proxy || {}).circuitBreakerCooldown || 30000,
+    }),
+    agent: createUpstreamAgent(upstreamUrl),
+  };
 }
 
-function switchProfile(profileName) {
+function initAllRuntimes() {
+  for (const key of Object.keys(runtimes)) delete runtimes[key];
+  for (const [name, profile] of Object.entries(config.profiles)) {
+    const suffix = profile.suffix || "";
+    runtimes[suffix] = createProfileRuntime(name, profile);
+  }
+  console.log(`[RUNTIME] Initialized ${Object.keys(runtimes).length} profile(s): ${Object.values(runtimes).map(r => `"${r.profileName}"(${JSON.stringify(r.suffix)})`).join(", ")}`);
+}
+
+function reloadProfileRuntime(profileName) {
   const profile = config.profiles[profileName];
-  if (!profile) throw new Error(`Profile "${profileName}" not found`);
-  config.activeProfile = profileName;
-  rt.upstream = profile.upstream;
-  rt.users = { ...(profile.users || {}) };
-  rt.allowedModels = profile.allowedModels || [];
-  rt.defaultModels = profile.defaultModels || { sonnet: "claude-sonnet-4-6", opus: "claude-opus-4-5", haiku: "claude-haiku-4-5" };
-  rt.globalUsers = { ...(config.users || {}) };
-  reloadAgent();
-  saveConfig(config);
-  console.log(`[PROFILE] Switched to "${profileName}" — upstream: ${profile.upstream}, users: ${Object.keys(rt.users).length}`);
+  if (!profile) return;
+  const suffix = profile.suffix || "";
+  const old = runtimes[suffix];
+  if (old) old.agent.destroy();
+  runtimes[suffix] = createProfileRuntime(profileName, profile);
+  console.log(`[RUNTIME] Reloaded "${profileName}" (suffix: ${JSON.stringify(suffix)})`);
+}
+
+function reloadAllRuntimes() {
+  for (const rt of Object.values(runtimes)) rt.agent.destroy();
+  initAllRuntimes();
+}
+
+// Global proxy settings (shared across profiles)
+const gProxy = { ...(config.proxy || {}) };
+gProxy.timeout = gProxy.timeout || 180000;
+gProxy.streamTimeout = gProxy.streamTimeout || 600000;
+gProxy.maxRetries = gProxy.maxRetries || 3;
+gProxy.retryDelay = gProxy.retryDelay || 1000;
+gProxy.retryableStatusCodes = gProxy.retryableStatusCodes || [429, 502, 503, 504];
+gProxy.maxConcurrentPerUser = gProxy.maxConcurrentPerUser || 5;
+gProxy.rateLimitPerMinute = gProxy.rateLimitPerMinute || 60;
+
+// Initialize all runtimes
+initAllRuntimes();
+// Backward-compat: rt → default profile runtime (used by non-request-path code)
+const rt = runtimes[""];
+
+// ─── Profile Route Resolver ─────────────────────────────────────────────────
+const RESERVED_SUFFIXES = new Set(["dashboard", "settings", "api", "health", "usage", "my-usage", "v1", "login", "logout", "favicon", "robots", "js", "css"]);
+
+function resolveProfile(url) {
+  // Try to match /<suffix>/... pattern
+  const seg = url.match(/^\/([a-zA-Z0-9_-]{2,20})(\/.*)/);
+  if (seg) {
+    const candidate = seg[1].toLowerCase();
+    if (!RESERVED_SUFFIXES.has(candidate) && runtimes[candidate]) {
+      return { suffix: candidate, runtime: runtimes[candidate], strippedUrl: seg[2] };
+    }
+  }
+  // Default profile (no suffix)
+  return { suffix: "", runtime: runtimes[""] || { upstreamUrl: new URL("http://localhost"), breaker: new CircuitBreaker(), agent: new http.Agent(), users: {}, allowedModels: [], defaultModels: {}, globalUsers: {} }, strippedUrl: url };
 }
 
 // ─── Concurrency & Rate Limit ────────────────────────────────────────────────
@@ -292,12 +356,12 @@ const userRateBucket = {};
 
 function checkConcurrency(key) {
   userConcurrent[key] = userConcurrent[key] || 0;
-  return userConcurrent[key] < rt.proxy.maxConcurrentPerUser;
+  return userConcurrent[key] < gProxy.maxConcurrentPerUser;
 }
 
 function tryAcquireConcurrency(key) {
   userConcurrent[key] = (userConcurrent[key] || 0) + 1;
-  if (userConcurrent[key] > rt.proxy.maxConcurrentPerUser) {
+  if (userConcurrent[key] > gProxy.maxConcurrentPerUser) {
     userConcurrent[key]--;
     return false;
   }
@@ -313,7 +377,7 @@ function checkAndRecordRate(key) {
   const windowMs = 60000;
   userRateBucket[key] = userRateBucket[key] || [];
   userRateBucket[key] = userRateBucket[key].filter(t => now - t < windowMs);
-  if (userRateBucket[key].length >= rt.proxy.rateLimitPerMinute) return false;
+  if (userRateBucket[key].length >= gProxy.rateLimitPerMinute) return false;
   userRateBucket[key].push(now);
   return true;
 }
@@ -469,6 +533,93 @@ function sanitizeStore(raw) {
 // ─── Data Store ──────────────────────────────────────────────────────────────
 let store = { users: {}, daily: {}, dailyModels: {}, dailyHourly: {}, models: {}, hourly: {}, errors: [], quotaAdjustHistory: [], _lastQuotaEval: null };
 
+// Per-profile store: non-default profiles store data under store._profiles[suffix]
+function getProfileStore(suffix) {
+  if (!suffix) return store; // default profile uses top-level store (backward compat)
+  if (!store._profiles) store._profiles = {};
+  if (!store._profiles[suffix]) {
+    store._profiles[suffix] = { users: {}, daily: {}, dailyModels: {}, dailyHourly: {}, models: {}, hourly: {}, errors: [] };
+  }
+  return store._profiles[suffix];
+}
+
+// Aggregate all profile stores for "all profiles" view
+function getAggregatedStore() {
+  const agg = { users: {}, daily: {}, dailyModels: {}, dailyHourly: {}, models: {}, hourly: {}, errors: [] };
+  // Default profile (top-level)
+  for (const k of ["users", "daily", "dailyModels", "dailyHourly", "models", "hourly"]) {
+    agg[k] = JSON.parse(JSON.stringify(store[k] || {}));
+  }
+  agg.errors = [...(store.errors || [])];
+  // Non-default profiles
+  for (const [suffix, ps] of Object.entries(store._profiles || {})) {
+    for (const [k, v] of Object.entries(ps.users || {})) {
+      if (!agg.users[k]) agg.users[k] = { ...v, totalInputTokens: 0, totalOutputTokens: 0, totalRequests: 0, cacheCreationTokens: 0, cacheReadTokens: 0 };
+      agg.users[k].totalInputTokens += (v.totalInputTokens || 0);
+      agg.users[k].totalOutputTokens += (v.totalOutputTokens || 0);
+      agg.users[k].totalRequests += (v.totalRequests || 0);
+      agg.users[k].cacheCreationTokens += (v.cacheCreationTokens || 0);
+      agg.users[k].cacheReadTokens += (v.cacheReadTokens || 0);
+      agg.users[k].lastActive = agg.users[k].lastActive > (v.lastActive || "") ? agg.users[k].lastActive : (v.lastActive || agg.users[k].lastActive);
+    }
+    for (const [day, ud] of Object.entries(ps.daily || {})) {
+      if (!agg.daily[day]) agg.daily[day] = {};
+      for (const [k, v] of Object.entries(ud)) {
+        if (!agg.daily[day][k]) agg.daily[day][k] = { inputTokens: 0, outputTokens: 0, requests: 0, cacheCreationTokens: 0, cacheReadTokens: 0 };
+        agg.daily[day][k].inputTokens += (v.inputTokens || 0);
+        agg.daily[day][k].outputTokens += (v.outputTokens || 0);
+        agg.daily[day][k].requests += (v.requests || 0);
+        agg.daily[day][k].cacheCreationTokens += (v.cacheCreationTokens || 0);
+        agg.daily[day][k].cacheReadTokens += (v.cacheReadTokens || 0);
+      }
+    }
+    for (const [m, v] of Object.entries(ps.models || {})) {
+      if (!agg.models[m]) agg.models[m] = { tokens: 0, requests: 0 };
+      agg.models[m].tokens += (v.tokens || 0);
+      agg.models[m].requests += (v.requests || 0);
+    }
+    for (const [day, hd] of Object.entries(ps.hourly || {})) {
+      if (!agg.hourly[day]) agg.hourly[day] = {};
+      for (const [h, v] of Object.entries(hd)) {
+        if (!agg.hourly[day][h]) agg.hourly[day][h] = { requests: 0, inputTokens: 0, outputTokens: 0, cacheCreationTokens: 0, cacheReadTokens: 0 };
+        agg.hourly[day][h].requests += (v.requests || 0);
+        agg.hourly[day][h].inputTokens += (v.inputTokens || 0);
+        agg.hourly[day][h].outputTokens += (v.outputTokens || 0);
+        agg.hourly[day][h].cacheCreationTokens += (v.cacheCreationTokens || 0);
+        agg.hourly[day][h].cacheReadTokens += (v.cacheReadTokens || 0);
+      }
+    }
+    for (const [day, dm] of Object.entries(ps.dailyModels || {})) {
+      if (!agg.dailyModels[day]) agg.dailyModels[day] = {};
+      for (const [k, models] of Object.entries(dm)) {
+        if (!agg.dailyModels[day][k]) agg.dailyModels[day][k] = {};
+        for (const [m, v] of Object.entries(models)) {
+          if (!agg.dailyModels[day][k][m]) agg.dailyModels[day][k][m] = { inputTokens: 0, outputTokens: 0, requests: 0 };
+          agg.dailyModels[day][k][m].inputTokens += (v.inputTokens || 0);
+          agg.dailyModels[day][k][m].outputTokens += (v.outputTokens || 0);
+          agg.dailyModels[day][k][m].requests += (v.requests || 0);
+        }
+      }
+    }
+    for (const [day, dh] of Object.entries(ps.dailyHourly || {})) {
+      if (!agg.dailyHourly[day]) agg.dailyHourly[day] = {};
+      for (const [k, hours] of Object.entries(dh)) {
+        if (!agg.dailyHourly[day][k]) agg.dailyHourly[day][k] = {};
+        for (const [h, v] of Object.entries(hours)) {
+          if (!agg.dailyHourly[day][k][h]) agg.dailyHourly[day][k][h] = { requests: 0, inputTokens: 0, outputTokens: 0, cacheCreationTokens: 0, cacheReadTokens: 0 };
+          agg.dailyHourly[day][k][h].requests += (v.requests || 0);
+          agg.dailyHourly[day][k][h].inputTokens += (v.inputTokens || 0);
+          agg.dailyHourly[day][k][h].outputTokens += (v.outputTokens || 0);
+          agg.dailyHourly[day][k][h].cacheCreationTokens += (v.cacheCreationTokens || 0);
+          agg.dailyHourly[day][k][h].cacheReadTokens += (v.cacheReadTokens || 0);
+        }
+      }
+    }
+    agg.errors = agg.errors.concat(ps.errors || []);
+  }
+  return agg;
+}
+
 function loadStore() {
   try {
     if (fs.existsSync(dataPath)) {
@@ -483,9 +634,10 @@ function loadStore() {
         errors: Array.isArray(raw.errors) ? raw.errors : [],
         quotaAdjustHistory: Array.isArray(raw.quotaAdjustHistory) ? raw.quotaAdjustHistory : [],
         _lastQuotaEval: raw._lastQuotaEval || null,
+        _profiles: raw._profiles || {},
       };
     }
-  } catch { store = { users: {}, daily: {}, dailyModels: {}, dailyHourly: {}, models: {}, hourly: {}, errors: [] }; }
+  } catch { store = { users: {}, daily: {}, dailyModels: {}, dailyHourly: {}, models: {}, hourly: {}, errors: [], _profiles: {} }; }
 }
 
 function saveStore() {
@@ -507,51 +659,54 @@ setInterval(saveStore, 30_000);
 // Normalize user config to { username, key, allowedModels }
 // Supports backward compat: old format "username" → new format object
 // Get global user info (username, expiresAt, disabled) from config.users
-function getGlobalUser(apiKey) {
-  return rt.globalUsers[apiKey] || null;
+function getGlobalUser(apiKey, _rt) {
+  return (_rt || rt).globalUsers[apiKey] || null;
 }
 
-function getUserConfig(apiKey) {
-  const key = resolveUserKey(apiKey);
-  const pu = rt.users[key]; // profile user: { key, disabled }
-  const gu = getGlobalUser(apiKey); // global user: { username, expiresAt, disabled }
+function getUserConfig(apiKey, _rt) {
+  const runtime = _rt || rt;
+  const key = resolveUserKey(apiKey, runtime);
+  const pu = runtime.users[key]; // profile user: { key, disabled }
+  const gu = getGlobalUser(apiKey, runtime); // global user: { username, expiresAt, disabled }
   const realKey = pu ? (typeof pu === "string" ? pu : (pu.key || key)) : key;
   const username = gu ? (gu.username || `未知`) : `未知(${key.slice(0, 8)})`;
   const expiresAt = gu ? (gu.expiresAt || null) : null;
   return { username, key: realKey, expiresAt };
 }
 
-function resolveUserKey(apiKey) {
-  if (rt.users[apiKey]) return apiKey;
+function resolveUserKey(apiKey, _rt) {
+  if ((_rt || rt).users[apiKey]) return apiKey;
   return apiKey.slice(0, 12);
 }
 
-function getUserName(apiKey) {
-  const gu = getGlobalUser(apiKey);
+function getUserName(apiKey, _rt) {
+  const gu = getGlobalUser(apiKey, _rt);
   return gu ? (gu.username || `未知`) : `未知(${apiKey.slice(0, 8)})`;
 }
 
-function getRealKey(apiKey) {
-  const key = resolveUserKey(apiKey);
-  const pu = rt.users[key];
+function getRealKey(apiKey, _rt) {
+  const runtime = _rt || rt;
+  const key = resolveUserKey(apiKey, runtime);
+  const pu = runtime.users[key];
   if (!pu) return apiKey;
   if (typeof pu === "string") return pu;
   return pu.key || apiKey;
 }
 
-function checkModelAllowed(model) {
+function checkModelAllowed(model, _rt) {
   if (!model || model === "unknown") return true;
-  const allowed = rt.allowedModels;
+  const allowed = (_rt || rt).allowedModels;
   if (!allowed || allowed.length === 0) return true;
   if (allowed.includes("*")) return true;
   return allowed.includes(model);
 }
 
-function generateVirtualKey() {
+function generateVirtualKey(_rt) {
+  const runtime = _rt || rt;
   let code;
   do {
     code = "jx-" + crypto.randomBytes(18).toString("base64url");
-  } while (rt.globalUsers[code] || rt.users[code]);
+  } while (runtime.globalUsers[code] || runtime.users[code]);
   return code;
 }
 
@@ -561,21 +716,22 @@ function checkKeyExpired(apiKey) {
   return new Date(gu.expiresAt).getTime() < Date.now();
 }
 
-function checkUserDisabled(apiKey) {
-  const key = resolveUserKey(apiKey);
+function checkUserDisabled(apiKey, _rt) {
+  const runtime = _rt || rt;
+  const key = resolveUserKey(apiKey, runtime);
   // Global disable
-  const gu = getGlobalUser(apiKey);
+  const gu = getGlobalUser(apiKey, runtime);
   if (gu && gu.disabled) return true;
   // Profile disable
-  const pu = rt.users[key];
+  const pu = runtime.users[key];
   if (pu && typeof pu === "object" && pu.disabled) return true;
   return false;
 }
 
-function resolveModel(model) {
+function resolveModel(model, _rt) {
   if (!model) return model;
   const alias = model.toLowerCase();
-  const dm = rt.defaultModels || {};
+  const dm = (_rt || rt).defaultModels || {};
   if (alias === "jx-sonnet") return dm.sonnet || model;
   if (alias === "jx-opus")   return dm.opus   || model;
   if (alias === "jx-haiku")  return dm.haiku  || model;
@@ -591,7 +747,8 @@ function cnNow() {
 function cnDate() { return cnNow().toISOString().slice(0, 10); }
 function cnHour() { return cnNow().getHours().toString().padStart(2, "0"); }
 
-function recordUsage(apiKey, usage, model) {
+function recordUsage(apiKey, usage, model, suffix) {
+  const s = getProfileStore(suffix || "");
   const key = resolveUserKey(apiKey);
   const today = cnDate();
   const hour = cnHour();
@@ -601,8 +758,8 @@ function recordUsage(apiKey, usage, model) {
   const cacheR = usage.cache_read_input_tokens || 0;
   const m = model || "unknown";
 
-  if (!store.users[key]) store.users[key] = { name: getUserName(apiKey), totalInputTokens: 0, totalOutputTokens: 0, totalRequests: 0, lastActive: null, cacheCreationTokens: 0, cacheReadTokens: 0 };
-  const u = store.users[key];
+  if (!s.users[key]) s.users[key] = { name: getUserName(apiKey), totalInputTokens: 0, totalOutputTokens: 0, totalRequests: 0, lastActive: null, cacheCreationTokens: 0, cacheReadTokens: 0 };
+  const u = s.users[key];
   u.totalInputTokens += inp;
   u.totalOutputTokens += out;
   u.totalRequests += 1;
@@ -610,68 +767,72 @@ function recordUsage(apiKey, usage, model) {
   u.cacheReadTokens = (u.cacheReadTokens || 0) + cacheR;
   u.lastActive = new Date().toISOString();
 
-  if (!store.daily[today]) store.daily[today] = {};
-  if (!store.daily[today][key]) store.daily[today][key] = { inputTokens: 0, outputTokens: 0, requests: 0, cacheCreationTokens: 0, cacheReadTokens: 0 };
-  store.daily[today][key].inputTokens += inp;
-  store.daily[today][key].outputTokens += out;
-  store.daily[today][key].requests += 1;
-  store.daily[today][key].cacheCreationTokens = (store.daily[today][key].cacheCreationTokens || 0) + cacheC;
-  store.daily[today][key].cacheReadTokens = (store.daily[today][key].cacheReadTokens || 0) + cacheR;
+  if (!s.daily[today]) s.daily[today] = {};
+  if (!s.daily[today][key]) s.daily[today][key] = { inputTokens: 0, outputTokens: 0, requests: 0, cacheCreationTokens: 0, cacheReadTokens: 0 };
+  s.daily[today][key].inputTokens += inp;
+  s.daily[today][key].outputTokens += out;
+  s.daily[today][key].requests += 1;
+  s.daily[today][key].cacheCreationTokens = (s.daily[today][key].cacheCreationTokens || 0) + cacheC;
+  s.daily[today][key].cacheReadTokens = (s.daily[today][key].cacheReadTokens || 0) + cacheR;
 
-  if (!store.models[m]) store.models[m] = { tokens: 0, requests: 0 };
-  store.models[m].tokens += inp + out;
-  store.models[m].requests += 1;
+  if (!s.models[m]) s.models[m] = { tokens: 0, requests: 0 };
+  s.models[m].tokens += inp + out;
+  s.models[m].requests += 1;
 
-  if (!store.hourly[today]) store.hourly[today] = {};
-  if (!store.hourly[today][hour]) store.hourly[today][hour] = { requests: 0, inputTokens: 0, outputTokens: 0, cacheCreationTokens: 0, cacheReadTokens: 0 };
-  store.hourly[today][hour].requests += 1;
-  store.hourly[today][hour].inputTokens += inp;
-  store.hourly[today][hour].outputTokens += out;
-  store.hourly[today][hour].cacheCreationTokens = (store.hourly[today][hour].cacheCreationTokens || 0) + cacheC;
-  store.hourly[today][hour].cacheReadTokens = (store.hourly[today][hour].cacheReadTokens || 0) + cacheR;
+  if (!s.hourly[today]) s.hourly[today] = {};
+  if (!s.hourly[today][hour]) s.hourly[today][hour] = { requests: 0, inputTokens: 0, outputTokens: 0, cacheCreationTokens: 0, cacheReadTokens: 0 };
+  s.hourly[today][hour].requests += 1;
+  s.hourly[today][hour].inputTokens += inp;
+  s.hourly[today][hour].outputTokens += out;
+  s.hourly[today][hour].cacheCreationTokens = (s.hourly[today][hour].cacheCreationTokens || 0) + cacheC;
+  s.hourly[today][hour].cacheReadTokens = (s.hourly[today][hour].cacheReadTokens || 0) + cacheR;
 
   // Per-user-per-model-daily tracking
-  if (!store.dailyModels[today]) store.dailyModels[today] = {};
-  if (!store.dailyModels[today][key]) store.dailyModels[today][key] = {};
-  if (!store.dailyModels[today][key][m]) store.dailyModels[today][key][m] = { inputTokens: 0, outputTokens: 0, requests: 0 };
-  store.dailyModels[today][key][m].inputTokens += inp;
-  store.dailyModels[today][key][m].outputTokens += out;
-  store.dailyModels[today][key][m].requests += 1;
+  if (!s.dailyModels[today]) s.dailyModels[today] = {};
+  if (!s.dailyModels[today][key]) s.dailyModels[today][key] = {};
+  if (!s.dailyModels[today][key][m]) s.dailyModels[today][key][m] = { inputTokens: 0, outputTokens: 0, requests: 0 };
+  s.dailyModels[today][key][m].inputTokens += inp;
+  s.dailyModels[today][key][m].outputTokens += out;
+  s.dailyModels[today][key][m].requests += 1;
 
   // Per-user-hourly tracking
-  if (!store.dailyHourly[today]) store.dailyHourly[today] = {};
-  if (!store.dailyHourly[today][key]) store.dailyHourly[today][key] = {};
-  if (!store.dailyHourly[today][key][hour]) store.dailyHourly[today][key][hour] = { requests: 0, inputTokens: 0, outputTokens: 0, cacheCreationTokens: 0, cacheReadTokens: 0 };
-  store.dailyHourly[today][key][hour].requests += 1;
-  store.dailyHourly[today][key][hour].inputTokens += inp;
-  store.dailyHourly[today][key][hour].outputTokens += out;
-  store.dailyHourly[today][key][hour].cacheCreationTokens = (store.dailyHourly[today][key][hour].cacheCreationTokens || 0) + cacheC;
-  store.dailyHourly[today][key][hour].cacheReadTokens = (store.dailyHourly[today][key][hour].cacheReadTokens || 0) + cacheR;
+  if (!s.dailyHourly[today]) s.dailyHourly[today] = {};
+  if (!s.dailyHourly[today][key]) s.dailyHourly[today][key] = {};
+  if (!s.dailyHourly[today][key][hour]) s.dailyHourly[today][key][hour] = { requests: 0, inputTokens: 0, outputTokens: 0, cacheCreationTokens: 0, cacheReadTokens: 0 };
+  s.dailyHourly[today][key][hour].requests += 1;
+  s.dailyHourly[today][key][hour].inputTokens += inp;
+  s.dailyHourly[today][key][hour].outputTokens += out;
+  s.dailyHourly[today][key][hour].cacheCreationTokens = (s.dailyHourly[today][key][hour].cacheCreationTokens || 0) + cacheC;
+  s.dailyHourly[today][key][hour].cacheReadTokens = (s.dailyHourly[today][key][hour].cacheReadTokens || 0) + cacheR;
 }
 
 // ─── Token Quota ──────────────────────────────────────────────────────────────
-function getProfileQuota() {
-  const profile = config.profiles[config.activeProfile];
+function getProfileQuota(suffix) {
+  const rt0 = runtimes[suffix || ""] || rt;
+  const profile = config.profiles[rt0.profileName];
   if (!profile || !profile.dailyTokenLimit) return 0;
   return profile.dailyTokenLimit;
 }
 
-function getUserQuota(apiKey) {
-  const key = resolveUserKey(apiKey);
-  const pu = rt.users[key];
+function getUserQuota(apiKey, _rt) {
+  const runtime = _rt || rt;
+  const key = resolveUserKey(apiKey, runtime);
+  const pu = runtime.users[key];
   if (!pu || typeof pu !== "object" || !pu.dailyTokenLimit) return 0;
   return pu.dailyTokenLimit;
 }
 
-function checkTokenQuota(apiKey) {
-  const key = resolveUserKey(apiKey);
+function checkTokenQuota(apiKey, suffix, _rt) {
+  const runtime = _rt || rt;
+  const key = resolveUserKey(apiKey, runtime);
+  const s = getProfileStore(suffix || "");
   const today = cnDate();
-  const todayUsage = (store.daily[today] || {})[key] || { inputTokens: 0, outputTokens: 0 };
+  const todayUsage = (s.daily[today] || {})[key] || { inputTokens: 0, outputTokens: 0 };
   const used = todayUsage.inputTokens + todayUsage.outputTokens;
 
   // User quota overrides profile quota
-  const userQuota = getUserQuota(apiKey);
-  const profileQuota = getProfileQuota();
+  const userQuota = getUserQuota(apiKey, runtime);
+  const profileQuota = getProfileQuota(suffix);
   const limit = userQuota > 0 ? userQuota : profileQuota;
 
   if (limit <= 0) return { allowed: true, limit: 0, used, remaining: Infinity, source: "无限制" };
@@ -711,7 +872,7 @@ function evaluateAutoQuotaAdjustments() {
     dates.push(new Date(utc + 8 * 3600000).toISOString().slice(0, 10));
   }
 
-  const profile = config.profiles[config.activeProfile];
+  const profile = config.profiles[getDefaultProfileName()];
   if (!profile || !profile.users) return;
 
   for (const [vk, pu] of Object.entries(profile.users)) {
@@ -803,24 +964,26 @@ function recordError(apiKey, statusCode, errorMessage, path, model) {
 }
 
 // ─── Personal Usage ───────────────────────────────────────────────────────────
-function getPersonalUsageData(apiKey) {
-  const key = resolveUserKey(apiKey);
+function getPersonalUsageData(apiKey, suffix) {
+  const s = getProfileStore(suffix || "");
+  const runtime = runtimes[suffix || ""] || rt;
+  const key = resolveUserKey(apiKey, runtime);
   const today = cnDate();
-  const username = getUserName(apiKey);
-  const quota = checkTokenQuota(apiKey);
+  const username = getUserName(apiKey, runtime);
+  const quota = checkTokenQuota(apiKey, suffix, runtime);
 
-  const todayUsage = (store.daily[today] || {})[key] || { inputTokens: 0, outputTokens: 0, requests: 0, cacheCreationTokens: 0, cacheReadTokens: 0 };
+  const todayUsage = (s.daily[today] || {})[key] || { inputTokens: 0, outputTokens: 0, requests: 0, cacheCreationTokens: 0, cacheReadTokens: 0 };
 
   // Per-model breakdown for today
   const todayModels = {};
-  const dm = (store.dailyModels[today] || {})[key] || {};
+  const dm = (s.dailyModels[today] || {})[key] || {};
   for (const [model, data] of Object.entries(dm)) {
     todayModels[model] = { ...data };
   }
 
   // Per-hour breakdown for today
   const todayHourly = {};
-  const dh = (store.dailyHourly[today] || {})[key] || {};
+  const dh = (s.dailyHourly[today] || {})[key] || {};
   for (const [h, data] of Object.entries(dh)) {
     todayHourly[h] = { ...data };
   }
@@ -831,7 +994,7 @@ function getPersonalUsageData(apiKey) {
     const d = new Date(Date.now() + 8 * 3600 * 1000);
     d.setDate(d.getDate() - i);
     const dateStr = d.toISOString().slice(0, 10);
-    const dayUsage = (store.daily[dateStr] || {})[key] || { inputTokens: 0, outputTokens: 0, requests: 0 };
+    const dayUsage = (s.daily[dateStr] || {})[key] || { inputTokens: 0, outputTokens: 0, requests: 0 };
     trend.push({ date: dateStr, input: dayUsage.inputTokens, output: dayUsage.outputTokens, requests: dayUsage.requests, total: dayUsage.inputTokens + dayUsage.outputTokens });
   }
 
@@ -839,9 +1002,20 @@ function getPersonalUsageData(apiKey) {
   const lastAdjust = (store.quotaAdjustHistory || []).findLast(h => h.user === key);
   const quotaAutoAdjusted = lastAdjust ? lastAdjust.auto : false;
 
+  // Determine which profiles this user has access to
+  const availableProfiles = [];
+  for (const [sfx, rt2] of Object.entries(runtimes)) {
+    const userKey = resolveUserKey(apiKey, rt2);
+    if (rt2.users[userKey] && !rt2.users[userKey].disabled) {
+      availableProfiles.push({ suffix: sfx, name: rt2.profileName, isDefault: rt2.isDefault });
+    }
+  }
+
   return {
     username,
-    profile: config.activeProfile,
+    profile: runtime.profileName,
+    profileSuffix: suffix || "",
+    availableProfiles,
     quota: { type: quota.source, limit: quota.limit, used: quota.used, remaining: quota.remaining, autoAdjusted: quotaAutoAdjusted },
     today: { input: todayUsage.inputTokens, output: todayUsage.outputTokens, requests: todayUsage.requests, cacheWrite: todayUsage.cacheCreationTokens || 0, cacheRead: todayUsage.cacheReadTokens || 0, total: todayUsage.inputTokens + todayUsage.outputTokens },
     models: todayModels,
@@ -865,18 +1039,33 @@ function jitter(ms) {
   return ms + (Math.random() * half * 2 - half);
 }
 
-function sendUpstream(body, reqUrl, reqMethod, reqHeaders, timeout) {
+function sendUpstream(body, reqUrl, reqMethod, reqHeaders, timeout, _rt) {
   return new Promise((resolve, reject) => {
+    const runtime = _rt || rt;
+    const upstreamPath = runtime.upstreamUrl.pathname.replace(/\/$/, "");
+    // Smart path concatenation: avoid double /v1 when upstream already contains it
+    let finalPath;
+    if (upstreamPath && reqUrl.startsWith("/v1/")) {
+      // Upstream has its own base path (e.g., /apps/anthropic or /compatible-mode/v1)
+      // Strip /v1 prefix from reqUrl to avoid duplication
+      if (upstreamPath.endsWith("/v1")) {
+        finalPath = upstreamPath + reqUrl.slice(3); // /v1 + /messages → /v1/messages
+      } else {
+        finalPath = upstreamPath + reqUrl; // different base path, keep as-is
+      }
+    } else {
+      finalPath = upstreamPath + reqUrl;
+    }
     const opts = {
-      hostname: rt.upstreamUrl.hostname,
-      port: rt.upstreamUrl.port || (rt.upstreamUrl.protocol === "https:" ? 443 : 80),
-      path: rt.upstreamUrl.pathname.replace(/\/$/, "") + reqUrl,
+      hostname: runtime.upstreamUrl.hostname,
+      port: runtime.upstreamUrl.port || (runtime.upstreamUrl.protocol === "https:" ? 443 : 80),
+      path: finalPath,
       method: reqMethod,
       headers: reqHeaders,
-      agent: keepAliveAgent,
+      agent: runtime.agent,
     };
 
-    const transport = rt.upstreamUrl.protocol === "https:" ? https : http;
+    const transport = runtime.upstreamUrl.protocol === "https:" ? https : http;
     const upReq = transport.request(opts, (upRes) => {
       const chunks = [];
       upRes.on("data", (c) => chunks.push(c));
@@ -903,6 +1092,8 @@ function sendUpstream(body, reqUrl, reqMethod, reqHeaders, timeout) {
 }
 
 function proxyRequest(req, res) {
+  // Resolve which profile this request targets
+  const { suffix, runtime, strippedUrl } = resolveProfile(req.url);
   const apiKey = getApiKey(req);
   const proxyStartTime = Date.now();
   let proxyPhase = "init";
@@ -917,14 +1108,14 @@ function proxyRequest(req, res) {
   }
 
   req.on("error", (err) => {
-    console.error(`[Socket] 客户端请求错误 phase=${proxyPhase} elapsed=${Date.now() - proxyStartTime}ms user=${getUserName(apiKey)} err=${err.message}`);
+    console.error(`[Socket] 客户端请求错误 phase=${proxyPhase} elapsed=${Date.now() - proxyStartTime}ms user=${getUserName(apiKey, runtime)} err=${err.message}`);
   });
   res.on("error", (err) => {
-    console.error(`[Socket] 客户端响应错误 phase=${proxyPhase} elapsed=${Date.now() - proxyStartTime}ms user=${getUserName(apiKey)} err=${err.message}`);
+    console.error(`[Socket] 客户端响应错误 phase=${proxyPhase} elapsed=${Date.now() - proxyStartTime}ms user=${getUserName(apiKey, runtime)} err=${err.message}`);
   });
   req.on("close", () => {
     if (!res.writableEnded) {
-      console.log(`[Socket] 客户端提前断开 phase=${proxyPhase} elapsed=${Date.now() - proxyStartTime}ms user=${getUserName(apiKey)}`);
+      console.log(`[Socket] 客户端提前断开 phase=${proxyPhase} elapsed=${Date.now() - proxyStartTime}ms user=${getUserName(apiKey, runtime)}`);
     }
   });
 
@@ -935,7 +1126,7 @@ function proxyRequest(req, res) {
     return;
   }
 
-  const userKey = resolveUserKey(apiKey);
+  const userKey = resolveUserKey(apiKey, runtime);
 
   readBody(req, 50_000_000).then(async (body) => {
     proxyPhase = "body-read";
@@ -963,7 +1154,7 @@ function proxyRequest(req, res) {
           reqSource = "子代理";
         }
       }
-      const resolved = resolveModel(reqModel);
+      const resolved = resolveModel(reqModel, runtime);
       if (resolved !== reqModel) {
         parsed.model = resolved;
         body = Buffer.from(JSON.stringify(parsed));
@@ -972,15 +1163,15 @@ function proxyRequest(req, res) {
     } catch {}
 
     // Model access restriction
-    if (!checkModelAllowed(reqModel)) {
+    if (!checkModelAllowed(reqModel, runtime)) {
       res.writeHead(403, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ error: `Model "${reqModel}" is not allowed. Use jx-sonnet/jx-opus/jx-haiku or a model from the allowed list.` }));
-      console.log(`[拦截] ${getUserName(apiKey)} model=${reqModel} 被拒绝`);
+      console.log(`[拦截] ${getUserName(apiKey, runtime)} model=${reqModel} 被拒绝`);
       return;
     }
 
     // Reject unknown API keys (not in configured user list)
-    if (!rt.users[userKey] && !rt.globalUsers[userKey]) {
+    if (!runtime.users[userKey] && !runtime.globalUsers[userKey]) {
       res.writeHead(403, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ error: "Unknown API key. Please use your assigned virtual key (jx-*)." }));
       console.log(`[拦截] 未知key=${apiKey.slice(0, 8)}**** model=${reqModel} 拒绝访问`);
@@ -988,8 +1179,8 @@ function proxyRequest(req, res) {
     }
 
     // Circuit breaker check
-    if (!upstreamBreaker.allowRequest()) {
-      const remaining = Math.ceil(upstreamBreaker.status().cooldownRemaining / 1000);
+    if (!runtime.breaker.allowRequest()) {
+      const remaining = Math.ceil(runtime.breaker.status().cooldownRemaining / 1000);
       res.writeHead(503, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ error: `Upstream temporarily unavailable. Circuit open, retry in ${remaining}s.` }));
       recordError(apiKey, 503, "Circuit breaker open", req.url, reqModel);
@@ -1011,7 +1202,7 @@ function proxyRequest(req, res) {
     }
 
     // Token quota check
-    const quota = checkTokenQuota(apiKey);
+    const quota = checkTokenQuota(apiKey, suffix, runtime);
     if (!quota.allowed) {
       const reqHost = req.headers.host || `localhost:${port}`;
       const usageUrl = `http://${reqHost}/usage/${apiKey}`;
@@ -1022,16 +1213,16 @@ function proxyRequest(req, res) {
         quota: { used: quota.used, limit: quota.limit, remaining: quota.remaining, source: quota.source },
         usageUrl,
       }));
-      console.log(`[配额] ${getUserName(apiKey)} 今日额度已用完 [${quota.source}] (已用: ${quota.used.toLocaleString()} / 限额: ${quota.limit.toLocaleString()})`);
+      console.log(`[配额] ${getUserName(apiKey, runtime)} 今日额度已用完 [${quota.source}] (已用: ${quota.used.toLocaleString()} / 限额: ${quota.limit.toLocaleString()})`);
       return;
     }
 
     // User disabled check (global or profile-level)
-    if (checkUserDisabled(apiKey)) {
+    if (checkUserDisabled(apiKey, runtime)) {
       releaseConcurrency(userKey);
       res.writeHead(403, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ error: "User is disabled." }));
-      console.log(`[禁用] ${getUserName(apiKey)} 用户已禁用`);
+      console.log(`[禁用] ${getUserName(apiKey, runtime)} 用户已禁用`);
       return;
     }
 
@@ -1040,19 +1231,19 @@ function proxyRequest(req, res) {
       releaseConcurrency(userKey);
       res.writeHead(403, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ error: "API key has expired. Please contact your administrator." }));
-      console.log(`[过期] ${getUserName(apiKey)} key已过期`);
+      console.log(`[过期] ${getUserName(apiKey, runtime)} key已过期`);
       return;
     }
 
     try {
       proxyPhase = "upstream-connect";
-      const realKey = getRealKey(apiKey);
-      const reqHeaders = { ...req.headers, host: rt.upstreamUrl.host, "content-length": body.length };
-      console.log(`── 请求开始 ── ${getUserName(apiKey)} [${reqSource}] 模型=${originalModel}${originalModel !== reqModel ? "→" + reqModel : ""} ──`);
+      const realKey = getRealKey(apiKey, runtime);
+      const reqHeaders = { ...req.headers, host: runtime.upstreamUrl.host, "content-length": body.length };
+      console.log(`── 请求开始 ── ${getUserName(apiKey, runtime)} [${reqSource}] 模型=${originalModel}${originalModel !== reqModel ? "→" + reqModel : ""}${suffix ? ` [${suffix}]` : ""} ──`);
       // Replace virtual key with real upstream key
       if (realKey !== apiKey) {
         reqHeaders["authorization"] = `Bearer ${realKey}`;
-        console.log(`[映射] ${getUserName(apiKey)} 虚拟key=${apiKey.slice(0,8)}**** 请求模型=${originalModel}${originalModel !== reqModel ? " → 实际=" + reqModel : ""}`);
+        console.log(`[映射] ${getUserName(apiKey, runtime)} 虚拟key=${apiKey.slice(0,8)}**** 请求模型=${originalModel}${originalModel !== reqModel ? " → 实际=" + reqModel : ""}`);
       }
       delete reqHeaders["connection"];
       delete reqHeaders["transfer-encoding"];
@@ -1062,12 +1253,12 @@ function proxyRequest(req, res) {
         (function() { try { return JSON.parse(body.toString()).stream; } catch { return false; } })();
 
       proxyPhase = isStreamRequest ? "streaming-proxy" : "json-proxy";
-      const timeout = isStreamRequest ? rt.proxy.streamTimeout : rt.proxy.timeout;
+      const timeout = isStreamRequest ? gProxy.streamTimeout : gProxy.timeout;
 
       if (isStreamRequest) {
-        await handleStreamingProxy(req, res, body, reqHeaders, apiKey, reqModel, timeout, reqSource);
+        await handleStreamingProxy(req, res, body, reqHeaders, apiKey, reqModel, timeout, reqSource, runtime, suffix, strippedUrl);
       } else {
-        await handleJsonProxy(req, res, body, reqHeaders, apiKey, reqModel, timeout, reqSource);
+        await handleJsonProxy(req, res, body, reqHeaders, apiKey, reqModel, timeout, reqSource, runtime, suffix, strippedUrl);
       }
     } catch (err) {
       const status = err.isTimeout ? 504 : 502;
@@ -1079,7 +1270,7 @@ function proxyRequest(req, res) {
       }
     } finally {
       releaseConcurrency(userKey);
-      console.log(`── 请求结束 ── ${getUserName(apiKey)} ──`);
+      console.log(`── 请求结束 ── ${getUserName(apiKey, runtime)} ──`);
     }
   }).catch(() => {
     if (!res.headersSent) {
@@ -1089,17 +1280,18 @@ function proxyRequest(req, res) {
   });
 }
 
-async function handleJsonProxy(req, res, body, reqHeaders, apiKey, reqModel, timeout, reqSource) {
+async function handleJsonProxy(req, res, body, reqHeaders, apiKey, reqModel, timeout, reqSource, _rt, suffix, strippedUrl) {
+  const runtime = _rt || rt;
   let lastError = null;
 
-  for (let attempt = 0; attempt <= rt.proxy.maxRetries; attempt++) {
+  for (let attempt = 0; attempt <= gProxy.maxRetries; attempt++) {
     try {
-      const upRes = await sendUpstream(body, req.url, req.method, reqHeaders, timeout);
+      const upRes = await sendUpstream(body, strippedUrl || req.url, req.method, reqHeaders, timeout, runtime);
       const text = upRes.body.toString();
 
       // Record success to circuit breaker for non-5xx responses
       if (upRes.statusCode < 500) {
-        upstreamBreaker.recordSuccess();
+        runtime.breaker.recordSuccess();
       }
 
       // Check for plan-exhausted / payment required
@@ -1112,11 +1304,11 @@ async function handleJsonProxy(req, res, body, reqHeaders, apiKey, reqModel, tim
       }
 
       // Retryable status codes
-      if (rt.proxy.retryableStatusCodes.includes(upRes.statusCode) && attempt < rt.proxy.maxRetries) {
-        const baseDelay = Math.min(rt.proxy.retryDelay * Math.pow(2, attempt), 10000);
+      if (gProxy.retryableStatusCodes.includes(upRes.statusCode) && attempt < gProxy.maxRetries) {
+        const baseDelay = Math.min(gProxy.retryDelay * Math.pow(2, attempt), 10000);
         const delay = Math.round(jitter(baseDelay));
-        console.log(`[重试] ${getUserName(apiKey)} ${upRes.statusCode} model=${reqModel} 第${attempt + 1}/${rt.proxy.maxRetries}次 ${delay}ms后重试`);
-        recordError(apiKey, upRes.statusCode, `Retryable error (attempt ${attempt + 1}/${rt.proxy.maxRetries})`, req.url, reqModel);
+        console.log(`[重试] ${getUserName(apiKey, runtime)} ${upRes.statusCode} model=${reqModel} 第${attempt + 1}/${gProxy.maxRetries}次 ${delay}ms后重试`);
+        recordError(apiKey, upRes.statusCode, `Retryable error (attempt ${attempt + 1}/${gProxy.maxRetries})`, req.url, reqModel);
         await sleep(delay);
         continue;
       }
@@ -1126,24 +1318,24 @@ async function handleJsonProxy(req, res, body, reqHeaders, apiKey, reqModel, tim
         const json = JSON.parse(text);
         if (upRes.statusCode >= 400) {
           recordError(apiKey, upRes.statusCode, json.error?.message || json.message || text.slice(0, 200), req.url, reqModel);
-          if (upRes.statusCode >= 500) upstreamBreaker.recordFailure();
+          if (upRes.statusCode >= 500) runtime.breaker.recordFailure();
         } else {
           // Try multiple possible usage field names
           const usage = json.usage || json.token_usage || json.usage_info;
           if (usage) {
-            recordUsage(apiKey, usage, json.model);
+            recordUsage(apiKey, usage, json.model, suffix);
             const modelName = json.model || reqModel;
-            console.log(`[Token] ${getUserName(apiKey)} [${reqSource}] model=${modelName} 输入=${usage.input_tokens || usage.prompt_tokens || 0} 输出=${usage.output_tokens || usage.completion_tokens || 0} 缓存写=${usage.cache_creation_input_tokens || 0} 缓存读=${usage.cache_read_input_tokens || 0}`);
+            console.log(`[Token] ${getUserName(apiKey, runtime)} [${reqSource}] model=${modelName} 输入=${usage.input_tokens || usage.prompt_tokens || 0} 输出=${usage.output_tokens || usage.completion_tokens || 0} 缓存写=${usage.cache_creation_input_tokens || 0} 缓存读=${usage.cache_read_input_tokens || 0}`);
           } else {
-            console.log(`[响应] ${getUserName(apiKey)} 200 OK 但无usage字段 model=${reqModel} body[0:300]=${text.slice(0, 300).replace(/\n/g, "\\n")}`);
+            console.log(`[响应] ${getUserName(apiKey, runtime)} 200 OK 但无usage字段 model=${reqModel} body[0:300]=${text.slice(0, 300).replace(/\n/g, "\\n")}`);
           }
         }
       } catch {
         if (upRes.statusCode >= 400) {
           recordError(apiKey, upRes.statusCode, text.slice(0, 200), req.url, reqModel);
-          if (upRes.statusCode >= 500) upstreamBreaker.recordFailure();
+          if (upRes.statusCode >= 500) runtime.breaker.recordFailure();
         } else {
-          console.log(`[响应] ${getUserName(apiKey)} ${upRes.statusCode} 非JSON响应 body[0:300]=${text.slice(0, 300).replace(/\n/g, "\\n")}`);
+          console.log(`[响应] ${getUserName(apiKey, runtime)} ${upRes.statusCode} 非JSON响应 body[0:300]=${text.slice(0, 300).replace(/\n/g, "\\n")}`);
         }
       }
 
@@ -1156,11 +1348,11 @@ async function handleJsonProxy(req, res, body, reqHeaders, apiKey, reqModel, tim
       return;
     } catch (err) {
       lastError = err;
-      upstreamBreaker.recordFailure();
-      if (attempt < rt.proxy.maxRetries) {
-        const baseDelay = Math.min(rt.proxy.retryDelay * Math.pow(2, attempt), 10000);
+      runtime.breaker.recordFailure();
+      if (attempt < gProxy.maxRetries) {
+        const baseDelay = Math.min(gProxy.retryDelay * Math.pow(2, attempt), 10000);
         const delay = Math.round(jitter(baseDelay));
-        console.log(`[重试] ${getUserName(apiKey)} 网络错误 model=${reqModel} 第${attempt + 1}/${rt.proxy.maxRetries}次 ${delay}ms后重试`);
+        console.log(`[重试] ${getUserName(apiKey, runtime)} 网络错误 model=${reqModel} 第${attempt + 1}/${gProxy.maxRetries}次 ${delay}ms后重试`);
         await sleep(delay);
       }
     }
@@ -1169,24 +1361,36 @@ async function handleJsonProxy(req, res, body, reqHeaders, apiKey, reqModel, tim
   // All retries exhausted
   const finalStatus = lastError?.isTimeout ? 504 : 502;
   const finalLabel = lastError?.isTimeout ? "Gateway Timeout" : "Bad Gateway";
-  recordError(apiKey, finalStatus, `${finalLabel} after ${rt.proxy.maxRetries} retries: ${lastError?.message}`, req.url, reqModel);
+  recordError(apiKey, finalStatus, `${finalLabel} after ${gProxy.maxRetries} retries: ${lastError?.message}`, req.url, reqModel);
   if (!res.headersSent) {
     res.writeHead(finalStatus, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ error: `Proxy ${finalLabel} after ${rt.proxy.maxRetries} retries. Please try again later.` }));
+    res.end(JSON.stringify({ error: `Proxy ${finalLabel} after ${gProxy.maxRetries} retries. Please try again later.` }));
   }
 }
 
-async function handleStreamingProxy(req, res, body, reqHeaders, apiKey, reqModel, timeout, reqSource) {
+async function handleStreamingProxy(req, res, body, reqHeaders, apiKey, reqModel, timeout, reqSource, _rt, suffix, strippedUrl) {
+  const runtime = _rt || rt;
+  const upstreamPath = runtime.upstreamUrl.pathname.replace(/\/$/, "");
+  let finalPath;
+  if (upstreamPath && (strippedUrl || req.url).startsWith("/v1/")) {
+    if (upstreamPath.endsWith("/v1")) {
+      finalPath = upstreamPath + (strippedUrl || req.url).slice(3);
+    } else {
+      finalPath = upstreamPath + (strippedUrl || req.url);
+    }
+  } else {
+    finalPath = upstreamPath + (strippedUrl || req.url);
+  }
   const opts = {
-    hostname: rt.upstreamUrl.hostname,
-    port: rt.upstreamUrl.port || (rt.upstreamUrl.protocol === "https:" ? 443 : 80),
-    path: rt.upstreamUrl.pathname.replace(/\/$/, "") + req.url,
+    hostname: runtime.upstreamUrl.hostname,
+    port: runtime.upstreamUrl.port || (runtime.upstreamUrl.protocol === "https:" ? 443 : 80),
+    path: finalPath,
     method: req.method,
     headers: reqHeaders,
-    agent: keepAliveAgent,
+    agent: runtime.agent,
   };
 
-  const transport = rt.upstreamUrl.protocol === "https:" ? https : http;
+  const transport = runtime.upstreamUrl.protocol === "https:" ? https : http;
 
   await new Promise((resolve, reject) => {
     const upReq = transport.request(opts, (upRes) => {
@@ -1213,15 +1417,15 @@ async function handleStreamingProxy(req, res, body, reqHeaders, apiKey, reqModel
         upRes.on("data", (c) => { if (clientGone) return; errBuf += c.toString(); res.write(c); });
         upRes.on("end", () => {
           recordError(apiKey, upRes.statusCode, errBuf.slice(0, 200), req.url, reqModel);
-          if (upRes.statusCode >= 500) upstreamBreaker.recordFailure();
-          else if (upRes.statusCode < 500) upstreamBreaker.recordSuccess();
+          if (upRes.statusCode >= 500) runtime.breaker.recordFailure();
+          else if (upRes.statusCode < 500) runtime.breaker.recordSuccess();
           if (!clientGone) res.end();
           safeResolve();
         });
         return;
       }
 
-      upstreamBreaker.recordSuccess();
+      runtime.breaker.recordSuccess();
 
       upRes.on("data", (chunk) => {
         if (clientGone) return;
@@ -1235,8 +1439,6 @@ async function handleStreamingProxy(req, res, body, reqHeaders, apiKey, reqModel
         buf = lines.pop() || "";
         for (const line of lines) {
           if (!line.trim()) continue;
-          // Try data: prefix first, then event: line, then raw JSON
-          // Handle both "data: " and "data:" (Kimi etc. omit the space)
           let jsonStr = "";
           if (line.startsWith("data:")) {
             jsonStr = line.slice(5).trim();
@@ -1250,7 +1452,7 @@ async function handleStreamingProxy(req, res, body, reqHeaders, apiKey, reqModel
           sseDataLines++;
           try {
             const d = JSON.parse(jsonStr);
-            if (sseDataLines <= 3) console.log(`[SSE] ${getUserName(apiKey)} 第${sseDataLines}条 类型=${d.type} 字段=${Object.keys(d).join(",")}`);
+            if (sseDataLines <= 3) console.log(`[SSE] ${getUserName(apiKey, runtime)} 第${sseDataLines}条 类型=${d.type} 字段=${Object.keys(d).join(",")}`);
             if (d.type === "message_start") {
               if (d.message) {
                 model = d.message.model || model;
@@ -1280,10 +1482,10 @@ async function handleStreamingProxy(req, res, body, reqHeaders, apiKey, reqModel
           try { const d = JSON.parse(buf.slice(6)); if (d.usage) { usage.output_tokens = d.usage.output_tokens || usage.output_tokens || 0; usage.cache_creation_input_tokens = d.usage.cache_creation_input_tokens || usage.cache_creation_input_tokens || 0; usage.cache_read_input_tokens = d.usage.cache_read_input_tokens || usage.cache_read_input_tokens || 0; } } catch {}
         }
         if (usage.input_tokens > 0 || usage.output_tokens > 0) {
-          recordUsage(apiKey, usage, model);
-          console.log(`[Token] ${getUserName(apiKey)} [${reqSource}] model=${model} 输入=${usage.input_tokens} 输出=${usage.output_tokens} 缓存写=${usage.cache_creation_input_tokens || 0} 缓存读=${usage.cache_read_input_tokens || 0}`);
+          recordUsage(apiKey, usage, model, suffix);
+          console.log(`[Token] ${getUserName(apiKey, runtime)} [${reqSource}] model=${model} 输入=${usage.input_tokens} 输出=${usage.output_tokens} 缓存写=${usage.cache_creation_input_tokens || 0} 缓存读=${usage.cache_read_input_tokens || 0}`);
         } else {
-          console.log(`[响应] ${getUserName(apiKey)} 流结束 无usage数据 model=${model} sse行数=${sseDataLines} 原始数据[0:200]=${rawSample.slice(0, 200).replace(/\n/g, "\\n")}`);
+          console.log(`[响应] ${getUserName(apiKey, runtime)} 流结束 无usage数据 model=${model} sse行数=${sseDataLines} 原始数据[0:200]=${rawSample.slice(0, 200).replace(/\n/g, "\\n")}`);
         }
         if (!clientGone) res.end();
         safeResolve();
@@ -1295,7 +1497,7 @@ async function handleStreamingProxy(req, res, body, reqHeaders, apiKey, reqModel
     });
 
     upReq.on("error", (err) => {
-      upstreamBreaker.recordFailure();
+      runtime.breaker.recordFailure();
       const isTimeout = err.message.includes("timeout");
       const status = isTimeout ? 504 : 502;
       const label = isTimeout ? "Gateway Timeout" : "Bad Gateway";
@@ -1340,17 +1542,17 @@ function getPublicSettings() {
   }
   return {
     upstream: rt.upstream,
-    proxy: { ...rt.proxy },
+    proxy: { ...gProxy },
     allowedModels: rt.allowedModels,
     defaultModels: { ...rt.defaultModels },
     profileUsers: safeProfileUsers,
     globalUsers: safeGlobalUsers,
-    activeProfile: config.activeProfile,
+    activeProfile: getDefaultProfileName(),
     profiles: listProfiles(),
-    circuitBreaker: upstreamBreaker.status(),
+    circuitBreaker: rt.breaker.status(),
     port: port,
     hasPassword: !!dashboardPassword,
-    profileQuota: getProfileQuota(),
+    profileQuota: getProfileQuota(""),
     autoQuotaAdjust: config.autoQuotaAdjust || {},
   };
 }
@@ -1474,15 +1676,14 @@ td{padding:6px 8px;border-bottom:1px solid var(--border);font-size:12px}
 <div class="sidebar">
 <div class="sidebar-hd"><h1>配置方案</h1><a href="/dashboard">← 面板</a></div>
 <div class="sidebar-list">${s.profiles.map(p => {
-    const isActive = p.isActive;
     const host = p.upstream.replace(/^https?:\/\//, "").replace(/\/.*/, "");
-    return `<div class="pl-item${isActive ? " active" : ""}" id="pl-${escHtml(p.name)}">
-<div class="pl-name">${escHtml(p.name)}</div>
+    const suffixLabel = p.isDefault ? '<span style="color:var(--green);font-size:10px">默认</span>' : '<span style="color:var(--accent);font-size:10px">/'+ escHtml(p.suffix)+'</span>';
+    return `<div class="pl-item${p.isDefault ? " active" : ""}" id="pl-${escHtml(p.name)}" onclick="editProfile('${escJs(p.name)}')">
+<div class="pl-name">${escHtml(p.name)} ${suffixLabel}</div>
 <div class="pl-host">${escHtml(host)}</div>
 <div class="pl-users">${p.userCount}位用户</div>
 <div class="pl-actions">
-  ${!isActive ? '<button class="pl-activate" onclick="switchToProfile(\'' + escJs(p.name) + '\')">✓ 启用</button>' : '<span class="pl-badge">当前</span>'}
-  ${!isActive ? '<button class="pl-delete" onclick="deleteProfile(\'' + escJs(p.name) + '\')">×</button>' : ''}
+  ${!p.isDefault ? '<button class="pl-delete" onclick="event.stopPropagation();deleteProfile(\'' + escJs(p.name) + '\')">×</button>' : ''}
 </div></div>`;
   }).join("")}</div>
 <div class="sidebar-ft" style="display:flex;gap:6px"><button class="btn btn-outline btn-sm" onclick="openUserModal()" style="flex:1">用户管理</button><button class="btn btn-outline btn-sm" onclick="addProfile()" style="flex:1">+ 新增方案</button></div>
@@ -1491,11 +1692,15 @@ td{padding:6px 8px;border-bottom:1px solid var(--border);font-size:12px}
 ${errDiv}
 <form method="post" action="/api/settings-save" id="settingsForm">
 <input type="hidden" name="_csrf" id="csrfToken">
+<input type="hidden" name="profileSuffix" id="profileSuffixInput" value="">
 
 <h2>上游代理 <span class="status ${s.circuitBreaker.state === 'CLOSED' ? 'status-ok' : s.circuitBreaker.state === 'HALF_OPEN' ? 'status-warn' : 'status-err'}">${s.circuitBreaker.state === 'CLOSED' ? '正常' : s.circuitBreaker.state === 'HALF_OPEN' ? '探测中' : '熔断中'}</span></h2>
 <div class="section">
-<label>上游 API 地址</label>
-<input type="text" name="upstream" value="${s.upstream}" placeholder="https://open.bigmodel.cn/api/anthropic">
+<div class="row">
+<div><label>上游 API 地址<span class="req">*</span></label><input type="text" name="upstream" value="${s.upstream}" placeholder="https://open.bigmodel.cn/api/anthropic"></div>
+<div><label>URL 后缀 <span style="font-size:11px;color:var(--dim);font-weight:400">(默认方案留空)</span></label><input type="text" name="suffix" id="suffixInput" value="${escHtml(s.profiles.find(p => p.isDefault)?.suffix || s.profiles[0]?.suffix || '')}" placeholder="如: glm" oninput="updateAccessUrl()"></div>
+</div>
+<div class="note" id="accessUrlPreview" style="margin-top:8px;color:var(--green)">接入地址: http://&lt;host&gt;:6789/v1</div>
 <div class="presets">
   <span style="font-size:11px;color:var(--dim);line-height:24px">快速填充：</span>
   <button type="button" class="preset" onclick="document.querySelector('[name=upstream]').value='https://open.bigmodel.cn/api/anthropic'">智谱 GLM</button>
@@ -1627,16 +1832,44 @@ function openUserModal(){document.getElementById('userModal').classList.add('ope
 function closeUserModal(){document.getElementById('userModal').classList.remove('open')}
 document.getElementById('userModal').addEventListener('click',function(e){if(e.target===this)closeUserModal()});
 async function switchToProfile(n){
-  if(!confirm('切换到方案 "'+n+'"？未保存的修改将丢失。'))return;
-  const r=await fetch('/api/profile/switch',{method:'POST',headers:csrfHeaders({'Content-Type':'application/json'}),body:JSON.stringify({profile:n})});
-  if(r.ok)location.reload();else{const e=await r.json();alert('切换失败: '+e.error)}
+  // No longer exclusive switch — just reload the profile into the form
+  editProfile(n);
+}
+let editingProfileName="${escJs(s.profiles.find(p=>p.isDefault)?.name||s.profiles[0]?.name||'')}";
+function updateAccessUrl(){
+  const sfx=document.getElementById('suffixInput').value.trim();
+  const preview=sfx?'http://&lt;host&gt;:6789/'+(sfx)+'/v1':'http://&lt;host&gt;:6789/v1';
+  document.getElementById('accessUrlPreview').innerHTML='接入地址: '+preview+(sfx?'':' <span style="color:var(--dim)">(默认方案，无后缀)</span>');
+}
+updateAccessUrl();
+async function editProfile(n){
+  const profiles=${JSON.stringify(s.profiles)};
+  const p=profiles.find(x=>x.name===n);
+  if(!p)return;
+  editingProfileName=n;
+  const fm=document.forms.settingsForm;
+  fm.upstream.value=p.upstream||'';
+  document.getElementById('suffixInput').value=p.suffix||'';
+  if(p.allowedModels)fm.allowedModels.value=p.allowedModels.join(', ');
+  if(p.defaultModels){
+    fm.defaultModels_sonnet.value=p.defaultModels.sonnet||'';
+    fm.defaultModels_opus.value=p.defaultModels.opus||'';
+    fm.defaultModels_haiku.value=p.defaultModels.haiku||'';
+  }
+  document.querySelectorAll('.pl-item').forEach(el=>el.classList.remove('active'));
+  const el=document.getElementById('pl-'+n);
+  if(el)el.classList.add('active');
+  document.getElementById('profileSuffixInput').value=p.suffix||'';
+  updateAccessUrl();
 }
 async function addProfile(){
   const name=prompt('请输入新方案名称');
   if(!name)return;
+  const suffix=prompt('请输入URL后缀（英文/数字/下划线，如: glm）\\n用户将通过 http://host:6789/<后缀>/v1 访问此方案');
+  if(suffix===null)return;
   const fm=document.forms.settingsForm;
   const r=await fetch('/api/profile/save',{method:'POST',headers:csrfHeaders({'Content-Type':'application/json'}),body:JSON.stringify({
-    profile:name,upstream:fm.upstream.value,allowedModels:fm.allowedModels.value,
+    profile:name,suffix:suffix||'',upstream:fm.upstream.value,allowedModels:fm.allowedModels.value,
     defaultModels:{sonnet:fm.defaultModels_sonnet.value,opus:fm.defaultModels_opus.value,haiku:fm.defaultModels_haiku.value}
   })});
   if(r.ok)location.reload();else{const e=await r.json();alert('创建失败: '+e.error)}
@@ -1742,7 +1975,7 @@ tr:last-child td{border-bottom:none}tr:hover td{background:rgba(255,255,255,.02)
 .empty{color:var(--dim);padding:24px;text-align:center;font-size:13px}
 @media(max-width:768px){.grid{grid-template-columns:1fr}.cards{grid-template-columns:1fr 1fr}}
 </style></head><body>
-<h1>团队AI Coding监控 <span style="float:right;font-size:12px;display:flex;gap:8px;align-items:center"><a href="/settings" style="color:var(--dim);text-decoration:none;font-size:12px;padding:4px 10px;border:1px solid var(--border);border-radius:4px">设置</a><button id="autoRefreshBtn" style="font-size:12px;background:rgba(52,211,153,.15);color:var(--green);border:none;padding:4px 12px;border-radius:4px;cursor:pointer">自动刷新: 开</button><button onclick="fetch('/api/logout',{method:'POST',headers:{'x-csrf-token':(document.cookie.match(/tm_csrf=([^;]+)/)||[])[1]||''}}).then(()=>location.reload())" style="font-size:12px;background:rgba(255,255,255,.06);color:var(--dim);border:none;padding:4px 12px;border-radius:4px;cursor:pointer">退出</button></span></h1>
+<h1>团队AI Coding监控 <span style="float:right;font-size:12px;display:flex;gap:8px;align-items:center"><select id="profileSel" style="font-size:12px;background:var(--card);color:var(--text);border:1px solid var(--border);padding:4px 8px;border-radius:4px;cursor:pointer;max-width:160px" onchange="switchProfileView(this.value)"><option value="">全部方案</option></select><a href="/settings" style="color:var(--dim);text-decoration:none;font-size:12px;padding:4px 10px;border:1px solid var(--border);border-radius:4px">设置</a><button id="autoRefreshBtn" style="font-size:12px;background:rgba(52,211,153,.15);color:var(--green);border:none;padding:4px 12px;border-radius:4px;cursor:pointer">自动刷新: 开</button><button onclick="fetch('/api/logout',{method:'POST',headers:{'x-csrf-token':(document.cookie.match(/tm_csrf=([^;]+)/)||[])[1]||''}}).then(()=>location.reload())" style="font-size:12px;background:rgba(255,255,255,.06);color:var(--dim);border:none;padding:4px 12px;border-radius:4px;cursor:pointer">退出</button></span></h1>
 <div class="meta" id="meta">Loading...</div>
 <div class="cards" id="cards"></div>
 <div class="tabs" id="tabs">
@@ -1768,7 +2001,7 @@ tr:last-child td{border-bottom:none}tr:hover td{background:rgba(255,255,255,.02)
 </thead><tbody></tbody></table>
 <div id="errPages" style="padding:8px 0;text-align:right"></div></div></div>
 <script>
-let D=null,P="day",C={t:null,p:null,m:null,h:null},errPage=1,autoRefresh=true,refreshTimer=null;
+let D=null,P="day",C={t:null,p:null,m:null,h:null},errPage=1,autoRefresh=true,refreshTimer=null,currentProfile="all";
 const ERR_PAGE_SIZE=20;
 const COL=["#7c6ef0","#5ba3f5","#34d399","#fbbf24","#f87171","#f472b6","#a78bfa","#38bdf8"];
 const fmtT=n=>n.toLocaleString("zh-CN");
@@ -1778,14 +2011,27 @@ function ago(iso){if(!iso)return"-";const d=Date.now()-new Date(iso).getTime();c
 function wk(s){const d=new Date(s),day=d.getDay()||7,mon=new Date(d);mon.setDate(d.getDate()-day+1);return mon.toISOString().slice(0,10)}
 function grp(daily,p){const g={};for(const[day,ud]of Object.entries(daily)){const k=p==="week"?wk(day):p==="month"?day.slice(0,7):p==="year"?day.slice(0,4):day;if(!g[k])g[k]={};for(const[u,s]of Object.entries(ud)){if(!g[k][u])g[k][u]={inputTokens:0,outputTokens:0,requests:0,cacheCreationTokens:0,cacheReadTokens:0};g[k][u].inputTokens+=s.inputTokens;g[k][u].outputTokens+=s.outputTokens;g[k][u].requests+=s.requests;g[k][u].cacheCreationTokens+=(s.cacheCreationTokens||0);g[k][u].cacheReadTokens+=(s.cacheReadTokens||0)}}return g}
 function lbl(p,k){if(p==="day")return k.slice(5);if(p==="week")return k.slice(5)+" 周";if(p==="month")return k;return k+"年"}
-function c(l,v,c){return'<div class="card"><div class="l">'+l+'</div><div class="v" style="color:'+c+'">'+v+'</div></div>'}
+function c(l,v,cl){return'<div class="card"><div class="l">'+l+'</div><div class="v" style="color:'+cl+'">'+v+'</div></div>'}
+function switchProfileView(v){currentProfile=v||"all";load()}
 function render(){
   if(!D)return;
+  // Populate profile dropdown
+  const sel=document.getElementById("profileSel");
+  if(sel.options.length<=1 && D.profiles){
+    sel.innerHTML='<option value="all">📊 全部方案</option>';
+    for(const p of D.profiles){
+      const sfx=p.suffix?"("+p.suffix+")":"(默认)";
+      sel.innerHTML+='<option value="'+escH(p.suffix)+'">'+escH(p.name)+' '+sfx+'</option>';
+    }
+    sel.value=currentProfile==="all"?"all":currentProfile;
+  }
   const us=Object.values(D.users),ti=us.reduce((s,u)=>s+u.totalInputTokens,0),to=us.reduce((s,u)=>s+u.totalOutputTokens,0),tr=us.reduce((s,u)=>s+u.totalRequests,0);
   const td=new Date(Date.now()+8*36e5).toISOString().slice(0,10),tdd=(D.daily||{})[td]||{};
   const tIn=Object.values(tdd).reduce((s,d)=>s+d.inputTokens,0),tOut=Object.values(tdd).reduce((s,d)=>s+d.outputTokens,0),tR=Object.values(tdd).reduce((s,d)=>s+d.requests,0);
   document.getElementById("cards").innerHTML=c("今日用量",fmtT(tIn+tOut),"var(--accent)")+c("今日请求",fmtT(tR),"var(--blue)")+c("总用量",fmtT(ti+to),"var(--green)")+c("总请求",fmtT(tr),"var(--orange)")+c("今日错误",fmtT((Array.isArray(D.errors)?D.errors:[]).filter(e=>e.time&&e.time.startsWith(td)).length),"var(--red)");
-  document.getElementById("meta").innerHTML='<span style="color:var(--accent);font-weight:600">方案: '+(D.activeProfile||"-")+'</span> &nbsp;|&nbsp; 上游: '+(D.upstream||"-").replace("https://","").replace("http://","")+' &nbsp;|&nbsp; 更新于 '+(function(){const d=new Date();const utc=d.getTime()+d.getTimezoneOffset()*60000;return new Date(utc+8*3600000).toLocaleTimeString("zh-CN")})()+" (北京时间) | 每30秒刷新";
+  const profileLabel=D.profileView||(currentProfile==="all"?"全部方案":"默认方案");
+  const upstreamInfo=D.upstream?(" | 上游: "+D.upstream.replace("https://","").replace("http://","")):"";
+  document.getElementById("meta").innerHTML='<span style="color:var(--accent);font-weight:600">方案: '+profileLabel+'</span>'+upstreamInfo+' &nbsp;|&nbsp; 更新于 '+(function(){const d=new Date();const utc=d.getTime()+d.getTimezoneOffset()*60000;return new Date(utc+8*3600000).toLocaleTimeString("zh-CN")})()+" (北京时间) | 每30秒刷新";
 
   // Charts
   const g=grp(D.daily||{},P),keys=Object.keys(g).sort(),uks=Object.keys(D.users);
@@ -1827,7 +2073,7 @@ function render(){
   document.getElementById("errorCount").textContent=allErrs.length>0?'('+allErrs.length+')':'';
   document.getElementById("errorHint").textContent=allErrs.length>0?(allErrs.length+'条错误'):'暂无错误';
 }
-async function load(){try{const r=await fetch("/api/stats");D=await r.json();render()}catch(e){document.getElementById("meta").textContent="Error: "+e.message}}
+async function load(){try{const profile=currentProfile==="all"?"all":currentProfile;const r=await fetch("/api/stats"+(profile?"?profile="+encodeURIComponent(profile):""));D=await r.json();render()}catch(e){document.getElementById("meta").textContent="Error: "+e.message}}
 function toggleSec(id){const body=document.getElementById(id+"Body");const icon=document.getElementById(id+"Icon");const open=body.classList.toggle("open");icon.classList.toggle("open",open)}
 document.querySelectorAll(".tab").forEach(b=>b.addEventListener("click",()=>{document.querySelectorAll(".tab").forEach(x=>x.classList.remove("on"));b.classList.add("on");P=b.dataset.p;render()}));
 document.getElementById("clearErrors").addEventListener("click",async()=>{if(confirm("确定清除所有错误记录？")){const csrf=(document.cookie.match(/tm_csrf=([^;]+)/)||[])[1]||'';await fetch("/api/clear-errors",{method:"POST",headers:{"x-csrf-token":csrf}});errPage=1;load()}});
@@ -1979,26 +2225,35 @@ function parseFormBody(body) {
 }
 
 function applySettings(formData) {
+  // Determine which profile is being edited (default to default profile)
+  const editingSuffix = formData.profileSuffix || "";
+  const editingRt = runtimes[editingSuffix] || rt;
+  const editingProfileName = editingRt.profileName;
+
   // Validate upstream URL
-  if (formData.upstream && formData.upstream !== rt.upstream) {
+  if (formData.upstream && formData.upstream !== editingRt.upstream) {
     if (!/^https?:\/\/[^\s]+/.test(formData.upstream)) throw new Error("Invalid upstream URL");
-    rt.upstream = formData.upstream;
-    reloadAgent();
+    editingRt.upstream = formData.upstream;
+    editingRt.upstreamUrl = new URL(formData.upstream);
+    editingRt.agent.destroy();
+    editingRt.agent = createUpstreamAgent(editingRt.upstreamUrl);
+    editingRt.breaker.reset();
+    console.log(`[CONFIG] Upstream reloaded: ${editingRt.upstream}`);
   }
 
-  // Update proxy settings with range validation
-  if (formData.timeout) rt.proxy.timeout = Math.max(10000, Math.min(600000, parseInt(formData.timeout, 10) || 180000));
-  if (formData.streamTimeout) rt.proxy.streamTimeout = Math.max(60000, Math.min(1800000, parseInt(formData.streamTimeout, 10) || 600000));
-  if (formData.maxRetries !== undefined) rt.proxy.maxRetries = Math.max(0, Math.min(10, parseInt(formData.maxRetries, 10) || 3));
-  if (formData.retryDelay) rt.proxy.retryDelay = Math.max(100, Math.min(30000, parseInt(formData.retryDelay, 10) || 1000));
-  if (formData.maxConcurrentPerUser) rt.proxy.maxConcurrentPerUser = Math.max(1, Math.min(50, parseInt(formData.maxConcurrentPerUser, 10) || 5));
-  if (formData.rateLimitPerMinute) rt.proxy.rateLimitPerMinute = Math.max(1, Math.min(600, parseInt(formData.rateLimitPerMinute, 10) || 60));
-  if (formData.circuitBreakerFailures) rt.proxy.circuitBreakerFailures = Math.max(1, Math.min(50, parseInt(formData.circuitBreakerFailures, 10) || 5));
-  if (formData.circuitBreakerCooldown) rt.proxy.circuitBreakerCooldown = Math.max(1000, Math.min(300000, parseInt(formData.circuitBreakerCooldown, 10) || 30000));
+  // Update proxy settings with range validation (global)
+  if (formData.timeout) gProxy.timeout = Math.max(10000, Math.min(600000, parseInt(formData.timeout, 10) || 180000));
+  if (formData.streamTimeout) gProxy.streamTimeout = Math.max(60000, Math.min(1800000, parseInt(formData.streamTimeout, 10) || 600000));
+  if (formData.maxRetries !== undefined) gProxy.maxRetries = Math.max(0, Math.min(10, parseInt(formData.maxRetries, 10) || 3));
+  if (formData.retryDelay) gProxy.retryDelay = Math.max(100, Math.min(30000, parseInt(formData.retryDelay, 10) || 1000));
+  if (formData.maxConcurrentPerUser) gProxy.maxConcurrentPerUser = Math.max(1, Math.min(50, parseInt(formData.maxConcurrentPerUser, 10) || 5));
+  if (formData.rateLimitPerMinute) gProxy.rateLimitPerMinute = Math.max(1, Math.min(600, parseInt(formData.rateLimitPerMinute, 10) || 60));
+  if (formData.circuitBreakerFailures) gProxy.circuitBreakerFailures = Math.max(1, Math.min(50, parseInt(formData.circuitBreakerFailures, 10) || 5));
+  if (formData.circuitBreakerCooldown) gProxy.circuitBreakerCooldown = Math.max(1000, Math.min(300000, parseInt(formData.circuitBreakerCooldown, 10) || 30000));
 
   // Update profile quota
   if (formData.profileQuota !== undefined) {
-    const ap = config.profiles[config.activeProfile];
+    const ap = config.profiles[editingProfileName];
     if (ap) {
       const q = parseInt(formData.profileQuota, 10) || 0;
       ap.dailyTokenLimit = q > 0 ? q : null;
@@ -2020,7 +2275,7 @@ function applySettings(formData) {
 
   // Update retryable status codes
   if (formData.retryableStatusCodes) {
-    rt.proxy.retryableStatusCodes = formData.retryableStatusCodes
+    gProxy.retryableStatusCodes = formData.retryableStatusCodes
       .split(",")
       .map(s => parseInt(s.trim(), 10))
       .filter(n => !isNaN(n));
@@ -2030,25 +2285,25 @@ function applySettings(formData) {
   if (formData.allowedModels !== undefined) {
     const raw = formData.allowedModels.trim();
     if (!raw) throw new Error("至少需要设置 1 个允许模型");
-    rt.allowedModels = raw.split(",").map(s => s.trim()).filter(Boolean);
-    if (rt.allowedModels.length === 0) throw new Error("至少需要设置 1 个允许模型");
+    editingRt.allowedModels = raw.split(",").map(s => s.trim()).filter(Boolean);
+    if (editingRt.allowedModels.length === 0) throw new Error("至少需要设置 1 个允许模型");
   }
 
   // Update default model mappings (jx-* aliases)
-  if (formData.defaultModels_sonnet) rt.defaultModels.sonnet = formData.defaultModels_sonnet.trim();
-  if (formData.defaultModels_opus)   rt.defaultModels.opus   = formData.defaultModels_opus.trim();
-  if (formData.defaultModels_haiku)  rt.defaultModels.haiku  = formData.defaultModels_haiku.trim();
+  if (formData.defaultModels_sonnet) editingRt.defaultModels.sonnet = formData.defaultModels_sonnet.trim();
+  if (formData.defaultModels_opus)   editingRt.defaultModels.opus   = formData.defaultModels_opus.trim();
+  if (formData.defaultModels_haiku)  editingRt.defaultModels.haiku  = formData.defaultModels_haiku.trim();
 
   // Ensure defaultModels values are always in allowedModels
-  for (const m of Object.values(rt.defaultModels)) {
-    if (m && !rt.allowedModels.includes(m)) {
-      rt.allowedModels.push(m);
+  for (const m of Object.values(editingRt.defaultModels)) {
+    if (m && !editingRt.allowedModels.includes(m)) {
+      editingRt.allowedModels.push(m);
     }
   }
 
-  // Update circuit breaker thresholds
-  upstreamBreaker.failureThreshold = rt.proxy.circuitBreakerFailures || 5;
-  upstreamBreaker.cooldownMs = rt.proxy.circuitBreakerCooldown || 30000;
+  // Update circuit breaker thresholds for this profile
+  editingRt.breaker.failureThreshold = gProxy.circuitBreakerFailures || 5;
+  editingRt.breaker.cooldownMs = gProxy.circuitBreakerCooldown || 30000;
 
   // Update global users
   const newGlobalUsers = {};
@@ -2073,7 +2328,7 @@ function applySettings(formData) {
     }
   }
   if (Object.keys(newGlobalUsers).length > 0) {
-    rt.globalUsers = newGlobalUsers;
+    editingRt.globalUsers = newGlobalUsers;
   }
 
   // Update profile users (key assignment + profile disable)
@@ -2092,23 +2347,22 @@ function applySettings(formData) {
     }
   }
   if (Object.keys(newProfileUsers).length > 0) {
-    rt.users = newProfileUsers;
+    editingRt.users = newProfileUsers;
   }
 
-  // Persist to config.json — use in-memory config directly to avoid stale-data overwrite
-  config.proxy = { ...rt.proxy };
-  config.users = { ...rt.globalUsers };
-  // Update active profile
-  const ap = config.profiles[config.activeProfile];
+  // Persist to config.json
+  config.proxy = { ...gProxy };
+  config.users = { ...editingRt.globalUsers };
+  const ap = config.profiles[editingProfileName];
   if (ap) {
-    ap.upstream = rt.upstream;
-    ap.allowedModels = rt.allowedModels;
-    ap.defaultModels = { ...rt.defaultModels };
-    ap.users = { ...rt.users };
+    ap.upstream = editingRt.upstream;
+    ap.allowedModels = editingRt.allowedModels;
+    ap.defaultModels = { ...editingRt.defaultModels };
+    ap.users = { ...editingRt.users };
   }
   saveConfig(config);
 
-  console.log(`[CONFIG] Settings saved to profile "${config.activeProfile}"`);
+  console.log(`[CONFIG] Settings saved to profile "${editingProfileName}"`);
 }
 
 const server = http.createServer((req, res) => {
@@ -2227,16 +2481,19 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  // Profile: switch
+  // Profile: switch (kept for backward compat — now just reloads the specified profile)
   if (req.method === "POST" && req.url === "/api/profile/switch") {
     if (!checkAuth(req)) { res.writeHead(401); res.end("Unauthorized"); return; }
     if (!checkCsrf(req)) { res.writeHead(403); res.end("CSRF validation failed"); return; }
     readBody(req).then(buf => {
       try {
         const { profile } = JSON.parse(buf.toString());
-        switchProfile(profile);
+        if (!config.profiles[profile]) throw new Error(`Profile "${profile}" not found`);
+        // No longer need exclusive switch — all profiles are always active
+        // Just reload its runtime to apply any config changes
+        reloadProfileRuntime(profile);
         res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ ok: true, activeProfile: config.activeProfile }));
+        res.end(JSON.stringify({ ok: true, profiles: listProfiles() }));
       } catch (err) {
         res.writeHead(400, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ error: err.message }));
@@ -2253,20 +2510,30 @@ const server = http.createServer((req, res) => {
     if (!checkCsrf(req)) { res.writeHead(403); res.end("CSRF validation failed"); return; }
     readBody(req).then(buf => {
       try {
-        const { profile, upstream, allowedModels, defaultModels } = JSON.parse(buf.toString());
+        const { profile, upstream, allowedModels, defaultModels, suffix } = JSON.parse(buf.toString());
         const name = (profile || "").trim();
         if (!name) throw new Error("Profile name required");
+        // Validate suffix
+        const sfx = (suffix || "").toLowerCase().replace(/[^a-z0-9_-]/g, "");
+        // Check for reserved suffixes
+        if (sfx && RESERVED_SUFFIXES.has(sfx)) throw new Error(`后缀 "${sfx}" 是系统保留的，请使用其他名称`);
+        // Check for suffix uniqueness
+        for (const [pn, p] of Object.entries(config.profiles)) {
+          if (pn !== name && (p.suffix || "") === sfx) throw new Error(`后缀 "${sfx}" 已被方案 "${pn}" 使用`);
+        }
         config.profiles[name] = {
           upstream: upstream || rt.upstream,
-          allowedModels: allowedModels ? allowedModels.split(",").map(s => s.trim()).filter(Boolean) : rt.allowedModels,
+          allowedModels: allowedModels ? allowedModels.split(",").map(s => s.trim()).filter(Boolean) : [...rt.allowedModels],
           defaultModels: defaultModels || { ...rt.defaultModels },
-          users: { ...rt.users },
+          users: {},
+          suffix: sfx,
+          isDefault: false,
         };
-        config.activeProfile = name;
+        reloadProfileRuntime(name);
         saveConfig(config);
-        console.log(`[PROFILE] Created new profile "${name}"`);
+        console.log(`[PROFILE] Created new profile "${name}" (suffix: ${JSON.stringify(sfx)})`);
         res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ ok: true, profile: name }));
+        res.end(JSON.stringify({ ok: true, profile: name, suffix: sfx }));
       } catch (err) {
         res.writeHead(400, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ error: err.message }));
@@ -2285,11 +2552,18 @@ const server = http.createServer((req, res) => {
       try {
         const { profile } = JSON.parse(buf.toString());
         if (Object.keys(config.profiles).length <= 1) throw new Error("Cannot delete last profile");
-        if (profile === config.activeProfile) throw new Error("Cannot delete active profile. Switch first.");
+        const p = config.profiles[profile];
+        if (p && p.isDefault) throw new Error("Cannot delete the default profile");
+        // Clean up runtime
+        if (p) {
+          const suffix = p.suffix || "";
+          const oldRt = runtimes[suffix];
+          if (oldRt) oldRt.agent.destroy();
+          delete runtimes[suffix];
+        }
         delete config.profiles[profile];
         saveConfig(config);
         console.log(`[PROFILE] Deleted profile "${profile}"`);
-        res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ ok: true }));
       } catch (err) {
         res.writeHead(400, { "Content-Type": "application/json" });
@@ -2357,13 +2631,23 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  // Reset circuit breaker
-  if (req.method === "POST" && req.url === "/api/circuit-breaker-reset") {
+  // Reset circuit breaker (for a specific profile or all)
+  if (req.method === "POST" && req.url.startsWith("/api/circuit-breaker-reset")) {
     if (!checkAuth(req)) { res.writeHead(401); res.end("Unauthorized"); return; }
     if (!checkCsrf(req)) { res.writeHead(403); res.end("CSRF validation failed"); return; }
-    upstreamBreaker.reset();
-    res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ ok: true, status: upstreamBreaker.status() }));
+    const url = new URL(req.url, `http://localhost`);
+    const profileSuffix = url.searchParams.get("profile") || "";
+    const targetRt = runtimes[profileSuffix];
+    if (targetRt) {
+      targetRt.breaker.reset();
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ ok: true, status: targetRt.breaker.status(), profile: targetRt.profileName }));
+    } else {
+      // Reset all
+      for (const r of Object.values(runtimes)) r.breaker.reset();
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ ok: true }));
+    }
     return;
   }
 
@@ -2379,18 +2663,47 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  // Protected API: stats
-  if (req.method === "GET" && req.url === "/api/stats") {
+  // Protected API: stats (supports ?profile=<suffix> and ?profile=all)
+  if (req.method === "GET" && req.url.startsWith("/api/stats")) {
     if (!checkAuth(req)) { res.writeHead(401); res.end("Unauthorized"); return; }
-    const data = sanitizeStore(store);
-    data.activeProfile = config.activeProfile;
-    data.upstream = rt.upstream;
-    data.profileQuota = getProfileQuota();
-    data.userQuotas = {};
-    for (const k of Object.keys(rt.users)) {
-      const q = getUserQuota(k);
-      if (q > 0) data.userQuotas[k.slice(0, 8) + "****"] = q;
+    const url = new URL(req.url, `http://localhost`);
+    const profileSuffix = url.searchParams.get("profile");
+    let data;
+    if (profileSuffix === "all") {
+      // Aggregate all profiles
+      const agg = getAggregatedStore();
+      data = sanitizeStore(agg);
+      data.profileView = "all";
+    } else {
+      const targetRt = runtimes[profileSuffix || ""];
+      if (targetRt) {
+        const s = getProfileStore(profileSuffix || "");
+        data = sanitizeStore(s);
+        data.profileView = targetRt.profileName;
+        data.profileSuffix = profileSuffix || "";
+        data.upstream = targetRt.upstream;
+        data.profileQuota = getProfileQuota(profileSuffix);
+        data.userQuotas = {};
+        for (const k of Object.keys(targetRt.users)) {
+          const q = getUserQuota(k, targetRt);
+          if (q > 0) data.userQuotas[k.slice(0, 8) + "****"] = q;
+        }
+      } else {
+        // Default: use default profile store
+        data = sanitizeStore(store);
+        data.profileView = runtimes[""] ? runtimes[""].profileName : "default";
+        data.profileSuffix = "";
+        data.upstream = rt.upstream;
+        data.profileQuota = getProfileQuota("");
+        data.userQuotas = {};
+        for (const k of Object.keys(rt.users)) {
+          const q = getUserQuota(k, rt);
+          if (q > 0) data.userQuotas[k.slice(0, 8) + "****"] = q;
+        }
+      }
     }
+    // Add profile list for dropdown
+    data.profiles = listProfiles();
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify(data));
     return;
@@ -2441,15 +2754,22 @@ const server = http.createServer((req, res) => {
     if (!checkCsrf(req)) { res.writeHead(403); res.end("CSRF validation failed"); return; }
     readBody(req).then(buf => {
       try {
-        const { users, profileUsers } = JSON.parse(buf.toString());
+        const { users, profileUsers, profileSuffix } = JSON.parse(buf.toString());
         if (!Array.isArray(users) || users.length === 0) throw new Error("No users provided");
         const newGlobalUsers = {};
         for (const u of users) {
           if (!u.key) continue;
           newGlobalUsers[u.key] = { username: u.username || u.key.slice(0, 8), expiresAt: u.expiresAt || null, disabled: !!u.disabled };
         }
-        rt.globalUsers = newGlobalUsers;
-        config.users = { ...rt.globalUsers };
+        // Update global users in all runtimes
+        for (const r of Object.values(runtimes)) {
+          r.globalUsers = { ...newGlobalUsers };
+        }
+        config.users = { ...newGlobalUsers };
+        // Determine which profile to update users for
+        const targetSuffix = profileSuffix || "";
+        const targetRt = runtimes[targetSuffix] || rt;
+        const targetProfileName = targetRt.profileName;
         // Update profile users (real keys + profile disable)
         if (Array.isArray(profileUsers)) {
           const newPU = {};
@@ -2457,14 +2777,13 @@ const server = http.createServer((req, res) => {
             if (!pu.key) continue;
             newPU[pu.key] = { key: pu.realKey || "", disabled: !!pu.disabled, dailyTokenLimit: pu.dailyTokenLimit || null };
           }
-          const ap = config.profiles[config.activeProfile];
+          const ap = config.profiles[targetProfileName];
           if (ap) {
             ap.users = newPU;
-            rt.users = { ...newPU };
+            targetRt.users = { ...newPU };
           }
         } else {
-          // Ensure profile users entries exist for new keys
-          const ap = config.profiles[config.activeProfile];
+          const ap = config.profiles[targetProfileName];
           if (ap) {
             for (const k of Object.keys(newGlobalUsers)) {
               if (!ap.users[k]) ap.users[k] = { key: "", disabled: false };
@@ -2510,17 +2829,24 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  // Personal usage API (authenticated by API key)
-  if (req.method === "GET" && req.url === "/api/my-usage") {
+  // Personal usage API (authenticated by API key, supports ?profile=<suffix>)
+  if (req.method === "GET" && req.url.startsWith("/api/my-usage")) {
     const apiKey = getApiKey(req);
-    const userKey = resolveUserKey(apiKey);
-    if (!rt.users[userKey] && !rt.globalUsers[userKey]) {
+    const url = new URL(req.url, `http://localhost`);
+    const profileSuffix = url.searchParams.get("profile") || "";
+    // Check if user exists in ANY profile
+    let found = false;
+    for (const rt2 of Object.values(runtimes)) {
+      const uk = resolveUserKey(apiKey, rt2);
+      if (rt2.users[uk] || rt2.globalUsers[uk]) { found = true; break; }
+    }
+    if (!found) {
       res.writeHead(401, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ error: "认证失败：请提供有效的虚拟Key (Authorization: Bearer jx-...)" }));
       return;
     }
     res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
-    res.end(JSON.stringify(getPersonalUsageData(apiKey), null, 2));
+    res.end(JSON.stringify(getPersonalUsageData(apiKey, profileSuffix), null, 2));
     return;
   }
 
@@ -2533,7 +2859,7 @@ const server = http.createServer((req, res) => {
       uptime: Math.floor(process.uptime()),
       activeConnections: activeConns,
       upstream: rt.upstream,
-      circuitBreaker: upstreamBreaker.status(),
+      circuitBreaker: rt.breaker.status(),
     }));
     return;
   }
@@ -2550,13 +2876,13 @@ const server = http.createServer((req, res) => {
 
 server.listen(port, "0.0.0.0", () => {
   console.log(`[团队AI Coding监控] http://0.0.0.0:${port}  Dashboard: http://localhost:${port}/dashboard`);
-  console.log(`[团队AI Coding监控] Profile: "${config.activeProfile}" → ${rt.upstream}`);
+  console.log(`[团队AI Coding监控] Profiles: ${Object.values(runtimes).map(r => `"${r.profileName}"(${JSON.stringify(r.suffix)})→${r.upstream.replace("https://","").replace("http://","").split("/")[0]}`).join(", ")}`);
   console.log(`[团队AI Coding监控] Settings: http://localhost:${port}/settings`);
   console.log(`[团队AI Coding监控] Users: ${Object.values(rt.globalUsers).map(u => u.username || "").join(", ")}`);
 });
 
 // Server timeouts
-const serverTimeout = Math.max(rt.proxy.streamTimeout, rt.proxy.timeout) + 60000;
+const serverTimeout = Math.max(gProxy.streamTimeout, gProxy.timeout) + 60000;
 server.timeout = serverTimeout;
 server.requestTimeout = serverTimeout;
 server.headersTimeout = 120000;

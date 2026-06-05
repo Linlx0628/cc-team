@@ -126,16 +126,32 @@ node server.mjs
 
 ## 接入 Claude Code
 
+### 默认方案（无后缀）
+
 ```bash
-export ANTHROPIC_BASE_URL="http://localhost:6789/v1"
+export ANTHROPIC_BASE_URL="http://localhost:6789"
 export ANTHROPIC_API_KEY="jx-your-virtual-key"
 ```
+
+### 指定方案（通过 URL 后缀）
+
+```bash
+# 使用 GLM 方案
+export ANTHROPIC_BASE_URL="http://localhost:6789/glm"
+export ANTHROPIC_API_KEY="jx-your-virtual-key"
+
+# 使用 DeepSeek 方案
+export ANTHROPIC_BASE_URL="http://localhost:6789/deepseek"
+export ANTHROPIC_API_KEY="jx-your-virtual-key"
+```
+
+所有方案同时在线，无需切换。后缀由管理员在设置页面创建方案时指定。
 
 ## 页面
 
 | 页面 | 地址 | 说明 |
 |------|------|------|
-| 监控面板 | `http://localhost:6789/dashboard` | 管理员查看全队用量，需登录 |
+| 监控面板 | `http://localhost:6789/dashboard` | 管理员查看全队用量，支持按方案筛选，需登录 |
 | 设置页面 | `http://localhost:6789/settings` | 配置方案、用户、配额，需登录 |
 | 个人用量 | `http://localhost:6789/usage/你的虚拟Key` | 用户查看自己的用量，无需登录 |
 | 用量输入 | `http://localhost:6789/my-usage` | 输入虚拟 Key 跳转个人页面 |

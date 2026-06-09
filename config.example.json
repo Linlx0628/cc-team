@@ -1,9 +1,11 @@
 {
   "port": 6789,
   "dashboardPassword": "change-me",
-  "activeProfile": "glm",
   "profiles": {
     "glm": {
+      "suffix": "glm",
+      "isDefault": true,
+      "apiProtocol": "anthropic",
       "upstream": "https://open.bigmodel.cn/api/anthropic",
       "allowedModels": ["glm-5.1"],
       "defaultModels": {
@@ -11,6 +13,13 @@
         "opus": "glm-5.1",
         "haiku": "glm-5.1"
       },
+      "modelAliases": {
+        "jx-sonnet": "glm-5.1",
+        "jx-opus": "glm-5.1",
+        "jx-haiku": "glm-5.1"
+      },
+      "openaiStreamUsage": true,
+      "responsesAdapter": "none",
       "users": {
         "example-api-key": {
           "username": "示例成员",
@@ -18,14 +27,61 @@
         }
       }
     },
+    "openai-codex": {
+      "suffix": "openai",
+      "isDefault": false,
+      "apiProtocol": "openai",
+      "upstream": "https://api.openai.com/v1",
+      "allowedModels": ["gpt-5", "gpt-5-mini"],
+      "modelAliases": {
+        "codex-main": "gpt-5",
+        "codex-fast": "gpt-5-mini"
+      },
+      "openaiStreamUsage": true,
+      "responsesAdapter": "none",
+      "users": {
+        "user-vk-1": {
+          "username": "张三",
+          "key": "sk-real-openai-or-vendor-key"
+        }
+      }
+    },
     "aliyun": {
+      "suffix": "aliyun",
+      "isDefault": false,
+      "apiProtocol": "openai",
       "upstream": "https://dashscope.aliyuncs.com/compatible-mode/v1",
       "allowedModels": ["qwen-plus", "qwen-max"],
-      "defaultModels": {
-        "sonnet": "qwen-max",
-        "opus": "qwen-max",
-        "haiku": "qwen-plus"
+      "modelAliases": {
+        "codex-main": "qwen-max",
+        "codex-fast": "qwen-plus"
       },
+      "openaiStreamUsage": true,
+      "responsesAdapter": "none",
+      "users": {
+        "user-vk-1": {
+          "username": "张三",
+          "key": "sk-shared-real-key"
+        },
+        "user-vk-2": {
+          "username": "李四",
+          "key": "sk-shared-real-key"
+        }
+      }
+    },
+    "aliyun-coding": {
+      "suffix": "aliyun-openai",
+      "isDefault": false,
+      "apiProtocol": "openai",
+      "upstream": "https://coding.dashscope.aliyuncs.com/v1",
+      "allowedModels": ["glm-5", "qwen3.7-plus", "qwen3.6-plus"],
+      "modelAliases": {
+        "codex-min": "qwen3.6-plus",
+        "codex-max": "qwen3.7-plus",
+        "codex-pro": "glm-5"
+      },
+      "openaiStreamUsage": true,
+      "responsesAdapter": "chat_completions",
       "users": {
         "user-vk-1": {
           "username": "张三",

@@ -21,6 +21,127 @@ const config = loadConfig();
 const { port } = config;
 const dashboardPassword = config.dashboardPassword || "";
 const dataPath = path.join(__dirname, "data.json");
+const RESERVED_SUFFIXES = new Set(["dashboard", "settings", "api", "health", "usage", "my-usage", "v1", "login", "logout", "favicon", "robots", "js", "css"]);
+const PROFILE_SUFFIX_RE = /^[a-z0-9_-]{2,20}$/;
+const API_PROTOCOLS = new Set(["anthropic", "openai"]);
+const OPENAI_STREAM_USAGE_DEFAULT = true;
+const RESPONSES_ADAPTERS = new Set(["none", "chat_completions"]);
+
+function normalizeProfileSuffix(value) {
+  return String(value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9_-]/g, "")
+    .slice(0, 20);
+}
+
+function makeProfileSuffix(name, used, fallbackIndex = 1) {
+  let base = normalizeProfileSuffix(name);
+  if (!base || base.length < 2 || RESERVED_SUFFIXES.has(base)) base = `p${fallbackIndex}`;
+  if (base.length < 2) base = `p${fallbackIndex}`;
+  let suffix = base;
+  let i = 2;
+  while (used.has(suffix) || RESERVED_SUFFIXES.has(suffix) || !PROFILE_SUFFIX_RE.test(suffix)) {
+    const tail = String(i++);
+    suffix = `${base.slice(0, Math.max(2, 20 - tail.length))}${tail}`;
+  }
+  used.add(suffix);
+  return suffix;
+}
+
+function validateProfileSuffix(suffix, currentProfileName = null) {
+  const sfx = normalizeProfileSuffix(suffix);
+  if (!sfx) throw new Error("URL 后缀不能为空");
+  if (!PROFILE_SUFFIX_RE.test(sfx)) throw new Error("URL 后缀只能使用 2-20 位小写字母、数字、下划线或连字符");
+  if (RESERVED_SUFFIXES.has(sfx)) throw new Error(`后缀 "${sfx}" 是系统保留的，请使用其他名称`);
+  for (const [name, profile] of Object.entries(config.profiles || {})) {
+    if (name !== currentProfileName && normalizeProfileSuffix(profile.suffix) === sfx) {
+      throw new Error(`后缀 "${sfx}" 已被方案 "${name}" 使用`);
+    }
+  }
+  return sfx;
+}
+
+function normalizeApiProtocol(value) {
+  const protocol = String(value || "anthropic").trim().toLowerCase();
+  return API_PROTOCOLS.has(protocol) ? protocol : "anthropic";
+}
+
+function validateApiProtocol(value) {
+  const protocol = String(value || "anthropic").trim().toLowerCase();
+  if (!API_PROTOCOLS.has(protocol)) throw new Error("接口协议只能是 anthropic 或 openai");
+  return protocol;
+}
+
+function normalizeResponsesAdapter(value) {
+  const adapter = String(value || "none").trim().toLowerCase();
+  return RESPONSES_ADAPTERS.has(adapter) ? adapter : "none";
+}
+
+function validateResponsesAdapter(value) {
+  const adapter = String(value || "none").trim().toLowerCase();
+  if (!RESPONSES_ADAPTERS.has(adapter)) throw new Error("Responses 兼容模式只能是 none 或 chat_completions");
+  return adapter;
+}
+
+function legacyDefaultModelAliases(defaultModels = {}) {
+  const aliases = {};
+  if (defaultModels.sonnet) aliases["jx-sonnet"] = String(defaultModels.sonnet).trim();
+  if (defaultModels.opus) aliases["jx-opus"] = String(defaultModels.opus).trim();
+  if (defaultModels.haiku) aliases["jx-haiku"] = String(defaultModels.haiku).trim();
+  return aliases;
+}
+
+function normalizeModelAliases(value) {
+  const aliases = {};
+  if (!value || typeof value !== "object" || Array.isArray(value)) return aliases;
+  for (const [alias, target] of Object.entries(value)) {
+    const key = String(alias || "").trim();
+    const mapped = String(target || "").trim();
+    if (key && mapped) aliases[key] = mapped;
+  }
+  return aliases;
+}
+
+function parseModelAliasesInput(value) {
+  if (value && typeof value === "object" && !Array.isArray(value)) return normalizeModelAliases(value);
+  const aliases = {};
+  const raw = String(value || "").trim();
+  if (!raw) return aliases;
+  for (const part of raw.split(/[\n,]+/)) {
+    const item = part.trim();
+    if (!item) continue;
+    const sep = item.includes("=") ? "=" : item.includes(":") ? ":" : "";
+    if (!sep) throw new Error(`模型别名格式错误: ${item}`);
+    const [aliasRaw, ...targetParts] = item.split(sep);
+    const alias = aliasRaw.trim();
+    const target = targetParts.join(sep).trim();
+    if (!alias || !target) throw new Error(`模型别名格式错误: ${item}`);
+    aliases[alias] = target;
+  }
+  return aliases;
+}
+
+function getProfileModelAliases(profile) {
+  const explicitAliases = normalizeModelAliases(profile?.modelAliases || {});
+  if (normalizeApiProtocol(profile?.apiProtocol) === "openai") return explicitAliases;
+  return {
+    ...legacyDefaultModelAliases(profile?.defaultModels || {}),
+    ...explicitAliases,
+  };
+}
+
+function getConfigurableModelAliases(profile) {
+  const aliases = normalizeModelAliases(profile?.modelAliases || {});
+  if (normalizeApiProtocol(profile?.apiProtocol) !== "openai") return aliases;
+  return Object.fromEntries(Object.entries(aliases).filter(([alias]) => !/^jx-(sonnet|opus|haiku)$/i.test(alias)));
+}
+
+function formatModelAliasesInput(aliases = {}) {
+  return Object.entries(normalizeModelAliases(aliases))
+    .map(([alias, target]) => `${alias}=${target}`)
+    .join("\n");
+}
 
 // ─── Profile System ──────────────────────────────────────────────────────────
 // Auto-migrate old config format to profile-based
@@ -64,6 +185,36 @@ if (!config.profiles) {
     }
   }
   if (migrated) { saveConfig(config); console.log("[MIGRATE] Added defaultModels to existing profiles"); }
+})();
+
+// Auto-migrate: add API protocol and generic model aliases.
+(function migrateProfileProtocolsAndAliases() {
+  let migrated = false;
+  for (const pname of Object.keys(config.profiles)) {
+    const p = config.profiles[pname];
+    const protocol = normalizeApiProtocol(p.apiProtocol);
+    if (p.apiProtocol !== protocol) {
+      p.apiProtocol = protocol;
+      migrated = true;
+    }
+    if (p.openaiStreamUsage === undefined) {
+      p.openaiStreamUsage = OPENAI_STREAM_USAGE_DEFAULT;
+      migrated = true;
+    }
+    const adapter = protocol === "openai" ? normalizeResponsesAdapter(p.responsesAdapter) : "none";
+    if (p.responsesAdapter !== adapter) {
+      p.responsesAdapter = adapter;
+      migrated = true;
+    }
+    const mergedAliases = protocol === "openai" ? getConfigurableModelAliases(p) : getProfileModelAliases(p);
+    const currentAliases = normalizeModelAliases(p.modelAliases || {});
+    const mergedJson = JSON.stringify(mergedAliases);
+    if (JSON.stringify(currentAliases) !== mergedJson) {
+      p.modelAliases = mergedAliases;
+      migrated = true;
+    }
+  }
+  if (migrated) { saveConfig(config); console.log("[MIGRATE] Added apiProtocol/modelAliases to profiles"); }
 })();
 
 // Auto-migrate: separate global users from profile-specific keys
@@ -126,45 +277,38 @@ if (!config.profiles) {
   }
 })();
 
-// Auto-migrate: add suffix and isDefault to profiles for multi-profile concurrent
+// Auto-migrate: ensure every profile has a stable suffix and exactly one default entry
 (function migrateProfileSuffix() {
   let migrated = false;
-  const suffixes = new Set();
-  for (const [pname, p] of Object.entries(config.profiles)) {
-    if (p.suffix === undefined) {
-      // Active profile becomes default (empty suffix)
-      if (pname === config.activeProfile) {
-        p.suffix = "";
-        p.isDefault = true;
-      } else {
-        // Auto-generate suffix from profile name (lowercase, alphanumeric only)
-        let s = pname.toLowerCase().replace(/[^a-z0-9]/g, "").slice(0, 20);
-        if (!s || s.length < 2) s = "p" + (Object.keys(config.profiles).indexOf(pname) + 1);
-        let base = s, i = 2;
-        while (suffixes.has(s)) { s = base + i; i++; }
-        p.suffix = s;
-        p.isDefault = false;
-      }
-      suffixes.add(p.suffix);
+  const names = Object.keys(config.profiles);
+  const explicitDefaults = names.filter(name => config.profiles[name].isDefault);
+  const defaultName = explicitDefaults[0] || (config.activeProfile && config.profiles[config.activeProfile] ? config.activeProfile : names[0]);
+  const used = new Set();
+
+  names.forEach((pname, index) => {
+    const profile = config.profiles[pname];
+    const normalized = normalizeProfileSuffix(profile.suffix);
+    if (!normalized || used.has(normalized) || RESERVED_SUFFIXES.has(normalized) || !PROFILE_SUFFIX_RE.test(normalized)) {
+      profile.suffix = makeProfileSuffix(pname, used, index + 1);
       migrated = true;
     } else {
-      suffixes.add(p.suffix);
+      if (profile.suffix !== normalized) {
+        profile.suffix = normalized;
+        migrated = true;
+      }
+      used.add(normalized);
     }
-  }
-  // Ensure exactly one default
-  const defaults = Object.entries(config.profiles).filter(([, p]) => p.isDefault);
-  if (defaults.length === 0) {
-    const first = Object.keys(config.profiles)[0];
-    config.profiles[first].isDefault = true;
-    config.profiles[first].suffix = "";
-    migrated = true;
-  } else if (defaults.length > 1) {
-    for (let i = 1; i < defaults.length; i++) defaults[i][1].isDefault = false;
-    migrated = true;
-  }
+
+    const shouldBeDefault = pname === defaultName;
+    if (!!profile.isDefault !== shouldBeDefault) {
+      profile.isDefault = shouldBeDefault;
+      migrated = true;
+    }
+  });
+
   if (migrated) {
     saveConfig(config);
-    console.log("[MIGRATE] Added suffix/isDefault:", Object.entries(config.profiles).map(([n, p]) => `${n}(${JSON.stringify(p.suffix)})`).join(", "));
+    console.log("[MIGRATE] Normalized profile suffix/default:", Object.entries(config.profiles).map(([n, p]) => `${n}(${JSON.stringify(p.suffix)}${p.isDefault ? ",default" : ""})`).join(", "));
   }
 })();
 
@@ -175,13 +319,35 @@ function getDefaultProfileName() {
   return Object.keys(config.profiles)[0];
 }
 
+function getDefaultProfileSuffix() {
+  const profile = config.profiles[getDefaultProfileName()];
+  return profile ? profile.suffix : "";
+}
+
+function getProfileNameBySuffix(suffix) {
+  const sfx = normalizeProfileSuffix(suffix);
+  for (const [name, profile] of Object.entries(config.profiles)) {
+    if (normalizeProfileSuffix(profile.suffix) === sfx) return name;
+  }
+  return null;
+}
+
 function listProfiles() {
   return Object.keys(config.profiles).map(name => ({
     name,
-    suffix: config.profiles[name].suffix || "",
+    suffix: normalizeProfileSuffix(config.profiles[name].suffix),
     isDefault: !!config.profiles[name].isDefault,
+    apiProtocol: normalizeApiProtocol(config.profiles[name].apiProtocol),
     upstream: config.profiles[name].upstream,
     userCount: Object.keys(config.profiles[name].users || {}).length,
+    allowedModels: config.profiles[name].allowedModels || [],
+    defaultModels: config.profiles[name].defaultModels || {},
+    modelAliases: getConfigurableModelAliases(config.profiles[name]),
+    openaiStreamUsage: config.profiles[name].openaiStreamUsage !== false,
+    responsesAdapter: normalizeApiProtocol(config.profiles[name].apiProtocol) === "openai"
+      ? normalizeResponsesAdapter(config.profiles[name].responsesAdapter)
+      : "none",
+    dailyTokenLimit: config.profiles[name].dailyTokenLimit || 0,
   }));
 }
 
@@ -279,13 +445,19 @@ function createProfileRuntime(profileName, profile) {
   const upstreamUrl = new URL(profile.upstream);
   return {
     profileName,
-    suffix: profile.suffix || "",
+    suffix: normalizeProfileSuffix(profile.suffix),
     isDefault: !!profile.isDefault,
+    apiProtocol: normalizeApiProtocol(profile.apiProtocol),
     upstream: profile.upstream,
     upstreamUrl,
     users: { ...(profile.users || {}) },
     allowedModels: profile.allowedModels || [],
     defaultModels: profile.defaultModels || { sonnet: "claude-sonnet-4-6", opus: "claude-opus-4-5", haiku: "claude-haiku-4-5" },
+    modelAliases: getProfileModelAliases(profile),
+    openaiStreamUsage: profile.openaiStreamUsage !== false,
+    responsesAdapter: normalizeApiProtocol(profile.apiProtocol) === "openai"
+      ? normalizeResponsesAdapter(profile.responsesAdapter)
+      : "none",
     globalUsers: { ...(config.users || {}) },
     breaker: new CircuitBreaker({
       failureThreshold: (config.proxy || {}).circuitBreakerFailures || 5,
@@ -298,7 +470,7 @@ function createProfileRuntime(profileName, profile) {
 function initAllRuntimes() {
   for (const key of Object.keys(runtimes)) delete runtimes[key];
   for (const [name, profile] of Object.entries(config.profiles)) {
-    const suffix = profile.suffix || "";
+    const suffix = normalizeProfileSuffix(profile.suffix);
     runtimes[suffix] = createProfileRuntime(name, profile);
   }
   console.log(`[RUNTIME] Initialized ${Object.keys(runtimes).length} profile(s): ${Object.values(runtimes).map(r => `"${r.profileName}"(${JSON.stringify(r.suffix)})`).join(", ")}`);
@@ -307,16 +479,18 @@ function initAllRuntimes() {
 function reloadProfileRuntime(profileName) {
   const profile = config.profiles[profileName];
   if (!profile) return;
-  const suffix = profile.suffix || "";
+  const suffix = normalizeProfileSuffix(profile.suffix);
   const old = runtimes[suffix];
   if (old) old.agent.destroy();
   runtimes[suffix] = createProfileRuntime(profileName, profile);
+  syncDefaultRuntime();
   console.log(`[RUNTIME] Reloaded "${profileName}" (suffix: ${JSON.stringify(suffix)})`);
 }
 
 function reloadAllRuntimes() {
   for (const rt of Object.values(runtimes)) rt.agent.destroy();
   initAllRuntimes();
+  syncDefaultRuntime();
 }
 
 // Global proxy settings (shared across profiles)
@@ -329,25 +503,44 @@ gProxy.retryableStatusCodes = gProxy.retryableStatusCodes || [429, 502, 503, 504
 gProxy.maxConcurrentPerUser = gProxy.maxConcurrentPerUser || 5;
 gProxy.rateLimitPerMinute = gProxy.rateLimitPerMinute || 60;
 
-// Initialize all runtimes
-initAllRuntimes();
 // Backward-compat: rt → default profile runtime (used by non-request-path code)
-const rt = runtimes[""];
+let rt;
+
+function getDefaultRuntime() {
+  return runtimes[getDefaultProfileSuffix()] || Object.values(runtimes)[0];
+}
+
+function syncDefaultRuntime() {
+  rt = getDefaultRuntime();
+}
 
 // ─── Profile Route Resolver ─────────────────────────────────────────────────
-const RESERVED_SUFFIXES = new Set(["dashboard", "settings", "api", "health", "usage", "my-usage", "v1", "login", "logout", "favicon", "robots", "js", "css"]);
+// Initialize all runtimes
+initAllRuntimes();
+syncDefaultRuntime();
 
 function resolveProfile(url) {
-  // Try to match /<suffix>/... pattern
-  const seg = url.match(/^\/([a-zA-Z0-9_-]{2,20})(\/.*)/);
+  const pathname = new URL(url, "http://localhost").pathname;
+  const defaultRuntime = getDefaultRuntime();
+  if (pathname === "/v1" || pathname.startsWith("/v1/")) {
+    return { suffix: defaultRuntime?.suffix || "", runtime: defaultRuntime, strippedUrl: url };
+  }
+
+  // Try to match /<suffix>/... pattern.
+  const seg = pathname.match(/^\/([a-zA-Z0-9_-]{2,20})(\/.*)?$/);
   if (seg) {
     const candidate = seg[1].toLowerCase();
     if (!RESERVED_SUFFIXES.has(candidate) && runtimes[candidate]) {
-      return { suffix: candidate, runtime: runtimes[candidate], strippedUrl: seg[2] };
+      const strippedPath = seg[2] || "/";
+      const query = url.includes("?") ? url.slice(url.indexOf("?")) : "";
+      return { suffix: candidate, runtime: runtimes[candidate], strippedUrl: strippedPath + query };
+    }
+    if (!RESERVED_SUFFIXES.has(candidate)) {
+      return { error: `Unknown profile suffix "${candidate}"` };
     }
   }
-  // Default profile (no suffix)
-  return { suffix: "", runtime: runtimes[""] || { upstreamUrl: new URL("http://localhost"), breaker: new CircuitBreaker(), agent: new http.Agent(), users: {}, allowedModels: [], defaultModels: {}, globalUsers: {} }, strippedUrl: url };
+
+  return { suffix: defaultRuntime?.suffix || "", runtime: defaultRuntime, strippedUrl: url };
 }
 
 // ─── Concurrency & Rate Limit ────────────────────────────────────────────────
@@ -535,18 +728,44 @@ let store = { users: {}, daily: {}, dailyModels: {}, dailyHourly: {}, models: {}
 
 // Per-profile store: non-default profiles store data under store._profiles[suffix]
 function getProfileStore(suffix) {
-  if (!suffix) return store; // default profile uses top-level store (backward compat)
+  let sfx = normalizeProfileSuffix(suffix);
+  if (!sfx) sfx = getDefaultProfileSuffix();
+  if (!sfx) return store; // legacy fallback
   if (!store._profiles) store._profiles = {};
-  if (!store._profiles[suffix]) {
-    store._profiles[suffix] = { users: {}, daily: {}, dailyModels: {}, dailyHourly: {}, models: {}, hourly: {}, errors: [] };
+  if (!store._profiles[sfx]) {
+    store._profiles[sfx] = { users: {}, daily: {}, dailyModels: {}, dailyHourly: {}, models: {}, hourly: {}, errors: [] };
   }
-  return store._profiles[suffix];
+  return store._profiles[sfx];
+}
+
+function topLevelStoreHasUsage() {
+  return ["users", "daily", "dailyModels", "dailyHourly", "models", "hourly", "errors"]
+    .some(k => Array.isArray(store[k]) ? store[k].length > 0 : Object.keys(store[k] || {}).length > 0);
+}
+
+function migrateDefaultStoreToProfileSuffix() {
+  const defaultSuffix = getDefaultProfileSuffix();
+  if (!defaultSuffix || store._defaultProfileSuffixMigrated === defaultSuffix || !topLevelStoreHasUsage()) return;
+  if (!store._profiles) store._profiles = {};
+  const target = store._profiles[defaultSuffix] || { users: {}, daily: {}, dailyModels: {}, dailyHourly: {}, models: {}, hourly: {}, errors: [] };
+  const targetHasUsage = ["users", "daily", "dailyModels", "dailyHourly", "models", "hourly", "errors"]
+    .some(k => Array.isArray(target[k]) ? target[k].length > 0 : Object.keys(target[k] || {}).length > 0);
+  if (!targetHasUsage) {
+    for (const key of ["users", "daily", "dailyModels", "dailyHourly", "models", "hourly", "errors"]) {
+      target[key] = store[key] || (key === "errors" ? [] : {});
+      store[key] = key === "errors" ? [] : {};
+    }
+    store._profiles[defaultSuffix] = target;
+    store._defaultProfileSuffixMigrated = defaultSuffix;
+    saveStore();
+    console.log(`[MIGRATE] Moved legacy default usage store to profile suffix "${defaultSuffix}"`);
+  }
 }
 
 // Aggregate all profile stores for "all profiles" view
 function getAggregatedStore() {
   const agg = { users: {}, daily: {}, dailyModels: {}, dailyHourly: {}, models: {}, hourly: {}, errors: [] };
-  // Default profile (top-level)
+  // Legacy top-level data, kept for backward compatibility with old data.json files.
   for (const k of ["users", "daily", "dailyModels", "dailyHourly", "models", "hourly"]) {
     agg[k] = JSON.parse(JSON.stringify(store[k] || {}));
   }
@@ -620,6 +839,31 @@ function getAggregatedStore() {
   return agg;
 }
 
+function getProfileSummaries() {
+  const today = cnDate();
+  return listProfiles().map(profile => {
+    const runtime = runtimes[profile.suffix];
+    const ps = getProfileStore(profile.suffix);
+    const todayUsers = ps.daily?.[today] || {};
+    let todayTokens = 0;
+    let todayRequests = 0;
+    for (const usage of Object.values(todayUsers)) {
+      todayTokens += (usage.inputTokens || 0) + (usage.outputTokens || 0);
+      todayRequests += usage.requests || 0;
+    }
+    return {
+      name: profile.name,
+      suffix: profile.suffix,
+      isDefault: profile.isDefault,
+      upstream: profile.upstream,
+      userCount: profile.userCount,
+      todayTokens,
+      todayRequests,
+      breakerState: runtime?.breaker?.status().state || "UNKNOWN",
+    };
+  });
+}
+
 function loadStore() {
   try {
     if (fs.existsSync(dataPath)) {
@@ -635,6 +879,7 @@ function loadStore() {
         quotaAdjustHistory: Array.isArray(raw.quotaAdjustHistory) ? raw.quotaAdjustHistory : [],
         _lastQuotaEval: raw._lastQuotaEval || null,
         _profiles: raw._profiles || {},
+        _defaultProfileSuffixMigrated: raw._defaultProfileSuffixMigrated || null,
       };
     }
   } catch { store = { users: {}, daily: {}, dailyModels: {}, dailyHourly: {}, models: {}, hourly: {}, errors: [], _profiles: {} }; }
@@ -653,6 +898,7 @@ function saveStore() {
 }
 
 loadStore();
+migrateDefaultStoreToProfileSuffix();
 setInterval(saveStore, 30_000);
 
 // ─── User Helpers ─────────────────────────────────────────────────────────────
@@ -660,7 +906,9 @@ setInterval(saveStore, 30_000);
 // Supports backward compat: old format "username" → new format object
 // Get global user info (username, expiresAt, disabled) from config.users
 function getGlobalUser(apiKey, _rt) {
-  return (_rt || rt).globalUsers[apiKey] || null;
+  const runtime = _rt || rt;
+  if (!runtime) return null;
+  return runtime.globalUsers[apiKey] || runtime.globalUsers[resolveUserKey(apiKey, runtime)] || null;
 }
 
 function getUserConfig(apiKey, _rt) {
@@ -675,7 +923,9 @@ function getUserConfig(apiKey, _rt) {
 }
 
 function resolveUserKey(apiKey, _rt) {
-  if ((_rt || rt).users[apiKey]) return apiKey;
+  const runtime = _rt || rt;
+  if (!runtime) return apiKey;
+  if (runtime.users[apiKey] || runtime.globalUsers[apiKey]) return apiKey;
   return apiKey.slice(0, 12);
 }
 
@@ -710,8 +960,8 @@ function generateVirtualKey(_rt) {
   return code;
 }
 
-function checkKeyExpired(apiKey) {
-  const gu = getGlobalUser(apiKey);
+function checkKeyExpired(apiKey, _rt) {
+  const gu = getGlobalUser(apiKey, _rt);
   if (!gu || !gu.expiresAt) return false;
   return new Date(gu.expiresAt).getTime() < Date.now();
 }
@@ -728,15 +978,354 @@ function checkUserDisabled(apiKey, _rt) {
   return false;
 }
 
+function getProfileUser(apiKey, _rt) {
+  const runtime = _rt || rt;
+  if (!runtime) return null;
+  return runtime.users[resolveUserKey(apiKey, runtime)] || null;
+}
+
+function hasProfileRealKey(apiKey, _rt) {
+  const pu = getProfileUser(apiKey, _rt);
+  if (!pu) return false;
+  if (typeof pu === "string") return !!pu.trim();
+  return !!(pu.key && String(pu.key).trim());
+}
+
+function canUseProfile(apiKey, _rt) {
+  const runtime = _rt || rt;
+  if (!runtime) return { allowed: false, reason: "Profile not found" };
+  const key = resolveUserKey(apiKey, runtime);
+  const gu = getGlobalUser(key, runtime);
+  if (!gu) return { allowed: false, reason: "Unknown API key" };
+  if (!hasProfileRealKey(key, runtime)) return { allowed: false, reason: `User is not allowed to use profile "${runtime.profileName}"` };
+  if (checkUserDisabled(key, runtime)) return { allowed: false, reason: "User is disabled." };
+  if (checkKeyExpired(key, runtime)) return { allowed: false, reason: "API key has expired. Please contact your administrator." };
+  return { allowed: true, userKey: key };
+}
+
+function getAccessibleProfiles(apiKey) {
+  const out = [];
+  for (const profile of listProfiles()) {
+    const runtime = runtimes[profile.suffix];
+    if (runtime && canUseProfile(apiKey, runtime).allowed) {
+      out.push({ suffix: profile.suffix, name: profile.name, isDefault: profile.isDefault });
+    }
+  }
+  return out;
+}
+
+function hasGlobalUser(apiKey) {
+  return Object.values(runtimes).some(runtime => !!getGlobalUser(apiKey, runtime));
+}
+
 function resolveModel(model, _rt) {
   if (!model) return model;
+  const runtime = _rt || rt;
+  const aliases = runtime.modelAliases || {};
+  if (aliases[model]) return aliases[model];
   const alias = model.toLowerCase();
-  const dm = (_rt || rt).defaultModels || {};
+  for (const [name, target] of Object.entries(aliases)) {
+    if (name.toLowerCase() === alias) return target;
+  }
+  const dm = runtime.defaultModels || {};
   if (alias === "jx-sonnet") return dm.sonnet || model;
   if (alias === "jx-opus")   return dm.opus   || model;
   if (alias === "jx-haiku")  return dm.haiku  || model;
   return model;
 }
+
+function isOpenAIChatCompletionsPath(reqUrl) {
+  const pathname = new URL(reqUrl || "/", "http://localhost").pathname;
+  return pathname === "/v1/chat/completions" || pathname.endsWith("/chat/completions");
+}
+
+function isOpenAIResponsesPath(reqUrl) {
+  const pathname = new URL(reqUrl || "/", "http://localhost").pathname;
+  return pathname === "/v1/responses" || pathname.endsWith("/responses");
+}
+
+function isOpenAIModelsPath(reqUrl) {
+  const pathname = new URL(reqUrl || "/", "http://localhost").pathname;
+  return pathname === "/v1/models" || pathname.endsWith("/models");
+}
+
+function shouldAdaptOpenAIResponses(runtime, reqUrl) {
+  return runtime?.apiProtocol === "openai" &&
+    runtime.responsesAdapter === "chat_completions" &&
+    isOpenAIResponsesPath(reqUrl);
+}
+
+function shouldServeLocalOpenAIModels(runtime, reqUrl) {
+  return runtime?.apiProtocol === "openai" &&
+    runtime.responsesAdapter === "chat_completions" &&
+    isOpenAIModelsPath(reqUrl);
+}
+
+function ensureOpenAIStreamUsage(body, runtime, reqUrl) {
+  if (runtime.apiProtocol !== "openai" || runtime.openaiStreamUsage === false || !isOpenAIChatCompletionsPath(reqUrl)) {
+    return body;
+  }
+  try {
+    const parsed = sanitizeJson(JSON.parse(body.toString()));
+    if (!parsed.stream) return body;
+    const opts = parsed.stream_options && typeof parsed.stream_options === "object" && !Array.isArray(parsed.stream_options)
+      ? parsed.stream_options
+      : {};
+    parsed.stream_options = { ...opts, include_usage: true };
+    return Buffer.from(JSON.stringify(parsed));
+  } catch {
+    return body;
+  }
+}
+
+function mergeUsageCounters(target, source) {
+  if (!source || typeof source !== "object") return;
+  const toTokenNumber = (value) => {
+    if (value === undefined || value === null || value === "") return null;
+    const n = Number(value);
+    return Number.isFinite(n) ? n : null;
+  };
+  const input = toTokenNumber(source.input_tokens ?? source.prompt_tokens);
+  const output = toTokenNumber(source.output_tokens ?? source.completion_tokens);
+  const total = toTokenNumber(source.total_tokens);
+  if (input !== null) target.input_tokens = input;
+  if (output !== null) target.output_tokens = output;
+  if (input === null && output === null && total !== null) {
+    target.output_tokens = total;
+  }
+  const cacheCreation = toTokenNumber(source.cache_creation_input_tokens);
+  const cacheRead = toTokenNumber(source.cache_read_input_tokens);
+  if (cacheCreation !== null) target.cache_creation_input_tokens = cacheCreation;
+  if (cacheRead !== null) target.cache_read_input_tokens = cacheRead;
+}
+
+function usageHasTokens(usage = {}) {
+  return !!((usage.input_tokens || 0) > 0 || (usage.output_tokens || 0) > 0 || (usage.prompt_tokens || 0) > 0 || (usage.completion_tokens || 0) > 0 || (usage.total_tokens || 0) > 0);
+}
+
+function usageToResponsesUsage(usage = {}) {
+  const toTokenNumber = (value) => {
+    if (value === undefined || value === null || value === "") return 0;
+    const n = Number(value);
+    return Number.isFinite(n) ? n : 0;
+  };
+  const input = toTokenNumber(usage.input_tokens ?? usage.prompt_tokens);
+  let output = toTokenNumber(usage.output_tokens ?? usage.completion_tokens);
+  const explicitTotal = toTokenNumber(usage.total_tokens);
+  if (!input && !output && explicitTotal) output = explicitTotal;
+  return {
+    input_tokens: input,
+    output_tokens: output,
+    total_tokens: explicitTotal || input + output,
+  };
+}
+
+function extractTextContent(content) {
+  if (content === undefined || content === null) return "";
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    return content.map((part) => {
+      if (part === undefined || part === null) return "";
+      if (typeof part === "string") return part;
+      if (typeof part !== "object") return String(part);
+      if (typeof part.text === "string") return part.text;
+      if (typeof part.input_text === "string") return part.input_text;
+      if (typeof part.output_text === "string") return part.output_text;
+      if (typeof part.refusal === "string") return part.refusal;
+      if (typeof part.content === "string") return part.content;
+      return "";
+    }).join("");
+  }
+  if (typeof content === "object") {
+    if (typeof content.text === "string") return content.text;
+    if (typeof content.input_text === "string") return content.input_text;
+    if (typeof content.output_text === "string") return content.output_text;
+    if (typeof content.content === "string") return content.content;
+  }
+  return String(content);
+}
+
+function normalizeChatRole(role) {
+  const r = String(role || "user").toLowerCase();
+  if (r === "developer") return "system";
+  if (["system", "user", "assistant", "tool"].includes(r)) return r;
+  return "user";
+}
+
+function responsesInputToChatMessages(input, instructions) {
+  const messages = [];
+  const systemText = extractTextContent(instructions).trim();
+  if (systemText) messages.push({ role: "system", content: systemText });
+
+  const addMessage = (role, content, extra = {}) => {
+    const text = extractTextContent(content);
+    messages.push({ role: normalizeChatRole(role), content: text, ...extra });
+  };
+
+  if (typeof input === "string") {
+    addMessage("user", input);
+  } else if (Array.isArray(input)) {
+    const looseText = [];
+    for (const item of input) {
+      if (typeof item === "string") {
+        looseText.push(item);
+        continue;
+      }
+      if (!item || typeof item !== "object") continue;
+      if (item.type === "function_call_output") {
+        messages.push({
+          role: "tool",
+          tool_call_id: item.call_id || item.id || "call_0",
+          content: extractTextContent(item.output),
+        });
+        continue;
+      }
+      if (item.type === "function_call") {
+        messages.push({
+          role: "assistant",
+          content: "",
+          tool_calls: [{
+            id: item.call_id || item.id || "call_0",
+            type: "function",
+            function: {
+              name: item.name || "unknown",
+              arguments: typeof item.arguments === "string" ? item.arguments : JSON.stringify(item.arguments || {}),
+            },
+          }],
+        });
+        continue;
+      }
+      if (item.role || item.type === "message") {
+        addMessage(item.role || "user", item.content ?? item.text ?? item.input_text ?? item.output_text ?? "");
+        continue;
+      }
+      looseText.push(extractTextContent(item.content ?? item.text ?? item.input_text ?? item.output_text ?? item));
+    }
+    if (looseText.length > 0) addMessage("user", looseText.filter(Boolean).join("\n"));
+  } else if (input && typeof input === "object") {
+    if (input.role || input.type === "message") addMessage(input.role || "user", input.content ?? input.text ?? "");
+    else addMessage("user", input.content ?? input.text ?? input.input_text ?? "");
+  }
+
+  if (messages.length === 0) messages.push({ role: "user", content: "" });
+  return messages;
+}
+
+function convertResponsesToolsToChatTools(tools) {
+  if (!Array.isArray(tools)) return undefined;
+  const converted = [];
+  for (const tool of tools) {
+    if (!tool || typeof tool !== "object") continue;
+    if (tool.type !== "function") continue;
+    if (tool.function && typeof tool.function === "object") {
+      converted.push({ type: "function", function: tool.function });
+      continue;
+    }
+    if (!tool.name) continue;
+    const fn = { name: tool.name };
+    if (tool.description) fn.description = tool.description;
+    if (tool.parameters) fn.parameters = tool.parameters;
+    if (tool.strict !== undefined) fn.strict = tool.strict;
+    converted.push({ type: "function", function: fn });
+  }
+  return converted.length > 0 ? converted : undefined;
+}
+
+function convertResponsesToolChoiceToChat(toolChoice) {
+  if (!toolChoice || typeof toolChoice === "string") return toolChoice;
+  if (toolChoice.type === "function" && toolChoice.name) {
+    return { type: "function", function: { name: toolChoice.name } };
+  }
+  return toolChoice;
+}
+
+function responsesRequestToChatCompletions(parsed, forceStream = false) {
+  const chat = {
+    model: parsed.model,
+    messages: Array.isArray(parsed.messages)
+      ? parsed.messages.map((m) => ({ ...m, role: normalizeChatRole(m.role) }))
+      : responsesInputToChatMessages(parsed.input, parsed.instructions),
+  };
+  const passthrough = [
+    "temperature",
+    "top_p",
+    "frequency_penalty",
+    "presence_penalty",
+    "stop",
+    "user",
+    "metadata",
+    "parallel_tool_calls",
+  ];
+  for (const key of passthrough) {
+    if (parsed[key] !== undefined) chat[key] = parsed[key];
+  }
+  const maxTokens = parsed.max_tokens ?? parsed.max_completion_tokens ?? parsed.max_output_tokens;
+  if (maxTokens !== undefined) chat.max_tokens = maxTokens;
+  const tools = convertResponsesToolsToChatTools(parsed.tools);
+  if (tools) chat.tools = tools;
+  const toolChoice = convertResponsesToolChoiceToChat(parsed.tool_choice);
+  if (toolChoice !== undefined) chat.tool_choice = toolChoice;
+  chat.stream = forceStream || !!parsed.stream;
+  if (chat.stream) {
+    const opts = parsed.stream_options && typeof parsed.stream_options === "object" && !Array.isArray(parsed.stream_options)
+      ? parsed.stream_options
+      : {};
+    chat.stream_options = { ...opts, include_usage: true };
+  }
+  return chat;
+}
+
+function convertChatToolCallsToResponsesOutput(toolCalls) {
+  if (!Array.isArray(toolCalls)) return [];
+  return toolCalls.map((call, index) => ({
+    type: "function_call",
+    id: call.id || `fc_${index}`,
+    call_id: call.id || `call_${index}`,
+    name: call.function?.name || call.name || "unknown",
+    arguments: call.function?.arguments || call.arguments || "{}",
+    status: "completed",
+  }));
+}
+
+function chatCompletionToResponse(chat, fallbackModel) {
+  const choice = Array.isArray(chat.choices) ? chat.choices[0] : null;
+  const message = choice?.message || {};
+  const text = extractTextContent(message.content);
+  const output = [];
+  if (text || !message.tool_calls) {
+    output.push({
+      type: "message",
+      role: "assistant",
+      content: [{ type: "output_text", text }],
+    });
+  }
+  output.push(...convertChatToolCallsToResponsesOutput(message.tool_calls));
+  const usage = usageToResponsesUsage(chat.usage || {});
+  return {
+    id: chat.id || `resp_${crypto.randomBytes(12).toString("hex")}`,
+    object: "response",
+    created_at: chat.created || Math.floor(Date.now() / 1000),
+    status: "completed",
+    model: chat.model || fallbackModel,
+    output,
+    output_text: text,
+    usage,
+  };
+}
+
+function localOpenAIModels(runtime) {
+  const ids = Array.from(new Set((runtime.allowedModels || []).filter((m) => m && m !== "*")));
+  if (ids.length === 0) {
+    for (const target of Object.values(runtime.modelAliases || {})) {
+      if (target && !ids.includes(target)) ids.push(target);
+    }
+  }
+  return {
+    object: "list",
+    data: ids.map((id) => ({ id, object: "model", created: 0, owned_by: "cc-team" })),
+  };
+}
+
 
 // ─── Timezone Helpers (UTC+8 北京时间) ────────────────────────────────────────
 function cnNow() {
@@ -747,18 +1336,26 @@ function cnNow() {
 function cnDate() { return cnNow().toISOString().slice(0, 10); }
 function cnHour() { return cnNow().getHours().toString().padStart(2, "0"); }
 
-function recordUsage(apiKey, usage, model, suffix) {
-  const s = getProfileStore(suffix || "");
-  const key = resolveUserKey(apiKey);
+function recordUsage(apiKey, usage, model, suffix, _rt) {
+  const runtime = _rt || runtimes[normalizeProfileSuffix(suffix)] || rt;
+  const sfx = normalizeProfileSuffix(suffix) || runtime?.suffix || getDefaultProfileSuffix();
+  const s = getProfileStore(sfx);
+  const key = resolveUserKey(apiKey, runtime);
   const today = cnDate();
   const hour = cnHour();
-  const inp = usage.input_tokens || usage.prompt_tokens || 0;
-  const out = usage.output_tokens || usage.completion_tokens || 0;
-  const cacheC = usage.cache_creation_input_tokens || 0;
-  const cacheR = usage.cache_read_input_tokens || 0;
+  const toTokenNumber = (value) => {
+    if (value === undefined || value === null || value === "") return 0;
+    const n = Number(value);
+    return Number.isFinite(n) ? n : 0;
+  };
+  const inp = toTokenNumber(usage.input_tokens ?? usage.prompt_tokens);
+  let out = toTokenNumber(usage.output_tokens ?? usage.completion_tokens);
+  if (!inp && !out && usage.total_tokens) out = toTokenNumber(usage.total_tokens);
+  const cacheC = toTokenNumber(usage.cache_creation_input_tokens);
+  const cacheR = toTokenNumber(usage.cache_read_input_tokens);
   const m = model || "unknown";
 
-  if (!s.users[key]) s.users[key] = { name: getUserName(apiKey), totalInputTokens: 0, totalOutputTokens: 0, totalRequests: 0, lastActive: null, cacheCreationTokens: 0, cacheReadTokens: 0 };
+  if (!s.users[key]) s.users[key] = { name: getUserName(key, runtime), totalInputTokens: 0, totalOutputTokens: 0, totalRequests: 0, lastActive: null, cacheCreationTokens: 0, cacheReadTokens: 0 };
   const u = s.users[key];
   u.totalInputTokens += inp;
   u.totalOutputTokens += out;
@@ -808,7 +1405,9 @@ function recordUsage(apiKey, usage, model, suffix) {
 
 // ─── Token Quota ──────────────────────────────────────────────────────────────
 function getProfileQuota(suffix) {
-  const rt0 = runtimes[suffix || ""] || rt;
+  const sfx = normalizeProfileSuffix(suffix) || getDefaultProfileSuffix();
+  const rt0 = runtimes[sfx] || rt;
+  if (!rt0) return 0;
   const profile = config.profiles[rt0.profileName];
   if (!profile || !profile.dailyTokenLimit) return 0;
   return profile.dailyTokenLimit;
@@ -825,7 +1424,7 @@ function getUserQuota(apiKey, _rt) {
 function checkTokenQuota(apiKey, suffix, _rt) {
   const runtime = _rt || rt;
   const key = resolveUserKey(apiKey, runtime);
-  const s = getProfileStore(suffix || "");
+  const s = getProfileStore(normalizeProfileSuffix(suffix) || runtime?.suffix || "");
   const today = cnDate();
   const todayUsage = (s.daily[today] || {})[key] || { inputTokens: 0, outputTokens: 0 };
   const used = todayUsage.inputTokens + todayUsage.outputTokens;
@@ -874,6 +1473,7 @@ function evaluateAutoQuotaAdjustments() {
 
   const profile = config.profiles[getDefaultProfileName()];
   if (!profile || !profile.users) return;
+  const defaultStore = getProfileStore(profile.suffix);
 
   for (const [vk, pu] of Object.entries(profile.users)) {
     if (typeof pu !== "object") continue;
@@ -894,7 +1494,7 @@ function evaluateAutoQuotaAdjustments() {
     let totalUsage = 0;
     let usageDays = 0;
     for (const date of dates) {
-      const dayData = (store.daily[date] || {})[vk];
+      const dayData = (defaultStore.daily[date] || {})[vk];
       if (!dayData) continue;
       const dayUsage = (dayData.inputTokens || 0) + (dayData.outputTokens || 0);
       if (dayUsage > 0) {
@@ -945,12 +1545,14 @@ function evaluateAutoQuotaAdjustments() {
 }
 
 // ─── Error Recording ──────────────────────────────────────────────────────────
-function recordError(apiKey, statusCode, errorMessage, path, model) {
-  const key = resolveUserKey(apiKey);
-  if (!Array.isArray(store.errors)) store.errors = [];
-  store.errors.unshift({
+function recordError(apiKey, statusCode, errorMessage, path, model, suffix, _rt) {
+  const runtime = _rt || runtimes[normalizeProfileSuffix(suffix)] || rt;
+  const key = resolveUserKey(apiKey, runtime);
+  const s = getProfileStore(normalizeProfileSuffix(suffix) || runtime?.suffix || "");
+  if (!Array.isArray(s.errors)) s.errors = [];
+  s.errors.unshift({
     time: new Date().toISOString(),
-    user: getUserName(apiKey),
+    user: getUserName(key, runtime),
     userKey: key,
     statusCode,
     error: errorMessage,
@@ -958,27 +1560,36 @@ function recordError(apiKey, statusCode, errorMessage, path, model) {
     model: model || "unknown",
   });
   const cutoff = new Date(Date.now() - 7 * 24 * 3600 * 1000).toISOString();
-  store.errors = store.errors.filter(e => e.time >= cutoff);
-  if (store.errors.length > 200) store.errors.length = 200;
-  console.log(`[错误] ${getUserName(apiKey)} ${statusCode} ${errorMessage} ${path} model=${model || "unknown"}`);
+  s.errors = s.errors.filter(e => e.time >= cutoff);
+  if (s.errors.length > 200) s.errors.length = 200;
+  console.log(`[错误] ${getUserName(key, runtime)} ${statusCode} ${errorMessage} ${path} model=${model || "unknown"}`);
 }
 
 // ─── Personal Usage ───────────────────────────────────────────────────────────
-function getPersonalUsageData(apiKey, suffix) {
-  const s = getProfileStore(suffix || "");
-  const runtime = runtimes[suffix || ""] || rt;
+function emptyUsageBucket() {
+  return { inputTokens: 0, outputTokens: 0, requests: 0, cacheCreationTokens: 0, cacheReadTokens: 0 };
+}
+
+function addUsageBucket(target, source = {}) {
+  target.inputTokens += source.inputTokens || 0;
+  target.outputTokens += source.outputTokens || 0;
+  target.requests += source.requests || 0;
+  target.cacheCreationTokens += source.cacheCreationTokens || 0;
+  target.cacheReadTokens += source.cacheReadTokens || 0;
+}
+
+function getProfilePersonalUsage(apiKey, suffix, runtime) {
+  const s = getProfileStore(suffix);
   const key = resolveUserKey(apiKey, runtime);
   const today = cnDate();
-  const username = getUserName(apiKey, runtime);
   const quota = checkTokenQuota(apiKey, suffix, runtime);
-
-  const todayUsage = (s.daily[today] || {})[key] || { inputTokens: 0, outputTokens: 0, requests: 0, cacheCreationTokens: 0, cacheReadTokens: 0 };
+  const todayUsage = (s.daily[today] || {})[key] || emptyUsageBucket();
 
   // Per-model breakdown for today
   const todayModels = {};
   const dm = (s.dailyModels[today] || {})[key] || {};
   for (const [model, data] of Object.entries(dm)) {
-    todayModels[model] = { ...data };
+    todayModels[model] = { ...data, total: (data.inputTokens || 0) + (data.outputTokens || 0) };
   }
 
   // Per-hour breakdown for today
@@ -1002,26 +1613,100 @@ function getPersonalUsageData(apiKey, suffix) {
   const lastAdjust = (store.quotaAdjustHistory || []).findLast(h => h.user === key);
   const quotaAutoAdjusted = lastAdjust ? lastAdjust.auto : false;
 
-  // Determine which profiles this user has access to
-  const availableProfiles = [];
-  for (const [sfx, rt2] of Object.entries(runtimes)) {
-    const userKey = resolveUserKey(apiKey, rt2);
-    if (rt2.users[userKey] && !rt2.users[userKey].disabled) {
-      availableProfiles.push({ suffix: sfx, name: rt2.profileName, isDefault: rt2.isDefault });
-    }
-  }
-
   return {
-    username,
     profile: runtime.profileName,
-    profileSuffix: suffix || "",
-    availableProfiles,
+    profileSuffix: suffix,
     quota: { type: quota.source, limit: quota.limit, used: quota.used, remaining: quota.remaining, autoAdjusted: quotaAutoAdjusted },
     today: { input: todayUsage.inputTokens, output: todayUsage.outputTokens, requests: todayUsage.requests, cacheWrite: todayUsage.cacheCreationTokens || 0, cacheRead: todayUsage.cacheReadTokens || 0, total: todayUsage.inputTokens + todayUsage.outputTokens },
     models: todayModels,
     hourly: todayHourly,
     trend,
   };
+}
+
+function getAggregatedPersonalUsage(apiKey, availableProfiles) {
+  const today = cnDate();
+  const todayUsage = emptyUsageBucket();
+  const todayModels = {};
+  const todayHourly = {};
+  const trendByDate = {};
+  let totalQuotaLimit = 0;
+  let totalQuotaUsed = 0;
+  let hasUnlimitedQuota = false;
+
+  for (const profile of availableProfiles) {
+    const runtime = runtimes[profile.suffix];
+    if (!runtime) continue;
+    const key = resolveUserKey(apiKey, runtime);
+    const s = getProfileStore(profile.suffix);
+    addUsageBucket(todayUsage, (s.daily[today] || {})[key] || emptyUsageBucket());
+
+    for (const [model, data] of Object.entries((s.dailyModels[today] || {})[key] || {})) {
+      if (!todayModels[model]) todayModels[model] = { inputTokens: 0, outputTokens: 0, requests: 0, total: 0 };
+      todayModels[model].inputTokens += data.inputTokens || 0;
+      todayModels[model].outputTokens += data.outputTokens || 0;
+      todayModels[model].requests += data.requests || 0;
+      todayModels[model].total += (data.inputTokens || 0) + (data.outputTokens || 0);
+    }
+
+    for (const [hour, data] of Object.entries((s.dailyHourly[today] || {})[key] || {})) {
+      if (!todayHourly[hour]) todayHourly[hour] = emptyUsageBucket();
+      addUsageBucket(todayHourly[hour], data);
+    }
+
+    for (let i = 6; i >= 0; i--) {
+      const d = new Date(Date.now() + 8 * 3600 * 1000);
+      d.setDate(d.getDate() - i);
+      const dateStr = d.toISOString().slice(0, 10);
+      if (!trendByDate[dateStr]) trendByDate[dateStr] = { date: dateStr, input: 0, output: 0, requests: 0, total: 0 };
+      const dayUsage = (s.daily[dateStr] || {})[key] || emptyUsageBucket();
+      trendByDate[dateStr].input += dayUsage.inputTokens || 0;
+      trendByDate[dateStr].output += dayUsage.outputTokens || 0;
+      trendByDate[dateStr].requests += dayUsage.requests || 0;
+      trendByDate[dateStr].total += (dayUsage.inputTokens || 0) + (dayUsage.outputTokens || 0);
+    }
+
+    const quota = checkTokenQuota(apiKey, profile.suffix, runtime);
+    totalQuotaUsed += quota.used || 0;
+    if (quota.limit > 0) totalQuotaLimit += quota.limit;
+    else hasUnlimitedQuota = true;
+  }
+
+  const limit = hasUnlimitedQuota ? 0 : totalQuotaLimit;
+  return {
+    profile: "全部可用方案",
+    profileSuffix: "all",
+    quota: {
+      type: limit > 0 ? "聚合配额" : "无限制",
+      limit,
+      used: totalQuotaUsed,
+      remaining: limit > 0 ? Math.max(0, limit - totalQuotaUsed) : Infinity,
+      autoAdjusted: false,
+    },
+    today: { input: todayUsage.inputTokens, output: todayUsage.outputTokens, requests: todayUsage.requests, cacheWrite: todayUsage.cacheCreationTokens || 0, cacheRead: todayUsage.cacheReadTokens || 0, total: todayUsage.inputTokens + todayUsage.outputTokens },
+    models: todayModels,
+    hourly: todayHourly,
+    trend: Object.values(trendByDate).sort((a, b) => a.date.localeCompare(b.date)),
+  };
+}
+
+function getPersonalUsageData(apiKey, requestedProfile = "all") {
+  const availableProfiles = getAccessibleProfiles(apiKey);
+  const username = getUserName(apiKey, rt) || apiKey.slice(0, 8);
+  const profile = requestedProfile || "all";
+
+  if (profile === "all") {
+    return { username, availableProfiles, ...getAggregatedPersonalUsage(apiKey, availableProfiles) };
+  }
+
+  const suffix = normalizeProfileSuffix(profile);
+  const runtime = runtimes[suffix];
+  if (!runtime || !availableProfiles.some(p => p.suffix === suffix)) {
+    const err = new Error(`User is not allowed to view profile "${profile}"`);
+    err.statusCode = 403;
+    throw err;
+  }
+  return { username, availableProfiles, ...getProfilePersonalUsage(apiKey, suffix, runtime) };
 }
 
 // ─── API Proxy ───────────────────────────────────────────────────────────────
@@ -1039,27 +1724,25 @@ function jitter(ms) {
   return ms + (Math.random() * half * 2 - half);
 }
 
+function buildUpstreamPath(reqUrl, runtime) {
+  const upstreamPath = runtime.upstreamUrl.pathname.replace(/\/$/, "");
+  // Smart path concatenation: avoid double /v1 when upstream already contains it
+  if (upstreamPath && reqUrl.startsWith("/v1/")) {
+    if (upstreamPath.endsWith("/v1")) {
+      return upstreamPath + reqUrl.slice(3); // /v1 + /messages -> /v1/messages
+    }
+    return upstreamPath + reqUrl;
+  }
+  return upstreamPath + reqUrl;
+}
+
 function sendUpstream(body, reqUrl, reqMethod, reqHeaders, timeout, _rt) {
   return new Promise((resolve, reject) => {
     const runtime = _rt || rt;
-    const upstreamPath = runtime.upstreamUrl.pathname.replace(/\/$/, "");
-    // Smart path concatenation: avoid double /v1 when upstream already contains it
-    let finalPath;
-    if (upstreamPath && reqUrl.startsWith("/v1/")) {
-      // Upstream has its own base path (e.g., /apps/anthropic or /compatible-mode/v1)
-      // Strip /v1 prefix from reqUrl to avoid duplication
-      if (upstreamPath.endsWith("/v1")) {
-        finalPath = upstreamPath + reqUrl.slice(3); // /v1 + /messages → /v1/messages
-      } else {
-        finalPath = upstreamPath + reqUrl; // different base path, keep as-is
-      }
-    } else {
-      finalPath = upstreamPath + reqUrl;
-    }
     const opts = {
       hostname: runtime.upstreamUrl.hostname,
       port: runtime.upstreamUrl.port || (runtime.upstreamUrl.protocol === "https:" ? 443 : 80),
-      path: finalPath,
+      path: buildUpstreamPath(reqUrl, runtime),
       method: reqMethod,
       headers: reqHeaders,
       agent: runtime.agent,
@@ -1093,7 +1776,13 @@ function sendUpstream(body, reqUrl, reqMethod, reqHeaders, timeout, _rt) {
 
 function proxyRequest(req, res) {
   // Resolve which profile this request targets
-  const { suffix, runtime, strippedUrl } = resolveProfile(req.url);
+  const resolvedProfile = resolveProfile(req.url);
+  if (resolvedProfile.error) {
+    res.writeHead(404, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ error: resolvedProfile.error }));
+    return;
+  }
+  const { suffix, runtime, strippedUrl } = resolvedProfile;
   const apiKey = getApiKey(req);
   const proxyStartTime = Date.now();
   let proxyPhase = "init";
@@ -1170,11 +1859,18 @@ function proxyRequest(req, res) {
       return;
     }
 
-    // Reject unknown API keys (not in configured user list)
-    if (!runtime.users[userKey] && !runtime.globalUsers[userKey]) {
+    // Reject unknown API keys and users not assigned to this profile.
+    const access = canUseProfile(apiKey, runtime);
+    if (!access.allowed) {
       res.writeHead(403, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: "Unknown API key. Please use your assigned virtual key (jx-*)." }));
-      console.log(`[拦截] 未知key=${apiKey.slice(0, 8)}**** model=${reqModel} 拒绝访问`);
+      res.end(JSON.stringify({ error: access.reason }));
+      console.log(`[拦截] ${apiKey.slice(0, 8)}**** profile=${runtime.profileName} model=${reqModel} ${access.reason}`);
+      return;
+    }
+
+    if (shouldServeLocalOpenAIModels(runtime, strippedUrl || req.url)) {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify(localOpenAIModels(runtime)));
       return;
     }
 
@@ -1183,7 +1879,7 @@ function proxyRequest(req, res) {
       const remaining = Math.ceil(runtime.breaker.status().cooldownRemaining / 1000);
       res.writeHead(503, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ error: `Upstream temporarily unavailable. Circuit open, retry in ${remaining}s.` }));
-      recordError(apiKey, 503, "Circuit breaker open", req.url, reqModel);
+      recordError(apiKey, 503, "Circuit breaker open", req.url, reqModel, suffix, runtime);
       return;
     }
 
@@ -1217,24 +1913,6 @@ function proxyRequest(req, res) {
       return;
     }
 
-    // User disabled check (global or profile-level)
-    if (checkUserDisabled(apiKey, runtime)) {
-      releaseConcurrency(userKey);
-      res.writeHead(403, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: "User is disabled." }));
-      console.log(`[禁用] ${getUserName(apiKey, runtime)} 用户已禁用`);
-      return;
-    }
-
-    // Key expiration check
-    if (checkKeyExpired(apiKey)) {
-      releaseConcurrency(userKey);
-      res.writeHead(403, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: "API key has expired. Please contact your administrator." }));
-      console.log(`[过期] ${getUserName(apiKey, runtime)} key已过期`);
-      return;
-    }
-
     try {
       proxyPhase = "upstream-connect";
       const realKey = getRealKey(apiKey, runtime);
@@ -1252,18 +1930,34 @@ function proxyRequest(req, res) {
       const isStreamRequest = (req.headers["accept"] || "").includes("text/event-stream") ||
         (function() { try { return JSON.parse(body.toString()).stream; } catch { return false; } })();
 
+      const targetUrl = strippedUrl || req.url;
+      const useResponsesAdapter = shouldAdaptOpenAIResponses(runtime, targetUrl);
+
+      if (isStreamRequest && !useResponsesAdapter) {
+        body = ensureOpenAIStreamUsage(body, runtime, strippedUrl || req.url);
+        reqHeaders["content-length"] = body.length;
+      }
+
       proxyPhase = isStreamRequest ? "streaming-proxy" : "json-proxy";
       const timeout = isStreamRequest ? gProxy.streamTimeout : gProxy.timeout;
 
       if (isStreamRequest) {
-        await handleStreamingProxy(req, res, body, reqHeaders, apiKey, reqModel, timeout, reqSource, runtime, suffix, strippedUrl);
+        if (useResponsesAdapter) {
+          await handleOpenAIResponsesAdapterStreamingProxy(req, res, body, reqHeaders, apiKey, reqModel, timeout, reqSource, runtime, suffix);
+        } else {
+          await handleStreamingProxy(req, res, body, reqHeaders, apiKey, reqModel, timeout, reqSource, runtime, suffix, strippedUrl);
+        }
       } else {
-        await handleJsonProxy(req, res, body, reqHeaders, apiKey, reqModel, timeout, reqSource, runtime, suffix, strippedUrl);
+        if (useResponsesAdapter) {
+          await handleOpenAIResponsesAdapterJsonProxy(req, res, body, reqHeaders, apiKey, reqModel, timeout, reqSource, runtime, suffix);
+        } else {
+          await handleJsonProxy(req, res, body, reqHeaders, apiKey, reqModel, timeout, reqSource, runtime, suffix, strippedUrl);
+        }
       }
     } catch (err) {
       const status = err.isTimeout ? 504 : 502;
       const label = err.isTimeout ? "Gateway Timeout" : "Bad Gateway";
-      recordError(apiKey, status, `${label}: ${err.message}`, req.url, reqModel);
+      recordError(apiKey, status, `${label}: ${err.message}`, req.url, reqModel, suffix, runtime);
       if (!res.headersSent) {
         res.writeHead(status, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ error: `Proxy ${label}. Please try again later.` }));
@@ -1277,6 +1971,325 @@ function proxyRequest(req, res) {
       res.writeHead(413, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ error: "Request body too large" }));
     }
+  });
+}
+
+function writeSseEvent(res, event, payload) {
+  res.write(`event: ${event}\n`);
+  res.write(`data: ${JSON.stringify(payload)}\n\n`);
+}
+
+async function handleOpenAIResponsesAdapterJsonProxy(req, res, body, reqHeaders, apiKey, reqModel, timeout, reqSource, _rt, suffix) {
+  const runtime = _rt || rt;
+  let parsed;
+  try {
+    parsed = sanitizeJson(JSON.parse(body.toString()));
+  } catch {
+    res.writeHead(400, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ error: "Invalid JSON request body" }));
+    return;
+  }
+
+  const chatPayload = responsesRequestToChatCompletions(parsed, false);
+  const chatBody = Buffer.from(JSON.stringify(chatPayload));
+  const chatHeaders = { ...reqHeaders, "content-type": "application/json", "content-length": chatBody.length };
+  let lastError = null;
+
+  for (let attempt = 0; attempt <= gProxy.maxRetries; attempt++) {
+    try {
+      const upRes = await sendUpstream(chatBody, "/v1/chat/completions", "POST", chatHeaders, timeout, runtime);
+      const text = upRes.body.toString();
+
+      if (upRes.statusCode < 500) {
+        runtime.breaker.recordSuccess();
+      }
+
+      if (gProxy.retryableStatusCodes.includes(upRes.statusCode) && attempt < gProxy.maxRetries) {
+        const baseDelay = Math.min(gProxy.retryDelay * Math.pow(2, attempt), 10000);
+        const delay = Math.round(jitter(baseDelay));
+        console.log(`[重试] ${getUserName(apiKey, runtime)} ${upRes.statusCode} model=${reqModel} responses→chat 第${attempt + 1}/${gProxy.maxRetries}次 ${delay}ms后重试`);
+        recordError(apiKey, upRes.statusCode, `Retryable adapter error (attempt ${attempt + 1}/${gProxy.maxRetries})`, req.url, reqModel, suffix, runtime);
+        await sleep(delay);
+        continue;
+      }
+
+      if (upRes.statusCode >= 400) {
+        let errMsg = text.slice(0, 200);
+        try {
+          const json = JSON.parse(text);
+          errMsg = json.error?.message || json.message || errMsg;
+        } catch {}
+        recordError(apiKey, upRes.statusCode, errMsg, req.url, reqModel, suffix, runtime);
+        if (upRes.statusCode >= 500) runtime.breaker.recordFailure();
+        const respHeaders = { ...upRes.headers };
+        delete respHeaders["content-encoding"];
+        delete respHeaders["content-length"];
+        res.writeHead(upRes.statusCode, respHeaders);
+        res.end(text);
+        return;
+      }
+
+      let chatJson;
+      try {
+        chatJson = JSON.parse(text);
+      } catch {
+        console.log(`[响应] ${getUserName(apiKey, runtime)} adapter 上游返回非JSON body[0:300]=${text.slice(0, 300).replace(/\n/g, "\\n")}`);
+        res.writeHead(upRes.statusCode, { "Content-Type": "text/plain" });
+        res.end(text);
+        return;
+      }
+
+      const responseJson = chatCompletionToResponse(chatJson, reqModel);
+      if (usageHasTokens(responseJson.usage)) {
+        recordUsage(apiKey, responseJson.usage, responseJson.model || reqModel, suffix, runtime);
+        console.log(`[Token] ${getUserName(apiKey, runtime)} [${reqSource}] model=${responseJson.model || reqModel} 输入=${responseJson.usage.input_tokens || 0} 输出=${responseJson.usage.output_tokens || 0} responses→chat`);
+      } else {
+        console.log(`[响应] ${getUserName(apiKey, runtime)} adapter 200 OK 但无usage字段 model=${responseJson.model || reqModel}`);
+      }
+
+      const respHeaders = { ...upRes.headers, "content-type": "application/json" };
+      delete respHeaders["content-encoding"];
+      delete respHeaders["content-length"];
+      if (attempt > 0) respHeaders["x-proxy-retry"] = String(attempt);
+      res.writeHead(upRes.statusCode, respHeaders);
+      res.end(JSON.stringify(responseJson));
+      return;
+    } catch (err) {
+      lastError = err;
+      runtime.breaker.recordFailure();
+      if (attempt < gProxy.maxRetries) {
+        const baseDelay = Math.min(gProxy.retryDelay * Math.pow(2, attempt), 10000);
+        const delay = Math.round(jitter(baseDelay));
+        console.log(`[重试] ${getUserName(apiKey, runtime)} adapter 网络错误 model=${reqModel} 第${attempt + 1}/${gProxy.maxRetries}次 ${delay}ms后重试`);
+        await sleep(delay);
+      }
+    }
+  }
+
+  const finalStatus = lastError?.isTimeout ? 504 : 502;
+  const finalLabel = lastError?.isTimeout ? "Gateway Timeout" : "Bad Gateway";
+  recordError(apiKey, finalStatus, `${finalLabel} adapter after ${gProxy.maxRetries} retries: ${lastError?.message}`, req.url, reqModel, suffix, runtime);
+  if (!res.headersSent) {
+    res.writeHead(finalStatus, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ error: `Proxy ${finalLabel} after ${gProxy.maxRetries} retries. Please try again later.` }));
+  }
+}
+
+async function handleOpenAIResponsesAdapterStreamingProxy(req, res, body, reqHeaders, apiKey, reqModel, timeout, reqSource, _rt, suffix) {
+  const runtime = _rt || rt;
+  let parsed;
+  try {
+    parsed = sanitizeJson(JSON.parse(body.toString()));
+  } catch {
+    res.writeHead(400, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ error: "Invalid JSON request body" }));
+    return;
+  }
+
+  const chatPayload = responsesRequestToChatCompletions(parsed, true);
+  const chatBody = Buffer.from(JSON.stringify(chatPayload));
+  const chatHeaders = {
+    ...reqHeaders,
+    accept: "text/event-stream",
+    "content-type": "application/json",
+    "content-length": chatBody.length,
+  };
+  const opts = {
+    hostname: runtime.upstreamUrl.hostname,
+    port: runtime.upstreamUrl.port || (runtime.upstreamUrl.protocol === "https:" ? 443 : 80),
+    path: buildUpstreamPath("/v1/chat/completions", runtime),
+    method: "POST",
+    headers: chatHeaders,
+    agent: runtime.agent,
+  };
+  const transport = runtime.upstreamUrl.protocol === "https:" ? https : http;
+
+  await new Promise((resolve) => {
+    let clientGone = false;
+    let resolved = false;
+    const responseId = `resp_${crypto.randomBytes(12).toString("hex")}`;
+    const createdAt = Math.floor(Date.now() / 1000);
+    let model = reqModel;
+    let buf = "";
+    let rawSample = "";
+    let sseDataLines = 0;
+    let completed = false;
+    const usage = { input_tokens: 0, output_tokens: 0 };
+    const textParts = [];
+
+    const safeResolve = () => {
+      if (!resolved) {
+        resolved = true;
+        resolve();
+      }
+    };
+    const finishStream = () => {
+      if (completed) return;
+      completed = true;
+      const outputText = textParts.join("");
+      const responseUsage = usageToResponsesUsage(usage);
+      if (!clientGone) {
+        writeSseEvent(res, "response.output_text.done", {
+          type: "response.output_text.done",
+          item_id: "msg_0",
+          output_index: 0,
+          content_index: 0,
+          text: outputText,
+        });
+        writeSseEvent(res, "response.completed", {
+          type: "response.completed",
+          response: {
+            id: responseId,
+            object: "response",
+            created_at: createdAt,
+            status: "completed",
+            model,
+            output: [{
+              type: "message",
+              role: "assistant",
+              content: [{ type: "output_text", text: outputText }],
+            }],
+            output_text: outputText,
+            usage: responseUsage,
+          },
+        });
+      }
+      if (usageHasTokens(responseUsage)) {
+        recordUsage(apiKey, responseUsage, model, suffix, runtime);
+        console.log(`[Token] ${getUserName(apiKey, runtime)} [${reqSource}] model=${model} 输入=${responseUsage.input_tokens || 0} 输出=${responseUsage.output_tokens || 0} responses→chat`);
+      } else {
+        console.log(`[响应] ${getUserName(apiKey, runtime)} adapter 流结束 无usage数据 model=${model} sse行数=${sseDataLines} 原始数据[0:200]=${rawSample.slice(0, 200).replace(/\n/g, "\\n")}`);
+      }
+      if (!clientGone) res.end();
+      safeResolve();
+    };
+
+    const upReq = transport.request(opts, (upRes) => {
+      if (upRes.statusCode >= 400) {
+        const h = { ...upRes.headers };
+        delete h["transfer-encoding"];
+        delete h["content-encoding"];
+        delete h["content-length"];
+        res.writeHead(upRes.statusCode, h);
+        let errBuf = "";
+        upRes.on("data", (c) => {
+          if (clientGone) return;
+          errBuf += c.toString();
+          res.write(c);
+        });
+        upRes.on("end", () => {
+          recordError(apiKey, upRes.statusCode, errBuf.slice(0, 200), req.url, reqModel, suffix, runtime);
+          if (upRes.statusCode >= 500) runtime.breaker.recordFailure();
+          else runtime.breaker.recordSuccess();
+          if (!clientGone) res.end();
+          safeResolve();
+        });
+        return;
+      }
+
+      runtime.breaker.recordSuccess();
+      res.writeHead(upRes.statusCode, {
+        "content-type": "text/event-stream",
+        "cache-control": "no-cache",
+        "connection": "keep-alive",
+      });
+      writeSseEvent(res, "response.created", {
+        type: "response.created",
+        response: {
+          id: responseId,
+          object: "response",
+          created_at: createdAt,
+          status: "in_progress",
+          model,
+          output: [],
+        },
+      });
+
+      res.on("error", () => {
+        clientGone = true;
+        upReq.destroy();
+        safeResolve();
+      });
+
+      const handleDataLine = (jsonStr) => {
+        if (jsonStr === "[DONE]") {
+          finishStream();
+          return;
+        }
+        sseDataLines++;
+        let d;
+        try {
+          d = JSON.parse(jsonStr);
+        } catch {
+          return;
+        }
+        if (sseDataLines <= 3) console.log(`[SSE] ${getUserName(apiKey, runtime)} adapter 第${sseDataLines}条 类型=${d.object || d.type || "chunk"} 字段=${Object.keys(d).join(",")}`);
+        if (d.model) model = d.model;
+        if (d.usage) mergeUsageCounters(usage, d.usage);
+        for (const choice of d.choices || []) {
+          const delta = choice.delta || {};
+          if (typeof delta.content === "string" && delta.content) {
+            textParts.push(delta.content);
+            if (!clientGone) {
+              writeSseEvent(res, "response.output_text.delta", {
+                type: "response.output_text.delta",
+                item_id: "msg_0",
+                output_index: 0,
+                content_index: 0,
+                delta: delta.content,
+              });
+            }
+          }
+          if (choice.message?.content) {
+            const text = extractTextContent(choice.message.content);
+            if (text) textParts.push(text);
+          }
+        }
+      };
+
+      upRes.on("data", (chunk) => {
+        if (clientGone || completed) return;
+        const text = chunk.toString();
+        if (rawSample.length < 500) rawSample += text;
+        buf += text;
+        const lines = buf.split("\n");
+        buf = lines.pop() || "";
+        for (const line of lines) {
+          if (!line.trim()) continue;
+          if (!line.startsWith("data:")) continue;
+          handleDataLine(line.slice(5).trim());
+        }
+      });
+
+      upRes.on("end", () => {
+        if (completed) return;
+        if (buf.trim().startsWith("data:")) {
+          handleDataLine(buf.trim().slice(5).trim());
+        }
+        finishStream();
+      });
+    });
+
+    upReq.setTimeout(timeout, () => {
+      upReq.destroy(new Error(`Upstream stream timeout (${timeout}ms)`));
+    });
+    upReq.on("error", (err) => {
+      runtime.breaker.recordFailure();
+      const isTimeout = err.message.includes("timeout");
+      const status = isTimeout ? 504 : 502;
+      const label = isTimeout ? "Gateway Timeout" : "Bad Gateway";
+      recordError(apiKey, status, `${label}: ${err.message}`, req.url, reqModel, suffix, runtime);
+      if (!res.headersSent && !clientGone) {
+        res.writeHead(status, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: `Proxy ${label}. Please try again later.` }));
+      } else if (!clientGone && !completed) {
+        finishStream();
+      }
+      safeResolve();
+    });
+
+    upReq.write(chatBody);
+    upReq.end();
   });
 }
 
@@ -1308,7 +2321,7 @@ async function handleJsonProxy(req, res, body, reqHeaders, apiKey, reqModel, tim
         const baseDelay = Math.min(gProxy.retryDelay * Math.pow(2, attempt), 10000);
         const delay = Math.round(jitter(baseDelay));
         console.log(`[重试] ${getUserName(apiKey, runtime)} ${upRes.statusCode} model=${reqModel} 第${attempt + 1}/${gProxy.maxRetries}次 ${delay}ms后重试`);
-        recordError(apiKey, upRes.statusCode, `Retryable error (attempt ${attempt + 1}/${gProxy.maxRetries})`, req.url, reqModel);
+        recordError(apiKey, upRes.statusCode, `Retryable error (attempt ${attempt + 1}/${gProxy.maxRetries})`, req.url, reqModel, suffix, runtime);
         await sleep(delay);
         continue;
       }
@@ -1317,13 +2330,13 @@ async function handleJsonProxy(req, res, body, reqHeaders, apiKey, reqModel, tim
       try {
         const json = JSON.parse(text);
         if (upRes.statusCode >= 400) {
-          recordError(apiKey, upRes.statusCode, json.error?.message || json.message || text.slice(0, 200), req.url, reqModel);
+          recordError(apiKey, upRes.statusCode, json.error?.message || json.message || text.slice(0, 200), req.url, reqModel, suffix, runtime);
           if (upRes.statusCode >= 500) runtime.breaker.recordFailure();
         } else {
           // Try multiple possible usage field names
           const usage = json.usage || json.token_usage || json.usage_info;
           if (usage) {
-            recordUsage(apiKey, usage, json.model, suffix);
+            recordUsage(apiKey, usage, json.model, suffix, runtime);
             const modelName = json.model || reqModel;
             console.log(`[Token] ${getUserName(apiKey, runtime)} [${reqSource}] model=${modelName} 输入=${usage.input_tokens || usage.prompt_tokens || 0} 输出=${usage.output_tokens || usage.completion_tokens || 0} 缓存写=${usage.cache_creation_input_tokens || 0} 缓存读=${usage.cache_read_input_tokens || 0}`);
           } else {
@@ -1332,7 +2345,7 @@ async function handleJsonProxy(req, res, body, reqHeaders, apiKey, reqModel, tim
         }
       } catch {
         if (upRes.statusCode >= 400) {
-          recordError(apiKey, upRes.statusCode, text.slice(0, 200), req.url, reqModel);
+          recordError(apiKey, upRes.statusCode, text.slice(0, 200), req.url, reqModel, suffix, runtime);
           if (upRes.statusCode >= 500) runtime.breaker.recordFailure();
         } else {
           console.log(`[响应] ${getUserName(apiKey, runtime)} ${upRes.statusCode} 非JSON响应 body[0:300]=${text.slice(0, 300).replace(/\n/g, "\\n")}`);
@@ -1361,7 +2374,7 @@ async function handleJsonProxy(req, res, body, reqHeaders, apiKey, reqModel, tim
   // All retries exhausted
   const finalStatus = lastError?.isTimeout ? 504 : 502;
   const finalLabel = lastError?.isTimeout ? "Gateway Timeout" : "Bad Gateway";
-  recordError(apiKey, finalStatus, `${finalLabel} after ${gProxy.maxRetries} retries: ${lastError?.message}`, req.url, reqModel);
+  recordError(apiKey, finalStatus, `${finalLabel} after ${gProxy.maxRetries} retries: ${lastError?.message}`, req.url, reqModel, suffix, runtime);
   if (!res.headersSent) {
     res.writeHead(finalStatus, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ error: `Proxy ${finalLabel} after ${gProxy.maxRetries} retries. Please try again later.` }));
@@ -1370,21 +2383,10 @@ async function handleJsonProxy(req, res, body, reqHeaders, apiKey, reqModel, tim
 
 async function handleStreamingProxy(req, res, body, reqHeaders, apiKey, reqModel, timeout, reqSource, _rt, suffix, strippedUrl) {
   const runtime = _rt || rt;
-  const upstreamPath = runtime.upstreamUrl.pathname.replace(/\/$/, "");
-  let finalPath;
-  if (upstreamPath && (strippedUrl || req.url).startsWith("/v1/")) {
-    if (upstreamPath.endsWith("/v1")) {
-      finalPath = upstreamPath + (strippedUrl || req.url).slice(3);
-    } else {
-      finalPath = upstreamPath + (strippedUrl || req.url);
-    }
-  } else {
-    finalPath = upstreamPath + (strippedUrl || req.url);
-  }
   const opts = {
     hostname: runtime.upstreamUrl.hostname,
     port: runtime.upstreamUrl.port || (runtime.upstreamUrl.protocol === "https:" ? 443 : 80),
-    path: finalPath,
+    path: buildUpstreamPath(strippedUrl || req.url, runtime),
     method: req.method,
     headers: reqHeaders,
     agent: runtime.agent,
@@ -1416,7 +2418,7 @@ async function handleStreamingProxy(req, res, body, reqHeaders, apiKey, reqModel
         let errBuf = "";
         upRes.on("data", (c) => { if (clientGone) return; errBuf += c.toString(); res.write(c); });
         upRes.on("end", () => {
-          recordError(apiKey, upRes.statusCode, errBuf.slice(0, 200), req.url, reqModel);
+          recordError(apiKey, upRes.statusCode, errBuf.slice(0, 200), req.url, reqModel, suffix, runtime);
           if (upRes.statusCode >= 500) runtime.breaker.recordFailure();
           else if (upRes.statusCode < 500) runtime.breaker.recordSuccess();
           if (!clientGone) res.end();
@@ -1449,6 +2451,7 @@ async function handleStreamingProxy(req, res, body, reqHeaders, apiKey, reqModel
           } else {
             continue;
           }
+          if (jsonStr === "[DONE]") continue;
           sseDataLines++;
           try {
             const d = JSON.parse(jsonStr);
@@ -1465,24 +2468,33 @@ async function handleStreamingProxy(req, res, body, reqHeaders, apiKey, reqModel
               model = d.model || model;
             } else if (d.type === "message_delta") {
               usage.output_tokens = d.usage?.output_tokens || 0;
+            } else if (d.response) {
+              model = d.response.model || model;
+              mergeUsageCounters(usage, d.response.usage);
             }
             if (d.usage) {
-              if (d.usage.input_tokens) usage.input_tokens = d.usage.input_tokens;
-              if (d.usage.output_tokens) usage.output_tokens = d.usage.output_tokens;
-              if (d.usage.cache_creation_input_tokens) usage.cache_creation_input_tokens = d.usage.cache_creation_input_tokens;
-              if (d.usage.cache_read_input_tokens) usage.cache_read_input_tokens = d.usage.cache_read_input_tokens;
+              mergeUsageCounters(usage, d.usage);
             }
-            if (d.model && model === "unknown") model = d.model;
+            if (d.model) model = d.model;
           } catch {}
         }
       });
 
       upRes.on("end", () => {
         if (buf.startsWith("data: ")) {
-          try { const d = JSON.parse(buf.slice(6)); if (d.usage) { usage.output_tokens = d.usage.output_tokens || usage.output_tokens || 0; usage.cache_creation_input_tokens = d.usage.cache_creation_input_tokens || usage.cache_creation_input_tokens || 0; usage.cache_read_input_tokens = d.usage.cache_read_input_tokens || usage.cache_read_input_tokens || 0; } } catch {}
+          try {
+            const tail = buf.slice(6).trim();
+            if (tail !== "[DONE]") {
+              const d = JSON.parse(tail);
+              if (d.model) model = d.model;
+              if (d.response?.model) model = d.response.model;
+              mergeUsageCounters(usage, d.usage);
+              mergeUsageCounters(usage, d.response?.usage);
+            }
+          } catch {}
         }
         if (usage.input_tokens > 0 || usage.output_tokens > 0) {
-          recordUsage(apiKey, usage, model, suffix);
+          recordUsage(apiKey, usage, model, suffix, runtime);
           console.log(`[Token] ${getUserName(apiKey, runtime)} [${reqSource}] model=${model} 输入=${usage.input_tokens} 输出=${usage.output_tokens} 缓存写=${usage.cache_creation_input_tokens || 0} 缓存读=${usage.cache_read_input_tokens || 0}`);
         } else {
           console.log(`[响应] ${getUserName(apiKey, runtime)} 流结束 无usage数据 model=${model} sse行数=${sseDataLines} 原始数据[0:200]=${rawSample.slice(0, 200).replace(/\n/g, "\\n")}`);
@@ -1501,7 +2513,7 @@ async function handleStreamingProxy(req, res, body, reqHeaders, apiKey, reqModel
       const isTimeout = err.message.includes("timeout");
       const status = isTimeout ? 504 : 502;
       const label = isTimeout ? "Gateway Timeout" : "Bad Gateway";
-      recordError(apiKey, status, `${label}: ${err.message}`, req.url, reqModel);
+      recordError(apiKey, status, `${label}: ${err.message}`, req.url, reqModel, suffix, runtime);
       if (!res.headersSent && !clientGone) {
         res.writeHead(status, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ error: `Proxy ${label}. Please try again later.` }));
@@ -1523,36 +2535,50 @@ function escJs(s) {
 }
 
 function getPublicSettings() {
-  const safeProfileUsers = {};
-  for (const [k, v] of Object.entries(rt.users)) {
-    const isObj = typeof v === "object" && v !== null;
-    safeProfileUsers[k] = {
-      key: isObj ? ((v.key || "").slice(0, 12) + "****") : (typeof v === "string" ? v.slice(0, 12) + "****" : ""),
-      disabled: isObj ? !!v.disabled : false,
-      dailyTokenLimit: isObj ? (v.dailyTokenLimit || 0) : 0,
-    };
-  }
-  const safeGlobalUsers = {};
-  for (const [k, v] of Object.entries(rt.globalUsers)) {
-    safeGlobalUsers[k] = {
+  const globalUsers = {};
+  for (const [k, v] of Object.entries(config.users || {})) {
+    globalUsers[k] = {
       username: v.username || "",
       expiresAt: v.expiresAt || "",
       disabled: !!v.disabled,
     };
   }
+  const profileAssignments = {};
+  for (const profile of listProfiles()) {
+    const rawUsers = config.profiles[profile.name]?.users || {};
+    profileAssignments[profile.suffix] = {};
+    for (const [k, v] of Object.entries(rawUsers)) {
+      const isObj = typeof v === "object" && v !== null;
+      profileAssignments[profile.suffix][k] = {
+        key: isObj ? (v.key || "") : (typeof v === "string" ? v : ""),
+        disabled: isObj ? !!v.disabled : false,
+        dailyTokenLimit: isObj ? (v.dailyTokenLimit || 0) : 0,
+      };
+    }
+  }
+  const defaultSuffix = getDefaultProfileSuffix();
+  const defaultProfile = config.profiles[getDefaultProfileName()];
   return {
-    upstream: rt.upstream,
+    upstream: defaultProfile?.upstream || "",
+    apiProtocol: normalizeApiProtocol(defaultProfile?.apiProtocol),
     proxy: { ...gProxy },
-    allowedModels: rt.allowedModels,
-    defaultModels: { ...rt.defaultModels },
-    profileUsers: safeProfileUsers,
-    globalUsers: safeGlobalUsers,
+    allowedModels: defaultProfile?.allowedModels || [],
+    defaultModels: { ...(defaultProfile?.defaultModels || {}) },
+    modelAliases: getConfigurableModelAliases(defaultProfile || {}),
+    openaiStreamUsage: defaultProfile?.openaiStreamUsage !== false,
+    responsesAdapter: normalizeApiProtocol(defaultProfile?.apiProtocol) === "openai"
+      ? normalizeResponsesAdapter(defaultProfile?.responsesAdapter)
+      : "none",
+    profileUsers: profileAssignments[defaultSuffix] || {},
+    profileAssignments,
+    globalUsers,
     activeProfile: getDefaultProfileName(),
     profiles: listProfiles(),
-    circuitBreaker: rt.breaker.status(),
+    selectedProfileSuffix: defaultSuffix,
+    circuitBreaker: rt?.breaker?.status() || { state: "UNKNOWN", failureCount: 0, totalSuccesses: 0, totalFailures: 0, cooldownRemaining: 0 },
     port: port,
     hasPassword: !!dashboardPassword,
-    profileQuota: getProfileQuota(""),
+    profileQuota: getProfileQuota(defaultSuffix),
     autoQuotaAdjust: config.autoQuotaAdjust || {},
   };
 }
@@ -1563,7 +2589,11 @@ function settingsHtml(errorMsg) {
   const errDiv = errorMsg ? `<div style="background:rgba(248,113,113,.12);color:var(--red);padding:10px 14px;border-radius:6px;margin-bottom:16px;font-size:13px">${errorMsg}</div>` : "";
 
   // Global users table rows
-  const globalUserRows = Object.entries(rt.globalUsers).map(([k, v]) => {
+  const initialSuffix = s.selectedProfileSuffix || getDefaultProfileSuffix();
+  const initialAssignments = s.profileAssignments[initialSuffix] || {};
+  const initialProfile = s.profiles.find(p => p.suffix === initialSuffix) || s.profiles[0] || {};
+
+  const globalUserRows = Object.entries(s.globalUsers).map(([k, v]) => {
     const isObj = typeof v === "object" && v !== null;
     const username = isObj ? (v.username || "") : (typeof v === "string" ? v : "");
     const expiresAt = isObj ? (v.expiresAt || "") : "";
@@ -1577,11 +2607,11 @@ function settingsHtml(errorMsg) {
   }).join("");
 
   // Profile user rows (key assignment)
-  const profileUserRows = Object.entries(rt.globalUsers).map(([k, v]) => {
+  const profileUserRows = Object.entries(s.globalUsers).map(([k, v]) => {
     const isObj = typeof v === "object" && v !== null;
     const username = isObj ? (v.username || "") : (typeof v === "string" ? v : "");
     const globalDisabled = isObj ? !!v.disabled : false;
-    const pu = rt.users[k];
+    const pu = initialAssignments[k];
     const realKey = pu ? (typeof pu === "string" ? pu : (pu.key || "")) : "";
     const profileDisabled = pu ? (typeof pu === "object" ? !!pu.disabled : false) : false;
     const userQuota = (pu && typeof pu === "object") ? (pu.dailyTokenLimit || 0) : 0;
@@ -1595,6 +2625,8 @@ function settingsHtml(errorMsg) {
   }).join("");
 
   const dm = s.defaultModels || {};
+  const aliasesText = formatModelAliasesInput(s.modelAliases || {});
+  const settingsJson = JSON.stringify(s).replace(/</g, "\\x3c");
 
   return `<!DOCTYPE html>
 <html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
@@ -1677,45 +2709,59 @@ td{padding:6px 8px;border-bottom:1px solid var(--border);font-size:12px}
 <div class="sidebar-hd"><h1>配置方案</h1><a href="/dashboard">← 面板</a></div>
 <div class="sidebar-list">${s.profiles.map(p => {
     const host = p.upstream.replace(/^https?:\/\//, "").replace(/\/.*/, "");
-    const suffixLabel = p.isDefault ? '<span style="color:var(--green);font-size:10px">默认</span>' : '<span style="color:var(--accent);font-size:10px">/'+ escHtml(p.suffix)+'</span>';
-    return `<div class="pl-item${p.isDefault ? " active" : ""}" id="pl-${escHtml(p.name)}" onclick="editProfile('${escJs(p.name)}')">
+    const suffixLabel = '<span style="color:var(--accent);font-size:10px">/'+ escHtml(p.suffix)+'</span>' + (p.isDefault ? ' <span style="color:var(--green);font-size:10px">默认入口</span>' : '');
+    return `<div class="pl-item${p.suffix === initialSuffix ? " active" : ""}" id="pl-${escHtml(p.name)}" onclick="editProfile('${escJs(p.name)}')">
 <div class="pl-name">${escHtml(p.name)} ${suffixLabel}</div>
 <div class="pl-host">${escHtml(host)}</div>
 <div class="pl-users">${p.userCount}位用户</div>
 <div class="pl-actions">
+  ${!p.isDefault ? '<button class="pl-activate" onclick="event.stopPropagation();setDefaultProfile(\'' + escJs(p.name) + '\')">设为默认</button>' : ''}
   ${!p.isDefault ? '<button class="pl-delete" onclick="event.stopPropagation();deleteProfile(\'' + escJs(p.name) + '\')">×</button>' : ''}
 </div></div>`;
   }).join("")}</div>
-<div class="sidebar-ft" style="display:flex;gap:6px"><button class="btn btn-outline btn-sm" onclick="openUserModal()" style="flex:1">用户管理</button><button class="btn btn-outline btn-sm" onclick="addProfile()" style="flex:1">+ 新增方案</button></div>
+<div class="sidebar-ft" style="display:flex;gap:6px"><button class="btn btn-outline btn-sm" onclick="openUserModal()" style="flex:1">用户管理</button><button class="btn btn-outline btn-sm" onclick="openProfileModal()" style="flex:1">+ 新增方案</button></div>
 </div>
 <div class="main">
 ${errDiv}
 <form method="post" action="/api/settings-save" id="settingsForm">
 <input type="hidden" name="_csrf" id="csrfToken">
-<input type="hidden" name="profileSuffix" id="profileSuffixInput" value="">
+<input type="hidden" name="profileName" id="profileNameInput" value="${escHtml(initialProfile.name || "")}">
+<input type="hidden" name="profileSuffix" id="profileSuffixInput" value="${escHtml(initialSuffix)}">
 
 <h2>上游代理 <span class="status ${s.circuitBreaker.state === 'CLOSED' ? 'status-ok' : s.circuitBreaker.state === 'HALF_OPEN' ? 'status-warn' : 'status-err'}">${s.circuitBreaker.state === 'CLOSED' ? '正常' : s.circuitBreaker.state === 'HALF_OPEN' ? '探测中' : '熔断中'}</span></h2>
 <div class="section">
-<div class="row">
+<div class="row3">
+<div><label>接口协议<span class="req">*</span></label><select name="apiProtocol" id="apiProtocolSelect" onchange="updateProtocolFields()"><option value="anthropic" ${s.apiProtocol === "anthropic" ? "selected" : ""}>Anthropic / Claude Code</option><option value="openai" ${s.apiProtocol === "openai" ? "selected" : ""}>OpenAI-compatible / Codex</option></select></div>
 <div><label>上游 API 地址<span class="req">*</span></label><input type="text" name="upstream" value="${s.upstream}" placeholder="https://open.bigmodel.cn/api/anthropic"></div>
-<div><label>URL 后缀 <span style="font-size:11px;color:var(--dim);font-weight:400">(默认方案留空)</span></label><input type="text" name="suffix" id="suffixInput" value="${escHtml(s.profiles.find(p => p.isDefault)?.suffix || s.profiles[0]?.suffix || '')}" placeholder="如: glm" oninput="updateAccessUrl()"></div>
+<div><label>URL 后缀 <span style="font-size:11px;color:var(--dim);font-weight:400">(所有方案必填)</span></label><input type="text" name="suffix" id="suffixInput" value="${escHtml(initialSuffix)}" placeholder="如: glm" oninput="updateAccessUrl()"></div>
+</div>
+<label style="display:flex;align-items:center;gap:6px;margin-top:12px"><input type="checkbox" name="openaiStreamUsage" id="openaiStreamUsageInput" ${s.openaiStreamUsage ? "checked" : ""} style="width:auto"> OpenAI 流式请求自动请求 usage 统计</label>
+<div id="responsesAdapterRow" style="margin-top:12px">
+<label>Responses 兼容模式</label>
+<select name="responsesAdapter" id="responsesAdapterSelect" onchange="updateAccessUrl()">
+  <option value="none" ${s.responsesAdapter === "none" ? "selected" : ""}>透明转发 /v1/responses</option>
+  <option value="chat_completions" ${s.responsesAdapter === "chat_completions" ? "selected" : ""}>将 /v1/responses 转为 /v1/chat/completions</option>
+</select>
+<div class="note">当上游只有 Chat Completions、没有 Responses 或 Models 端点时启用。启用后 /v1/models 由本平台按允许模型列表返回。</div>
 </div>
 <div class="note" id="accessUrlPreview" style="margin-top:8px;color:var(--green)">接入地址: http://&lt;host&gt;:6789/v1</div>
 <div class="presets">
   <span style="font-size:11px;color:var(--dim);line-height:24px">快速填充：</span>
-  <button type="button" class="preset" onclick="document.querySelector('[name=upstream]').value='https://open.bigmodel.cn/api/anthropic'">智谱 GLM</button>
-  <button type="button" class="preset" onclick="document.querySelector('[name=upstream]').value='https://api.anthropic.com'">Anthropic</button>
-  <button type="button" class="preset" onclick="document.querySelector('[name=upstream]').value='https://api.openai.com/v1'">OpenAI</button>
-  <button type="button" class="preset" onclick="document.querySelector('[name=upstream]').value='https://api.deepseek.com/anthropic'">DeepSeek</button>
-  <button type="button" class="preset" onclick="document.querySelector('[name=upstream]').value='https://api.moonshot.cn/v1'">Moonshot</button>
-  <button type="button" class="preset" onclick="document.querySelector('[name=upstream]').value='https://dashscope.aliyuncs.com/compatible-mode/v1'">阿里百炼</button>
-  <button type="button" class="preset" onclick="document.querySelector('[name=upstream]').value='https://token-plan.cn-beijing.maas.aliyuncs.com/apps/anthropic'">阿里Token Plan</button>
+  <button type="button" class="preset" onclick="fillUpstream('anthropic','https://open.bigmodel.cn/api/anthropic')">智谱 GLM Anthropic</button>
+  <button type="button" class="preset" onclick="fillUpstream('anthropic','https://api.anthropic.com')">Anthropic</button>
+  <button type="button" class="preset" onclick="fillUpstream('openai','https://api.openai.com/v1')">OpenAI</button>
+  <button type="button" class="preset" onclick="fillUpstream('anthropic','https://api.deepseek.com/anthropic')">DeepSeek Anthropic</button>
+  <button type="button" class="preset" onclick="fillUpstream('openai','https://api.deepseek.com/v1')">DeepSeek OpenAI</button>
+  <button type="button" class="preset" onclick="fillUpstream('openai','https://dashscope.aliyuncs.com/compatible-mode/v1')">阿里百炼 OpenAI</button>
+  <button type="button" class="preset" onclick="fillUpstream('openai','https://coding.dashscope.aliyuncs.com/v1','chat_completions')">阿里 Coding OpenAI</button>
+  <button type="button" class="preset" onclick="fillUpstream('anthropic','https://token-plan.cn-beijing.maas.aliyuncs.com/apps/anthropic')">阿里Token Plan</button>
 </div>
 <div class="note" style="margin-top:8px">状态：${s.circuitBreaker.state === 'CLOSED' ? '正常运行' : s.circuitBreaker.state === 'HALF_OPEN' ? '探测恢复中...' : '熔断中(' + Math.ceil(s.circuitBreaker.cooldownRemaining / 1000) + 's)'} | 失败 ${s.circuitBreaker.failureCount} | 成功 ${s.circuitBreaker.totalSuccesses} | 失败 ${s.circuitBreaker.totalFailures}</div>
 </div>
 
-<h2>默认模型映射 <span style="font-size:11px;color:var(--dim);font-weight:400">jx-sonnet / jx-opus / jx-haiku 别名映射</span></h2>
+<h2><span id="modelConfigTitle">模型配置</span> <span id="modelConfigHint" style="font-size:11px;color:var(--dim);font-weight:400"></span></h2>
 <div class="section">
+<div id="anthropicAliasFields">
 <div class="row3">
 <div><label>jx-sonnet → 实际模型<span class="req">*</span></label><input type="text" name="defaultModels_sonnet" value="${dm.sonnet || ''}" placeholder="如: deepseek-v4-pro"></div>
 <div><label>jx-opus → 实际模型<span class="req">*</span></label><input type="text" name="defaultModels_opus" value="${dm.opus || ''}" placeholder="如: deepseek-v4-pro"></div>
@@ -1729,12 +2775,23 @@ ${errDiv}
   <button type="button" class="preset" onclick="fillDefaults('qwen-max','qwen-max','qwen-plus')">通义千问</button>
 </div>
 </div>
+<div id="openaiModelFields" style="display:none">
+<div class="note" style="margin-top:0;color:var(--green)">Codex/OpenAI 请求会携带真实 model，网关不需要配置 sonnet/opus/haiku 三档模型。下方只需要放行真实模型；模型别名是可选项。</div>
+</div>
+<label id="modelAliasesLabel">可选模型别名（每行 alias=实际模型）</label>
+<textarea name="modelAliases" id="modelAliasesInput" rows="4" placeholder="codex-main=gpt-5&#10;codex-fast=gpt-5-mini">${escHtml(aliasesText)}</textarea>
+<div class="note" id="modelAliasesNote">用于自定义别名映射到真实模型；留空表示客户端直接使用真实模型名。</div>
+<div class="presets" id="openaiAliasPresets">
+  <span style="font-size:11px;color:var(--dim);line-height:24px">快速填充：</span>
+  <button type="button" class="preset" onclick="fillOpenAIAliases()">Codex OpenAI</button>
+</div>
+</div>
 
 <h2>允许模型<span class="req">*必填</span></h2>
 <div class="section">
 <label>可用模型列表 (逗号分隔，至少1个)<span class="req">*必填</span></label>
-<input type="text" name="allowedModels" value="${(s.allowedModels || []).join(",")}" placeholder="必填，如: deepseek-v4-pro, deepseek-v4-flash" required>
-<div class="note">不在列表中的模型请求将被拦截返回403。默认模型映射的值会自动添加到此列表。</div>
+<input type="text" name="allowedModels" id="allowedModelsInput" value="${(s.allowedModels || []).join(",")}" placeholder="必填，如: deepseek-v4-pro, deepseek-v4-flash" required>
+<div class="note" id="allowedModelsNote">不在列表中的模型请求将被拦截返回403。Anthropic 三档别名映射的目标模型会自动添加到此列表。</div>
 </div>
 
 <h2>超时 & 重试</h2>
@@ -1811,7 +2868,12 @@ ${(store.quotaAdjustHistory && store.quotaAdjustHistory.length > 0) ? `<h4 style
 <button type="button" class="btn btn-outline btn-sm" onclick="addGlobalUser()">+ 添加用户</button>
 <span class="note">虚拟Key自动生成（jx-开头24位随机码），点击可复制。失效时间留空=永不过期。</span>
 </div>
-<h4 style="font-size:13px;color:var(--accent);margin:16px 0 8px">方案真实Key分配 <span style="font-size:11px;color:var(--dim);font-weight:400">（当前方案：${config.activeProfile}）</span></h4>
+<h4 style="font-size:13px;color:var(--accent);margin:16px 0 8px;display:flex;align-items:center;justify-content:space-between;gap:12px">
+<span>方案真实Key分配 <span style="font-size:11px;color:var(--dim);font-weight:400">（按方案独立授权）</span></span>
+<select id="userProfileSel" onchange="switchUserProfile(this.value)" style="width:220px;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:5px 8px;border-radius:4px;font-size:12px">
+${s.profiles.map(p => `<option value="${escHtml(p.suffix)}" ${p.suffix === initialSuffix ? "selected" : ""}>${escHtml(p.name)} /${escHtml(p.suffix)}${p.isDefault ? " · 默认入口" : ""}</option>`).join("")}
+</select>
+</h4>
 <table id="profileUsersTable">
 <thead><tr><th>虚拟 Key</th><th>用户名称</th><th>真实 Key</th><th style="width:120px">每日配额</th><th style="width:80px">方案禁用</th></tr></thead>
 <tbody>${profileUserRows}</tbody>
@@ -1824,55 +2886,139 @@ ${(store.quotaAdjustHistory && store.quotaAdjustHistory.length > 0) ? `<h4 style
 </div>
 </div>
 </div>
+<div class="modal-overlay" id="profileModal">
+<div class="modal" style="max-width:640px">
+<div class="modal-hd"><h3>新增方案</h3><button class="modal-close" onclick="closeProfileModal()">&times;</button></div>
+<div class="modal-body">
+<div class="row3">
+<div><label>方案名称<span class="req">*</span></label><input type="text" id="newProfileName" placeholder="如: GLM 项目组"></div>
+<div><label>URL 后缀<span class="req">*</span></label><input type="text" id="newProfileSuffix" placeholder="如: glm"></div>
+<div><label>接口协议<span class="req">*</span></label><select id="newProfileProtocol" onchange="updateNewProfileFields()"><option value="anthropic">Anthropic / Claude Code</option><option value="openai">OpenAI-compatible / Codex</option></select></div>
+</div>
+<div id="newProfileResponsesAdapterRow" style="display:none">
+<label>Responses 兼容模式</label>
+<select id="newProfileResponsesAdapter">
+  <option value="none">透明转发 /v1/responses</option>
+  <option value="chat_completions">将 /v1/responses 转为 /v1/chat/completions</option>
+</select>
+</div>
+<label>上游 API 地址<span class="req">*</span></label><input type="text" id="newProfileUpstream" value="${escHtml(initialProfile.upstream || s.upstream || "")}" placeholder="https://open.bigmodel.cn/api/anthropic">
+<label>允许模型</label><input type="text" id="newProfileModels" value="${escHtml((initialProfile.allowedModels || s.allowedModels || []).join(","))}" placeholder="glm-5.1,qwen-max">
+<label>模型别名（每行 alias=实际模型，可选）</label><textarea id="newProfileAliases" rows="3" placeholder="codex-main=gpt-5&#10;codex-fast=gpt-5-mini"></textarea>
+<div class="note">创建后会出现在左侧方案列表。默认入口可在左侧点击“设为默认”。</div>
+<div style="margin-top:16px;display:flex;justify-content:flex-end;gap:8px">
+<button type="button" class="btn btn-outline btn-sm" onclick="closeProfileModal()">取消</button>
+<button type="button" class="btn btn-primary btn-sm" onclick="createProfile()">创建方案</button>
+</div>
+</div>
+</div>
+</div>
 <script>
+const SETTINGS=${settingsJson};
 function getCsrf(){const m=document.cookie.match(/tm_csrf=([^;]+)/);return m?m[1]:''}
 document.getElementById('csrfToken').value=getCsrf();
 function csrfHeaders(h){h=h||{};h['x-csrf-token']=getCsrf();return h}
-function openUserModal(){document.getElementById('userModal').classList.add('open')}
+function h(v){return String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
+function aliasText(aliases){return Object.entries(aliases||{}).map(([a,m])=>a+'='+m).join('\\n')}
+function currentProtocol(){return document.getElementById('apiProtocolSelect').value||'anthropic'}
+function updateProtocolFields(){
+  const protocol=currentProtocol();
+  const streamRow=document.getElementById('openaiStreamUsageInput')?.closest('label');
+  if(streamRow)streamRow.style.display=protocol==='openai'?'flex':'none';
+  const adapterRow=document.getElementById('responsesAdapterRow');
+  if(adapterRow)adapterRow.style.display=protocol==='openai'?'block':'none';
+  const anthropicFields=document.getElementById('anthropicAliasFields');
+  const openaiFields=document.getElementById('openaiModelFields');
+  const openaiPresets=document.getElementById('openaiAliasPresets');
+  if(anthropicFields)anthropicFields.style.display=protocol==='openai'?'none':'block';
+  if(openaiFields)openaiFields.style.display=protocol==='openai'?'block':'none';
+  if(openaiPresets)openaiPresets.style.display=protocol==='openai'?'flex':'none';
+  const title=document.getElementById('modelConfigTitle');
+  const hint=document.getElementById('modelConfigHint');
+  if(title)title.textContent=protocol==='openai'?'OpenAI / Codex 模型':'Claude 模型别名';
+  if(hint)hint.textContent=protocol==='openai'?'真实模型直传，可选 alias':'jx-sonnet / jx-opus / jx-haiku';
+  const aliasLabel=document.getElementById('modelAliasesLabel');
+  if(aliasLabel)aliasLabel.textContent=protocol==='openai'?'可选模型别名（每行 alias=实际模型）':'通用模型别名（每行 alias=实际模型，可选）';
+  const aliasNote=document.getElementById('modelAliasesNote');
+  if(aliasNote)aliasNote.textContent=protocol==='openai'?'Codex 可直接使用真实模型名；只有需要自定义短名称时才填写这里。':'jx-* 三个别名由上方字段生成；这里可额外增加自定义别名。';
+  const allowed=document.getElementById('allowedModelsInput');
+  if(allowed)allowed.placeholder=protocol==='openai'?'必填，如: gpt-5, qwen3-coder-plus, glm-5':'必填，如: deepseek-v4-pro, deepseek-v4-flash';
+  const allowedNote=document.getElementById('allowedModelsNote');
+  if(allowedNote)allowedNote.textContent=protocol==='openai'?'Codex/OpenAI 请求中的 model 必须在此列表中；留空不会放行。':'不在列表中的模型请求将被拦截返回403。Anthropic 三档别名映射的目标模型会自动添加到此列表。';
+  const up=document.querySelector('[name=upstream]');
+  if(up)up.placeholder=protocol==='openai'?'https://api.openai.com/v1 或 compatible-mode/v1':'https://open.bigmodel.cn/api/anthropic';
+  updateAccessUrl();
+}
+function openUserModal(){const sfx=document.getElementById('profileSuffixInput').value||SETTINGS.selectedProfileSuffix;document.getElementById('userProfileSel').value=sfx;renderProfileUsers(sfx);document.getElementById('userModal').classList.add('open')}
 function closeUserModal(){document.getElementById('userModal').classList.remove('open')}
 document.getElementById('userModal').addEventListener('click',function(e){if(e.target===this)closeUserModal()});
+function openProfileModal(){document.getElementById('profileModal').classList.add('open');document.getElementById('newProfileName').focus()}
+function closeProfileModal(){document.getElementById('profileModal').classList.remove('open')}
+document.getElementById('profileModal').addEventListener('click',function(e){if(e.target===this)closeProfileModal()});
 async function switchToProfile(n){
   // No longer exclusive switch — just reload the profile into the form
   editProfile(n);
 }
-let editingProfileName="${escJs(s.profiles.find(p=>p.isDefault)?.name||s.profiles[0]?.name||'')}";
+let editingProfileName="${escJs(initialProfile.name || '')}";
 function updateAccessUrl(){
   const sfx=document.getElementById('suffixInput').value.trim();
-  const preview=sfx?'http://&lt;host&gt;:6789/'+(sfx)+'/v1':'http://&lt;host&gt;:6789/v1';
-  document.getElementById('accessUrlPreview').innerHTML='接入地址: '+preview+(sfx?'':' <span style="color:var(--dim)">(默认方案，无后缀)</span>');
+  const p=SETTINGS.profiles.find(x=>x.name===editingProfileName);
+  const defaultNote=p&&p.isDefault?' <span style="color:var(--green)">默认入口也可用 http://&lt;host&gt;:6789/v1</span>':'';
+  const protocol=currentProtocol();
+  const endpoint=protocol==='openai'?'/v1/responses 或 /v1/chat/completions':'/v1/messages';
+  const adapter=document.getElementById('responsesAdapterSelect')?.value||'none';
+  const adapterNote=protocol==='openai'&&adapter==='chat_completions'?' <span style="color:var(--orange)">已启用 Responses→Chat 适配</span>':'';
+  document.getElementById('accessUrlPreview').innerHTML='接入地址: http://&lt;host&gt;:6789/'+h(sfx)+endpoint+defaultNote+adapterNote;
 }
-updateAccessUrl();
+updateProtocolFields();
 async function editProfile(n){
-  const profiles=${JSON.stringify(s.profiles)};
-  const p=profiles.find(x=>x.name===n);
+  const p=SETTINGS.profiles.find(x=>x.name===n);
   if(!p)return;
   editingProfileName=n;
   const fm=document.forms.settingsForm;
+  fm.apiProtocol.value=p.apiProtocol||'anthropic';
   fm.upstream.value=p.upstream||'';
   document.getElementById('suffixInput').value=p.suffix||'';
+  document.getElementById('profileNameInput').value=p.name||'';
   if(p.allowedModels)fm.allowedModels.value=p.allowedModels.join(', ');
-  if(p.defaultModels){
-    fm.defaultModels_sonnet.value=p.defaultModels.sonnet||'';
-    fm.defaultModels_opus.value=p.defaultModels.opus||'';
-    fm.defaultModels_haiku.value=p.defaultModels.haiku||'';
-  }
+  fm.defaultModels_sonnet.value=p.defaultModels?.sonnet||'';
+  fm.defaultModels_opus.value=p.defaultModels?.opus||'';
+  fm.defaultModels_haiku.value=p.defaultModels?.haiku||'';
+  if(fm.modelAliases)fm.modelAliases.value=aliasText(p.modelAliases||{});
+  const osu=document.getElementById('openaiStreamUsageInput');
+  if(osu)osu.checked=p.openaiStreamUsage!==false;
+  if(fm.responsesAdapter)fm.responsesAdapter.value=p.responsesAdapter||'none';
+  if(fm.profileQuota)fm.profileQuota.value=p.dailyTokenLimit||0;
   document.querySelectorAll('.pl-item').forEach(el=>el.classList.remove('active'));
   const el=document.getElementById('pl-'+n);
   if(el)el.classList.add('active');
   document.getElementById('profileSuffixInput').value=p.suffix||'';
-  updateAccessUrl();
+  const userSel=document.getElementById('userProfileSel');
+  if(userSel){userSel.value=p.suffix||'';renderProfileUsers(p.suffix||'')}
+  updateProtocolFields();
 }
-async function addProfile(){
-  const name=prompt('请输入新方案名称');
-  if(!name)return;
-  const suffix=prompt('请输入URL后缀（英文/数字/下划线，如: glm）\\n用户将通过 http://host:6789/<后缀>/v1 访问此方案');
-  if(suffix===null)return;
+async function createProfile(){
+  const name=document.getElementById('newProfileName').value.trim();
+  const suffix=document.getElementById('newProfileSuffix').value.trim();
+  const apiProtocol=document.getElementById('newProfileProtocol').value;
+  const upstream=document.getElementById('newProfileUpstream').value.trim();
+  const models=document.getElementById('newProfileModels').value.trim();
+  const modelAliases=document.getElementById('newProfileAliases').value.trim();
+  const responsesAdapter=document.getElementById('newProfileResponsesAdapter').value||'none';
+  if(!name||!suffix||!upstream){alert('方案名称、URL 后缀和上游 API 地址必填');return}
   const fm=document.forms.settingsForm;
   const r=await fetch('/api/profile/save',{method:'POST',headers:csrfHeaders({'Content-Type':'application/json'}),body:JSON.stringify({
-    profile:name,suffix:suffix||'',upstream:fm.upstream.value,allowedModels:fm.allowedModels.value,
-    defaultModels:{sonnet:fm.defaultModels_sonnet.value,opus:fm.defaultModels_opus.value,haiku:fm.defaultModels_haiku.value}
+    profile:name,suffix:suffix,apiProtocol:apiProtocol,upstream:upstream,allowedModels:models||fm.allowedModels.value,
+    defaultModels:apiProtocol==='anthropic'?{sonnet:fm.defaultModels_sonnet.value,opus:fm.defaultModels_opus.value,haiku:fm.defaultModels_haiku.value}:undefined,
+    modelAliases:modelAliases,
+    openaiStreamUsage:true,
+    responsesAdapter:apiProtocol==='openai'?responsesAdapter:'none'
   })});
   if(r.ok)location.reload();else{const e=await r.json();alert('创建失败: '+e.error)}
+}
+async function setDefaultProfile(n){
+  const r=await fetch('/api/profile/default',{method:'POST',headers:csrfHeaders({'Content-Type':'application/json'}),body:JSON.stringify({profile:n})});
+  if(r.ok)location.reload();else{const e=await r.json();alert('设置失败: '+e.error)}
 }
 async function deleteProfile(n){
   if(!confirm('确定删除方案 "'+n+'"？'))return;
@@ -1884,6 +3030,26 @@ async function deleteGlobalUser(k){
   const r=await fetch('/api/global-user/delete',{method:'POST',headers:csrfHeaders({'Content-Type':'application/json'}),body:JSON.stringify({key:k})});
   if(r.ok)location.reload();else{const e=await r.json();alert('删除失败: '+e.error)}
 }
+function renderProfileUsers(suffix){
+  const assignments=SETTINGS.profileAssignments[suffix]||{};
+  const tbody=document.querySelector("#profileUsersTable tbody");
+  tbody.innerHTML=Object.entries(SETTINGS.globalUsers).map(([k,v])=>{
+    const username=v.username||'';
+    const globalDisabled=!!v.disabled;
+    const pu=assignments[k]||{};
+    const realKey=pu.key||'';
+    const profileDisabled=!!pu.disabled;
+    const userQuota=pu.dailyTokenLimit||0;
+    const rowStyle=globalDisabled?'opacity:0.4':'';
+    return '<tr style="'+rowStyle+'">'
+      +'<td><code style="font-size:11px;color:var(--accent)">'+h(k)+'</code></td>'
+      +'<td>'+h(username)+'</td>'
+      +'<td><input type="text" name="pu_rk_'+h(k)+'" value="'+h(realKey)+'" style="width:100%;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:4px 8px;border-radius:4px;font-size:12px;font-family:monospace" placeholder="真实Key (留空=不可用此方案)"></td>'
+      +'<td><input type="number" name="pu_quota_'+h(k)+'" value="'+h(userQuota)+'" style="width:100%;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:4px 8px;border-radius:4px;font-size:12px" min="0" step="100000" placeholder="0=不限"></td>'
+      +'<td><label style="display:inline-flex;align-items:center;gap:4px;margin:0;cursor:pointer"><input type="checkbox" name="pu_dis_'+h(k)+'" '+(profileDisabled?'checked':'')+' style="width:auto;accent-color:var(--orange)"><span style="font-size:11px;color:'+(profileDisabled?'var(--orange)':'var(--dim)')+'">'+(profileDisabled?'已禁用':'正常')+'</span></label></td></tr>';
+  }).join('');
+}
+function switchUserProfile(suffix){renderProfileUsers(suffix)}
 async function saveUsers(){
   const tbody=document.querySelector("#globalUsersTable tbody");
   const rows=tbody.querySelectorAll("tr");
@@ -1909,7 +3075,8 @@ async function saveUsers(){
     const qv=parseInt(qInput?qInput.value:'0',10)||0;
     profileUsers.push({key:vk,realKey:rkInput?rkInput.value.trim():'',disabled:disInput?disInput.checked:false,dailyTokenLimit:qv>0?qv:null});
   });
-  const r=await fetch('/api/global-user/save',{method:'POST',headers:csrfHeaders({'Content-Type':'application/json'}),body:JSON.stringify({users,profileUsers})});
+  const profileSuffix=document.getElementById('userProfileSel').value;
+  const r=await fetch('/api/global-user/save',{method:'POST',headers:csrfHeaders({'Content-Type':'application/json'}),body:JSON.stringify({users,profileUsers,profileSuffix})});
   if(r.ok){alert('保存成功');location.reload()}else{const e=await r.json();alert('保存失败: '+e.error)}
 }
 function genVK(){const c="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";const a=new Uint8Array(24);crypto.getRandomValues(a);let k="jx-";for(let i=0;i<24;i++)k+=c[a[i]%c.length];return k}
@@ -1923,12 +3090,36 @@ function addGlobalUser(){
     +'<td><label style="display:inline-flex;align-items:center;gap:4px;margin:0;cursor:pointer"><input type="checkbox" name="gu_dis_new_'+vk+'" style="width:auto;accent-color:var(--red)"><span style="font-size:11px;color:var(--dim)">正常</span></label></td>'
     +'<td><button type="button" onclick="this.closest(\\'tr\\').remove()" style="background:rgba(248,113,113,.15);color:var(--red);border:none;padding:2px 8px;border-radius:4px;cursor:pointer;font-size:11px">删除</button></td>';
   tbody.appendChild(tr);
+  SETTINGS.globalUsers[vk]={username:'',expiresAt:'',disabled:false};
+  for(const p of SETTINGS.profiles){if(!SETTINGS.profileAssignments[p.suffix])SETTINGS.profileAssignments[p.suffix]={}}
+  renderProfileUsers(document.getElementById('userProfileSel').value);
 }
 function fillDefaults(s,o,h){
   document.querySelector('[name=defaultModels_sonnet]').value=s;
   document.querySelector('[name=defaultModels_opus]').value=o;
   document.querySelector('[name=defaultModels_haiku]').value=h;
 }
+function fillOpenAIAliases(){
+  const fm=document.forms.settingsForm;
+  fm.apiProtocol.value='openai';
+  fm.modelAliases.value='codex-main=gpt-5\\ncodex-fast=gpt-5-mini';
+  if(fm.responsesAdapter)fm.responsesAdapter.value='none';
+  updateProtocolFields();
+}
+function fillUpstream(protocol,url,responsesAdapter){
+  document.forms.settingsForm.apiProtocol.value=protocol;
+  document.querySelector('[name=upstream]').value=url;
+  const adapter=document.getElementById('responsesAdapterSelect');
+  if(adapter)adapter.value=protocol==='openai'?(responsesAdapter||'none'):'none';
+  updateProtocolFields();
+}
+function updateNewProfileFields(){
+  const protocol=document.getElementById('newProfileProtocol').value;
+  const row=document.getElementById('newProfileResponsesAdapterRow');
+  if(row)row.style.display=protocol==='openai'?'block':'none';
+  if(protocol!=='openai')document.getElementById('newProfileResponsesAdapter').value='none';
+}
+updateNewProfileFields();
 document.addEventListener("keydown",e=>{if(e.key==="Enter"&&e.target.tagName!=="TEXTAREA"&&e.target.tagName!=="INPUT")e.preventDefault()});
 </script>
 </body></html>`;
@@ -1978,6 +3169,7 @@ tr:last-child td{border-bottom:none}tr:hover td{background:rgba(255,255,255,.02)
 <h1>团队AI Coding监控 <span style="float:right;font-size:12px;display:flex;gap:8px;align-items:center"><select id="profileSel" style="font-size:12px;background:var(--card);color:var(--text);border:1px solid var(--border);padding:4px 8px;border-radius:4px;cursor:pointer;max-width:160px" onchange="switchProfileView(this.value)"><option value="">全部方案</option></select><a href="/settings" style="color:var(--dim);text-decoration:none;font-size:12px;padding:4px 10px;border:1px solid var(--border);border-radius:4px">设置</a><button id="autoRefreshBtn" style="font-size:12px;background:rgba(52,211,153,.15);color:var(--green);border:none;padding:4px 12px;border-radius:4px;cursor:pointer">自动刷新: 开</button><button onclick="fetch('/api/logout',{method:'POST',headers:{'x-csrf-token':(document.cookie.match(/tm_csrf=([^;]+)/)||[])[1]||''}}).then(()=>location.reload())" style="font-size:12px;background:rgba(255,255,255,.06);color:var(--dim);border:none;padding:4px 12px;border-radius:4px;cursor:pointer">退出</button></span></h1>
 <div class="meta" id="meta">Loading...</div>
 <div class="cards" id="cards"></div>
+<div class="sec" id="profileSummarySec" style="display:none"><h3>方案中心</h3><table><thead><tr><th>方案</th><th>入口</th><th>上游</th><th class="n">今日请求</th><th class="n">今日用量</th><th>状态</th></tr></thead><tbody id="profileSummaryBody"></tbody></table></div>
 <div class="tabs" id="tabs">
   <button class="tab on" data-p="day">按日</button>
   <button class="tab" data-p="week">按周</button>
@@ -2004,6 +3196,7 @@ tr:last-child td{border-bottom:none}tr:hover td{background:rgba(255,255,255,.02)
 let D=null,P="day",C={t:null,p:null,m:null,h:null},errPage=1,autoRefresh=true,refreshTimer=null,currentProfile="all";
 const ERR_PAGE_SIZE=20;
 const COL=["#7c6ef0","#5ba3f5","#34d399","#fbbf24","#f87171","#f472b6","#a78bfa","#38bdf8"];
+const escH=s=>String(s??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 const fmtT=n=>n.toLocaleString("zh-CN");
 const fmtTk=n=>{if(n>=1e6)return(n/1e6).toFixed(1)+"M";if(n>=1e3)return(n/1e3).toFixed(1)+"k";return n.toString()};
 function fmtBJ(iso){if(!iso)return"-";const d=new Date(iso);const utc=d.getTime()+d.getTimezoneOffset()*60000;return new Date(utc+8*3600000).toLocaleString("zh-CN")};
@@ -2020,7 +3213,7 @@ function render(){
   if(sel.options.length<=1 && D.profiles){
     sel.innerHTML='<option value="all">📊 全部方案</option>';
     for(const p of D.profiles){
-      const sfx=p.suffix?"("+p.suffix+")":"(默认)";
+      const sfx="/"+p.suffix+(p.isDefault?" · 默认入口":"");
       sel.innerHTML+='<option value="'+escH(p.suffix)+'">'+escH(p.name)+' '+sfx+'</option>';
     }
     sel.value=currentProfile==="all"?"all":currentProfile;
@@ -2029,6 +3222,8 @@ function render(){
   const td=new Date(Date.now()+8*36e5).toISOString().slice(0,10),tdd=(D.daily||{})[td]||{};
   const tIn=Object.values(tdd).reduce((s,d)=>s+d.inputTokens,0),tOut=Object.values(tdd).reduce((s,d)=>s+d.outputTokens,0),tR=Object.values(tdd).reduce((s,d)=>s+d.requests,0);
   document.getElementById("cards").innerHTML=c("今日用量",fmtT(tIn+tOut),"var(--accent)")+c("今日请求",fmtT(tR),"var(--blue)")+c("总用量",fmtT(ti+to),"var(--green)")+c("总请求",fmtT(tr),"var(--orange)")+c("今日错误",fmtT((Array.isArray(D.errors)?D.errors:[]).filter(e=>e.time&&e.time.startsWith(td)).length),"var(--red)");
+  const ps=document.getElementById("profileSummarySec"),psb=document.getElementById("profileSummaryBody");
+  if(currentProfile==="all"&&Array.isArray(D.profileSummaries)){ps.style.display="block";psb.innerHTML=D.profileSummaries.map(p=>{const st=p.breakerState||"UNKNOWN";const col=st==="CLOSED"?"var(--green)":st==="HALF_OPEN"?"var(--orange)":"var(--red)";return'<tr><td>'+escH(p.name)+(p.isDefault?' <span style="color:var(--green);font-size:11px">默认入口</span>':'')+'</td><td><code>/'+escH(p.suffix)+'</code>'+(p.isDefault?' 或 <code>/v1</code>':'')+'</td><td style="font-size:12px;color:var(--dim);max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+escH((p.upstream||'').replace('https://','').replace('http://',''))+'</td><td class="n">'+fmtT(p.todayRequests||0)+'</td><td class="n hl">'+fmtT(p.todayTokens||0)+'</td><td style="color:'+col+'">'+st+'</td></tr>'}).join('')}else{ps.style.display="none"}
   const profileLabel=D.profileView||(currentProfile==="all"?"全部方案":"默认方案");
   const upstreamInfo=D.upstream?(" | 上游: "+D.upstream.replace("https://","").replace("http://","")):"";
   document.getElementById("meta").innerHTML='<span style="color:var(--accent);font-weight:600">方案: '+profileLabel+'</span>'+upstreamInfo+' &nbsp;|&nbsp; 更新于 '+(function(){const d=new Date();const utc=d.getTime()+d.getTimezoneOffset()*60000;return new Date(utc+8*3600000).toLocaleTimeString("zh-CN")})()+" (北京时间) | 每30秒刷新";
@@ -2146,6 +3341,7 @@ function personalUsageHtml(virtualKey) {
 *{margin:0;padding:0;box-sizing:border-box}
 body{font-family:-apple-system,BlinkMacSystemFont,sans-serif;background:var(--bg);color:var(--text);padding:20px 24px}
 h1{font-size:18px;margin-bottom:4px}.meta{font-size:12px;color:var(--dim);margin-bottom:20px}
+select{background:var(--card);color:var(--text);border:1px solid var(--border);padding:4px 8px;border-radius:4px;font-size:12px}
 .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:10px;margin-bottom:20px}
 .card{background:var(--card);border:1px solid var(--border);border-radius:8px;padding:14px 16px}
 .card .l{font-size:12px;color:var(--dim);margin-bottom:4px}.card .v{font-size:22px;font-weight:700;font-variant-numeric:tabular-nums}
@@ -2158,7 +3354,7 @@ td{padding:6px 12px;font-size:13px;border-bottom:1px solid var(--border)}.n{text
 .progress{width:100%;height:8px;background:var(--border);border-radius:4px;overflow:hidden;margin-top:6px}
 .progress-bar{height:100%;border-radius:4px;transition:width .3s}
 </style></head><body>
-<h1>我的用量统计</h1>
+<h1>我的用量统计 <span style="float:right;font-size:12px"><select id="profileSel" onchange="switchProfile(this.value)"><option value="all">全部可用方案</option></select></span></h1>
 <div class="meta" id="meta">加载中...</div>
 <div class="cards" id="cards"></div>
 <div class="box"><h3>今日24小时趋势</h3><canvas id="hourChart"></canvas></div>
@@ -2166,18 +3362,24 @@ td{padding:6px 12px;font-size:13px;border-bottom:1px solid var(--border)}.n{text
 <div class="box"><h3>今日模型用量</h3><table id="modelTable"><thead><tr><th>模型</th><th class="n">请求数</th><th class="n">输入</th><th class="n">输出</th><th class="n">合计</th></tr></thead><tbody></tbody></table></div>
 <script>
 const VK='${escJs(virtualKey)}';
-let D=null,C={h:null,t:null};
+let D=null,C={h:null,t:null},currentProfile='all';
 const fmtT=n=>n.toLocaleString("zh-CN");
 const fmtTk=n=>{if(n>=1e6)return(n/1e6).toFixed(1)+"M";if(n>=1e3)return(n/1e3).toFixed(1)+"k";return n.toString()};
 async function load(){
   try{
-    const r=await fetch('/api/my-usage',{headers:{'Authorization':'Bearer '+VK}});
+    const r=await fetch('/api/my-usage?profile='+encodeURIComponent(currentProfile),{headers:{'Authorization':'Bearer '+VK}});
     if(!r.ok){document.getElementById('meta').textContent='认证失败';return}
     D=await r.json();render();
   }catch(e){document.getElementById('meta').textContent='Error: '+e.message}
 }
+function switchProfile(v){currentProfile=v||'all';load()}
 function render(){
   if(!D)return;
+  const sel=document.getElementById('profileSel');
+  if(sel.options.length<=1){
+    sel.innerHTML='<option value="all">全部可用方案</option>'+(D.availableProfiles||[]).map(p=>'<option value="'+p.suffix+'">'+p.name+' /'+p.suffix+(p.isDefault?' · 默认入口':'')+'</option>').join('');
+  }
+  sel.value=currentProfile;
   const q=D.quota,t=D.today;
   const pct=q.limit>0?Math.min(100,Math.round(q.used/q.limit*100)):0;
   const color=pct>90?'var(--red)':pct>70?'var(--orange)':'var(--green)';
@@ -2225,20 +3427,39 @@ function parseFormBody(body) {
 }
 
 function applySettings(formData) {
-  // Determine which profile is being edited (default to default profile)
-  const editingSuffix = formData.profileSuffix || "";
-  const editingRt = runtimes[editingSuffix] || rt;
-  const editingProfileName = editingRt.profileName;
+  const editingProfileName = formData.profileName || getProfileNameBySuffix(formData.profileSuffix) || getDefaultProfileName();
+  const editingProfile = config.profiles[editingProfileName];
+  if (!editingProfile) throw new Error(`Profile "${editingProfileName}" not found`);
 
-  // Validate upstream URL
-  if (formData.upstream && formData.upstream !== editingRt.upstream) {
+  if (formData.apiProtocol !== undefined) {
+    editingProfile.apiProtocol = validateApiProtocol(formData.apiProtocol);
+  }
+  if (formData.openaiStreamUsage !== undefined || formData.apiProtocol !== undefined) {
+    editingProfile.openaiStreamUsage = formData.openaiStreamUsage === "on" || formData.openaiStreamUsage === true;
+  }
+  if (formData.responsesAdapter !== undefined || formData.apiProtocol !== undefined) {
+    const protocol = normalizeApiProtocol(editingProfile.apiProtocol);
+    editingProfile.responsesAdapter = protocol === "openai"
+      ? validateResponsesAdapter(formData.responsesAdapter || "none")
+      : "none";
+  }
+
+  if (formData.upstream && formData.upstream !== editingProfile.upstream) {
     if (!/^https?:\/\/[^\s]+/.test(formData.upstream)) throw new Error("Invalid upstream URL");
-    editingRt.upstream = formData.upstream;
-    editingRt.upstreamUrl = new URL(formData.upstream);
-    editingRt.agent.destroy();
-    editingRt.agent = createUpstreamAgent(editingRt.upstreamUrl);
-    editingRt.breaker.reset();
-    console.log(`[CONFIG] Upstream reloaded: ${editingRt.upstream}`);
+    editingProfile.upstream = formData.upstream.trim();
+    console.log(`[CONFIG] Upstream updated: ${editingProfile.upstream}`);
+  }
+
+  if (formData.suffix !== undefined) {
+    const nextSuffix = validateProfileSuffix(formData.suffix, editingProfileName);
+    const oldSuffix = editingProfile.suffix;
+    if (nextSuffix !== oldSuffix) {
+      editingProfile.suffix = nextSuffix;
+      if (store._profiles?.[oldSuffix] && !store._profiles[nextSuffix]) {
+        store._profiles[nextSuffix] = store._profiles[oldSuffix];
+        delete store._profiles[oldSuffix];
+      }
+    }
   }
 
   // Update proxy settings with range validation (global)
@@ -2253,11 +3474,8 @@ function applySettings(formData) {
 
   // Update profile quota
   if (formData.profileQuota !== undefined) {
-    const ap = config.profiles[editingProfileName];
-    if (ap) {
-      const q = parseInt(formData.profileQuota, 10) || 0;
-      ap.dailyTokenLimit = q > 0 ? q : null;
-    }
+    const q = parseInt(formData.profileQuota, 10) || 0;
+    editingProfile.dailyTokenLimit = q > 0 ? q : null;
   }
 
   // Update auto quota adjustment settings
@@ -2285,25 +3503,29 @@ function applySettings(formData) {
   if (formData.allowedModels !== undefined) {
     const raw = formData.allowedModels.trim();
     if (!raw) throw new Error("至少需要设置 1 个允许模型");
-    editingRt.allowedModels = raw.split(",").map(s => s.trim()).filter(Boolean);
-    if (editingRt.allowedModels.length === 0) throw new Error("至少需要设置 1 个允许模型");
+    editingProfile.allowedModels = raw.split(",").map(s => s.trim()).filter(Boolean);
+    if (editingProfile.allowedModels.length === 0) throw new Error("至少需要设置 1 个允许模型");
   }
 
   // Update default model mappings (jx-* aliases)
-  if (formData.defaultModels_sonnet) editingRt.defaultModels.sonnet = formData.defaultModels_sonnet.trim();
-  if (formData.defaultModels_opus)   editingRt.defaultModels.opus   = formData.defaultModels_opus.trim();
-  if (formData.defaultModels_haiku)  editingRt.defaultModels.haiku  = formData.defaultModels_haiku.trim();
-
-  // Ensure defaultModels values are always in allowedModels
-  for (const m of Object.values(editingRt.defaultModels)) {
-    if (m && !editingRt.allowedModels.includes(m)) {
-      editingRt.allowedModels.push(m);
-    }
+  if (!editingProfile.defaultModels) editingProfile.defaultModels = {};
+  if (formData.defaultModels_sonnet) editingProfile.defaultModels.sonnet = formData.defaultModels_sonnet.trim();
+  if (formData.defaultModels_opus)   editingProfile.defaultModels.opus   = formData.defaultModels_opus.trim();
+  if (formData.defaultModels_haiku)  editingProfile.defaultModels.haiku  = formData.defaultModels_haiku.trim();
+  if (formData.modelAliases !== undefined) {
+    const parsedAliases = parseModelAliasesInput(formData.modelAliases);
+    editingProfile.modelAliases = parsedAliases;
+  } else {
+    editingProfile.modelAliases = getConfigurableModelAliases(editingProfile);
   }
 
-  // Update circuit breaker thresholds for this profile
-  editingRt.breaker.failureThreshold = gProxy.circuitBreakerFailures || 5;
-  editingRt.breaker.cooldownMs = gProxy.circuitBreakerCooldown || 30000;
+  // Ensure alias targets are always in allowedModels
+  if (!Array.isArray(editingProfile.allowedModels)) editingProfile.allowedModels = [];
+  for (const m of Object.values(getProfileModelAliases(editingProfile))) {
+    if (m && !editingProfile.allowedModels.includes(m)) {
+      editingProfile.allowedModels.push(m);
+    }
+  }
 
   // Update global users
   const newGlobalUsers = {};
@@ -2328,7 +3550,7 @@ function applySettings(formData) {
     }
   }
   if (Object.keys(newGlobalUsers).length > 0) {
-    editingRt.globalUsers = newGlobalUsers;
+    config.users = newGlobalUsers;
   }
 
   // Update profile users (key assignment + profile disable)
@@ -2347,20 +3569,14 @@ function applySettings(formData) {
     }
   }
   if (Object.keys(newProfileUsers).length > 0) {
-    editingRt.users = newProfileUsers;
+    editingProfile.users = newProfileUsers;
   }
 
   // Persist to config.json
   config.proxy = { ...gProxy };
-  config.users = { ...editingRt.globalUsers };
-  const ap = config.profiles[editingProfileName];
-  if (ap) {
-    ap.upstream = editingRt.upstream;
-    ap.allowedModels = editingRt.allowedModels;
-    ap.defaultModels = { ...editingRt.defaultModels };
-    ap.users = { ...editingRt.users };
-  }
   saveConfig(config);
+  saveStore();
+  reloadAllRuntimes();
 
   console.log(`[CONFIG] Settings saved to profile "${editingProfileName}"`);
 }
@@ -2504,33 +3720,67 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+  // Profile: set default entry alias
+  if (req.method === "POST" && req.url === "/api/profile/default") {
+    if (!checkAuth(req)) { res.writeHead(401); res.end("Unauthorized"); return; }
+    if (!checkCsrf(req)) { res.writeHead(403); res.end("CSRF validation failed"); return; }
+    readBody(req).then(buf => {
+      try {
+        const { profile, suffix } = JSON.parse(buf.toString());
+        const name = profile || getProfileNameBySuffix(suffix);
+        if (!name || !config.profiles[name]) throw new Error(`Profile "${profile || suffix}" not found`);
+        for (const [pname, p] of Object.entries(config.profiles)) {
+          p.isDefault = pname === name;
+        }
+        saveConfig(config);
+        reloadAllRuntimes();
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: true, defaultProfile: name, profiles: listProfiles() }));
+      } catch (err) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: err.message }));
+      }
+    }).catch(() => {
+      res.writeHead(413); res.end("Request too large");
+    });
+    return;
+  }
+
   // Profile: save as new
   if (req.method === "POST" && req.url === "/api/profile/save") {
     if (!checkAuth(req)) { res.writeHead(401); res.end("Unauthorized"); return; }
     if (!checkCsrf(req)) { res.writeHead(403); res.end("CSRF validation failed"); return; }
     readBody(req).then(buf => {
       try {
-        const { profile, upstream, allowedModels, defaultModels, suffix } = JSON.parse(buf.toString());
+        const { profile, upstream, allowedModels, defaultModels, suffix, apiProtocol, modelAliases, openaiStreamUsage, responsesAdapter } = JSON.parse(buf.toString());
         const name = (profile || "").trim();
         if (!name) throw new Error("Profile name required");
-        // Validate suffix
-        const sfx = (suffix || "").toLowerCase().replace(/[^a-z0-9_-]/g, "");
-        // Check for reserved suffixes
-        if (sfx && RESERVED_SUFFIXES.has(sfx)) throw new Error(`后缀 "${sfx}" 是系统保留的，请使用其他名称`);
-        // Check for suffix uniqueness
-        for (const [pn, p] of Object.entries(config.profiles)) {
-          if (pn !== name && (p.suffix || "") === sfx) throw new Error(`后缀 "${sfx}" 已被方案 "${pn}" 使用`);
+        if (config.profiles[name]) throw new Error(`方案 "${name}" 已存在`);
+        const sfx = validateProfileSuffix(suffix, name);
+        const protocol = validateApiProtocol(apiProtocol || "anthropic");
+        const nextDefaultModels = defaultModels || { ...rt.defaultModels };
+        const aliases = parseModelAliasesInput(modelAliases);
+        const runtimeAliases = protocol === "anthropic"
+          ? { ...legacyDefaultModelAliases(nextDefaultModels), ...aliases }
+          : aliases;
+        const models = allowedModels ? allowedModels.split(",").map(s => s.trim()).filter(Boolean) : [...rt.allowedModels];
+        for (const m of Object.values(runtimeAliases)) {
+          if (m && !models.includes(m)) models.push(m);
         }
         config.profiles[name] = {
           upstream: upstream || rt.upstream,
-          allowedModels: allowedModels ? allowedModels.split(",").map(s => s.trim()).filter(Boolean) : [...rt.allowedModels],
-          defaultModels: defaultModels || { ...rt.defaultModels },
+          apiProtocol: protocol,
+          allowedModels: models,
+          defaultModels: nextDefaultModels,
+          modelAliases: aliases,
+          openaiStreamUsage: openaiStreamUsage !== false,
+          responsesAdapter: protocol === "openai" ? validateResponsesAdapter(responsesAdapter || "none") : "none",
           users: {},
           suffix: sfx,
           isDefault: false,
         };
-        reloadProfileRuntime(name);
         saveConfig(config);
+        reloadAllRuntimes();
         console.log(`[PROFILE] Created new profile "${name}" (suffix: ${JSON.stringify(sfx)})`);
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ ok: true, profile: name, suffix: sfx }));
@@ -2581,8 +3831,13 @@ const server = http.createServer((req, res) => {
     if (!checkCsrf(req)) { res.writeHead(403); res.end("CSRF validation failed"); return; }
     readBody(req).then(buf => {
       try {
-        const updates = JSON.parse(Buffer.concat(chunks).toString());
+        const updates = JSON.parse(buf.toString());
         const formData = {};
+        if (updates.profileName) formData.profileName = updates.profileName;
+        if (updates.profileSuffix) formData.profileSuffix = updates.profileSuffix;
+        if (updates.apiProtocol) formData.apiProtocol = updates.apiProtocol;
+        if (updates.openaiStreamUsage !== undefined) formData.openaiStreamUsage = updates.openaiStreamUsage;
+        if (updates.responsesAdapter !== undefined) formData.responsesAdapter = updates.responsesAdapter;
         if (updates.upstream) formData.upstream = updates.upstream;
         if (updates.proxy) {
           Object.assign(formData, {
@@ -2604,6 +3859,9 @@ const server = http.createServer((req, res) => {
           if (updates.defaultModels.sonnet) formData.defaultModels_sonnet = updates.defaultModels.sonnet;
           if (updates.defaultModels.opus)   formData.defaultModels_opus   = updates.defaultModels.opus;
           if (updates.defaultModels.haiku)  formData.defaultModels_haiku  = updates.defaultModels.haiku;
+        }
+        if (updates.modelAliases !== undefined) {
+          formData.modelAliases = updates.modelAliases;
         }
         if (updates.users) {
           for (const [k, v] of Object.entries(updates.users)) {
@@ -2667,7 +3925,7 @@ const server = http.createServer((req, res) => {
   if (req.method === "GET" && req.url.startsWith("/api/stats")) {
     if (!checkAuth(req)) { res.writeHead(401); res.end("Unauthorized"); return; }
     const url = new URL(req.url, `http://localhost`);
-    const profileSuffix = url.searchParams.get("profile");
+    const profileSuffix = url.searchParams.get("profile") || "all";
     let data;
     if (profileSuffix === "all") {
       // Aggregate all profiles
@@ -2675,35 +3933,29 @@ const server = http.createServer((req, res) => {
       data = sanitizeStore(agg);
       data.profileView = "all";
     } else {
-      const targetRt = runtimes[profileSuffix || ""];
+      const targetSuffix = normalizeProfileSuffix(profileSuffix);
+      const targetRt = runtimes[targetSuffix];
       if (targetRt) {
-        const s = getProfileStore(profileSuffix || "");
+        const s = getProfileStore(targetSuffix);
         data = sanitizeStore(s);
         data.profileView = targetRt.profileName;
-        data.profileSuffix = profileSuffix || "";
+        data.profileSuffix = targetSuffix;
         data.upstream = targetRt.upstream;
-        data.profileQuota = getProfileQuota(profileSuffix);
+        data.profileQuota = getProfileQuota(targetSuffix);
         data.userQuotas = {};
         for (const k of Object.keys(targetRt.users)) {
           const q = getUserQuota(k, targetRt);
           if (q > 0) data.userQuotas[k.slice(0, 8) + "****"] = q;
         }
       } else {
-        // Default: use default profile store
-        data = sanitizeStore(store);
-        data.profileView = runtimes[""] ? runtimes[""].profileName : "default";
-        data.profileSuffix = "";
-        data.upstream = rt.upstream;
-        data.profileQuota = getProfileQuota("");
-        data.userQuotas = {};
-        for (const k of Object.keys(rt.users)) {
-          const q = getUserQuota(k, rt);
-          if (q > 0) data.userQuotas[k.slice(0, 8) + "****"] = q;
-        }
+        res.writeHead(404, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: `Unknown profile suffix "${profileSuffix}"` }));
+        return;
       }
     }
     // Add profile list for dropdown
     data.profiles = listProfiles();
+    data.profileSummaries = getProfileSummaries();
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify(data));
     return;
@@ -2714,6 +3966,7 @@ const server = http.createServer((req, res) => {
     if (!checkAuth(req)) { res.writeHead(401); res.end("Unauthorized"); return; }
     if (!checkCsrf(req)) { res.writeHead(403); res.end("CSRF validation failed"); return; }
     store.errors = [];
+    for (const ps of Object.values(store._profiles || {})) ps.errors = [];
     saveStore();
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ ok: true }));
@@ -2728,13 +3981,12 @@ const server = http.createServer((req, res) => {
       try {
         const { key } = JSON.parse(buf.toString());
         if (!key) throw new Error("Key required");
-        delete rt.globalUsers[key];
+        delete config.users[key];
         for (const pname of Object.keys(config.profiles)) {
           delete config.profiles[pname].users[key];
         }
-        delete rt.users[key];
-        config.users = { ...rt.globalUsers };
         saveConfig(config);
+        reloadAllRuntimes();
         console.log(`[USER] Deleted global user: ${key}`);
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ ok: true }));
@@ -2756,19 +4008,17 @@ const server = http.createServer((req, res) => {
       try {
         const { users, profileUsers, profileSuffix } = JSON.parse(buf.toString());
         if (!Array.isArray(users) || users.length === 0) throw new Error("No users provided");
+        const targetSuffix = normalizeProfileSuffix(profileSuffix);
+        if (!targetSuffix) throw new Error("profileSuffix is required");
         const newGlobalUsers = {};
         for (const u of users) {
           if (!u.key) continue;
           newGlobalUsers[u.key] = { username: u.username || u.key.slice(0, 8), expiresAt: u.expiresAt || null, disabled: !!u.disabled };
         }
-        // Update global users in all runtimes
-        for (const r of Object.values(runtimes)) {
-          r.globalUsers = { ...newGlobalUsers };
-        }
         config.users = { ...newGlobalUsers };
         // Determine which profile to update users for
-        const targetSuffix = profileSuffix || "";
-        const targetRt = runtimes[targetSuffix] || rt;
+        const targetRt = runtimes[targetSuffix];
+        if (!targetRt) throw new Error(`Profile suffix "${targetSuffix}" not found`);
         const targetProfileName = targetRt.profileName;
         // Update profile users (real keys + profile disable)
         if (Array.isArray(profileUsers)) {
@@ -2780,7 +4030,6 @@ const server = http.createServer((req, res) => {
           const ap = config.profiles[targetProfileName];
           if (ap) {
             ap.users = newPU;
-            targetRt.users = { ...newPU };
           }
         } else {
           const ap = config.profiles[targetProfileName];
@@ -2791,6 +4040,7 @@ const server = http.createServer((req, res) => {
           }
         }
         saveConfig(config);
+        reloadAllRuntimes();
         console.log(`[USER] Saved ${Object.keys(newGlobalUsers).length} global users`);
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ ok: true }));
@@ -2833,20 +4083,20 @@ const server = http.createServer((req, res) => {
   if (req.method === "GET" && req.url.startsWith("/api/my-usage")) {
     const apiKey = getApiKey(req);
     const url = new URL(req.url, `http://localhost`);
-    const profileSuffix = url.searchParams.get("profile") || "";
-    // Check if user exists in ANY profile
-    let found = false;
-    for (const rt2 of Object.values(runtimes)) {
-      const uk = resolveUserKey(apiKey, rt2);
-      if (rt2.users[uk] || rt2.globalUsers[uk]) { found = true; break; }
-    }
-    if (!found) {
-      res.writeHead(401, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: "认证失败：请提供有效的虚拟Key (Authorization: Bearer jx-...)" }));
+    const profileSuffix = url.searchParams.get("profile") || "all";
+    if (!getAccessibleProfiles(apiKey).length) {
+      const knownUser = hasGlobalUser(apiKey);
+      res.writeHead(knownUser ? 403 : 401, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: knownUser ? "User is not allowed to view any profile." : "认证失败：请提供有效的虚拟Key (Authorization: Bearer jx-...)" }));
       return;
     }
-    res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
-    res.end(JSON.stringify(getPersonalUsageData(apiKey, profileSuffix), null, 2));
+    try {
+      res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+      res.end(JSON.stringify(getPersonalUsageData(apiKey, profileSuffix), null, 2));
+    } catch (err) {
+      res.writeHead(err.statusCode || 400, { "Content-Type": "application/json; charset=utf-8" });
+      res.end(JSON.stringify({ error: err.message }));
+    }
     return;
   }
 

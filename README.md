@@ -11,9 +11,10 @@
 ## 功能
 
 - **透明代理**：请求/响应原样透传，零影响 LLM 上下文和输出质量
-- **多方案切换**：GLM、阿里云 Token Plan、DeepSeek 等多上游配置，一键热切换
+- **多方案并发**：GLM、阿里云 Token Plan、DeepSeek 等多上游配置同时在线，通过 URL 后缀区分
 - **虚拟 Key 映射**：多人共享同一上游账号，各自使用 `jx-` 虚拟 Key，用量分人统计
-- **模型别名**：`jx-sonnet` / `jx-opus` / `jx-haiku` 自动映射到实际模型
+- **协议方案**：每个方案可选择 Anthropic 或 OpenAI-compatible 协议，Claude Code 和 Codex 可共用同一套用户/配额/监控
+- **模型别名**：支持通用 `alias=实际模型`，并兼容 `jx-sonnet` / `jx-opus` / `jx-haiku`
 - **模型准入**：按方案限制可用模型，拦截未知 Key
 - **Token 配额**：方案级 + 用户级每日 token 限额，超限自动拦截
 - **自动增长额度**：高强度用户自动增长配额
@@ -95,9 +96,11 @@ node server.mjs
 {
   "port": 6789,
   "dashboardPassword": "your-password",
-  "activeProfile": "glm",
   "profiles": {
     "glm": {
+      "suffix": "glm",
+      "isDefault": true,
+      "apiProtocol": "anthropic",
       "upstream": "https://open.bigmodel.cn/api/anthropic",
       "dailyTokenLimit": 2000000,
       "allowedModels": ["glm-5.1", "glm-5-turbo", "glm-4.7"],
@@ -106,6 +109,28 @@ node server.mjs
         "opus": "glm-5.1",
         "haiku": "glm-4.7"
       },
+      "modelAliases": {
+        "jx-sonnet": "glm-5-turbo",
+        "jx-opus": "glm-5.1",
+        "jx-haiku": "glm-4.7"
+      },
+      "openaiStreamUsage": true,
+      "responsesAdapter": "none",
+      "users": {}
+    },
+    "openai-codex": {
+      "suffix": "openai",
+      "isDefault": false,
+      "apiProtocol": "openai",
+      "upstream": "https://api.openai.com/v1",
+      "dailyTokenLimit": 2000000,
+      "allowedModels": ["gpt-5", "gpt-5-mini"],
+      "modelAliases": {
+        "codex-main": "gpt-5",
+        "codex-fast": "gpt-5-mini"
+      },
+      "openaiStreamUsage": true,
+      "responsesAdapter": "none",
       "users": {}
     }
   },
@@ -133,19 +158,99 @@ export ANTHROPIC_BASE_URL="http://localhost:6789"
 export ANTHROPIC_API_KEY="jx-your-virtual-key"
 ```
 
+默认入口是当前默认方案的别名。默认方案也保留自己的后缀入口，例如：
+
+```bash
+export ANTHROPIC_BASE_URL="http://localhost:6789/glm"
+export ANTHROPIC_API_KEY="jx-your-virtual-key"
+```
+
 ### 指定方案（通过 URL 后缀）
 
 ```bash
-# 使用 GLM 方案
-export ANTHROPIC_BASE_URL="http://localhost:6789/glm"
-export ANTHROPIC_API_KEY="jx-your-virtual-key"
-
 # 使用 DeepSeek 方案
 export ANTHROPIC_BASE_URL="http://localhost:6789/deepseek"
 export ANTHROPIC_API_KEY="jx-your-virtual-key"
 ```
 
-所有方案同时在线，无需切换。后缀由管理员在设置页面创建方案时指定。
+所有方案同时在线，无需切换。每个方案都必须有唯一后缀；管理员可在设置页把任一方案设为默认入口。
+
+## 接入 Codex / OpenAI-compatible 客户端
+
+创建方案时把"接口协议"设为 `OpenAI-compatible / Codex`，上游地址填写 OpenAI 或中转商提供的 OpenAI-compatible base URL：
+
+```json
+{
+  "suffix": "openai",
+  "apiProtocol": "openai",
+  "upstream": "https://api.openai.com/v1",
+  "allowedModels": ["gpt-5", "gpt-5-mini"],
+  "modelAliases": {
+    "codex-main": "gpt-5",
+    "codex-fast": "gpt-5-mini"
+  },
+  "openaiStreamUsage": true,
+  "responsesAdapter": "none"
+}
+```
+
+Codex 或 OpenAI SDK 填的是 base URL，不是完整 endpoint。Codex 推荐写到 `/v1`：
+
+```toml
+model = "gpt-5"
+model_provider = "cc-team-openai"
+
+[model_providers.cc-team-openai]
+name = "CC-Team OpenAI"
+base_url = "http://localhost:6789/openai/v1"
+env_key = "OPENAI_API_KEY"
+wire_api = "responses"
+```
+
+如果 OpenAI 方案被设为默认入口，也可以使用 `base_url = "http://localhost:6789/v1"`。
+
+启动 Codex 前导出虚拟 Key：
+
+```bash
+export OPENAI_API_KEY="jx-your-virtual-key"
+```
+
+Codex 的模型由 Codex 客户端配置或请求体里的 `model` 决定，例如 `gpt-5`、`qwen3-coder-plus`、`glm-5`。平台侧不需要配置 `jx-sonnet`、`jx-opus`、`jx-haiku`；这些只是 Claude/Anthropic 方案的兼容别名。
+
+默认模式是 OpenAI 透明代理：客户端请求 `/v1/responses`、`/v1/chat/completions`、`/v1/models` 等 OpenAI-compatible 端点时，平台只做虚拟 Key 映射、可选模型别名、限额和 usage 统计，不把 Anthropic `/v1/messages` 转换成 OpenAI 请求。如果你的客户端固定使用 Anthropic 协议，请配置上游的 Anthropic 接口；OpenAI-only 上游需要客户端按 OpenAI 协议访问。
+
+### Aliyun Coding Plan / 只有 Chat Completions 的上游
+
+如果上游像 `https://coding.dashscope.aliyuncs.com/v1` 这样只有 `/v1/chat/completions`，没有 `/v1/responses` 或 `/v1/models`，创建 OpenAI 方案时启用 `responsesAdapter: "chat_completions"`：
+
+```json
+{
+  "suffix": "aliyun-openai",
+  "apiProtocol": "openai",
+  "upstream": "https://coding.dashscope.aliyuncs.com/v1",
+  "allowedModels": ["glm-5", "qwen3.7-plus", "qwen3.6-plus"],
+  "modelAliases": {
+    "codex-min": "qwen3.6-plus",
+    "codex-max": "qwen3.7-plus",
+    "codex-pro": "glm-5"
+  },
+  "openaiStreamUsage": true,
+  "responsesAdapter": "chat_completions"
+}
+```
+
+Codex 仍然使用 Responses wire API，网关负责把 `/v1/responses` 转为上游 `/v1/chat/completions`，并用 `allowedModels` 本地返回 `/v1/models`：
+
+```toml
+model = "glm-5"
+model_provider = "cc-team-aliyun"
+
+[model_providers.cc-team-aliyun]
+name = "CC-Team Aliyun Coding"
+base_url = "http://localhost:6789/aliyun-openai/v1"
+env_key = "OPENAI_API_KEY"
+wire_api = "responses"
+```
 
 ## 页面
 
@@ -163,9 +268,10 @@ export ANTHROPIC_API_KEY="jx-your-virtual-key"
 
 1. **添加用户**：点击"添加用户"，自动生成 `jx-` 开头的虚拟 Key
 2. **填写信息**：用户名、失效时间（可选）
-3. **分配真实 Key**：在"方案真实Key分配"表格中填入上游真实 API Key
-4. **设置配额**：可选，设每日 token 限额（0 = 跟随方案配额）
-5. 点击"保存全部"
+3. **选择方案**：在"方案真实Key分配"区域先选择要配置的方案
+4. **分配真实 Key**：为该方案填入上游真实 API Key；留空表示该用户不能使用此方案
+5. **设置配额**：可选，设每日 token 限额（0 = 跟随方案配额）
+6. 点击"保存全部"
 
 ## Token 配额
 
@@ -213,13 +319,15 @@ curl -H "Authorization: Bearer jx-your-key" http://localhost:6789/api/my-usage
 
 ## 方案说明
 
-### 多方案切换
+### 多方案并发与默认入口
 
-每个方案独立配置上游地址、模型列表、用户分配。在设置页左侧切换。
+每个方案独立配置上游地址、模型列表、用户分配和 URL 后缀。设置页左侧用于编辑方案；所有方案始终同时在线。
+
+默认入口是一个无后缀别名：`http://host:6789/v1/*` 会路由到被标记为默认入口的方案。该方案自己的后缀入口仍然可用，例如 `http://host:6789/glm/v1/*`。
 
 ### 模型别名
 
-`jx-sonnet` / `jx-opus` / `jx-haiku` 自动映射到实际模型，通过设置页"默认模型映射"配置。
+Anthropic 方案中，`jx-sonnet` / `jx-opus` / `jx-haiku` 自动映射到实际模型。OpenAI/Codex 方案中，客户端直接发送真实模型名；`modelAliases` 只用于可选短别名，例如 `codex-main=gpt-5`。
 
 ### 模型准入
 
@@ -229,7 +337,8 @@ curl -H "Authorization: Bearer jx-your-key" http://localhost:6789/api/my-usage
 
 | 端点 | 方法 | 说明 |
 |------|------|------|
-| `/v1/*` | * | 代理转发至上游 |
+| `/v1/*` | * | 默认入口代理转发至上游 |
+| `/:suffix/v1/*` | * | 指定方案代理转发至上游 |
 | `/dashboard` | GET | 监控面板（需登录） |
 | `/settings` | GET | 设置页面（需登录） |
 | `/usage/:key` | GET | 个人用量页面（Key 即认证） |
@@ -238,8 +347,9 @@ curl -H "Authorization: Bearer jx-your-key" http://localhost:6789/api/my-usage
 | `/api/stats` | GET | 全队统计 JSON（需登录） |
 | `/api/settings` | GET | 当前设置 JSON |
 | `/api/settings-save` | POST | 保存设置（表单提交） |
-| `/api/profile/switch` | POST | 切换方案 |
-| `/api/profile/save` | POST | 另存为新方案 |
+| `/api/profile/switch` | POST | 兼容旧客户端，重新加载指定方案 |
+| `/api/profile/save` | POST | 创建新方案 |
+| `/api/profile/default` | POST | 设置默认入口方案 |
 | `/api/profile/delete` | POST | 删除方案 |
 | `/api/global-user/save` | POST | 保存用户管理 |
 | `/api/global-user/delete` | POST | 删除用户 |
@@ -268,12 +378,14 @@ curl -H "Authorization: Bearer jx-your-key" http://localhost:6789/api/my-usage
 
 ## 代理透明度
 
-代理对请求/响应内容零修改：
+默认情况下代理对请求/响应内容保持透明：
 
-- 请求 body（messages、system prompt、参数）原样透传
+- 请求 body（messages/input、system prompt、参数）原样透传；OpenAI Chat Completions 流式请求会在启用 `openaiStreamUsage` 时合并 `stream_options.include_usage=true`
 - 响应 body（JSON / SSE 流）逐字节转发
 - 只替换 `Authorization` header 实现 Key 映射
 - 本地处理延迟 < 1ms
+
+例外：OpenAI 方案启用 `responsesAdapter: "chat_completions"` 后，网关会把客户端 `/v1/responses` 请求转换为上游 `/v1/chat/completions`，并本地返回 `/v1/models`。
 
 ## 技术栈
 

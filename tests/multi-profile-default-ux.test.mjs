@@ -426,6 +426,23 @@ describe("OpenAI transparent proxy support", () => {
     assert.match(res.json.error, /not allowed/i);
     assert.equal(upstreamHits.length, 0);
   });
+
+  it("uses OpenAI-specific copy when rejecting disallowed OpenAI models", async () => {
+    upstreamHits.length = 0;
+
+    const res = await request("POST", "/openai/v1/responses", {
+      body: {
+        model: "gpt-5.5",
+        input: "hello",
+      },
+    });
+
+    assert.equal(res.status, 403);
+    assert.match(res.json.error, /allowed models/i);
+    assert.match(res.json.error, /gpt-5/);
+    assert.doesNotMatch(res.json.error, /jx-sonnet|jx-opus|jx-haiku/);
+    assert.equal(upstreamHits.length, 0);
+  });
 });
 
 describe("OpenAI Responses to Chat Completions adapter", () => {

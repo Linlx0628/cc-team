@@ -951,6 +951,22 @@ function checkModelAllowed(model, _rt) {
   return allowed.includes(model);
 }
 
+function previewList(values, fallback = "none") {
+  const items = Array.from(new Set((values || []).filter(Boolean)));
+  if (items.length === 0) return fallback;
+  const shown = items.slice(0, 8).join(", ");
+  return items.length > 8 ? `${shown}, ...` : shown;
+}
+
+function modelNotAllowedMessage(model, runtime) {
+  if (runtime?.apiProtocol === "openai") {
+    const aliases = Object.keys(runtime.modelAliases || {});
+    const aliasHint = aliases.length > 0 ? ` Configured aliases: ${previewList(aliases)}.` : "";
+    return `Model "${model}" is not allowed for OpenAI/Codex profile "${runtime.profileName}". Allowed models: ${previewList(runtime.allowedModels)}.${aliasHint} Configure Codex to use an allowed model, or add a model alias such as gpt-5.5=<real model>.`;
+  }
+  return `Model "${model}" is not allowed. Use jx-sonnet/jx-opus/jx-haiku or a model from the allowed list.`;
+}
+
 function generateVirtualKey(_rt) {
   const runtime = _rt || rt;
   let code;
@@ -1854,7 +1870,7 @@ function proxyRequest(req, res) {
     // Model access restriction
     if (!checkModelAllowed(reqModel, runtime)) {
       res.writeHead(403, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: `Model "${reqModel}" is not allowed. Use jx-sonnet/jx-opus/jx-haiku or a model from the allowed list.` }));
+      res.end(JSON.stringify({ error: modelNotAllowedMessage(reqModel, runtime) }));
       console.log(`[拦截] ${getUserName(apiKey, runtime)} model=${reqModel} 被拒绝`);
       return;
     }

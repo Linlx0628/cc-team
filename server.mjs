@@ -2132,6 +2132,15 @@ async function handleOpenAIResponsesAdapterStreamingProxy(req, res, body, reqHea
     let completed = false;
     const usage = { input_tokens: 0, output_tokens: 0 };
     const textParts = [];
+    const messageItemId = "msg_0";
+
+    const buildMessageItem = (text, status = "in_progress") => ({
+      id: messageItemId,
+      type: "message",
+      status,
+      role: "assistant",
+      content: [{ type: "output_text", text }],
+    });
 
     const safeResolve = () => {
       if (!resolved) {
@@ -2144,13 +2153,26 @@ async function handleOpenAIResponsesAdapterStreamingProxy(req, res, body, reqHea
       completed = true;
       const outputText = textParts.join("");
       const responseUsage = usageToResponsesUsage(usage);
+      const messageItem = buildMessageItem(outputText, "completed");
       if (!clientGone) {
         writeSseEvent(res, "response.output_text.done", {
           type: "response.output_text.done",
-          item_id: "msg_0",
+          item_id: messageItemId,
           output_index: 0,
           content_index: 0,
           text: outputText,
+        });
+        writeSseEvent(res, "response.content_part.done", {
+          type: "response.content_part.done",
+          item_id: messageItemId,
+          output_index: 0,
+          content_index: 0,
+          part: { type: "output_text", text: outputText },
+        });
+        writeSseEvent(res, "response.output_item.done", {
+          type: "response.output_item.done",
+          output_index: 0,
+          item: messageItem,
         });
         writeSseEvent(res, "response.completed", {
           type: "response.completed",
@@ -2160,11 +2182,7 @@ async function handleOpenAIResponsesAdapterStreamingProxy(req, res, body, reqHea
             created_at: createdAt,
             status: "completed",
             model,
-            output: [{
-              type: "message",
-              role: "assistant",
-              content: [{ type: "output_text", text: outputText }],
-            }],
+            output: [messageItem],
             output_text: outputText,
             usage: responseUsage,
           },
@@ -2220,6 +2238,18 @@ async function handleOpenAIResponsesAdapterStreamingProxy(req, res, body, reqHea
           output: [],
         },
       });
+      writeSseEvent(res, "response.output_item.added", {
+        type: "response.output_item.added",
+        output_index: 0,
+        item: buildMessageItem(""),
+      });
+      writeSseEvent(res, "response.content_part.added", {
+        type: "response.content_part.added",
+        item_id: messageItemId,
+        output_index: 0,
+        content_index: 0,
+        part: { type: "output_text", text: "" },
+      });
 
       res.on("error", () => {
         clientGone = true;
@@ -2249,7 +2279,7 @@ async function handleOpenAIResponsesAdapterStreamingProxy(req, res, body, reqHea
             if (!clientGone) {
               writeSseEvent(res, "response.output_text.delta", {
                 type: "response.output_text.delta",
-                item_id: "msg_0",
+                item_id: messageItemId,
                 output_index: 0,
                 content_index: 0,
                 delta: delta.content,

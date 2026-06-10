@@ -505,8 +505,12 @@ describe("OpenAI Responses to Chat Completions adapter", () => {
 
     assert.equal(res.status, 200);
     assert.match(res.text, /event: response\.created/);
+    assert.match(res.text, /event: response\.output_item\.added/);
+    assert.match(res.text, /event: response\.content_part\.added/);
     assert.match(res.text, /event: response\.output_text\.delta/);
     assert.match(res.text, /"delta":"hello"/);
+    assert.match(res.text, /event: response\.content_part\.done/);
+    assert.match(res.text, /event: response\.output_item\.done/);
     assert.match(res.text, /event: response\.completed/);
     assert.equal(upstreamHits.length, 1);
     assert.equal(upstreamHits[0].path, "/compatible-mode/v1/chat/completions");

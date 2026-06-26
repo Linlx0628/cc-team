@@ -5,8 +5,108 @@ import { URL } from "node:url";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import Database from "better-sqlite3";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
+
+// ─── Cyberpunk Pixel Theme (shared by all pages) ─────────────────────────────
+// ponytail: :root tokens were copy-pasted into all 5 pages; centralized here so the
+// pixel theme lives in one place. Page-specific layout CSS still stays inline per page.
+const PIXEL_FONT = `<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Press+Start+2P&family=Pixelify+Sans:wght@400;500;600;700&family=VT323&display=swap" rel="stylesheet">`;
+
+const PIXEL_THEME = `
+:root{
+  --bg:#080812;--bg2:#0e0e1c;--card:#11111e;--card2:#171730;--border:#2c2658;
+  --text:#eaeefc;--dim:#9aa3cc;--dim2:#7681a8;--grid:rgba(0,229,255,.07);
+  --accent:#22e9ff;--blue:#46c6ff;--green:#27ffae;--yellow:#ffd23f;--orange:#ff9f1c;--red:#ff5470;
+  --magenta:#ff3d9a;--purple:#b14eff;
+  --font-pixel:'Press Start 2P',monospace;
+  --font-body:'Pixelify Sans','VT323',monospace,system-ui;
+  --glow:0 0 16px rgba(34,233,255,.45);
+}
+*{margin:0;padding:0;box-sizing:border-box}
+::selection{background:var(--accent);color:var(--bg)}
+body{font-family:var(--font-body);font-weight:500;font-size:16px;background:var(--bg);color:var(--text);min-height:100vh;letter-spacing:.2px;position:relative;isolation:isolate}
+/* drifting neon aurora blobs (behind content, so text stays crisp) */
+body::before{content:"";position:fixed;inset:-15%;z-index:-1;pointer-events:none;filter:blur(70px);
+  background:radial-gradient(40% 38% at 18% 26%,rgba(34,233,255,.20),transparent 70%),radial-gradient(42% 42% at 82% 18%,rgba(255,61,154,.16),transparent 70%),radial-gradient(48% 48% at 60% 86%,rgba(177,78,255,.16),transparent 70%);
+  animation:blob 24s ease-in-out infinite alternate}
+/* synthwave perspective floor receding at the bottom edge */
+html::after{content:"";position:fixed;left:-25%;right:-25%;bottom:0;height:40vh;z-index:1;pointer-events:none;opacity:.4;
+  background-image:linear-gradient(rgba(34,233,255,.5) 1px,transparent 1px),linear-gradient(90deg,rgba(34,233,255,.5) 1px,transparent 1px);
+  background-size:46px 46px;transform:perspective(320px) rotateX(62deg);transform-origin:bottom center;
+  -webkit-mask-image:linear-gradient(transparent 45%,#000 90%);mask-image:linear-gradient(transparent 45%,#000 90%);
+  animation:floor 5s linear infinite}
+/* mouse HUD spotlight (position updated by PIXEL_JS) */
+.fx-spot{position:fixed;inset:0;z-index:3;pointer-events:none;mix-blend-mode:screen}
+/* breathing neon edge on chart panels */
+.box{animation:pulse-glow 3.6s ease-in-out infinite}
+/* faint scanlines + soft vignette — kept light so text stays readable */
+body::after{content:"";position:fixed;inset:0;z-index:2;pointer-events:none;
+  background:repeating-linear-gradient(0deg,rgba(0,0,0,0) 0 3px,rgba(0,0,0,.05) 3px 4px),radial-gradient(ellipse at center,transparent 62%,rgba(0,0,0,.34) 100%)}
+/* moving CRT scan band sweeping the viewport */
+html::before{content:"";position:fixed;left:0;right:0;top:0;height:150px;z-index:3;pointer-events:none;
+  background:linear-gradient(180deg,transparent,rgba(34,233,255,.04) 55%,rgba(34,233,255,.11) 90%,transparent);
+  animation:scanbar 7s linear infinite}
+/* stat numbers: chunky pixel, glowing in their own color */
+.card .v{font-family:var(--font-pixel);font-variant-numeric:tabular-nums;line-height:1.5;letter-spacing:0;text-shadow:0 0 10px currentColor,0 0 2px currentColor}
+.display,.title-pixel{font-family:var(--font-pixel);letter-spacing:.5px;line-height:1.4}
+/* segmented HP/MP bar */
+.hp{display:inline-flex;gap:2px;height:13px;vertical-align:middle}
+.hp>i{width:7px;height:100%;background:#1c1735;display:block}
+.hp>i.on{background:var(--green);box-shadow:0 0 6px var(--green)}
+.hp.warn>i.on{background:var(--yellow);box-shadow:0 0 6px var(--yellow)}
+.hp.crit>i.on{background:var(--red);box-shadow:0 0 6px var(--red)}
+/* pixel status LED */
+.led{display:inline-block;width:10px;height:10px;vertical-align:middle;background:var(--dim2);margin-right:5px}
+.led.on{background:var(--green);box-shadow:0 0 8px var(--green);animation:blink 2.4s steps(1) infinite}
+.led.warn{background:var(--orange);box-shadow:0 0 8px var(--orange);animation:pulse-led 1.8s ease-in-out infinite}
+.led.err{background:var(--red);box-shadow:0 0 8px var(--red);animation:pulse-led 1.1s ease-in-out infinite}
+/* glitch title on hover */
+.glitch{cursor:default}
+.glitch:hover{animation:glitch .32s steps(2) 2}
+/* HUD corner brackets */
+.hud{position:relative}
+.hud::before,.hud::after{content:"";position:absolute;width:11px;height:11px;border:2px solid var(--accent);pointer-events:none;opacity:.65;z-index:1}
+.hud::before{top:-2px;left:-2px;border-right:0;border-bottom:0}
+.hud::after{bottom:-2px;right:-2px;border-left:0;border-top:0}
+/* animated equalizer — "system active" pulse */
+.eq{display:inline-flex;gap:2px;align-items:flex-end;height:14px;vertical-align:-2px}
+.eq>i{width:3px;height:4px;background:var(--accent);box-shadow:0 0 5px var(--accent);animation:eq 1s ease-in-out infinite}
+.eq>i:nth-child(2){animation-delay:.15s}.eq>i:nth-child(3){animation-delay:.3s}.eq>i:nth-child(4){animation-delay:.45s}
+/* terminal panel */
+.term{background:var(--card);border:2px solid var(--accent);box-shadow:6px 6px 0 0 var(--accent),var(--glow);padding:34px;position:relative}
+.term .cursor{display:inline-block;width:.6em;height:1.05em;background:var(--accent);vertical-align:-3px;margin-left:3px;animation:blink 1.05s steps(1) infinite}
+.boot{animation:boot-in .5s ease-out both}
+@keyframes grid-drift{from{background-position:0 0,0 0}to{background-position:44px 44px,44px 44px}}
+@keyframes scanbar{0%{transform:translateY(-150px)}100%{transform:translateY(100vh)}}
+@keyframes eq{0%,100%{height:4px}50%{height:14px}}
+@keyframes blink{0%,49%{opacity:1}50%,100%{opacity:0}}
+@keyframes pulse-led{0%,100%{opacity:1}50%{opacity:.3}}
+@keyframes glitch{0%{text-shadow:0 0 transparent}20%{text-shadow:-2px 0 var(--magenta),2px 0 var(--accent)}40%{text-shadow:2px 0 var(--magenta),-2px 0 var(--accent);transform:translateX(1px)}60%{text-shadow:0 0 var(--accent)}100%{text-shadow:0 0 transparent;transform:translateX(0)}}
+@keyframes boot-in{from{opacity:0;transform:translateY(12px)}to{opacity:1;transform:translateY(0)}}
+@keyframes blob{from{transform:translate3d(-3%,-2%,0) scale(1)}to{transform:translate3d(4%,3%,0) scale(1.1)}}
+@keyframes floor{from{background-position:0 0}to{background-position:0 46px}}
+@keyframes pulse-glow{0%,100%{box-shadow:0 0 0 0 rgba(34,233,255,0)}50%{box-shadow:0 0 16px 1px rgba(34,233,255,.16)}}
+@media (prefers-reduced-motion: reduce){*,*::before,*::after{animation:none!important;transition:none!important}}
+`;
+
+// ponytail: shared JS helpers for the fun data-viz (count-up, segmented HP bar).
+// Kept free of template-literal interpolation so it can sit inside any page's <script>.
+const PIXEL_JS = `
+function _cuFmt(n,k){if(k){if(n>=1e6)return(n/1e6).toFixed(1)+'M';if(n>=1e3)return(n/1e3).toFixed(1)+'k';return ''+n}return n.toLocaleString('zh-CN')}
+function countUp(el,to,k){if(!el)return;var from=Number(el.dataset.cur||0),st=performance.now();
+  function step(t){var p=Math.min(1,(t-st)/600);var e=1-Math.pow(1-p,3);el.textContent=_cuFmt(Math.round(from+(to-from)*e),k);if(p<1)requestAnimationFrame(step);else el.dataset.cur=to;}
+  requestAnimationFrame(step);}
+function runCountUps(root){(root||document).querySelectorAll('[data-cu]').forEach(function(el){countUp(el,Number(el.dataset.cu),el.hasAttribute('data-cu-k'))})}
+function hpBar(pct,segs){segs=segs||20;var on=Math.round(pct/100*segs);var cls=pct>90?'crit':pct>70?'warn':'';
+  var s='<span class="hp '+cls+'">';for(var i=0;i<segs;i++){s+='<i class="'+(i<on?'on':'')+'"></i>';}return s+'</span>';}
+// mouse HUD spotlight — creates .fx-spot once and tracks the cursor (rAF-throttled)
+(function(){var d=document,b=d.body;if(!b)return;var s=d.createElement('div');s.className='fx-spot';b.appendChild(s);
+  var pend=false,x=0,y=0;d.addEventListener('mousemove',function(e){x=e.clientX;y=e.clientY;if(!pend){pend=true;requestAnimationFrame(function(){s.style.background='radial-gradient(260px circle at '+x+'px '+y+'px,rgba(34,233,255,.10),transparent 70%)';pend=false})}},{passive:true})})();
+`;
 
 // ─── Config ──────────────────────────────────────────────────────────────────
 const configPath = path.join(__dirname, "config.json");
@@ -21,6 +121,7 @@ const config = loadConfig();
 const { port } = config;
 const dashboardPassword = config.dashboardPassword || "";
 const dataPath = path.join(__dirname, "data.json");
+const dbPath = path.join(__dirname, "data.db");
 const RESERVED_SUFFIXES = new Set(["dashboard", "settings", "api", "health", "usage", "my-usage", "v1", "login", "logout", "favicon", "robots", "js", "css"]);
 const PROFILE_SUFFIX_RE = /^[a-z0-9_-]{2,20}$/;
 const API_PROTOCOLS = new Set(["anthropic", "openai"]);
@@ -282,7 +383,10 @@ if (!config.profiles) {
   let migrated = false;
   const names = Object.keys(config.profiles);
   const explicitDefaults = names.filter(name => config.profiles[name].isDefault);
-  const defaultName = explicitDefaults[0] || (config.activeProfile && config.profiles[config.activeProfile] ? config.activeProfile : names[0]);
+  // Determine the default profile. We trust the explicit isDefault flag over the
+  // legacy activeProfile hint — activeProfile is a leftover from the old single-profile
+  // switch model and can point at a non-default profile, silently misrouting /v1/* traffic.
+  const defaultName = explicitDefaults[0] || names[0];
   const used = new Set();
 
   names.forEach((pname, index) => {
@@ -723,119 +827,307 @@ function sanitizeStore(raw) {
   return s;
 }
 
-// ─── Data Store ──────────────────────────────────────────────────────────────
-let store = { users: {}, daily: {}, dailyModels: {}, dailyHourly: {}, models: {}, hourly: {}, errors: [], quotaAdjustHistory: [], _lastQuotaEval: null };
+// ─── SQLite Persistence (multi-table, incremental) ──────────────────────────
+// All usage/error data lives in normalized SQLite tables. Writes are incremental
+// UPSERTs (ON CONFLICT ... DO UPDATE SET x = x + ?), reads use GROUP BY + SUM.
+// There is no in-memory `store` object anymore — every read goes to the DB.
+let db = null;
+let stmts = {};   // prepared statements, populated by initDb()
 
-// Per-profile store: non-default profiles store data under store._profiles[suffix]
-function getProfileStore(suffix) {
-  let sfx = normalizeProfileSuffix(suffix);
-  if (!sfx) sfx = getDefaultProfileSuffix();
-  if (!sfx) return store; // legacy fallback
-  if (!store._profiles) store._profiles = {};
-  if (!store._profiles[sfx]) {
-    store._profiles[sfx] = { users: {}, daily: {}, dailyModels: {}, dailyHourly: {}, models: {}, hourly: {}, errors: [] };
-  }
-  return store._profiles[sfx];
+function initDb() {
+  db = new Database(dbPath);
+  db.pragma("journal_mode = WAL");      // crash-safe + concurrent reads don't block writes
+  db.pragma("synchronous = NORMAL");    // WAL mode: safe against app crashes, fast
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS users (
+      profile TEXT NOT NULL, user_key TEXT NOT NULL, name TEXT NOT NULL,
+      total_input INTEGER DEFAULT 0, total_output INTEGER DEFAULT 0,
+      total_requests INTEGER DEFAULT 0, cache_creation INTEGER DEFAULT 0,
+      cache_read INTEGER DEFAULT 0, last_active TEXT,
+      PRIMARY KEY (profile, user_key)
+    );
+    CREATE TABLE IF NOT EXISTS usage_daily (
+      profile TEXT NOT NULL, date TEXT NOT NULL, user_key TEXT NOT NULL,
+      input_tokens INTEGER DEFAULT 0, output_tokens INTEGER DEFAULT 0,
+      requests INTEGER DEFAULT 0, cache_creation INTEGER DEFAULT 0, cache_read INTEGER DEFAULT 0,
+      PRIMARY KEY (profile, date, user_key)
+    );
+    CREATE TABLE IF NOT EXISTS usage_daily_model (
+      profile TEXT NOT NULL, date TEXT NOT NULL, user_key TEXT NOT NULL, model TEXT NOT NULL,
+      input_tokens INTEGER DEFAULT 0, output_tokens INTEGER DEFAULT 0, requests INTEGER DEFAULT 0,
+      PRIMARY KEY (profile, date, user_key, model)
+    );
+    CREATE TABLE IF NOT EXISTS usage_daily_hourly (
+      profile TEXT NOT NULL, date TEXT NOT NULL, user_key TEXT NOT NULL, hour TEXT NOT NULL,
+      requests INTEGER DEFAULT 0, input_tokens INTEGER DEFAULT 0, output_tokens INTEGER DEFAULT 0,
+      cache_creation INTEGER DEFAULT 0, cache_read INTEGER DEFAULT 0,
+      PRIMARY KEY (profile, date, user_key, hour)
+    );
+    CREATE TABLE IF NOT EXISTS usage_model (
+      profile TEXT NOT NULL, model TEXT NOT NULL,
+      tokens INTEGER DEFAULT 0, requests INTEGER DEFAULT 0,
+      PRIMARY KEY (profile, model)
+    );
+    CREATE TABLE IF NOT EXISTS usage_hourly (
+      profile TEXT NOT NULL, date TEXT NOT NULL, hour TEXT NOT NULL,
+      requests INTEGER DEFAULT 0, input_tokens INTEGER DEFAULT 0, output_tokens INTEGER DEFAULT 0,
+      cache_creation INTEGER DEFAULT 0, cache_read INTEGER DEFAULT 0,
+      PRIMARY KEY (profile, date, hour)
+    );
+    CREATE TABLE IF NOT EXISTS errors (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      profile TEXT NOT NULL, time TEXT NOT NULL,
+      user_name TEXT, user_key TEXT, status_code INTEGER,
+      error TEXT, path TEXT, model TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_errors_profile_time ON errors(profile, time);
+    CREATE TABLE IF NOT EXISTS quota_adjust_history (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_key TEXT NOT NULL, user_name TEXT, date TEXT NOT NULL,
+      old_quota INTEGER, new_quota INTEGER, hit_rate REAL,
+      avg_daily_usage INTEGER, auto INTEGER DEFAULT 1, time TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS kv_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+  `);
+
+  // ── Write statements (UPSERT / INSERT) ──
+  stmts.upsertUser = db.prepare(`INSERT INTO users (profile,user_key,name,total_input,total_output,total_requests,cache_creation,cache_read,last_active)
+    VALUES (@profile,@key,@name,@inp,@out,1,@cacheC,@cacheR,@now)
+    ON CONFLICT(profile,user_key) DO UPDATE SET
+      total_input=total_input+@inp, total_output=total_output+@out, total_requests=total_requests+1,
+      cache_creation=cache_creation+@cacheC, cache_read=cache_read+@cacheR, name=@name, last_active=@now`);
+  stmts.upsertDaily = db.prepare(`INSERT INTO usage_daily (profile,date,user_key,input_tokens,output_tokens,requests,cache_creation,cache_read)
+    VALUES (@profile,@today,@key,@inp,@out,1,@cacheC,@cacheR)
+    ON CONFLICT(profile,date,user_key) DO UPDATE SET
+      input_tokens=input_tokens+@inp, output_tokens=output_tokens+@out, requests=requests+1,
+      cache_creation=cache_creation+@cacheC, cache_read=cache_read+@cacheR`);
+  stmts.upsertModel = db.prepare(`INSERT INTO usage_model (profile,model,tokens,requests)
+    VALUES (@profile,@m,@tokenTotal,1)
+    ON CONFLICT(profile,model) DO UPDATE SET tokens=tokens+@tokenTotal, requests=requests+1`);
+  stmts.upsertHourly = db.prepare(`INSERT INTO usage_hourly (profile,date,hour,requests,input_tokens,output_tokens,cache_creation,cache_read)
+    VALUES (@profile,@today,@hour,1,@inp,@out,@cacheC,@cacheR)
+    ON CONFLICT(profile,date,hour) DO UPDATE SET
+      requests=requests+1, input_tokens=input_tokens+@inp, output_tokens=output_tokens+@out,
+      cache_creation=cache_creation+@cacheC, cache_read=cache_read+@cacheR`);
+  stmts.upsertDailyModel = db.prepare(`INSERT INTO usage_daily_model (profile,date,user_key,model,input_tokens,output_tokens,requests)
+    VALUES (@profile,@today,@key,@m,@inp,@out,1)
+    ON CONFLICT(profile,date,user_key,model) DO UPDATE SET
+      input_tokens=input_tokens+@inp, output_tokens=output_tokens+@out, requests=requests+1`);
+  stmts.upsertDailyHourly = db.prepare(`INSERT INTO usage_daily_hourly (profile,date,user_key,hour,requests,input_tokens,output_tokens,cache_creation,cache_read)
+    VALUES (@profile,@today,@key,@hour,1,@inp,@out,@cacheC,@cacheR)
+    ON CONFLICT(profile,date,user_key,hour) DO UPDATE SET
+      requests=requests+1, input_tokens=input_tokens+@inp, output_tokens=output_tokens+@out,
+      cache_creation=cache_creation+@cacheC, cache_read=cache_read+@cacheR`);
+  stmts.insertError = db.prepare(`INSERT INTO errors (profile,time,user_name,user_key,status_code,error,path,model)
+    VALUES (@profile,@time,@userName,@key,@statusCode,@error,@path,@model)`);
+  stmts.pruneErrors = db.prepare(`DELETE FROM errors WHERE time < ?`);
+  stmts.trimErrors = db.prepare(`DELETE FROM errors WHERE id NOT IN (SELECT id FROM errors ORDER BY id DESC LIMIT 200)`);
+  stmts.pruneDailyModel = db.prepare(`DELETE FROM usage_daily_model WHERE date < ?`);
+  stmts.pruneDailyHourly = db.prepare(`DELETE FROM usage_daily_hourly WHERE date < ?`);
+  stmts.insertQuotaAdjust = db.prepare(`INSERT INTO quota_adjust_history (user_key,user_name,date,old_quota,new_quota,hit_rate,avg_daily_usage,auto,time)
+    VALUES (@user,@username,@date,@oldQuota,@newQuota,@hitRate,@avgDailyUsage,1,@time)`);
+  stmts.trimQuotaAdjust = db.prepare(`DELETE FROM quota_adjust_history WHERE id NOT IN (SELECT id FROM quota_adjust_history ORDER BY id DESC LIMIT 100)`);
+  stmts.upsertMeta = db.prepare(`INSERT INTO kv_meta (key,value) VALUES (@k,@v) ON CONFLICT(key) DO UPDATE SET value=excluded.value`);
+
+  // ── Read statements ──
+  stmts.todayUsageForQuota = db.prepare(`SELECT COALESCE(SUM(input_tokens+output_tokens),0) AS used FROM usage_daily WHERE profile=? AND date=? AND user_key=?`);
+  stmts.profileDailyRow = db.prepare(`SELECT * FROM usage_daily WHERE profile=? AND date=? AND user_key=?`);
+  stmts.profileDailyModelRows = db.prepare(`SELECT model,input_tokens,output_tokens,requests FROM usage_daily_model WHERE profile=? AND date=? AND user_key=?`);
+  stmts.profileDailyHourlyRows = db.prepare(`SELECT hour,requests,input_tokens,output_tokens,cache_creation,cache_read FROM usage_daily_hourly WHERE profile=? AND date=? AND user_key=?`);
+  stmts.profileDailyTrend = db.prepare(`SELECT date,input_tokens,output_tokens,requests,cache_creation,cache_read FROM usage_daily WHERE profile=? AND user_key=? AND date>=? ORDER BY date`);
+  stmts.profileSummaryToday = db.prepare(`SELECT COALESCE(SUM(input_tokens+output_tokens),0) AS tokens, COALESCE(SUM(requests),0) AS requests FROM usage_daily WHERE profile=? AND date=?`);
+  stmts.lastQuotaAdjust = db.prepare(`SELECT * FROM quota_adjust_history WHERE user_key=? ORDER BY id DESC LIMIT 1`);
+  stmts.quotaAdjustRecent = db.prepare(`SELECT * FROM quota_adjust_history ORDER BY id DESC LIMIT 20`);
+  stmts.defaultDailyForUser = db.prepare(`SELECT date,input_tokens,output_tokens FROM usage_daily WHERE profile=? AND user_key=? AND date>=?`);
 }
 
-function topLevelStoreHasUsage() {
-  return ["users", "daily", "dailyModels", "dailyHourly", "models", "hourly", "errors"]
-    .some(k => Array.isArray(store[k]) ? store[k].length > 0 : Object.keys(store[k] || {}).length > 0);
+// ── Pruning (called once a day via a lazy check) ──
+let lastPruneDate = null;
+function pruneOldDataIfNewDay() {
+  const today = cnDate();
+  if (lastPruneDate === today) return;
+  lastPruneDate = today;
+  const cutoff = new Date(Date.now() - 7 * 24 * 3600 * 1000 + 8 * 3600 * 1000).toISOString().slice(0, 10);
+  const cutoff7d = new Date(Date.now() - 7 * 24 * 3600 * 1000).toISOString();
+  const tx = db.transaction(() => {
+    stmts.pruneDailyModel.run(cutoff);
+    stmts.pruneDailyHourly.run(cutoff);
+    stmts.pruneErrors.run(cutoff7d);
+  });
+  tx();
 }
 
-function migrateDefaultStoreToProfileSuffix() {
+// ── Migration: data.json → SQLite tables (one-time, idempotent) ──
+function migrateFromJsonIfNeeded() {
+  const { c } = db.prepare("SELECT COUNT(*) AS c FROM users").get();
+  if (c > 0) return;  // already has data
+  if (!fs.existsSync(dataPath)) return;
+  let raw;
+  try { raw = JSON.parse(fs.readFileSync(dataPath, "utf-8")); }
+  catch (err) { console.error("[MIGRATE] data.json 读取失败:", err.message); return; }
+
+  console.log("[MIGRATE] 从 data.json 迁移到 SQLite 多表...");
+  const profiles = raw._profiles || {};
+  // Legacy top-level data maps to the default profile suffix.
   const defaultSuffix = getDefaultProfileSuffix();
-  if (!defaultSuffix || store._defaultProfileSuffixMigrated === defaultSuffix || !topLevelStoreHasUsage()) return;
-  if (!store._profiles) store._profiles = {};
-  const target = store._profiles[defaultSuffix] || { users: {}, daily: {}, dailyModels: {}, dailyHourly: {}, models: {}, hourly: {}, errors: [] };
-  const targetHasUsage = ["users", "daily", "dailyModels", "dailyHourly", "models", "hourly", "errors"]
-    .some(k => Array.isArray(target[k]) ? target[k].length > 0 : Object.keys(target[k] || {}).length > 0);
-  if (!targetHasUsage) {
-    for (const key of ["users", "daily", "dailyModels", "dailyHourly", "models", "hourly", "errors"]) {
-      target[key] = store[key] || (key === "errors" ? [] : {});
-      store[key] = key === "errors" ? [] : {};
+  const hasTopLevel = ["users","daily","dailyModels","dailyHourly","models","hourly","errors"]
+    .some(k => Array.isArray(raw[k]) ? raw[k].length > 0 : Object.keys(raw[k] || {}).length > 0);
+  if (hasTopLevel && defaultSuffix && !profiles[defaultSuffix]) {
+    profiles[defaultSuffix] = { users: raw.users||{}, daily: raw.daily||{}, dailyModels: raw.dailyModels||{}, dailyHourly: raw.dailyHourly||{}, models: raw.models||{}, hourly: raw.hourly||{}, errors: raw.errors||[] };
+  }
+
+  const tx = db.transaction(() => {
+    for (const [suffix, ps] of Object.entries(profiles)) {
+      for (const [k, u] of Object.entries(ps.users || {})) {
+        db.prepare(`INSERT INTO users (profile,user_key,name,total_input,total_output,total_requests,cache_creation,cache_read,last_active)
+          VALUES (?,?,?,?,?,?,?,?,?) ON CONFLICT(profile,user_key) DO UPDATE SET
+            total_input=total_input+excluded.total_input, total_output=total_output+excluded.total_output,
+            total_requests=total_requests+excluded.total_requests, cache_creation=cache_creation+excluded.cache_creation,
+            cache_read=cache_read+excluded.cache_read, last_active=excluded.last_active`)
+          .run(suffix, k, u.name||k.slice(0,8), u.totalInputTokens||0, u.totalOutputTokens||0, u.totalRequests||0, u.cacheCreationTokens||0, u.cacheReadTokens||0, u.lastActive||null);
+      }
+      for (const [date, ud] of Object.entries(ps.daily || {})) {
+        for (const [k, v] of Object.entries(ud)) {
+          db.prepare(`INSERT INTO usage_daily (profile,date,user_key,input_tokens,output_tokens,requests,cache_creation,cache_read) VALUES (?,?,?,?,?,?,?,?)
+            ON CONFLICT(profile,date,user_key) DO UPDATE SET input_tokens=input_tokens+excluded.input_tokens, output_tokens=output_tokens+excluded.output_tokens, requests=requests+excluded.requests, cache_creation=cache_creation+excluded.cache_creation, cache_read=cache_read+excluded.cache_read`)
+            .run(suffix, date, k, v.inputTokens||0, v.outputTokens||0, v.requests||0, v.cacheCreationTokens||0, v.cacheReadTokens||0);
+        }
+      }
+      for (const [m, v] of Object.entries(ps.models || {})) {
+        db.prepare(`INSERT INTO usage_model (profile,model,tokens,requests) VALUES (?,?,?,?)
+          ON CONFLICT(profile,model) DO UPDATE SET tokens=tokens+excluded.tokens, requests=requests+excluded.requests`)
+          .run(suffix, m, v.tokens||0, v.requests||0);
+      }
+      for (const [date, hd] of Object.entries(ps.hourly || {})) {
+        for (const [h, v] of Object.entries(hd)) {
+          db.prepare(`INSERT INTO usage_hourly (profile,date,hour,requests,input_tokens,output_tokens,cache_creation,cache_read) VALUES (?,?,?,?,?,?,?,?)
+            ON CONFLICT(profile,date,hour) DO UPDATE SET requests=requests+excluded.requests, input_tokens=input_tokens+excluded.input_tokens, output_tokens=output_tokens+excluded.output_tokens, cache_creation=cache_creation+excluded.cache_creation, cache_read=cache_read+excluded.cache_read`)
+            .run(suffix, date, h, v.requests||0, v.inputTokens||0, v.outputTokens||0, v.cacheCreationTokens||0, v.cacheReadTokens||0);
+        }
+      }
+      for (const [date, dm] of Object.entries(ps.dailyModels || {})) {
+        for (const [k, models] of Object.entries(dm)) {
+          for (const [m, v] of Object.entries(models)) {
+            db.prepare(`INSERT INTO usage_daily_model (profile,date,user_key,model,input_tokens,output_tokens,requests) VALUES (?,?,?,?,?,?,?)
+              ON CONFLICT(profile,date,user_key,model) DO UPDATE SET input_tokens=input_tokens+excluded.input_tokens, output_tokens=output_tokens+excluded.output_tokens, requests=requests+excluded.requests`)
+              .run(suffix, date, k, m, v.inputTokens||0, v.outputTokens||0, v.requests||0);
+          }
+        }
+      }
+      for (const [date, dh] of Object.entries(ps.dailyHourly || {})) {
+        for (const [k, hours] of Object.entries(dh)) {
+          for (const [h, v] of Object.entries(hours)) {
+            db.prepare(`INSERT INTO usage_daily_hourly (profile,date,user_key,hour,requests,input_tokens,output_tokens,cache_creation,cache_read) VALUES (?,?,?,?,?,?,?,?,?)
+              ON CONFLICT(profile,date,user_key,hour) DO UPDATE SET requests=requests+excluded.requests, input_tokens=input_tokens+excluded.input_tokens, output_tokens=output_tokens+excluded.output_tokens, cache_creation=cache_creation+excluded.cache_creation, cache_read=cache_read+excluded.cache_read`)
+              .run(suffix, date, k, h, v.requests||0, v.inputTokens||0, v.outputTokens||0, v.cacheCreationTokens||0, v.cacheReadTokens||0);
+          }
+        }
+      }
+      for (const e of (ps.errors || [])) {
+        stmts.insertError.run({ profile: suffix, time: e.time, userName: e.user, key: e.userKey, statusCode: e.statusCode, error: e.error, path: e.path, model: e.model });
+      }
     }
-    store._profiles[defaultSuffix] = target;
-    store._defaultProfileSuffixMigrated = defaultSuffix;
-    saveStore();
-    console.log(`[MIGRATE] Moved legacy default usage store to profile suffix "${defaultSuffix}"`);
+    // Global: quotaAdjustHistory
+    for (const h of (raw.quotaAdjustHistory || [])) {
+      stmts.insertQuotaAdjust.run({ user: h.user, username: h.username, date: h.date, oldQuota: h.oldQuota, newQuota: h.newQuota, hitRate: h.hitRate, avgDailyUsage: h.avgDailyUsage, time: (h.date||new Date().toISOString())+"T00:00:00.000Z" });
+    }
+    // Global: _lastQuotaEval
+    if (raw._lastQuotaEval) stmts.upsertMeta.run({ k: "lastQuotaEval", v: raw._lastQuotaEval });
+  });
+  tx();
+
+  try {
+    fs.renameSync(dataPath, dataPath + ".migrated");
+    console.log("[MIGRATE] data.json 已重命名为 data.json.migrated（SQLite 多表已接管持久化）");
+  } catch (err) {
+    console.warn("[MIGRATE] data.json 重命名失败（不影响已迁移的数据）:", err.message);
   }
 }
 
-// Aggregate all profile stores for "all profiles" view
+// ── Meta helpers (kv_meta: _lastQuotaEval) ──
+function getMeta(key, fallback = null) {
+  const row = db.prepare("SELECT value FROM kv_meta WHERE key=?").get(key);
+  return row ? row.value : fallback;
+}
+function setMeta(key, value) { stmts.upsertMeta.run({ k: key, v: String(value) }); }
+
+// ── Profile snapshot: assemble nested object for sanitizeStore (single profile) ──
+function loadProfileSnapshot(suffix) {
+  const users = {};
+  for (const r of db.prepare("SELECT user_key,name,total_input,total_output,total_requests,cache_creation,cache_read,last_active FROM users WHERE profile=?").all(suffix)) {
+    users[r.user_key] = { name: r.name, totalInputTokens: r.total_input, totalOutputTokens: r.total_output, totalRequests: r.total_requests, cacheCreationTokens: r.cache_creation, cacheReadTokens: r.cache_read, lastActive: r.last_active };
+  }
+  const daily = {};
+  for (const r of db.prepare("SELECT date,user_key,input_tokens,output_tokens,requests,cache_creation,cache_read FROM usage_daily WHERE profile=?").all(suffix)) {
+    if (!daily[r.date]) daily[r.date] = {};
+    daily[r.date][r.user_key] = { inputTokens: r.input_tokens, outputTokens: r.output_tokens, requests: r.requests, cacheCreationTokens: r.cache_creation, cacheReadTokens: r.cache_read };
+  }
+  const models = {};
+  for (const r of db.prepare("SELECT model,tokens,requests FROM usage_model WHERE profile=?").all(suffix)) {
+    models[r.model] = { tokens: r.tokens, requests: r.requests };
+  }
+  const hourly = {};
+  for (const r of db.prepare("SELECT date,hour,requests,input_tokens,output_tokens,cache_creation,cache_read FROM usage_hourly WHERE profile=?").all(suffix)) {
+    if (!hourly[r.date]) hourly[r.date] = {};
+    hourly[r.date][r.hour] = { requests: r.requests, inputTokens: r.input_tokens, outputTokens: r.output_tokens, cacheCreationTokens: r.cache_creation, cacheReadTokens: r.cache_read };
+  }
+  const dailyModels = {};
+  for (const r of db.prepare("SELECT date,user_key,model,input_tokens,output_tokens,requests FROM usage_daily_model WHERE profile=?").all(suffix)) {
+    if (!dailyModels[r.date]) dailyModels[r.date] = {};
+    if (!dailyModels[r.date][r.user_key]) dailyModels[r.date][r.user_key] = {};
+    dailyModels[r.date][r.user_key][r.model] = { inputTokens: r.input_tokens, outputTokens: r.output_tokens, requests: r.requests };
+  }
+  const dailyHourly = {};
+  for (const r of db.prepare("SELECT date,user_key,hour,requests,input_tokens,output_tokens,cache_creation,cache_read FROM usage_daily_hourly WHERE profile=?").all(suffix)) {
+    if (!dailyHourly[r.date]) dailyHourly[r.date] = {};
+    if (!dailyHourly[r.date][r.user_key]) dailyHourly[r.date][r.user_key] = {};
+    dailyHourly[r.date][r.user_key][r.hour] = { requests: r.requests, inputTokens: r.input_tokens, outputTokens: r.output_tokens, cacheCreationTokens: r.cache_creation, cacheReadTokens: r.cache_read };
+  }
+  const errors = db.prepare("SELECT time,user_name AS user,user_key AS userKey,status_code AS statusCode,error,path,model FROM errors WHERE profile=? ORDER BY id DESC LIMIT 200").all(suffix);
+  return { users, daily, dailyModels, dailyHourly, models, hourly, errors };
+}
+
+initDb();
+migrateFromJsonIfNeeded();
+
+// Aggregate all profiles for "all profiles" view, assembled via SQL GROUP BY.
+// Returns the same nested shape as loadProfileSnapshot so sanitizeStore and the
+// frontend work unchanged.
 function getAggregatedStore() {
   const agg = { users: {}, daily: {}, dailyModels: {}, dailyHourly: {}, models: {}, hourly: {}, errors: [] };
-  // Legacy top-level data, kept for backward compatibility with old data.json files.
-  for (const k of ["users", "daily", "dailyModels", "dailyHourly", "models", "hourly"]) {
-    agg[k] = JSON.parse(JSON.stringify(store[k] || {}));
+
+  // users: GROUP BY user_key across all profiles
+  for (const r of db.prepare(`SELECT user_key, MAX(name) AS name, SUM(total_input) AS ti, SUM(total_output) AS tout, SUM(total_requests) AS tr, SUM(cache_creation) AS cc, SUM(cache_read) AS cr, MAX(last_active) AS la FROM users GROUP BY user_key`).all()) {
+    agg.users[r.user_key] = { name: r.name, totalInputTokens: r.ti||0, totalOutputTokens: r.tout||0, totalRequests: r.tr||0, cacheCreationTokens: r.cc||0, cacheReadTokens: r.cr||0, lastActive: r.la };
   }
-  agg.errors = [...(store.errors || [])];
-  // Non-default profiles
-  for (const [suffix, ps] of Object.entries(store._profiles || {})) {
-    for (const [k, v] of Object.entries(ps.users || {})) {
-      if (!agg.users[k]) agg.users[k] = { ...v, totalInputTokens: 0, totalOutputTokens: 0, totalRequests: 0, cacheCreationTokens: 0, cacheReadTokens: 0 };
-      agg.users[k].totalInputTokens += (v.totalInputTokens || 0);
-      agg.users[k].totalOutputTokens += (v.totalOutputTokens || 0);
-      agg.users[k].totalRequests += (v.totalRequests || 0);
-      agg.users[k].cacheCreationTokens += (v.cacheCreationTokens || 0);
-      agg.users[k].cacheReadTokens += (v.cacheReadTokens || 0);
-      agg.users[k].lastActive = agg.users[k].lastActive > (v.lastActive || "") ? agg.users[k].lastActive : (v.lastActive || agg.users[k].lastActive);
-    }
-    for (const [day, ud] of Object.entries(ps.daily || {})) {
-      if (!agg.daily[day]) agg.daily[day] = {};
-      for (const [k, v] of Object.entries(ud)) {
-        if (!agg.daily[day][k]) agg.daily[day][k] = { inputTokens: 0, outputTokens: 0, requests: 0, cacheCreationTokens: 0, cacheReadTokens: 0 };
-        agg.daily[day][k].inputTokens += (v.inputTokens || 0);
-        agg.daily[day][k].outputTokens += (v.outputTokens || 0);
-        agg.daily[day][k].requests += (v.requests || 0);
-        agg.daily[day][k].cacheCreationTokens += (v.cacheCreationTokens || 0);
-        agg.daily[day][k].cacheReadTokens += (v.cacheReadTokens || 0);
-      }
-    }
-    for (const [m, v] of Object.entries(ps.models || {})) {
-      if (!agg.models[m]) agg.models[m] = { tokens: 0, requests: 0 };
-      agg.models[m].tokens += (v.tokens || 0);
-      agg.models[m].requests += (v.requests || 0);
-    }
-    for (const [day, hd] of Object.entries(ps.hourly || {})) {
-      if (!agg.hourly[day]) agg.hourly[day] = {};
-      for (const [h, v] of Object.entries(hd)) {
-        if (!agg.hourly[day][h]) agg.hourly[day][h] = { requests: 0, inputTokens: 0, outputTokens: 0, cacheCreationTokens: 0, cacheReadTokens: 0 };
-        agg.hourly[day][h].requests += (v.requests || 0);
-        agg.hourly[day][h].inputTokens += (v.inputTokens || 0);
-        agg.hourly[day][h].outputTokens += (v.outputTokens || 0);
-        agg.hourly[day][h].cacheCreationTokens += (v.cacheCreationTokens || 0);
-        agg.hourly[day][h].cacheReadTokens += (v.cacheReadTokens || 0);
-      }
-    }
-    for (const [day, dm] of Object.entries(ps.dailyModels || {})) {
-      if (!agg.dailyModels[day]) agg.dailyModels[day] = {};
-      for (const [k, models] of Object.entries(dm)) {
-        if (!agg.dailyModels[day][k]) agg.dailyModels[day][k] = {};
-        for (const [m, v] of Object.entries(models)) {
-          if (!agg.dailyModels[day][k][m]) agg.dailyModels[day][k][m] = { inputTokens: 0, outputTokens: 0, requests: 0 };
-          agg.dailyModels[day][k][m].inputTokens += (v.inputTokens || 0);
-          agg.dailyModels[day][k][m].outputTokens += (v.outputTokens || 0);
-          agg.dailyModels[day][k][m].requests += (v.requests || 0);
-        }
-      }
-    }
-    for (const [day, dh] of Object.entries(ps.dailyHourly || {})) {
-      if (!agg.dailyHourly[day]) agg.dailyHourly[day] = {};
-      for (const [k, hours] of Object.entries(dh)) {
-        if (!agg.dailyHourly[day][k]) agg.dailyHourly[day][k] = {};
-        for (const [h, v] of Object.entries(hours)) {
-          if (!agg.dailyHourly[day][k][h]) agg.dailyHourly[day][k][h] = { requests: 0, inputTokens: 0, outputTokens: 0, cacheCreationTokens: 0, cacheReadTokens: 0 };
-          agg.dailyHourly[day][k][h].requests += (v.requests || 0);
-          agg.dailyHourly[day][k][h].inputTokens += (v.inputTokens || 0);
-          agg.dailyHourly[day][k][h].outputTokens += (v.outputTokens || 0);
-          agg.dailyHourly[day][k][h].cacheCreationTokens += (v.cacheCreationTokens || 0);
-          agg.dailyHourly[day][k][h].cacheReadTokens += (v.cacheReadTokens || 0);
-        }
-      }
-    }
-    agg.errors = agg.errors.concat(ps.errors || []);
+  // daily: GROUP BY date, user_key
+  for (const r of db.prepare(`SELECT date, user_key, SUM(input_tokens) AS ti, SUM(output_tokens) AS tout, SUM(requests) AS tr, SUM(cache_creation) AS cc, SUM(cache_read) AS cr FROM usage_daily GROUP BY date, user_key`).all()) {
+    if (!agg.daily[r.date]) agg.daily[r.date] = {};
+    agg.daily[r.date][r.user_key] = { inputTokens: r.ti||0, outputTokens: r.tout||0, requests: r.tr||0, cacheCreationTokens: r.cc||0, cacheReadTokens: r.cr||0 };
   }
+  // models: GROUP BY model
+  for (const r of db.prepare(`SELECT model, SUM(tokens) AS t, SUM(requests) AS r FROM usage_model GROUP BY model`).all()) {
+    agg.models[r.model] = { tokens: r.t||0, requests: r.r||0 };
+  }
+  // hourly: GROUP BY date, hour
+  for (const r of db.prepare(`SELECT date, hour, SUM(requests) AS r, SUM(input_tokens) AS ti, SUM(output_tokens) AS tout, SUM(cache_creation) AS cc, SUM(cache_read) AS cr FROM usage_hourly GROUP BY date, hour`).all()) {
+    if (!agg.hourly[r.date]) agg.hourly[r.date] = {};
+    agg.hourly[r.date][r.hour] = { requests: r.r||0, inputTokens: r.ti||0, outputTokens: r.tout||0, cacheCreationTokens: r.cc||0, cacheReadTokens: r.cr||0 };
+  }
+  // dailyModels: GROUP BY date, user_key, model
+  for (const r of db.prepare(`SELECT date, user_key, model, SUM(input_tokens) AS ti, SUM(output_tokens) AS tout, SUM(requests) AS tr FROM usage_daily_model GROUP BY date, user_key, model`).all()) {
+    if (!agg.dailyModels[r.date]) agg.dailyModels[r.date] = {};
+    if (!agg.dailyModels[r.date][r.user_key]) agg.dailyModels[r.date][r.user_key] = {};
+    agg.dailyModels[r.date][r.user_key][r.model] = { inputTokens: r.ti||0, outputTokens: r.tout||0, requests: r.tr||0 };
+  }
+  // dailyHourly: GROUP BY date, user_key, hour
+  for (const r of db.prepare(`SELECT date, user_key, hour, SUM(requests) AS r, SUM(input_tokens) AS ti, SUM(output_tokens) AS tout, SUM(cache_creation) AS cc, SUM(cache_read) AS cr FROM usage_daily_hourly GROUP BY date, user_key, hour`).all()) {
+    if (!agg.dailyHourly[r.date]) agg.dailyHourly[r.date] = {};
+    if (!agg.dailyHourly[r.date][r.user_key]) agg.dailyHourly[r.date][r.user_key] = {};
+    agg.dailyHourly[r.date][r.user_key][r.hour] = { requests: r.r||0, inputTokens: r.ti||0, outputTokens: r.tout||0, cacheCreationTokens: r.cc||0, cacheReadTokens: r.cr||0 };
+  }
+  // errors: merge all profiles (most recent 200)
+  agg.errors = db.prepare("SELECT time, user_name AS user, user_key AS userKey, status_code AS statusCode, error, path, model FROM errors ORDER BY id DESC LIMIT 200").all();
   return agg;
 }
 
@@ -843,63 +1135,19 @@ function getProfileSummaries() {
   const today = cnDate();
   return listProfiles().map(profile => {
     const runtime = runtimes[profile.suffix];
-    const ps = getProfileStore(profile.suffix);
-    const todayUsers = ps.daily?.[today] || {};
-    let todayTokens = 0;
-    let todayRequests = 0;
-    for (const usage of Object.values(todayUsers)) {
-      todayTokens += (usage.inputTokens || 0) + (usage.outputTokens || 0);
-      todayRequests += usage.requests || 0;
-    }
+    const row = stmts.profileSummaryToday.get(profile.suffix, today);
     return {
       name: profile.name,
       suffix: profile.suffix,
       isDefault: profile.isDefault,
       upstream: profile.upstream,
       userCount: profile.userCount,
-      todayTokens,
-      todayRequests,
+      todayTokens: row.tokens || 0,
+      todayRequests: row.requests || 0,
       breakerState: runtime?.breaker?.status().state || "UNKNOWN",
     };
   });
 }
-
-function loadStore() {
-  try {
-    if (fs.existsSync(dataPath)) {
-      const raw = JSON.parse(fs.readFileSync(dataPath, "utf-8"));
-      store = {
-        users: raw.users || {},
-        daily: raw.daily || {},
-        dailyModels: raw.dailyModels || {},
-        dailyHourly: raw.dailyHourly || {},
-        models: raw.models || {},
-        hourly: raw.hourly || {},
-        errors: Array.isArray(raw.errors) ? raw.errors : [],
-        quotaAdjustHistory: Array.isArray(raw.quotaAdjustHistory) ? raw.quotaAdjustHistory : [],
-        _lastQuotaEval: raw._lastQuotaEval || null,
-        _profiles: raw._profiles || {},
-        _defaultProfileSuffixMigrated: raw._defaultProfileSuffixMigrated || null,
-      };
-    }
-  } catch { store = { users: {}, daily: {}, dailyModels: {}, dailyHourly: {}, models: {}, hourly: {}, errors: [], _profiles: {} }; }
-}
-
-function saveStore() {
-  try {
-    // Prune old dailyModels/dailyHourly (>7 days)
-    const cutoff = new Date(Date.now() - 7 * 24 * 3600 * 1000 + 8 * 3600 * 1000).toISOString().slice(0, 10);
-    for (const d of Object.keys(store.dailyModels)) { if (d < cutoff) delete store.dailyModels[d]; }
-    for (const d of Object.keys(store.dailyHourly)) { if (d < cutoff) delete store.dailyHourly[d]; }
-    fs.writeFileSync(dataPath, JSON.stringify(store, null, 2), "utf-8");
-  } catch (err) {
-    console.error("[STORE] Save failed:", err.message);
-  }
-}
-
-loadStore();
-migrateDefaultStoreToProfileSuffix();
-setInterval(saveStore, 30_000);
 
 // ─── User Helpers ─────────────────────────────────────────────────────────────
 // Normalize user config to { username, key, allowedModels }
@@ -1065,6 +1313,24 @@ function isOpenAIModelsPath(reqUrl) {
   return pathname === "/v1/models" || pathname.endsWith("/models");
 }
 
+function isAllowedOpenAIProxyPath(reqUrl, method) {
+  const upperMethod = String(method || "GET").toUpperCase();
+  if (isOpenAIModelsPath(reqUrl)) return upperMethod === "GET" || upperMethod === "HEAD";
+  if (upperMethod !== "POST") return false;
+  return isOpenAIResponsesPath(reqUrl) || isOpenAIChatCompletionsPath(reqUrl);
+}
+
+function validateProxyTarget(runtime, reqUrl, method) {
+  if (runtime?.apiProtocol !== "openai") return { allowed: true };
+  if (isAllowedOpenAIProxyPath(reqUrl, method)) return { allowed: true };
+  const pathname = new URL(reqUrl || "/", "http://localhost").pathname;
+  return {
+    allowed: false,
+    statusCode: 404,
+    message: `Unsupported OpenAI/Codex proxy endpoint ${String(method || "GET").toUpperCase()} ${pathname}. Allowed endpoints: POST /v1/responses, POST /v1/chat/completions, and local GET /v1/models.`,
+  };
+}
+
 function shouldAdaptOpenAIResponses(runtime, reqUrl) {
   return runtime?.apiProtocol === "openai" &&
     runtime.responsesAdapter === "chat_completions" &&
@@ -1073,7 +1339,6 @@ function shouldAdaptOpenAIResponses(runtime, reqUrl) {
 
 function shouldServeLocalOpenAIModels(runtime, reqUrl) {
   return runtime?.apiProtocol === "openai" &&
-    runtime.responsesAdapter === "chat_completions" &&
     isOpenAIModelsPath(reqUrl);
 }
 
@@ -1355,7 +1620,6 @@ function cnHour() { return cnNow().getHours().toString().padStart(2, "0"); }
 function recordUsage(apiKey, usage, model, suffix, _rt) {
   const runtime = _rt || runtimes[normalizeProfileSuffix(suffix)] || rt;
   const sfx = normalizeProfileSuffix(suffix) || runtime?.suffix || getDefaultProfileSuffix();
-  const s = getProfileStore(sfx);
   const key = resolveUserKey(apiKey, runtime);
   const today = cnDate();
   const hour = cnHour();
@@ -1371,52 +1635,18 @@ function recordUsage(apiKey, usage, model, suffix, _rt) {
   const cacheR = toTokenNumber(usage.cache_read_input_tokens);
   const m = model || "unknown";
 
-  if (!s.users[key]) s.users[key] = { name: getUserName(key, runtime), totalInputTokens: 0, totalOutputTokens: 0, totalRequests: 0, lastActive: null, cacheCreationTokens: 0, cacheReadTokens: 0 };
-  const u = s.users[key];
-  u.totalInputTokens += inp;
-  u.totalOutputTokens += out;
-  u.totalRequests += 1;
-  u.cacheCreationTokens = (u.cacheCreationTokens || 0) + cacheC;
-  u.cacheReadTokens = (u.cacheReadTokens || 0) + cacheR;
-  u.lastActive = new Date().toISOString();
+  pruneOldDataIfNewDay();
 
-  if (!s.daily[today]) s.daily[today] = {};
-  if (!s.daily[today][key]) s.daily[today][key] = { inputTokens: 0, outputTokens: 0, requests: 0, cacheCreationTokens: 0, cacheReadTokens: 0 };
-  s.daily[today][key].inputTokens += inp;
-  s.daily[today][key].outputTokens += out;
-  s.daily[today][key].requests += 1;
-  s.daily[today][key].cacheCreationTokens = (s.daily[today][key].cacheCreationTokens || 0) + cacheC;
-  s.daily[today][key].cacheReadTokens = (s.daily[today][key].cacheReadTokens || 0) + cacheR;
-
-  if (!s.models[m]) s.models[m] = { tokens: 0, requests: 0 };
-  s.models[m].tokens += inp + out;
-  s.models[m].requests += 1;
-
-  if (!s.hourly[today]) s.hourly[today] = {};
-  if (!s.hourly[today][hour]) s.hourly[today][hour] = { requests: 0, inputTokens: 0, outputTokens: 0, cacheCreationTokens: 0, cacheReadTokens: 0 };
-  s.hourly[today][hour].requests += 1;
-  s.hourly[today][hour].inputTokens += inp;
-  s.hourly[today][hour].outputTokens += out;
-  s.hourly[today][hour].cacheCreationTokens = (s.hourly[today][hour].cacheCreationTokens || 0) + cacheC;
-  s.hourly[today][hour].cacheReadTokens = (s.hourly[today][hour].cacheReadTokens || 0) + cacheR;
-
-  // Per-user-per-model-daily tracking
-  if (!s.dailyModels[today]) s.dailyModels[today] = {};
-  if (!s.dailyModels[today][key]) s.dailyModels[today][key] = {};
-  if (!s.dailyModels[today][key][m]) s.dailyModels[today][key][m] = { inputTokens: 0, outputTokens: 0, requests: 0 };
-  s.dailyModels[today][key][m].inputTokens += inp;
-  s.dailyModels[today][key][m].outputTokens += out;
-  s.dailyModels[today][key][m].requests += 1;
-
-  // Per-user-hourly tracking
-  if (!s.dailyHourly[today]) s.dailyHourly[today] = {};
-  if (!s.dailyHourly[today][key]) s.dailyHourly[today][key] = {};
-  if (!s.dailyHourly[today][key][hour]) s.dailyHourly[today][key][hour] = { requests: 0, inputTokens: 0, outputTokens: 0, cacheCreationTokens: 0, cacheReadTokens: 0 };
-  s.dailyHourly[today][key][hour].requests += 1;
-  s.dailyHourly[today][key][hour].inputTokens += inp;
-  s.dailyHourly[today][key][hour].outputTokens += out;
-  s.dailyHourly[today][key][hour].cacheCreationTokens = (s.dailyHourly[today][key][hour].cacheCreationTokens || 0) + cacheC;
-  s.dailyHourly[today][key][hour].cacheReadTokens = (s.dailyHourly[today][key][hour].cacheReadTokens || 0) + cacheR;
+  const p = { profile: sfx, key, name: getUserName(key, runtime), inp, out, cacheC, cacheR, m, tokenTotal: inp + out, today, hour, now: new Date().toISOString() };
+  const tx = db.transaction(() => {
+    stmts.upsertUser.run(p);
+    stmts.upsertDaily.run(p);
+    stmts.upsertModel.run(p);
+    stmts.upsertHourly.run(p);
+    stmts.upsertDailyModel.run(p);
+    stmts.upsertDailyHourly.run(p);
+  });
+  tx();
 }
 
 // ─── Token Quota ──────────────────────────────────────────────────────────────
@@ -1440,10 +1670,9 @@ function getUserQuota(apiKey, _rt) {
 function checkTokenQuota(apiKey, suffix, _rt) {
   const runtime = _rt || rt;
   const key = resolveUserKey(apiKey, runtime);
-  const s = getProfileStore(normalizeProfileSuffix(suffix) || runtime?.suffix || "");
+  const sfx = normalizeProfileSuffix(suffix) || runtime?.suffix || "";
   const today = cnDate();
-  const todayUsage = (s.daily[today] || {})[key] || { inputTokens: 0, outputTokens: 0 };
-  const used = todayUsage.inputTokens + todayUsage.outputTokens;
+  const used = stmts.todayUsageForQuota.get(sfx, today, key).used;
 
   // User quota overrides profile quota
   const userQuota = getUserQuota(apiKey, runtime);
@@ -1467,8 +1696,8 @@ function evaluateAutoQuotaAdjustments() {
   if (!cfg || !cfg.enabled) return;
 
   const today = cnDate();
-  if (store._lastQuotaEval === today) return;
-  store._lastQuotaEval = today;
+  if (getMeta("lastQuotaEval") === today) return;
+  setMeta("lastQuotaEval", today);
 
   const period = cfg.evaluationPeriodDays || 5;
   const hitThreshold = cfg.hitThreshold || 0.9;
@@ -1489,7 +1718,7 @@ function evaluateAutoQuotaAdjustments() {
 
   const profile = config.profiles[getDefaultProfileName()];
   if (!profile || !profile.users) return;
-  const defaultStore = getProfileStore(profile.suffix);
+  const defaultSuffix = profile.suffix;
 
   for (const [vk, pu] of Object.entries(profile.users)) {
     if (typeof pu !== "object") continue;
@@ -1497,7 +1726,7 @@ function evaluateAutoQuotaAdjustments() {
     if (!userQuota || userQuota <= 0) continue; // skip users without quota
 
     // Check cooldown
-    const lastAdjust = (store.quotaAdjustHistory || []).findLast(h => h.user === vk);
+    const lastAdjust = stmts.lastQuotaAdjust.get(vk);
     if (lastAdjust) {
       const lastDate = new Date(lastAdjust.date);
       const nowDate = new Date(today);
@@ -1505,14 +1734,14 @@ function evaluateAutoQuotaAdjustments() {
       if (diffDays < cooldownDays) continue;
     }
 
-    // Count hit days and calculate average usage
+    // Count hit days and calculate average usage (one SQL query per user)
+    const earliest = dates[dates.length - 1];
+    const dayRows = stmts.defaultDailyForUser.all(defaultSuffix, vk, earliest).filter(r => dates.includes(r.date));
     let hitCount = 0;
     let totalUsage = 0;
     let usageDays = 0;
-    for (const date of dates) {
-      const dayData = (defaultStore.daily[date] || {})[vk];
-      if (!dayData) continue;
-      const dayUsage = (dayData.inputTokens || 0) + (dayData.outputTokens || 0);
+    for (const r of dayRows) {
+      const dayUsage = (r.input_tokens || 0) + (r.output_tokens || 0);
       if (dayUsage > 0) {
         usageDays++;
         totalUsage += dayUsage;
@@ -1539,23 +1768,14 @@ function evaluateAutoQuotaAdjustments() {
     // Execute adjustment
     pu.dailyTokenLimit = newQuota;
 
-    const record = {
-      user: vk,
-      username: getUserName(vk),
-      date: today,
-      oldQuota: userQuota,
-      newQuota,
-      hitRate: Math.round(actualHitRate * 100) / 100,
-      avgDailyUsage: Math.round(avgDaily),
-      auto: true,
-    };
-    if (!store.quotaAdjustHistory) store.quotaAdjustHistory = [];
-    store.quotaAdjustHistory.push(record);
-    // Keep only last 100 records
-    if (store.quotaAdjustHistory.length > 100) store.quotaAdjustHistory = store.quotaAdjustHistory.slice(-100);
+    stmts.insertQuotaAdjust.run({
+      user: vk, username: getUserName(vk), date: today, oldQuota: userQuota, newQuota,
+      hitRate: Math.round(actualHitRate * 100) / 100, avgDailyUsage: Math.round(avgDaily),
+      time: new Date().toISOString(),
+    });
+    stmts.trimQuotaAdjust.run();
 
     saveConfig(config);
-    saveStore();
     console.log(`[配额调整] ${getUserName(vk)} ${userQuota.toLocaleString()} → ${newQuota.toLocaleString()} (命中率${Math.round(actualHitRate * 100)}%, 均值${Math.round(avgDaily).toLocaleString()})`);
   }
 }
@@ -1564,20 +1784,17 @@ function evaluateAutoQuotaAdjustments() {
 function recordError(apiKey, statusCode, errorMessage, path, model, suffix, _rt) {
   const runtime = _rt || runtimes[normalizeProfileSuffix(suffix)] || rt;
   const key = resolveUserKey(apiKey, runtime);
-  const s = getProfileStore(normalizeProfileSuffix(suffix) || runtime?.suffix || "");
-  if (!Array.isArray(s.errors)) s.errors = [];
-  s.errors.unshift({
-    time: new Date().toISOString(),
-    user: getUserName(key, runtime),
-    userKey: key,
-    statusCode,
-    error: errorMessage,
-    path,
-    model: model || "unknown",
+  const sfx = normalizeProfileSuffix(suffix) || runtime?.suffix || "";
+  stmts.insertError.run({
+    profile: sfx, time: new Date().toISOString(), userName: getUserName(key, runtime),
+    key, statusCode, error: errorMessage, path, model: model || "unknown",
   });
-  const cutoff = new Date(Date.now() - 7 * 24 * 3600 * 1000).toISOString();
-  s.errors = s.errors.filter(e => e.time >= cutoff);
-  if (s.errors.length > 200) s.errors.length = 200;
+  const cutoff7d = new Date(Date.now() - 7 * 24 * 3600 * 1000).toISOString();
+  const tx = db.transaction(() => {
+    stmts.pruneErrors.run(cutoff7d);
+    stmts.trimErrors.run();
+  });
+  tx();
   console.log(`[错误] ${getUserName(key, runtime)} ${statusCode} ${errorMessage} ${path} model=${model || "unknown"}`);
 }
 
@@ -1595,45 +1812,49 @@ function addUsageBucket(target, source = {}) {
 }
 
 function getProfilePersonalUsage(apiKey, suffix, runtime) {
-  const s = getProfileStore(suffix);
   const key = resolveUserKey(apiKey, runtime);
   const today = cnDate();
   const quota = checkTokenQuota(apiKey, suffix, runtime);
-  const todayUsage = (s.daily[today] || {})[key] || emptyUsageBucket();
+  const todayRow = stmts.profileDailyRow.get(suffix, today, key) || emptyUsageBucket();
+  const todayUsage = todayRow.inputTokens != null ? todayRow : { inputTokens: todayRow.input_tokens||0, outputTokens: todayRow.output_tokens||0, requests: todayRow.requests||0, cacheCreationTokens: todayRow.cache_creation||0, cacheReadTokens: todayRow.cache_read||0 };
 
   // Per-model breakdown for today
   const todayModels = {};
-  const dm = (s.dailyModels[today] || {})[key] || {};
-  for (const [model, data] of Object.entries(dm)) {
-    todayModels[model] = { ...data, total: (data.inputTokens || 0) + (data.outputTokens || 0) };
+  for (const r of stmts.profileDailyModelRows.all(suffix, today, key)) {
+    todayModels[r.model] = { inputTokens: r.input_tokens, outputTokens: r.output_tokens, requests: r.requests, total: r.input_tokens + r.output_tokens };
   }
 
   // Per-hour breakdown for today
   const todayHourly = {};
-  const dh = (s.dailyHourly[today] || {})[key] || {};
-  for (const [h, data] of Object.entries(dh)) {
-    todayHourly[h] = { ...data };
+  for (const r of stmts.profileDailyHourlyRows.all(suffix, today, key)) {
+    todayHourly[r.hour] = { requests: r.requests, inputTokens: r.input_tokens, outputTokens: r.output_tokens, cacheCreationTokens: r.cache_creation, cacheReadTokens: r.cache_read };
   }
 
   // 7-day trend
+  const trendStart = new Date(Date.now() + 8 * 3600 * 1000);
+  trendStart.setDate(trendStart.getDate() - 6);
+  const trendStartDate = trendStart.toISOString().slice(0, 10);
+  const trendMap = {};
+  for (const r of stmts.profileDailyTrend.all(suffix, key, trendStartDate)) {
+    trendMap[r.date] = { date: r.date, input: r.input_tokens||0, output: r.output_tokens||0, requests: r.requests||0, total: (r.input_tokens||0)+(r.output_tokens||0) };
+  }
   const trend = [];
   for (let i = 6; i >= 0; i--) {
     const d = new Date(Date.now() + 8 * 3600 * 1000);
     d.setDate(d.getDate() - i);
     const dateStr = d.toISOString().slice(0, 10);
-    const dayUsage = (s.daily[dateStr] || {})[key] || { inputTokens: 0, outputTokens: 0, requests: 0 };
-    trend.push({ date: dateStr, input: dayUsage.inputTokens, output: dayUsage.outputTokens, requests: dayUsage.requests, total: dayUsage.inputTokens + dayUsage.outputTokens });
+    trend.push(trendMap[dateStr] || { date: dateStr, input: 0, output: 0, requests: 0, total: 0 });
   }
 
   // Check if quota was auto-adjusted
-  const lastAdjust = (store.quotaAdjustHistory || []).findLast(h => h.user === key);
-  const quotaAutoAdjusted = lastAdjust ? lastAdjust.auto : false;
+  const lastAdjust = stmts.lastQuotaAdjust.get(key);
+  const quotaAutoAdjusted = lastAdjust ? !!lastAdjust.auto : false;
 
   return {
     profile: runtime.profileName,
     profileSuffix: suffix,
     quota: { type: quota.source, limit: quota.limit, used: quota.used, remaining: quota.remaining, autoAdjusted: quotaAutoAdjusted },
-    today: { input: todayUsage.inputTokens, output: todayUsage.outputTokens, requests: todayUsage.requests, cacheWrite: todayUsage.cacheCreationTokens || 0, cacheRead: todayUsage.cacheReadTokens || 0, total: todayUsage.inputTokens + todayUsage.outputTokens },
+    today: { input: todayUsage.inputTokens||0, output: todayUsage.outputTokens||0, requests: todayUsage.requests||0, cacheWrite: todayUsage.cacheCreationTokens||0, cacheRead: todayUsage.cacheReadTokens||0, total: (todayUsage.inputTokens||0)+(todayUsage.outputTokens||0) },
     models: todayModels,
     hourly: todayHourly,
     trend,
@@ -1650,36 +1871,51 @@ function getAggregatedPersonalUsage(apiKey, availableProfiles) {
   let totalQuotaUsed = 0;
   let hasUnlimitedQuota = false;
 
+  const trendStart = new Date(Date.now() + 8 * 3600 * 1000);
+  trendStart.setDate(trendStart.getDate() - 6);
+  const trendStartDate = trendStart.toISOString().slice(0, 10);
+  for (let i = 6; i >= 0; i--) {
+    const d = new Date(Date.now() + 8 * 3600 * 1000);
+    d.setDate(d.getDate() - i);
+    const dateStr = d.toISOString().slice(0, 10);
+    trendByDate[dateStr] = { date: dateStr, input: 0, output: 0, requests: 0, total: 0 };
+  }
+
   for (const profile of availableProfiles) {
     const runtime = runtimes[profile.suffix];
     if (!runtime) continue;
     const key = resolveUserKey(apiKey, runtime);
-    const s = getProfileStore(profile.suffix);
-    addUsageBucket(todayUsage, (s.daily[today] || {})[key] || emptyUsageBucket());
+    const suffix = profile.suffix;
 
-    for (const [model, data] of Object.entries((s.dailyModels[today] || {})[key] || {})) {
-      if (!todayModels[model]) todayModels[model] = { inputTokens: 0, outputTokens: 0, requests: 0, total: 0 };
-      todayModels[model].inputTokens += data.inputTokens || 0;
-      todayModels[model].outputTokens += data.outputTokens || 0;
-      todayModels[model].requests += data.requests || 0;
-      todayModels[model].total += (data.inputTokens || 0) + (data.outputTokens || 0);
+    const todayRow = stmts.profileDailyRow.get(suffix, today, key);
+    if (todayRow) {
+      todayUsage.inputTokens += todayRow.input_tokens || 0;
+      todayUsage.outputTokens += todayRow.output_tokens || 0;
+      todayUsage.requests += todayRow.requests || 0;
+      todayUsage.cacheCreationTokens += todayRow.cache_creation || 0;
+      todayUsage.cacheReadTokens += todayRow.cache_read || 0;
     }
 
-    for (const [hour, data] of Object.entries((s.dailyHourly[today] || {})[key] || {})) {
-      if (!todayHourly[hour]) todayHourly[hour] = emptyUsageBucket();
-      addUsageBucket(todayHourly[hour], data);
+    for (const r of stmts.profileDailyModelRows.all(suffix, today, key)) {
+      if (!todayModels[r.model]) todayModels[r.model] = { inputTokens: 0, outputTokens: 0, requests: 0, total: 0 };
+      todayModels[r.model].inputTokens += r.input_tokens || 0;
+      todayModels[r.model].outputTokens += r.output_tokens || 0;
+      todayModels[r.model].requests += r.requests || 0;
+      todayModels[r.model].total += (r.input_tokens||0) + (r.output_tokens||0);
     }
 
-    for (let i = 6; i >= 0; i--) {
-      const d = new Date(Date.now() + 8 * 3600 * 1000);
-      d.setDate(d.getDate() - i);
-      const dateStr = d.toISOString().slice(0, 10);
-      if (!trendByDate[dateStr]) trendByDate[dateStr] = { date: dateStr, input: 0, output: 0, requests: 0, total: 0 };
-      const dayUsage = (s.daily[dateStr] || {})[key] || emptyUsageBucket();
-      trendByDate[dateStr].input += dayUsage.inputTokens || 0;
-      trendByDate[dateStr].output += dayUsage.outputTokens || 0;
-      trendByDate[dateStr].requests += dayUsage.requests || 0;
-      trendByDate[dateStr].total += (dayUsage.inputTokens || 0) + (dayUsage.outputTokens || 0);
+    for (const r of stmts.profileDailyHourlyRows.all(suffix, today, key)) {
+      if (!todayHourly[r.hour]) todayHourly[r.hour] = emptyUsageBucket();
+      addUsageBucket(todayHourly[r.hour], { inputTokens: r.input_tokens, outputTokens: r.output_tokens, requests: r.requests, cacheCreationTokens: r.cache_creation, cacheReadTokens: r.cache_read });
+    }
+
+    for (const r of stmts.profileDailyTrend.all(suffix, key, trendStartDate)) {
+      if (trendByDate[r.date]) {
+        trendByDate[r.date].input += r.input_tokens || 0;
+        trendByDate[r.date].output += r.output_tokens || 0;
+        trendByDate[r.date].requests += r.requests || 0;
+        trendByDate[r.date].total += (r.input_tokens||0) + (r.output_tokens||0);
+      }
     }
 
     const quota = checkTokenQuota(apiKey, profile.suffix, runtime);
@@ -1734,6 +1970,88 @@ function getApiKey(req) {
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
+function makeClientAbortError(reason = "client disconnected") {
+  const err = new Error(`Client disconnected: ${reason}`);
+  err.code = "CLIENT_ABORT";
+  err.isClientAbort = true;
+  return err;
+}
+
+function isClientAbortError(err) {
+  return !!(err?.isClientAbort || err?.code === "CLIENT_ABORT");
+}
+
+function createClientAbortState() {
+  return {
+    aborted: false,
+    reason: "",
+    upstreamRequest: null,
+    listeners: new Set(),
+  };
+}
+
+function markClientAborted(state, reason) {
+  if (!state || state.aborted) return;
+  state.aborted = true;
+  state.reason = reason || "unknown";
+  if (state.upstreamRequest && !state.upstreamRequest.destroyed) {
+    state.upstreamRequest.destroy(makeClientAbortError(state.reason));
+  }
+  for (const listener of [...state.listeners]) {
+    try { listener(state.reason); } catch {}
+  }
+}
+
+function addClientAbortListener(state, listener) {
+  if (!state) return () => {};
+  if (state.aborted) {
+    listener(state.reason);
+    return () => {};
+  }
+  state.listeners.add(listener);
+  return () => state.listeners.delete(listener);
+}
+
+function setActiveUpstreamRequest(state, upReq) {
+  if (!state) return () => {};
+  state.upstreamRequest = upReq;
+  if (state.aborted && !upReq.destroyed) {
+    upReq.destroy(makeClientAbortError(state.reason));
+  }
+  return () => {
+    if (state.upstreamRequest === upReq) state.upstreamRequest = null;
+  };
+}
+
+function throwIfClientAborted(state) {
+  if (state?.aborted) throw makeClientAbortError(state.reason);
+}
+
+function sleepWithClientAbort(ms, state) {
+  if (!state) return sleep(ms);
+  return new Promise((resolve, reject) => {
+    if (state.aborted) {
+      reject(makeClientAbortError(state.reason));
+      return;
+    }
+    let done = false;
+    let cleanup = () => {};
+    const timer = setTimeout(() => {
+      if (done) return;
+      done = true;
+      cleanup();
+      resolve();
+    }, ms);
+    cleanup = addClientAbortListener(state, (reason) => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      cleanup();
+      reject(makeClientAbortError(reason));
+    });
+  });
+}
+
 // Jitter: ±25% random variation
 function jitter(ms) {
   const half = ms * 0.25;
@@ -1752,8 +2070,14 @@ function buildUpstreamPath(reqUrl, runtime) {
   return upstreamPath + reqUrl;
 }
 
-function sendUpstream(body, reqUrl, reqMethod, reqHeaders, timeout, _rt) {
+function sendUpstream(body, reqUrl, reqMethod, reqHeaders, timeout, _rt, clientState) {
   return new Promise((resolve, reject) => {
+    try {
+      throwIfClientAborted(clientState);
+    } catch (err) {
+      reject(err);
+      return;
+    }
     const runtime = _rt || rt;
     const opts = {
       hostname: runtime.upstreamUrl.hostname,
@@ -1769,6 +2093,7 @@ function sendUpstream(body, reqUrl, reqMethod, reqHeaders, timeout, _rt) {
       const chunks = [];
       upRes.on("data", (c) => chunks.push(c));
       upRes.on("end", () => {
+        cleanupUpstream();
         resolve({
           statusCode: upRes.statusCode,
           headers: upRes.headers,
@@ -1776,12 +2101,14 @@ function sendUpstream(body, reqUrl, reqMethod, reqHeaders, timeout, _rt) {
         });
       });
     });
+    const cleanupUpstream = setActiveUpstreamRequest(clientState, upReq);
 
     upReq.setTimeout(timeout, () => {
       upReq.destroy(new Error(`Upstream timeout (${timeout}ms)`));
     });
 
     upReq.on("error", (err) => {
+      cleanupUpstream();
       err.isTimeout = err.message.includes("timeout");
       reject(err);
     });
@@ -1802,6 +2129,7 @@ function proxyRequest(req, res) {
   const apiKey = getApiKey(req);
   const proxyStartTime = Date.now();
   let proxyPhase = "init";
+  const clientState = createClientAbortState();
 
   // Global IP rate limit
   const clientIp = getClientIp(req);
@@ -1817,10 +2145,18 @@ function proxyRequest(req, res) {
   });
   res.on("error", (err) => {
     console.error(`[Socket] 客户端响应错误 phase=${proxyPhase} elapsed=${Date.now() - proxyStartTime}ms user=${getUserName(apiKey, runtime)} err=${err.message}`);
+    markClientAborted(clientState, "response-error");
   });
-  req.on("close", () => {
+  req.on("aborted", () => {
     if (!res.writableEnded) {
-      console.log(`[Socket] 客户端提前断开 phase=${proxyPhase} elapsed=${Date.now() - proxyStartTime}ms user=${getUserName(apiKey, runtime)}`);
+      markClientAborted(clientState, "request-aborted");
+      console.log(`[Socket] 客户端提前断开 phase=${proxyPhase} elapsed=${Date.now() - proxyStartTime}ms user=${getUserName(apiKey, runtime)} reason=request-aborted`);
+    }
+  });
+  res.on("close", () => {
+    if (!res.writableEnded) {
+      markClientAborted(clientState, "response-closed");
+      console.log(`[Socket] 客户端提前断开 phase=${proxyPhase} elapsed=${Date.now() - proxyStartTime}ms user=${getUserName(apiKey, runtime)} reason=response-closed`);
     }
   });
 
@@ -1832,6 +2168,35 @@ function proxyRequest(req, res) {
   }
 
   const userKey = resolveUserKey(apiKey, runtime);
+  const targetUrl = strippedUrl || req.url;
+
+  // Reject unknown API keys and users not assigned to this profile before any upstream work.
+  const earlyAccess = canUseProfile(apiKey, runtime);
+  if (!earlyAccess.allowed) {
+    res.writeHead(403, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ error: earlyAccess.reason }));
+    console.log(`[拦截] ${apiKey.slice(0, 8)}**** profile=${runtime.profileName} ${req.method} ${targetUrl} ${earlyAccess.reason}`);
+    return;
+  }
+
+  // OpenAI/Codex model discovery is served locally to prevent client probes from touching upstream billing endpoints.
+  if (shouldServeLocalOpenAIModels(runtime, targetUrl) && ["GET", "HEAD"].includes(String(req.method || "GET").toUpperCase())) {
+    res.writeHead(200, { "Content-Type": "application/json", "X-Proxy-Local": "models" });
+    if (req.method === "HEAD") res.end();
+    else res.end(JSON.stringify(localOpenAIModels(runtime)));
+    console.log(`[本地] ${getUserName(apiKey, runtime)} profile=${runtime.profileName} ${req.method} ${targetUrl} 返回模型列表，不转发上游`);
+    return;
+  }
+
+  const targetValidation = validateProxyTarget(runtime, targetUrl, req.method);
+  if (!targetValidation.allowed) {
+    const status = targetValidation.statusCode || 404;
+    res.writeHead(status, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ error: targetValidation.message }));
+    recordError(apiKey, status, targetValidation.message, targetUrl, "unknown", suffix, runtime);
+    console.log(`[拦截] ${getUserName(apiKey, runtime)} profile=${runtime.profileName} ${req.method} ${targetUrl} 不转发上游`);
+    return;
+  }
 
   readBody(req, 50_000_000).then(async (body) => {
     proxyPhase = "body-read";
@@ -1872,21 +2237,6 @@ function proxyRequest(req, res) {
       res.writeHead(403, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ error: modelNotAllowedMessage(reqModel, runtime) }));
       console.log(`[拦截] ${getUserName(apiKey, runtime)} model=${reqModel} 被拒绝`);
-      return;
-    }
-
-    // Reject unknown API keys and users not assigned to this profile.
-    const access = canUseProfile(apiKey, runtime);
-    if (!access.allowed) {
-      res.writeHead(403, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: access.reason }));
-      console.log(`[拦截] ${apiKey.slice(0, 8)}**** profile=${runtime.profileName} model=${reqModel} ${access.reason}`);
-      return;
-    }
-
-    if (shouldServeLocalOpenAIModels(runtime, strippedUrl || req.url)) {
-      res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify(localOpenAIModels(runtime)));
       return;
     }
 
@@ -1946,7 +2296,6 @@ function proxyRequest(req, res) {
       const isStreamRequest = (req.headers["accept"] || "").includes("text/event-stream") ||
         (function() { try { return JSON.parse(body.toString()).stream; } catch { return false; } })();
 
-      const targetUrl = strippedUrl || req.url;
       const useResponsesAdapter = shouldAdaptOpenAIResponses(runtime, targetUrl);
 
       if (isStreamRequest && !useResponsesAdapter) {
@@ -1959,18 +2308,22 @@ function proxyRequest(req, res) {
 
       if (isStreamRequest) {
         if (useResponsesAdapter) {
-          await handleOpenAIResponsesAdapterStreamingProxy(req, res, body, reqHeaders, apiKey, reqModel, timeout, reqSource, runtime, suffix);
+          await handleOpenAIResponsesAdapterStreamingProxy(req, res, body, reqHeaders, apiKey, reqModel, timeout, reqSource, runtime, suffix, clientState);
         } else {
-          await handleStreamingProxy(req, res, body, reqHeaders, apiKey, reqModel, timeout, reqSource, runtime, suffix, strippedUrl);
+          await handleStreamingProxy(req, res, body, reqHeaders, apiKey, reqModel, timeout, reqSource, runtime, suffix, strippedUrl, clientState);
         }
       } else {
         if (useResponsesAdapter) {
-          await handleOpenAIResponsesAdapterJsonProxy(req, res, body, reqHeaders, apiKey, reqModel, timeout, reqSource, runtime, suffix);
+          await handleOpenAIResponsesAdapterJsonProxy(req, res, body, reqHeaders, apiKey, reqModel, timeout, reqSource, runtime, suffix, clientState);
         } else {
-          await handleJsonProxy(req, res, body, reqHeaders, apiKey, reqModel, timeout, reqSource, runtime, suffix, strippedUrl);
+          await handleJsonProxy(req, res, body, reqHeaders, apiKey, reqModel, timeout, reqSource, runtime, suffix, strippedUrl, clientState);
         }
       }
     } catch (err) {
+      if (isClientAbortError(err)) {
+        console.log(`[取消] ${getUserName(apiKey, runtime)} 客户端已断开，停止代理 model=${reqModel} phase=${proxyPhase}`);
+        return;
+      }
       const status = err.isTimeout ? 504 : 502;
       const label = err.isTimeout ? "Gateway Timeout" : "Bad Gateway";
       recordError(apiKey, status, `${label}: ${err.message}`, req.url, reqModel, suffix, runtime);
@@ -1995,7 +2348,7 @@ function writeSseEvent(res, event, payload) {
   res.write(`data: ${JSON.stringify(payload)}\n\n`);
 }
 
-async function handleOpenAIResponsesAdapterJsonProxy(req, res, body, reqHeaders, apiKey, reqModel, timeout, reqSource, _rt, suffix) {
+async function handleOpenAIResponsesAdapterJsonProxy(req, res, body, reqHeaders, apiKey, reqModel, timeout, reqSource, _rt, suffix, clientState) {
   const runtime = _rt || rt;
   let parsed;
   try {
@@ -2013,7 +2366,8 @@ async function handleOpenAIResponsesAdapterJsonProxy(req, res, body, reqHeaders,
 
   for (let attempt = 0; attempt <= gProxy.maxRetries; attempt++) {
     try {
-      const upRes = await sendUpstream(chatBody, "/v1/chat/completions", "POST", chatHeaders, timeout, runtime);
+      throwIfClientAborted(clientState);
+      const upRes = await sendUpstream(chatBody, "/v1/chat/completions", "POST", chatHeaders, timeout, runtime, clientState);
       const text = upRes.body.toString();
 
       if (upRes.statusCode < 500) {
@@ -2025,7 +2379,7 @@ async function handleOpenAIResponsesAdapterJsonProxy(req, res, body, reqHeaders,
         const delay = Math.round(jitter(baseDelay));
         console.log(`[重试] ${getUserName(apiKey, runtime)} ${upRes.statusCode} model=${reqModel} responses→chat 第${attempt + 1}/${gProxy.maxRetries}次 ${delay}ms后重试`);
         recordError(apiKey, upRes.statusCode, `Retryable adapter error (attempt ${attempt + 1}/${gProxy.maxRetries})`, req.url, reqModel, suffix, runtime);
-        await sleep(delay);
+        await sleepWithClientAbort(delay, clientState);
         continue;
       }
 
@@ -2071,13 +2425,17 @@ async function handleOpenAIResponsesAdapterJsonProxy(req, res, body, reqHeaders,
       res.end(JSON.stringify(responseJson));
       return;
     } catch (err) {
+      if (isClientAbortError(err)) {
+        console.log(`[取消] ${getUserName(apiKey, runtime)} adapter JSON 客户端断开 model=${reqModel}`);
+        return;
+      }
       lastError = err;
       runtime.breaker.recordFailure();
       if (attempt < gProxy.maxRetries) {
         const baseDelay = Math.min(gProxy.retryDelay * Math.pow(2, attempt), 10000);
         const delay = Math.round(jitter(baseDelay));
         console.log(`[重试] ${getUserName(apiKey, runtime)} adapter 网络错误 model=${reqModel} 第${attempt + 1}/${gProxy.maxRetries}次 ${delay}ms后重试`);
-        await sleep(delay);
+        await sleepWithClientAbort(delay, clientState);
       }
     }
   }
@@ -2091,8 +2449,9 @@ async function handleOpenAIResponsesAdapterJsonProxy(req, res, body, reqHeaders,
   }
 }
 
-async function handleOpenAIResponsesAdapterStreamingProxy(req, res, body, reqHeaders, apiKey, reqModel, timeout, reqSource, _rt, suffix) {
+async function handleOpenAIResponsesAdapterStreamingProxy(req, res, body, reqHeaders, apiKey, reqModel, timeout, reqSource, _rt, suffix, clientState) {
   const runtime = _rt || rt;
+  throwIfClientAborted(clientState);
   let parsed;
   try {
     parsed = sanitizeJson(JSON.parse(body.toString()));
@@ -2121,72 +2480,192 @@ async function handleOpenAIResponsesAdapterStreamingProxy(req, res, body, reqHea
   const transport = runtime.upstreamUrl.protocol === "https:" ? https : http;
 
   await new Promise((resolve) => {
-    let clientGone = false;
+    let clientGone = !!clientState?.aborted;
     let resolved = false;
+    let cleanupUpstream = () => {};
+    let cleanupClientAbort = () => {};
     const responseId = `resp_${crypto.randomBytes(12).toString("hex")}`;
     const createdAt = Math.floor(Date.now() / 1000);
     let model = reqModel;
     let buf = "";
     let rawSample = "";
     let sseDataLines = 0;
-    let completed = false;
-    const usage = { input_tokens: 0, output_tokens: 0 };
-    const textParts = [];
-    const messageItemId = "msg_0";
+	    let completed = false;
+	    const usage = { input_tokens: 0, output_tokens: 0 };
+	    const textParts = [];
+	    const outputItems = [];
+	    const toolCalls = new Map();
+	    let nextOutputIndex = 0;
+	    const messageItemId = "msg_0";
+	    let messageOutputIndex = null;
+	    let messageStarted = false;
+	    let messageDone = false;
 
-    const buildMessageItem = (text, status = "in_progress") => ({
-      id: messageItemId,
-      type: "message",
-      status,
-      role: "assistant",
-      content: [{ type: "output_text", text }],
-    });
+	    const buildMessageItem = (text, status = "in_progress") => ({
+	      id: messageItemId,
+	      type: "message",
+	      status,
+	      role: "assistant",
+	      content: [{ type: "output_text", text }],
+	    });
+	    const buildToolCallItem = (tool, status = "in_progress") => ({
+	      id: tool.itemId,
+	      type: "function_call",
+	      status,
+	      call_id: tool.callId,
+	      name: tool.name || "unknown",
+	      arguments: tool.arguments,
+	    });
+	    const ensureMessageItem = () => {
+	      if (messageStarted) return;
+	      messageStarted = true;
+	      messageOutputIndex = nextOutputIndex++;
+	      if (!clientGone) {
+	        writeSseEvent(res, "response.output_item.added", {
+	          type: "response.output_item.added",
+	          output_index: messageOutputIndex,
+	          item: buildMessageItem(""),
+	        });
+	        writeSseEvent(res, "response.content_part.added", {
+	          type: "response.content_part.added",
+	          item_id: messageItemId,
+	          output_index: messageOutputIndex,
+	          content_index: 0,
+	          part: { type: "output_text", text: "" },
+	        });
+	      }
+	    };
+	    const finishMessageItem = () => {
+	      if (!messageStarted || messageDone) return;
+	      messageDone = true;
+	      const outputText = textParts.join("");
+	      const messageItem = buildMessageItem(outputText, "completed");
+	      outputItems[messageOutputIndex] = messageItem;
+	      if (!clientGone) {
+	        writeSseEvent(res, "response.output_text.done", {
+	          type: "response.output_text.done",
+	          item_id: messageItemId,
+	          output_index: messageOutputIndex,
+	          content_index: 0,
+	          text: outputText,
+	        });
+	        writeSseEvent(res, "response.content_part.done", {
+	          type: "response.content_part.done",
+	          item_id: messageItemId,
+	          output_index: messageOutputIndex,
+	          content_index: 0,
+	          part: { type: "output_text", text: outputText },
+	        });
+	        writeSseEvent(res, "response.output_item.done", {
+	          type: "response.output_item.done",
+	          output_index: messageOutputIndex,
+	          item: messageItem,
+	        });
+	      }
+	    };
+	    const ensureToolCall = (call) => {
+	      const chatIndex = Number.isInteger(call?.index) ? call.index : toolCalls.size;
+	      const key = String(chatIndex);
+	      let tool = toolCalls.get(key);
+	      if (!tool) {
+	        const callId = call?.id || `call_${chatIndex}`;
+	        tool = {
+	          chatIndex,
+	          outputIndex: nextOutputIndex++,
+	          itemId: callId,
+	          callId,
+	          name: "",
+	          arguments: "",
+	          started: false,
+	          done: false,
+	        };
+	        toolCalls.set(key, tool);
+	      }
+	      if (call?.id && !tool.started) {
+	        tool.itemId = call.id;
+	        tool.callId = call.id;
+	      }
+	      if (call?.function?.name) tool.name = call.function.name;
+	      if (!tool.started) {
+	        tool.started = true;
+	        if (!clientGone) {
+	          writeSseEvent(res, "response.output_item.added", {
+	            type: "response.output_item.added",
+	            output_index: tool.outputIndex,
+	            item: buildToolCallItem(tool),
+	          });
+	        }
+	      }
+	      return tool;
+	    };
+	    const handleToolCallDelta = (call) => {
+	      if (!call || typeof call !== "object") return;
+	      const tool = ensureToolCall(call);
+	      const argDelta = typeof call.function?.arguments === "string" ? call.function.arguments : "";
+	      if (!argDelta) return;
+	      tool.arguments += argDelta;
+	      if (!clientGone) {
+	        writeSseEvent(res, "response.function_call_arguments.delta", {
+	          type: "response.function_call_arguments.delta",
+	          item_id: tool.itemId,
+	          output_index: tool.outputIndex,
+	          delta: argDelta,
+	        });
+	      }
+	    };
+	    const finishToolCalls = () => {
+	      for (const tool of [...toolCalls.values()].sort((a, b) => a.outputIndex - b.outputIndex)) {
+	        if (tool.done) continue;
+	        tool.done = true;
+	        const item = buildToolCallItem(tool, "completed");
+	        outputItems[tool.outputIndex] = item;
+	        if (!clientGone) {
+	          writeSseEvent(res, "response.function_call_arguments.done", {
+	            type: "response.function_call_arguments.done",
+	            item_id: tool.itemId,
+	            output_index: tool.outputIndex,
+	            arguments: tool.arguments,
+	          });
+	          writeSseEvent(res, "response.output_item.done", {
+	            type: "response.output_item.done",
+	            output_index: tool.outputIndex,
+	            item,
+	          });
+	        }
+	      }
+	    };
 
-    const safeResolve = () => {
-      if (!resolved) {
-        resolved = true;
+	    const safeResolve = () => {
+	      if (!resolved) {
+	        resolved = true;
+        cleanupClientAbort();
+        cleanupUpstream();
         resolve();
       }
     };
-    const finishStream = () => {
-      if (completed) return;
-      completed = true;
-      const outputText = textParts.join("");
-      const responseUsage = usageToResponsesUsage(usage);
-      const messageItem = buildMessageItem(outputText, "completed");
-      if (!clientGone) {
-        writeSseEvent(res, "response.output_text.done", {
-          type: "response.output_text.done",
-          item_id: messageItemId,
-          output_index: 0,
-          content_index: 0,
-          text: outputText,
-        });
-        writeSseEvent(res, "response.content_part.done", {
-          type: "response.content_part.done",
-          item_id: messageItemId,
-          output_index: 0,
-          content_index: 0,
-          part: { type: "output_text", text: outputText },
-        });
-        writeSseEvent(res, "response.output_item.done", {
-          type: "response.output_item.done",
-          output_index: 0,
-          item: messageItem,
-        });
-        writeSseEvent(res, "response.completed", {
-          type: "response.completed",
-          response: {
-            id: responseId,
+	    const finishStream = () => {
+	      if (completed) return;
+	      completed = true;
+	      const outputText = textParts.join("");
+	      const responseUsage = usageToResponsesUsage(usage);
+	      if (!messageStarted && toolCalls.size === 0) ensureMessageItem();
+	      finishMessageItem();
+	      finishToolCalls();
+	      const finalOutput = outputItems.filter(Boolean);
+	      if (!clientGone) {
+	        writeSseEvent(res, "response.completed", {
+	          type: "response.completed",
+	          response: {
+	            id: responseId,
             object: "response",
-            created_at: createdAt,
-            status: "completed",
-            model,
-            output: [messageItem],
-            output_text: outputText,
-            usage: responseUsage,
-          },
-        });
+	            created_at: createdAt,
+	            status: "completed",
+	            model,
+	            output: finalOutput,
+	            output_text: outputText,
+	            usage: responseUsage,
+	          },
+	        });
       }
       if (usageHasTokens(responseUsage)) {
         recordUsage(apiKey, responseUsage, model, suffix, runtime);
@@ -2227,33 +2706,21 @@ async function handleOpenAIResponsesAdapterStreamingProxy(req, res, body, reqHea
         "cache-control": "no-cache",
         "connection": "keep-alive",
       });
-      writeSseEvent(res, "response.created", {
-        type: "response.created",
-        response: {
-          id: responseId,
+	      writeSseEvent(res, "response.created", {
+	        type: "response.created",
+	        response: {
+	          id: responseId,
           object: "response",
           created_at: createdAt,
           status: "in_progress",
           model,
-          output: [],
-        },
-      });
-      writeSseEvent(res, "response.output_item.added", {
-        type: "response.output_item.added",
-        output_index: 0,
-        item: buildMessageItem(""),
-      });
-      writeSseEvent(res, "response.content_part.added", {
-        type: "response.content_part.added",
-        item_id: messageItemId,
-        output_index: 0,
-        content_index: 0,
-        part: { type: "output_text", text: "" },
-      });
+	          output: [],
+	        },
+	      });
 
-      res.on("error", () => {
-        clientGone = true;
-        upReq.destroy();
+	      res.on("error", () => {
+	        clientGone = true;
+        upReq.destroy(makeClientAbortError("response-error"));
         safeResolve();
       });
 
@@ -2271,27 +2738,34 @@ async function handleOpenAIResponsesAdapterStreamingProxy(req, res, body, reqHea
         }
         if (sseDataLines <= 3) console.log(`[SSE] ${getUserName(apiKey, runtime)} adapter 第${sseDataLines}条 类型=${d.object || d.type || "chunk"} 字段=${Object.keys(d).join(",")}`);
         if (d.model) model = d.model;
-        if (d.usage) mergeUsageCounters(usage, d.usage);
-        for (const choice of d.choices || []) {
-          const delta = choice.delta || {};
-          if (typeof delta.content === "string" && delta.content) {
-            textParts.push(delta.content);
-            if (!clientGone) {
-              writeSseEvent(res, "response.output_text.delta", {
-                type: "response.output_text.delta",
-                item_id: messageItemId,
-                output_index: 0,
-                content_index: 0,
-                delta: delta.content,
-              });
-            }
-          }
-          if (choice.message?.content) {
-            const text = extractTextContent(choice.message.content);
-            if (text) textParts.push(text);
-          }
-        }
-      };
+	        if (d.usage) mergeUsageCounters(usage, d.usage);
+	        for (const choice of d.choices || []) {
+	          const delta = choice.delta || {};
+	          if (typeof delta.content === "string" && delta.content) {
+	            ensureMessageItem();
+	            textParts.push(delta.content);
+	            if (!clientGone) {
+	              writeSseEvent(res, "response.output_text.delta", {
+	                type: "response.output_text.delta",
+	                item_id: messageItemId,
+	                output_index: messageOutputIndex,
+	                content_index: 0,
+	                delta: delta.content,
+	              });
+	            }
+	          }
+	          for (const call of delta.tool_calls || []) {
+	            handleToolCallDelta(call);
+	          }
+	          if (choice.message?.content) {
+	            const text = extractTextContent(choice.message.content);
+	            if (text) {
+	              ensureMessageItem();
+	              textParts.push(text);
+	            }
+	          }
+	        }
+	      };
 
       upRes.on("data", (chunk) => {
         if (clientGone || completed) return;
@@ -2315,11 +2789,22 @@ async function handleOpenAIResponsesAdapterStreamingProxy(req, res, body, reqHea
         finishStream();
       });
     });
+    cleanupUpstream = setActiveUpstreamRequest(clientState, upReq);
+    cleanupClientAbort = addClientAbortListener(clientState, (reason) => {
+      clientGone = true;
+      upReq.destroy(makeClientAbortError(reason));
+      safeResolve();
+    });
 
     upReq.setTimeout(timeout, () => {
       upReq.destroy(new Error(`Upstream stream timeout (${timeout}ms)`));
     });
     upReq.on("error", (err) => {
+      if (isClientAbortError(err) || clientState?.aborted) {
+        console.log(`[取消] ${getUserName(apiKey, runtime)} adapter 流式客户端断开 model=${reqModel}`);
+        safeResolve();
+        return;
+      }
       runtime.breaker.recordFailure();
       const isTimeout = err.message.includes("timeout");
       const status = isTimeout ? 504 : 502;
@@ -2339,13 +2824,14 @@ async function handleOpenAIResponsesAdapterStreamingProxy(req, res, body, reqHea
   });
 }
 
-async function handleJsonProxy(req, res, body, reqHeaders, apiKey, reqModel, timeout, reqSource, _rt, suffix, strippedUrl) {
+async function handleJsonProxy(req, res, body, reqHeaders, apiKey, reqModel, timeout, reqSource, _rt, suffix, strippedUrl, clientState) {
   const runtime = _rt || rt;
   let lastError = null;
 
   for (let attempt = 0; attempt <= gProxy.maxRetries; attempt++) {
     try {
-      const upRes = await sendUpstream(body, strippedUrl || req.url, req.method, reqHeaders, timeout, runtime);
+      throwIfClientAborted(clientState);
+      const upRes = await sendUpstream(body, strippedUrl || req.url, req.method, reqHeaders, timeout, runtime, clientState);
       const text = upRes.body.toString();
 
       // Record success to circuit breaker for non-5xx responses
@@ -2368,7 +2854,7 @@ async function handleJsonProxy(req, res, body, reqHeaders, apiKey, reqModel, tim
         const delay = Math.round(jitter(baseDelay));
         console.log(`[重试] ${getUserName(apiKey, runtime)} ${upRes.statusCode} model=${reqModel} 第${attempt + 1}/${gProxy.maxRetries}次 ${delay}ms后重试`);
         recordError(apiKey, upRes.statusCode, `Retryable error (attempt ${attempt + 1}/${gProxy.maxRetries})`, req.url, reqModel, suffix, runtime);
-        await sleep(delay);
+        await sleepWithClientAbort(delay, clientState);
         continue;
       }
 
@@ -2406,13 +2892,17 @@ async function handleJsonProxy(req, res, body, reqHeaders, apiKey, reqModel, tim
       res.end(text);
       return;
     } catch (err) {
+      if (isClientAbortError(err)) {
+        console.log(`[取消] ${getUserName(apiKey, runtime)} JSON 客户端断开 model=${reqModel}`);
+        return;
+      }
       lastError = err;
       runtime.breaker.recordFailure();
       if (attempt < gProxy.maxRetries) {
         const baseDelay = Math.min(gProxy.retryDelay * Math.pow(2, attempt), 10000);
         const delay = Math.round(jitter(baseDelay));
         console.log(`[重试] ${getUserName(apiKey, runtime)} 网络错误 model=${reqModel} 第${attempt + 1}/${gProxy.maxRetries}次 ${delay}ms后重试`);
-        await sleep(delay);
+        await sleepWithClientAbort(delay, clientState);
       }
     }
   }
@@ -2427,8 +2917,9 @@ async function handleJsonProxy(req, res, body, reqHeaders, apiKey, reqModel, tim
   }
 }
 
-async function handleStreamingProxy(req, res, body, reqHeaders, apiKey, reqModel, timeout, reqSource, _rt, suffix, strippedUrl) {
+async function handleStreamingProxy(req, res, body, reqHeaders, apiKey, reqModel, timeout, reqSource, _rt, suffix, strippedUrl, clientState) {
   const runtime = _rt || rt;
+  throwIfClientAborted(clientState);
   const opts = {
     hostname: runtime.upstreamUrl.hostname,
     port: runtime.upstreamUrl.port || (runtime.upstreamUrl.protocol === "https:" ? 443 : 80),
@@ -2441,6 +2932,18 @@ async function handleStreamingProxy(req, res, body, reqHeaders, apiKey, reqModel
   const transport = runtime.upstreamUrl.protocol === "https:" ? https : http;
 
   await new Promise((resolve, reject) => {
+    let clientGone = !!clientState?.aborted;
+    let resolved = false;
+    let cleanupUpstream = () => {};
+    let cleanupClientAbort = () => {};
+    function safeResolve() {
+      if (!resolved) {
+        resolved = true;
+        cleanupClientAbort();
+        cleanupUpstream();
+        resolve();
+      }
+    }
     const upReq = transport.request(opts, (upRes) => {
       const h = { ...upRes.headers };
       delete h["transfer-encoding"];
@@ -2451,10 +2954,11 @@ async function handleStreamingProxy(req, res, body, reqHeaders, apiKey, reqModel
       h["connection"] = "keep-alive";
       res.writeHead(upRes.statusCode, h);
 
-      let clientGone = false;
-      let resolved = false;
-      function safeResolve() { if (!resolved) { resolved = true; resolve(); } }
-      res.on("error", () => { clientGone = true; upReq.destroy(); safeResolve(); });
+      res.on("error", () => {
+        clientGone = true;
+        upReq.destroy(makeClientAbortError("response-error"));
+        safeResolve();
+      });
 
       let buf = "", usage = { input_tokens: 0, output_tokens: 0 }, model = reqModel;
       let sseDataLines = 0;
@@ -2549,12 +3053,23 @@ async function handleStreamingProxy(req, res, body, reqHeaders, apiKey, reqModel
         safeResolve();
       });
     });
+    cleanupUpstream = setActiveUpstreamRequest(clientState, upReq);
+    cleanupClientAbort = addClientAbortListener(clientState, (reason) => {
+      clientGone = true;
+      upReq.destroy(makeClientAbortError(reason));
+      safeResolve();
+    });
 
     upReq.setTimeout(timeout, () => {
       upReq.destroy(new Error(`Upstream stream timeout (${timeout}ms)`));
     });
 
     upReq.on("error", (err) => {
+      if (isClientAbortError(err) || clientState?.aborted) {
+        console.log(`[取消] ${getUserName(apiKey, runtime)} 流式客户端断开 model=${reqModel}`);
+        safeResolve();
+        return;
+      }
       runtime.breaker.recordFailure();
       const isTimeout = err.message.includes("timeout");
       const status = isTimeout ? 504 : 502;
@@ -2632,7 +3147,7 @@ function getPublicSettings() {
 // ─── Settings Page HTML ──────────────────────────────────────────────────────
 function settingsHtml(errorMsg) {
   const s = getPublicSettings();
-  const errDiv = errorMsg ? `<div style="background:rgba(248,113,113,.12);color:var(--red);padding:10px 14px;border-radius:6px;margin-bottom:16px;font-size:13px">${errorMsg}</div>` : "";
+  const errDiv = errorMsg ? `<div style="background:rgba(255,56,96,.12);color:var(--red);padding:10px 14px;border-radius:6px;margin-bottom:16px;font-size:13px">${errorMsg}</div>` : "";
 
   // Global users table rows
   const initialSuffix = s.selectedProfileSuffix || getDefaultProfileSuffix();
@@ -2649,7 +3164,7 @@ function settingsHtml(errorMsg) {
 <td><input type="text" name="gu_un_${escHtml(k)}" value="${escHtml(username)}" style="width:100%;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:4px 8px;border-radius:4px;font-size:12px" placeholder="用户名"></td>
 <td><input type="datetime-local" name="gu_ex_${escHtml(k)}" value="${escHtml(expiresAt)}" style="width:100%;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:3px 6px;border-radius:4px;font-size:11px;font-family:monospace;color-scheme:dark" title="留空=永不过期"></td>
 <td><label style="display:inline-flex;align-items:center;gap:4px;margin:0;cursor:pointer"><input type="checkbox" name="gu_dis_${escHtml(k)}" ${disabled ? "checked" : ""} style="width:auto;accent-color:var(--red)"><span style="font-size:11px;color:${disabled ? "var(--red)" : "var(--dim)"}">${disabled ? "已禁用" : "正常"}</span></label></td>
-<td><button type="button" onclick="deleteGlobalUser('${escJs(k)}')" style="background:rgba(248,113,113,.15);color:var(--red);border:none;padding:2px 8px;border-radius:4px;cursor:pointer;font-size:11px">删除</button></td></tr>`;
+<td><button type="button" onclick="deleteGlobalUser('${escJs(k)}')" style="background:rgba(255,56,96,.15);color:var(--red);border:none;padding:2px 8px;border-radius:4px;cursor:pointer;font-size:11px">删除</button></td></tr>`;
   }).join("");
 
   // Profile user rows (key assignment)
@@ -2677,10 +3192,10 @@ function settingsHtml(errorMsg) {
   return `<!DOCTYPE html>
 <html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
 <title>代理设置 - 团队AI Coding监控</title>
+${PIXEL_FONT}
 <style>
-:root{--bg:#0a0a0a;--card:#141414;--border:#2a2a2a;--text:#e5e5e5;--dim:#999;--accent:#7c6ef0;--blue:#5ba3f5;--green:#34d399;--orange:#fbbf24;--red:#f87171}
-*{margin:0;padding:0;box-sizing:border-box}
-body{font-family:-apple-system,BlinkMacSystemFont,sans-serif;background:var(--bg);color:var(--text);padding:0;overflow:hidden;height:100vh}
+${PIXEL_THEME}
+body{padding:0;overflow:hidden;height:100vh}
 .layout{display:flex;height:100vh}
 .sidebar{width:240px;min-width:240px;background:var(--card);border-right:1px solid var(--border);display:flex;flex-direction:column;overflow:hidden}
 .sidebar-hd{padding:16px 14px 10px;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between}
@@ -2693,24 +3208,25 @@ body{font-family:-apple-system,BlinkMacSystemFont,sans-serif;background:var(--bg
 .sidebar-ft{padding:10px;border-top:1px solid var(--border)}
 .pl-item{background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:10px 12px;margin-bottom:8px;position:relative;transition:border-color .15s}
 .pl-item:hover{border-color:var(--dim)}
-.pl-item.active{border-color:var(--accent);background:rgba(124,110,240,.08)}
+.pl-item.active{border-color:var(--accent);background:rgba(0,229,255,.08)}
 .pl-name{font-size:14px;font-weight:600;margin-bottom:2px}
 .pl-host{font-size:11px;color:var(--dim);font-family:monospace;word-break:break-all;margin-bottom:2px}
 .pl-users{font-size:11px;color:var(--dim)}
 .pl-actions{display:none;position:absolute;top:8px;right:8px;gap:4px}
 .pl-item:hover .pl-actions{display:flex}
 .pl-item.active .pl-actions{display:flex}
-.pl-activate{font-size:10px;padding:2px 8px;border-radius:4px;border:1px solid var(--accent);background:rgba(124,110,240,.15);color:var(--accent);cursor:pointer;white-space:nowrap}
+.pl-activate{font-size:10px;padding:2px 8px;border-radius:4px;border:1px solid var(--accent);background:rgba(0,229,255,.15);color:var(--accent);cursor:pointer;white-space:nowrap}
 .pl-activate:hover{background:var(--accent);color:#fff}
 .pl-delete{font-size:12px;padding:1px 6px;border:none;background:none;color:var(--dim);cursor:pointer;border-radius:3px}
-.pl-delete:hover{background:rgba(248,113,113,.15);color:var(--red)}
-.pl-badge{font-size:10px;padding:2px 8px;border-radius:4px;background:rgba(124,110,240,.2);color:var(--accent);white-space:nowrap}
+.pl-delete:hover{background:rgba(255,56,96,.15);color:var(--red)}
+.pl-badge{font-size:10px;padding:2px 8px;border-radius:4px;background:rgba(0,229,255,.2);color:var(--accent);white-space:nowrap}
 .main{flex:1;overflow-y:auto;padding:20px 28px}
 .main::-webkit-scrollbar{width:6px}
 .main::-webkit-scrollbar-thumb{background:var(--border);border-radius:3px}
 .main h2{font-size:14px;margin:20px 0 10px;padding-bottom:8px;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between}
 .main h2:first-of-type{margin-top:0}
-.section{background:var(--card);border:1px solid var(--border);border-radius:8px;padding:16px;margin-bottom:12px}
+.section{position:relative;background:var(--card);border:2px solid var(--border);padding:16px;margin-bottom:12px}
+.section::before{content:"";position:absolute;top:0;left:0;right:0;height:2px;background:linear-gradient(90deg,var(--accent),var(--magenta),transparent)}
 label{display:block;font-size:12px;color:var(--dim);margin-bottom:4px;margin-top:10px}
 label:first-child{margin-top:0}
 input,select,textarea{width:100%;padding:8px 12px;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:13px;font-family:monospace;outline:none}
@@ -2720,8 +3236,8 @@ input:focus,select:focus,textarea:focus{border-color:var(--accent)}
 .btn{padding:8px 20px;border:none;border-radius:6px;font-size:13px;cursor:pointer;font-weight:600}
 .btn-primary{background:var(--accent);color:#fff}
 .btn-primary:hover{opacity:.9}
-.btn-danger{background:rgba(248,113,113,.15);color:var(--red)}
-.btn-danger:hover{background:rgba(248,113,113,.25)}
+.btn-danger{background:rgba(255,56,96,.15);color:var(--red)}
+.btn-danger:hover{background:rgba(255,56,96,.25)}
 .btn-outline{background:transparent;border:1px solid var(--border);color:var(--text)}
 .btn-outline:hover{background:rgba(255,255,255,.04)}
 .btn-sm{padding:4px 12px;font-size:11px}
@@ -2730,9 +3246,9 @@ table{width:100%;border-collapse:collapse;margin-top:8px}
 th{text-align:left;padding:6px 8px;font-size:11px;color:var(--dim);border-bottom:1px solid var(--border)}
 td{padding:6px 8px;border-bottom:1px solid var(--border);font-size:12px}
 .status{display:inline-block;padding:2px 8px;border-radius:4px;font-size:11px}
-.status-ok{background:rgba(52,211,153,.15);color:var(--green)}
-.status-warn{background:rgba(251,191,36,.15);color:var(--orange)}
-.status-err{background:rgba(248,113,113,.15);color:var(--red)}
+.status-ok{background:rgba(0,255,136,.15);color:var(--green)}
+.status-warn{background:rgba(255,159,28,.15);color:var(--orange)}
+.status-err{background:rgba(255,56,96,.15);color:var(--red)}
 .note{font-size:11px;color:var(--dim);margin-top:6px}
 .presets{display:flex;gap:6px;flex-wrap:wrap;margin-top:6px}
 .preset{font-size:11px;padding:4px 10px;border-radius:4px;border:1px solid var(--border);background:var(--bg);color:var(--dim);cursor:pointer;font-family:monospace}
@@ -2749,6 +3265,20 @@ td{padding:6px 8px;border-bottom:1px solid var(--border);font-size:12px}
 .modal-body::-webkit-scrollbar{width:4px}
 .modal-body::-webkit-scrollbar-thumb{background:var(--border);border-radius:2px}
 @media(max-width:768px){.layout{flex-direction:column}.sidebar{width:100%;min-width:0;max-height:200px}.row3{grid-template-columns:1fr 1fr}}
+.pl-item,.section,.modal,.preset,.btn,input,select,textarea{border-radius:0!important}/*pixel: force sharp corners over inline modal styles*/
+.sidebar{border-right:2px solid var(--accent);box-shadow:var(--glow)}
+.sidebar-hd h1{font-family:var(--font-pixel);font-size:11px;color:var(--accent);letter-spacing:1px}
+.sidebar-hd a{font-family:'VT323',monospace;font-size:14px}
+.main h2{font-family:var(--font-pixel);font-size:11px;border-bottom:2px solid var(--accent);color:var(--text);letter-spacing:1px}
+.modal{border:2px solid var(--accent);box-shadow:8px 8px 0 0 var(--accent),var(--glow)}
+.modal-hd h3{font-family:var(--font-pixel);font-size:12px;color:var(--accent);letter-spacing:1px}
+.btn-primary{color:var(--bg);box-shadow:4px 4px 0 0 var(--magenta);transition:transform .08s,box-shadow .08s}
+.btn-primary:hover{transform:translate(-2px,-2px);box-shadow:6px 6px 0 0 var(--magenta);opacity:1}
+.btn-primary:active{transform:translate(2px,2px);box-shadow:1px 1px 0 0 var(--magenta)}
+input,select,textarea{font-family:'VT323',monospace;font-size:14px;letter-spacing:1px}
+input:focus,select:focus,textarea:focus{box-shadow:var(--glow)}
+label,.note,.pl-host,.pl-users,.preset,.status{font-family:'VT323',monospace}
+.pl-host,.preset{letter-spacing:.5px}
 </style></head><body>
 <div class="layout">
 <div class="sidebar">
@@ -2788,7 +3318,7 @@ ${errDiv}
   <option value="none" ${s.responsesAdapter === "none" ? "selected" : ""}>透明转发 /v1/responses</option>
   <option value="chat_completions" ${s.responsesAdapter === "chat_completions" ? "selected" : ""}>将 /v1/responses 转为 /v1/chat/completions</option>
 </select>
-<div class="note">当上游只有 Chat Completions、没有 Responses 或 Models 端点时启用。启用后 /v1/models 由本平台按允许模型列表返回。</div>
+<div class="note">所有 OpenAI 方案的 /v1/models 都由本平台按允许模型列表本地返回，避免客户端探测打到上游。上游只有 Chat Completions、没有 Responses 端点时启用此兼容模式。</div>
 </div>
 <div class="note" id="accessUrlPreview" style="margin-top:8px;color:var(--green)">接入地址: http://&lt;host&gt;:6789/v1</div>
 <div class="presets">
@@ -2891,7 +3421,7 @@ ${errDiv}
 <div><label>配额上限</label><input type="number" name="aqMaxQuota" value="${s.autoQuotaAdjust?.maxAutoQuota ?? 10000000}" min="0" step="100000"><span class="note">自动调整不超过此值</span></div>
 <div><label>冷却天数</label><input type="number" name="aqCooldown" value="${s.autoQuotaAdjust?.cooldownDays ?? 3}" min="1" max="30"><span class="note">两次调整最小间隔</span></div>
 </div>
-${(store.quotaAdjustHistory && store.quotaAdjustHistory.length > 0) ? `<h4 style="font-size:13px;color:var(--accent);margin:16px 0 8px">调整历史</h4><table style="width:100%;border-collapse:collapse;font-size:12px"><thead><tr><th style="text-align:left;padding:4px 8px;border-bottom:1px solid var(--border)">时间</th><th style="text-align:left;padding:4px 8px;border-bottom:1px solid var(--border)">用户</th><th style="text-align:right;padding:4px 8px;border-bottom:1px solid var(--border)">旧配额</th><th style="text-align:right;padding:4px 8px;border-bottom:1px solid var(--border)">新配额</th><th style="text-align:right;padding:4px 8px;border-bottom:1px solid var(--border)">命中率</th><th style="text-align:right;padding:4px 8px;border-bottom:1px solid var(--border)">日均用量</th></tr></thead><tbody>${store.quotaAdjustHistory.slice(-20).reverse().map(h => `<tr><td style="padding:4px 8px">${h.date}</td><td style="padding:4px 8px">${h.username || h.user.slice(0, 8)}</td><td style="text-align:right;padding:4px 8px">${(h.oldQuota || 0).toLocaleString()}</td><td style="text-align:right;padding:4px 8px;color:var(--green)">${(h.newQuota || 0).toLocaleString()}</td><td style="text-align:right;padding:4px 8px">${Math.round((h.hitRate || 0) * 100)}%</td><td style="text-align:right;padding:4px 8px">${(h.avgDailyUsage || 0).toLocaleString()}</td></tr>`).join("")}</tbody></table>` : '<div class="note" style="margin-top:8px">暂无自动调整记录</div>'}
+${((() => { const qa = stmts.quotaAdjustRecent.all(); return qa.length > 0 ? `<h4 style="font-size:13px;color:var(--accent);margin:16px 0 8px">调整历史</h4><table style="width:100%;border-collapse:collapse;font-size:12px"><thead><tr><th style="text-align:left;padding:4px 8px;border-bottom:1px solid var(--border)">时间</th><th style="text-align:left;padding:4px 8px;border-bottom:1px solid var(--border)">用户</th><th style="text-align:right;padding:4px 8px;border-bottom:1px solid var(--border)">旧配额</th><th style="text-align:right;padding:4px 8px;border-bottom:1px solid var(--border)">新配额</th><th style="text-align:right;padding:4px 8px;border-bottom:1px solid var(--border)">命中率</th><th style="text-align:right;padding:4px 8px;border-bottom:1px solid var(--border)">日均用量</th></tr></thead><tbody>${qa.map(h => `<tr><td style="padding:4px 8px">${h.date}</td><td style="padding:4px 8px">${h.user_name || h.user_key.slice(0, 8)}</td><td style="text-align:right;padding:4px 8px">${(h.old_quota || 0).toLocaleString()}</td><td style="text-align:right;padding:4px 8px;color:var(--green)">${(h.new_quota || 0).toLocaleString()}</td><td style="text-align:right;padding:4px 8px">${Math.round((h.hit_rate || 0) * 100)}%</td><td style="text-align:right;padding:4px 8px">${(h.avg_daily_usage || 0).toLocaleString()}</td></tr>`).join("")}</tbody></table>` : '<div class="note" style="margin-top:8px">暂无自动调整记录</div>'; })())}
 </div>
 
 <div class="actions">
@@ -3134,7 +3664,7 @@ function addGlobalUser(){
     +'<td><input type="text" name="gu_un_new_'+vk+'" placeholder="用户名" style="width:100%;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:4px 8px;border-radius:4px;font-size:12px"></td>'
     +'<td><input type="datetime-local" name="gu_ex_new_'+vk+'" style="width:100%;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:3px 6px;border-radius:4px;font-size:11px;color-scheme:dark"></td>'
     +'<td><label style="display:inline-flex;align-items:center;gap:4px;margin:0;cursor:pointer"><input type="checkbox" name="gu_dis_new_'+vk+'" style="width:auto;accent-color:var(--red)"><span style="font-size:11px;color:var(--dim)">正常</span></label></td>'
-    +'<td><button type="button" onclick="this.closest(\\'tr\\').remove()" style="background:rgba(248,113,113,.15);color:var(--red);border:none;padding:2px 8px;border-radius:4px;cursor:pointer;font-size:11px">删除</button></td>';
+    +'<td><button type="button" onclick="this.closest(\\'tr\\').remove()" style="background:rgba(255,56,96,.15);color:var(--red);border:none;padding:2px 8px;border-radius:4px;cursor:pointer;font-size:11px">删除</button></td>';
   tbody.appendChild(tr);
   SETTINGS.globalUsers[vk]={username:'',expiresAt:'',disabled:false};
   for(const p of SETTINGS.profiles){if(!SETTINGS.profileAssignments[p.suffix])SETTINGS.profileAssignments[p.suffix]={}}
@@ -3176,43 +3706,63 @@ function dashboardHtml() {
   return `<!DOCTYPE html>
 <html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
 <title>团队AI Coding监控</title>
+${PIXEL_FONT}
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js"><\/script>
 <style>
-:root{--bg:#0a0a0a;--card:#141414;--border:#2a2a2a;--text:#e5e5e5;--dim:#999;--accent:#7c6ef0;--blue:#5ba3f5;--green:#34d399;--orange:#fbbf24;--red:#f87171}
-*{margin:0;padding:0;box-sizing:border-box}
-body{font-family:-apple-system,BlinkMacSystemFont,sans-serif;background:var(--bg);color:var(--text);padding:20px 24px}
-h1{font-size:20px;margin-bottom:4px}.meta{font-size:12px;color:var(--dim);margin-bottom:20px}
-.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px;margin-bottom:20px}
-.card{background:var(--card);border:1px solid var(--border);border-radius:8px;padding:14px 16px}
-.card .l{font-size:12px;color:var(--dim);margin-bottom:4px}.card .v{font-size:22px;font-weight:700;font-variant-numeric:tabular-nums}
-.tabs{display:flex;gap:4px;margin-bottom:16px;background:var(--card);border-radius:6px;padding:3px;width:fit-content}
-.tab{padding:6px 16px;font-size:13px;border:none;background:transparent;color:var(--dim);cursor:pointer;border-radius:5px}
-.tab.on{background:var(--accent);color:#fff}
+${PIXEL_THEME}
+body{padding:22px 26px}
+.top,.meta,.tabs,.grid,.box,.sec{animation:boot-in .45s ease-out both}
+.top{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-bottom:6px}
+.top h1{font-family:var(--font-pixel);font-size:18px;color:var(--accent);text-shadow:0 0 14px rgba(34,233,255,.7),0 0 4px rgba(34,233,255,.9);letter-spacing:1px;line-height:1.6}
+.top h1::after{content:"";display:block;width:130px;height:3px;margin-top:8px;background:linear-gradient(90deg,var(--accent),var(--magenta),transparent);box-shadow:0 0 8px var(--accent)}
+.top .sub{font-family:'Pixelify Sans',monospace;font-weight:500;font-size:15px;color:var(--dim);letter-spacing:1px;margin-top:8px;display:flex;align-items:center;gap:7px}
+.top .sub b{color:var(--green);font-weight:600;letter-spacing:2px}
+.controls{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.controls select,.controls a,.controls button{font-family:'VT323',monospace;font-size:15px;background:var(--card);color:var(--text);border:2px solid var(--border);padding:5px 11px;cursor:pointer;letter-spacing:1px;text-decoration:none;line-height:1.4}
+.controls select:focus,.controls a:hover,.controls button:hover{border-color:var(--accent);color:var(--accent)}
+.controls .ar-on{border-color:var(--green);color:var(--green);box-shadow:0 0 8px rgba(0,255,136,.35)}
+.controls .ar-off{color:var(--dim)}
+.meta{font-family:'VT323',monospace;font-size:15px;color:var(--dim);margin-bottom:18px;letter-spacing:1px;border-left:3px solid var(--accent);padding:2px 0 2px 10px}
+.meta b{color:var(--accent);font-weight:400}
+.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px;margin-bottom:22px}
+.card{background:linear-gradient(180deg,var(--card2),var(--card));border:2px solid var(--border);padding:16px 16px 14px;position:relative;overflow:hidden;transition:transform .12s,border-color .12s,box-shadow .12s}
+.card::after{content:"";position:absolute;top:0;left:0;right:0;height:2px;background:linear-gradient(90deg,var(--accent),var(--magenta));opacity:.9}
+.card:hover{transform:translate(-3px,-3px);border-color:var(--accent);box-shadow:5px 5px 0 0 var(--accent),-3px -3px 0 0 var(--magenta),var(--glow)}
+.card .l{font-family:'Pixelify Sans',monospace;font-weight:600;font-size:14px;color:var(--dim);margin-bottom:8px;letter-spacing:1px;text-transform:uppercase}
+.card .v{font-size:15px}
+.tabs{display:flex;gap:4px;margin-bottom:16px;background:var(--card);border:2px solid var(--border);padding:3px;width:fit-content}
+.tab{padding:6px 16px;font-family:'VT323',monospace;font-size:15px;border:none;background:transparent;color:var(--dim);cursor:pointer;letter-spacing:1px}
+.tab:hover{color:var(--text)}
+.tab.on{background:var(--accent);color:var(--bg);font-weight:700}
 .grid{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-bottom:20px}
-.box{background:var(--card);border:1px solid var(--border);border-radius:8px;padding:16px}
-.box h3{font-size:12px;color:var(--dim);margin-bottom:10px}
+.box{position:relative;background:var(--card);border:2px solid var(--border);padding:16px}
+.box::before,.box::after{content:"";position:absolute;width:12px;height:12px;border:2px solid var(--accent);pointer-events:none;opacity:.6}
+.box::before{top:-2px;left:-2px;border-right:0;border-bottom:0}.box::after{bottom:-2px;right:-2px;border-left:0;border-top:0}
+.box h3{font-family:'Pixelify Sans',monospace;font-weight:600;font-size:15px;color:var(--accent);margin-bottom:10px;letter-spacing:1px;text-transform:uppercase;text-shadow:0 0 8px rgba(34,233,255,.5)}
+.box h3::before{content:"// ";color:var(--magenta)}
 .box canvas{max-height:260px}
-.sec{background:var(--card);border:1px solid var(--border);border-radius:8px;overflow:hidden;margin-bottom:20px}
-.sec h3{font-size:12px;color:var(--dim);padding:12px 16px 0;margin:0}
+.sec{background:var(--card);border:2px solid var(--border);overflow:hidden;margin-bottom:20px}
+.sec>h3{font-family:'Pixelify Sans',monospace;font-weight:600;font-size:15px;color:var(--accent);padding:12px 16px 0;margin:0;letter-spacing:1px;text-transform:uppercase;text-shadow:0 0 8px rgba(34,233,255,.5)}
 .sec-collapsible h3{display:flex;align-items:center;gap:6px;cursor:pointer;user-select:none;padding:12px 16px}
 .sec-collapsible h3:hover{color:var(--text)}
-.sec-toggle{display:inline-block;width:16px;font-size:10px;transition:transform .2s;flex-shrink:0;color:var(--dim)}
+.sec-toggle{display:inline-block;width:16px;font-size:10px;transition:transform .2s;flex-shrink:0;color:var(--accent)}
 .sec-toggle.open{transform:rotate(90deg)}
-.sec-hint{font-size:11px;color:var(--dim);font-weight:400;margin-left:auto}
+.sec-hint{font-family:'VT323',monospace;font-size:13px;color:var(--dim);font-weight:400;margin-left:auto}
 .sec-body{display:none;padding:0 16px 12px}
 .sec-body.open{display:block}
 .sec-body table{margin-top:0}
 .sec-body .empty{padding:16px 0}
 table{width:100%;border-collapse:collapse}
-th{text-align:left;padding:8px 16px;font-size:11px;color:var(--dim);border-bottom:1px solid var(--border)}
-td{padding:8px 16px;font-size:13px;border-bottom:1px solid var(--border)}
-tr:last-child td{border-bottom:none}tr:hover td{background:rgba(255,255,255,.02)}
+th{text-align:left;padding:8px 16px;font-family:'Pixelify Sans',monospace;font-weight:600;font-size:13px;color:#b4bcd9;border-bottom:2px solid var(--accent);letter-spacing:1px;text-transform:uppercase}
+td{padding:8px 16px;font-size:14px;border-bottom:1px solid var(--border)}
+tr:last-child td{border-bottom:none}tbody tr{transition:background .1s}tbody tr:hover td{background:rgba(0,229,255,.05)}
 .n{font-variant-numeric:tabular-nums;text-align:right}
 .hl{color:var(--accent);font-weight:600}
-.empty{color:var(--dim);padding:24px;text-align:center;font-size:13px}
+code{font-family:'VT323',monospace;color:var(--accent);font-size:14px}
+.empty{font-family:'VT323',monospace;color:var(--dim);padding:24px;text-align:center;font-size:15px;letter-spacing:1px}
 @media(max-width:768px){.grid{grid-template-columns:1fr}.cards{grid-template-columns:1fr 1fr}}
 </style></head><body>
-<h1>团队AI Coding监控 <span style="float:right;font-size:12px;display:flex;gap:8px;align-items:center"><select id="profileSel" style="font-size:12px;background:var(--card);color:var(--text);border:1px solid var(--border);padding:4px 8px;border-radius:4px;cursor:pointer;max-width:160px" onchange="switchProfileView(this.value)"><option value="">全部方案</option></select><a href="/settings" style="color:var(--dim);text-decoration:none;font-size:12px;padding:4px 10px;border:1px solid var(--border);border-radius:4px">设置</a><button id="autoRefreshBtn" style="font-size:12px;background:rgba(52,211,153,.15);color:var(--green);border:none;padding:4px 12px;border-radius:4px;cursor:pointer">自动刷新: 开</button><button onclick="fetch('/api/logout',{method:'POST',headers:{'x-csrf-token':(document.cookie.match(/tm_csrf=([^;]+)/)||[])[1]||''}}).then(()=>location.reload())" style="font-size:12px;background:rgba(255,255,255,.06);color:var(--dim);border:none;padding:4px 12px;border-radius:4px;cursor:pointer">退出</button></span></h1>
+<div class="top"><div><h1 class="glitch">CODING MONITOR</h1><div class="sub"><span class="eq"><i></i><i></i><i></i><i></i></span>团队 AI 用量监控 <b>// LIVE</b></div></div><div class="controls"><select id="profileSel" onchange="switchProfileView(this.value)"><option value="">全部方案</option></select><a href="/settings">设置</a><button id="autoRefreshBtn" class="ar-on">自动刷新: 开</button><button onclick="fetch('/api/logout',{method:'POST',headers:{'x-csrf-token':(document.cookie.match(/tm_csrf=([^;]+)/)||[])[1]||''}}).then(()=>location.reload())">退出</button></div></div>
 <div class="meta" id="meta">Loading...</div>
 <div class="cards" id="cards"></div>
 <div class="sec" id="profileSummarySec" style="display:none"><h3>方案中心</h3><table><thead><tr><th>方案</th><th>入口</th><th>上游</th><th class="n">今日请求</th><th class="n">今日用量</th><th>状态</th></tr></thead><tbody id="profileSummaryBody"></tbody></table></div>
@@ -3234,14 +3784,16 @@ tr:last-child td{border-bottom:none}tr:hover td{background:rgba(255,255,255,.02)
 <div class="sec sec-collapsible" id="detailSec"><h3 onclick="toggleSec('detailSec')"><span class="sec-toggle" id="detailSecIcon">▶</span>明细记录<span class="sec-hint" id="detailHint"></span></h3><div class="sec-body" id="detailSecBody"><table id="dTable"><thead>
 <tr><th>时间</th><th>用户</th><th class="n">请求数</th><th class="n">输入</th><th class="n">输出</th><th class="n">缓存写入</th><th class="n">缓存命中</th><th class="n">合计</th></tr>
 </thead><tbody></tbody></table></div></div>
-<div class="sec sec-collapsible" id="errorSec"><h3 onclick="toggleSec('errorSec')"><span class="sec-toggle" id="errorSecIcon">▶</span>错误记录<span id="errorCount" style="font-size:11px;color:var(--red);font-weight:400;margin-left:4px"></span><span class="sec-hint" id="errorHint" style="margin-left:auto"></span><button id="clearErrors" onclick="event.stopPropagation()" style="font-size:11px;background:rgba(248,113,113,.15);color:var(--red);border:none;padding:2px 10px;border-radius:4px;cursor:pointer;margin-left:8px">清除</button></h3><div class="sec-body" id="errorSecBody"><table id="eTable"><thead>
+<div class="sec sec-collapsible" id="errorSec"><h3 onclick="toggleSec('errorSec')"><span class="sec-toggle" id="errorSecIcon">▶</span>错误记录<span id="errorCount" style="font-size:11px;color:var(--red);font-weight:400;margin-left:4px"></span><span class="sec-hint" id="errorHint" style="margin-left:auto"></span><button id="clearErrors" onclick="event.stopPropagation()" style="font-family:'VT323',monospace;font-size:14px;background:rgba(255,56,96,.15);color:var(--red);border:1px solid var(--red);padding:2px 10px;cursor:pointer;margin-left:8px;letter-spacing:1px">清除</button></h3><div class="sec-body" id="errorSecBody"><table id="eTable"><thead>
 <tr><th>时间</th><th>用户</th><th class="n">状态码</th><th>模型</th><th>路径</th><th>错误信息</th></tr>
 </thead><tbody></tbody></table>
 <div id="errPages" style="padding:8px 0;text-align:right"></div></div></div>
 <script>
+${PIXEL_JS}
+Chart.defaults.color='#9aa0c8';Chart.defaults.font.family="'Pixelify Sans',monospace";Chart.defaults.font.size=11;
 let D=null,P="day",C={t:null,p:null,m:null,h:null},errPage=1,autoRefresh=true,refreshTimer=null,currentProfile="all";
 const ERR_PAGE_SIZE=20;
-const COL=["#7c6ef0","#5ba3f5","#34d399","#fbbf24","#f87171","#f472b6","#a78bfa","#38bdf8"];
+const COL=["#00e5ff","#ff2d95","#00ff88","#ffd23f","#b14eff","#ff3860","#29e7ff","#ff9f1c"];
 const escH=s=>String(s??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 const fmtT=n=>n.toLocaleString("zh-CN");
 const fmtTk=n=>{if(n>=1e6)return(n/1e6).toFixed(1)+"M";if(n>=1e3)return(n/1e3).toFixed(1)+"k";return n.toString()};
@@ -3250,7 +3802,7 @@ function ago(iso){if(!iso)return"-";const d=Date.now()-new Date(iso).getTime();c
 function wk(s){const d=new Date(s),day=d.getDay()||7,mon=new Date(d);mon.setDate(d.getDate()-day+1);return mon.toISOString().slice(0,10)}
 function grp(daily,p){const g={};for(const[day,ud]of Object.entries(daily)){const k=p==="week"?wk(day):p==="month"?day.slice(0,7):p==="year"?day.slice(0,4):day;if(!g[k])g[k]={};for(const[u,s]of Object.entries(ud)){if(!g[k][u])g[k][u]={inputTokens:0,outputTokens:0,requests:0,cacheCreationTokens:0,cacheReadTokens:0};g[k][u].inputTokens+=s.inputTokens;g[k][u].outputTokens+=s.outputTokens;g[k][u].requests+=s.requests;g[k][u].cacheCreationTokens+=(s.cacheCreationTokens||0);g[k][u].cacheReadTokens+=(s.cacheReadTokens||0)}}return g}
 function lbl(p,k){if(p==="day")return k.slice(5);if(p==="week")return k.slice(5)+" 周";if(p==="month")return k;return k+"年"}
-function c(l,v,cl){return'<div class="card"><div class="l">'+l+'</div><div class="v" style="color:'+cl+'">'+v+'</div></div>'}
+function c(l,v,cl,k){return'<div class="card"><div class="l">'+l+'</div><div class="v" data-cu="'+v+'"'+(k?' data-cu-k':'')+' style="color:'+cl+'">0</div></div>'}
 function switchProfileView(v){currentProfile=v||"all";load()}
 function render(){
   if(!D)return;
@@ -3267,9 +3819,10 @@ function render(){
   const us=Object.values(D.users),ti=us.reduce((s,u)=>s+u.totalInputTokens,0),to=us.reduce((s,u)=>s+u.totalOutputTokens,0),tr=us.reduce((s,u)=>s+u.totalRequests,0);
   const td=new Date(Date.now()+8*36e5).toISOString().slice(0,10),tdd=(D.daily||{})[td]||{};
   const tIn=Object.values(tdd).reduce((s,d)=>s+d.inputTokens,0),tOut=Object.values(tdd).reduce((s,d)=>s+d.outputTokens,0),tR=Object.values(tdd).reduce((s,d)=>s+d.requests,0);
-  document.getElementById("cards").innerHTML=c("今日用量",fmtT(tIn+tOut),"var(--accent)")+c("今日请求",fmtT(tR),"var(--blue)")+c("总用量",fmtT(ti+to),"var(--green)")+c("总请求",fmtT(tr),"var(--orange)")+c("今日错误",fmtT((Array.isArray(D.errors)?D.errors:[]).filter(e=>e.time&&e.time.startsWith(td)).length),"var(--red)");
+  document.getElementById("cards").innerHTML=c("今日用量",tIn+tOut,"var(--accent)",1)+c("今日请求",tR,"var(--blue)",1)+c("总用量",ti+to,"var(--green)",1)+c("总请求",tr,"var(--orange)",1)+c("今日错误",(Array.isArray(D.errors)?D.errors:[]).filter(e=>e.time&&e.time.startsWith(td)).length,"var(--red)",1);
+  runCountUps(document.getElementById("cards"));
   const ps=document.getElementById("profileSummarySec"),psb=document.getElementById("profileSummaryBody");
-  if(currentProfile==="all"&&Array.isArray(D.profileSummaries)){ps.style.display="block";psb.innerHTML=D.profileSummaries.map(p=>{const st=p.breakerState||"UNKNOWN";const col=st==="CLOSED"?"var(--green)":st==="HALF_OPEN"?"var(--orange)":"var(--red)";return'<tr><td>'+escH(p.name)+(p.isDefault?' <span style="color:var(--green);font-size:11px">默认入口</span>':'')+'</td><td><code>/'+escH(p.suffix)+'</code>'+(p.isDefault?' 或 <code>/v1</code>':'')+'</td><td style="font-size:12px;color:var(--dim);max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+escH((p.upstream||'').replace('https://','').replace('http://',''))+'</td><td class="n">'+fmtT(p.todayRequests||0)+'</td><td class="n hl">'+fmtT(p.todayTokens||0)+'</td><td style="color:'+col+'">'+st+'</td></tr>'}).join('')}else{ps.style.display="none"}
+  if(currentProfile==="all"&&Array.isArray(D.profileSummaries)){ps.style.display="block";psb.innerHTML=D.profileSummaries.map(p=>{const st=p.breakerState||"UNKNOWN";const col=st==="CLOSED"?"var(--green)":st==="HALF_OPEN"?"var(--orange)":"var(--red)";const led=st==="CLOSED"?"on":st==="HALF_OPEN"?"warn":"err";const lbl=st==="CLOSED"?"正常":st==="HALF_OPEN"?"探测中":"熔断";return'<tr><td>'+escH(p.name)+(p.isDefault?' <span style="color:var(--green);font-family:var(--font-pixel);font-size:9px;vertical-align:middle">DEF</span>':'')+'</td><td><code>/'+escH(p.suffix)+'</code>'+(p.isDefault?' <span style="color:var(--dim)">/ <code>/v1</code></span>':'')+'</td><td style="font-size:13px;color:var(--dim);max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+escH((p.upstream||'').replace('https://','').replace('http://',''))+'</td><td class="n">'+fmtT(p.todayRequests||0)+'</td><td class="n hl">'+fmtT(p.todayTokens||0)+'</td><td><span class="led '+led+'"></span><span style="color:'+col+';font-size:13px">'+lbl+'</span></td></tr>'}).join('')}else{ps.style.display="none"}
   const profileLabel=D.profileView||(currentProfile==="all"?"全部方案":"默认方案");
   const upstreamInfo=D.upstream?(" | 上游: "+D.upstream.replace("https://","").replace("http://","")):"";
   document.getElementById("meta").innerHTML='<span style="color:var(--accent);font-weight:600">方案: '+profileLabel+'</span>'+upstreamInfo+' &nbsp;|&nbsp; 更新于 '+(function(){const d=new Date();const utc=d.getTime()+d.getTimezoneOffset()*60000;return new Date(utc+8*3600000).toLocaleTimeString("zh-CN")})()+" (北京时间) | 每30秒刷新";
@@ -3277,13 +3830,13 @@ function render(){
   // Charts
   const g=grp(D.daily||{},P),keys=Object.keys(g).sort(),uks=Object.keys(D.users);
   if(C.t)C.t.destroy();if(C.p)C.p.destroy();if(C.m)C.m.destroy();if(C.h)C.h.destroy();
-  C.t=new Chart(document.getElementById("trend"),{type:"bar",data:{labels:keys.map(k=>lbl(P,k)),datasets:uks.map((u,i)=>({label:D.users[u].name,data:keys.map(k=>(g[k][u]||{}).inputTokens+(g[k][u]||{}).outputTokens||0),backgroundColor:COL[i%COL.length]+"cc",borderRadius:3,borderSkipped:false}))},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{labels:{color:"#999",font:{size:11}}},tooltip:{callbacks:{label:ctx=>ctx.dataset.label+": "+fmtT(ctx.raw)}}},scales:{x:{stacked:true,ticks:{color:"#666",font:{size:10}},grid:{color:"#1a1a1a"}},y:{stacked:true,ticks:{color:"#666",callback:v=>fmtTk(v)},grid:{color:"#1a1a1a"}}}}});
+  C.t=new Chart(document.getElementById("trend"),{type:"bar",data:{labels:keys.map(k=>lbl(P,k)),datasets:uks.map((u,i)=>({label:D.users[u].name,data:keys.map(k=>(g[k][u]||{}).inputTokens+(g[k][u]||{}).outputTokens||0),backgroundColor:COL[i%COL.length]+"cc",borderRadius:3,borderSkipped:false}))},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{labels:{color:"#9aa0c8",font:{size:11}}},tooltip:{callbacks:{label:ctx=>ctx.dataset.label+": "+fmtT(ctx.raw)}}},scales:{x:{stacked:true,ticks:{color:"#6f6f8f",font:{size:10}},grid:{color:"rgba(0,229,255,.08)"}},y:{stacked:true,ticks:{color:"#6f6f8f",callback:v=>fmtTk(v)},grid:{color:"rgba(0,229,255,.08)"}}}}});
   const tot=uks.map(u=>{let t=0;for(const k of keys)t+=(g[k][u]||{}).inputTokens+(g[k][u]||{}).outputTokens||0;return t});
-  C.p=new Chart(document.getElementById("pie"),{type:"doughnut",data:{labels:uks.map(k=>D.users[k].name),datasets:[{data:tot,backgroundColor:uks.map((_,i)=>COL[i%COL.length]+"cc"),borderWidth:0}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{position:"right",labels:{color:"#999",font:{size:11},padding:12}},tooltip:{callbacks:{label:ctx=>ctx.label+": "+fmtT(ctx.raw)+" tokens"}}},cutout:"55%"}});
+  C.p=new Chart(document.getElementById("pie"),{type:"doughnut",data:{labels:uks.map(k=>D.users[k].name),datasets:[{data:tot,backgroundColor:uks.map((_,i)=>COL[i%COL.length]+"cc"),borderWidth:0}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{position:"right",labels:{color:"#9aa0c8",font:{size:11},padding:12}},tooltip:{callbacks:{label:ctx=>ctx.label+": "+fmtT(ctx.raw)+" tokens"}}},cutout:"55%"}});
 
   // 模型分布
   const mods=D.models||{};const mNames=Object.keys(mods);
-  C.m=new Chart(document.getElementById("modelChart"),{type:"doughnut",data:{labels:mNames,datasets:[{data:mNames.map(m=>mods[m].tokens),backgroundColor:mNames.map((_,i)=>COL[i%COL.length]+"cc"),borderWidth:0}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{position:"right",labels:{color:"#999",font:{size:11},padding:12}},tooltip:{callbacks:{label:ctx=>ctx.label+": "+fmtT(ctx.raw)+" tokens"}}},cutout:"55%"}});
+  C.m=new Chart(document.getElementById("modelChart"),{type:"doughnut",data:{labels:mNames,datasets:[{data:mNames.map(m=>mods[m].tokens),backgroundColor:mNames.map((_,i)=>COL[i%COL.length]+"cc"),borderWidth:0}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{position:"right",labels:{color:"#9aa0c8",font:{size:11},padding:12}},tooltip:{callbacks:{label:ctx=>ctx.label+": "+fmtT(ctx.raw)+" tokens"}}},cutout:"55%"}});
 
   // 24小时趋势图
   const hrs=[];for(let i=0;i<24;i++)hrs.push(i.toString().padStart(2,"0")+":00");
@@ -3291,12 +3844,12 @@ function render(){
   const hReq=hrs.map((_,i)=>{const h=todayHourly[i.toString().padStart(2,"0")];return typeof h==="object"?(h.requests||0):0});
   const hIn=hrs.map((_,i)=>{const h=todayHourly[i.toString().padStart(2,"0")];return typeof h==="object"?(h.inputTokens||0):0});
   const hOut=hrs.map((_,i)=>{const h=todayHourly[i.toString().padStart(2,"0")];return typeof h==="object"?(h.outputTokens||0):0});
-  C.h=new Chart(document.getElementById("hourChart"),{type:"line",data:{labels:hrs,datasets:[{label:"请求数",data:hReq,borderColor:"#5ba3f5",backgroundColor:"rgba(91,163,245,.12)",fill:true,tension:.4,pointRadius:3,pointBackgroundColor:"#5ba3f5",pointHoverRadius:6,borderWidth:2.5,yAxisID:"y"},{label:"输入",data:hIn,borderColor:"#a78bfa",backgroundColor:"rgba(167,139,250,.12)",fill:true,tension:.4,pointRadius:3,pointBackgroundColor:"#a78bfa",pointHoverRadius:6,borderWidth:2.5,yAxisID:"y1"},{label:"输出",data:hOut,borderColor:"#f87171",backgroundColor:"rgba(248,113,113,.12)",fill:true,tension:.4,pointRadius:3,pointBackgroundColor:"#f87171",pointHoverRadius:6,borderWidth:2.5,yAxisID:"y1"}]},options:{responsive:true,maintainAspectRatio:false,interaction:{mode:"index",intersect:false},plugins:{legend:{labels:{color:"#999",font:{size:11},usePointStyle:true,pointStyle:"circle"}},tooltip:{callbacks:{label:ctx=>ctx.dataset.label+": "+fmtT(ctx.raw)}}},scales:{x:{ticks:{color:"#666",font:{size:9},maxRotation:0,autoSkip:true,maxTicksLimit:12},grid:{display:false}},y:{type:"linear",position:"left",ticks:{color:"#5ba3f5"},grid:{color:"#1a1a1a"},title:{display:true,text:"请求数",color:"#5ba3f5",font:{size:10}}},y1:{type:"linear",position:"right",ticks:{color:"#a78bfa",callback:v=>fmtTk(v)},grid:{drawOnChartArea:false},title:{display:true,text:"Tokens",color:"#a78bfa",font:{size:10}}}}}});
+  C.h=new Chart(document.getElementById("hourChart"),{type:"line",data:{labels:hrs,datasets:[{label:"请求数",data:hReq,borderColor:"#29e7ff",backgroundColor:"rgba(41,231,255,.12)",fill:true,tension:.4,pointRadius:3,pointBackgroundColor:"#29e7ff",pointHoverRadius:6,borderWidth:2.5,yAxisID:"y"},{label:"输入",data:hIn,borderColor:"#b14eff",backgroundColor:"rgba(177,78,255,.12)",fill:true,tension:.4,pointRadius:3,pointBackgroundColor:"#b14eff",pointHoverRadius:6,borderWidth:2.5,yAxisID:"y1"},{label:"输出",data:hOut,borderColor:"#ff3860",backgroundColor:"rgba(255,56,96,.12)",fill:true,tension:.4,pointRadius:3,pointBackgroundColor:"#ff3860",pointHoverRadius:6,borderWidth:2.5,yAxisID:"y1"}]},options:{responsive:true,maintainAspectRatio:false,interaction:{mode:"index",intersect:false},plugins:{legend:{labels:{color:"#9aa0c8",font:{size:11},usePointStyle:true,pointStyle:"circle"}},tooltip:{callbacks:{label:ctx=>ctx.dataset.label+": "+fmtT(ctx.raw)}}},scales:{x:{ticks:{color:"#6f6f8f",font:{size:9},maxRotation:0,autoSkip:true,maxTicksLimit:12},grid:{display:false}},y:{type:"linear",position:"left",ticks:{color:"#29e7ff"},grid:{color:"rgba(0,229,255,.08)"},title:{display:true,text:"请求数",color:"#29e7ff",font:{size:10}}},y1:{type:"linear",position:"right",ticks:{color:"#b14eff",callback:v=>fmtTk(v)},grid:{drawOnChartArea:false},title:{display:true,text:"Tokens",color:"#b14eff",font:{size:10}}}}}});
 
   // User table
   const ut=document.querySelector("#uTable tbody");
   const ul=Object.entries(D.users).sort((a,b)=>(b[1].totalInputTokens+b[1].totalOutputTokens)-(a[1].totalInputTokens+a[1].totalOutputTokens));
-  if(!ul.length){ut.innerHTML='<tr><td colspan="10" class="empty">暂无数据</td></tr>'}else{ut.innerHTML=ul.map(([uk,u])=>{const on=u.lastActive&&Date.now()-new Date(u.lastActive).getTime()<36e5;const uq=(D.userQuotas||{})[uk]||D.profileQuota||0;const td2=(D.daily||{})[td]||{};const tdu=td2[uk]||{inputTokens:0,outputTokens:0};const used=tdu.inputTokens+tdu.outputTokens;const qPct=uq>0?Math.min(100,Math.round(used/uq*100)):0;const qCol=qPct>90?'var(--red)':qPct>70?'var(--orange)':'var(--green)';const qLabel=uq>0?'<span style="color:'+qCol+'">'+qPct+'%</span>':'<span style="color:var(--dim)">-</span>';return'<tr><td>'+u.name+'</td><td><span style="padding:2px 8px;border-radius:4px;font-size:11px;background:'+(on?'rgba(52,211,153,.15)':'rgba(255,255,255,.05)')+';color:'+(on?'var(--green)':'var(--dim)')+'">'+(on?'在线':'离线')+'</span></td><td class="n">'+fmtT(u.totalRequests)+'</td><td class="n">'+fmtT(u.totalInputTokens)+'</td><td class="n">'+fmtT(u.totalOutputTokens)+'</td><td class="n">'+fmtT(u.cacheCreationTokens || 0)+'</td><td class="n">'+fmtT(u.cacheReadTokens || 0)+'</td><td class="n hl">'+fmtT(u.totalInputTokens+u.totalOutputTokens)+'</td><td class="n">'+qLabel+'</td><td>'+ago(u.lastActive)+'</td></tr>'}).join("")}
+  if(!ul.length){ut.innerHTML='<tr><td colspan="10" class="empty">暂无数据</td></tr>'}else{ut.innerHTML=ul.map(([uk,u],idx)=>{const on=u.lastActive&&Date.now()-new Date(u.lastActive).getTime()<36e5;const uq=(D.userQuotas||{})[uk]||D.profileQuota||0;const td2=(D.daily||{})[td]||{};const tdu=td2[uk]||{inputTokens:0,outputTokens:0};const used=tdu.inputTokens+tdu.outputTokens;const qPct=uq>0?Math.min(100,Math.round(used/uq*100)):0;const medal=idx<3?['🥇','🥈','🥉'][idx]+' ':'<span style="display:inline-block;width:1.2em"></span>';const qCell=uq>0?'<span style="color:var(--accent);font-size:12px">'+qPct+'%</span> '+hpBar(qPct,12):'<span style="color:var(--dim)">-</span>';return'<tr><td>'+medal+u.name+'</td><td><span class="led '+(on?'on':'')+'"></span><span style="color:'+(on?'var(--green)':'var(--dim)')+';font-size:12px">'+(on?'在线':'离线')+'</span></td><td class="n">'+fmtT(u.totalRequests)+'</td><td class="n">'+fmtT(u.totalInputTokens)+'</td><td class="n">'+fmtT(u.totalOutputTokens)+'</td><td class="n">'+fmtT(u.cacheCreationTokens || 0)+'</td><td class="n">'+fmtT(u.cacheReadTokens || 0)+'</td><td class="n hl">'+fmtT(u.totalInputTokens+u.totalOutputTokens)+'</td><td class="n" style="white-space:nowrap">'+qCell+'</td><td style="font-size:12px;color:var(--dim)">'+ago(u.lastActive)+'</td></tr>'}).join("")}
 
   // Detail table
   const dt=document.querySelector("#dTable tbody");
@@ -3319,7 +3872,7 @@ function toggleSec(id){const body=document.getElementById(id+"Body");const icon=
 document.querySelectorAll(".tab").forEach(b=>b.addEventListener("click",()=>{document.querySelectorAll(".tab").forEach(x=>x.classList.remove("on"));b.classList.add("on");P=b.dataset.p;render()}));
 document.getElementById("clearErrors").addEventListener("click",async()=>{if(confirm("确定清除所有错误记录？")){const csrf=(document.cookie.match(/tm_csrf=([^;]+)/)||[])[1]||'';await fetch("/api/clear-errors",{method:"POST",headers:{"x-csrf-token":csrf}});errPage=1;load()}});
 function startAutoRefresh(){if(refreshTimer)clearInterval(refreshTimer);refreshTimer=setInterval(()=>{if(autoRefresh)load()},30000)}
-document.getElementById("autoRefreshBtn").addEventListener("click",()=>{autoRefresh=!autoRefresh;const btn=document.getElementById("autoRefreshBtn");btn.textContent="自动刷新: "+(autoRefresh?"开":"关");btn.style.background=autoRefresh?"rgba(52,211,153,.15)":"rgba(255,255,255,.06)";btn.style.color=autoRefresh?"var(--green)":"var(--dim)"});
+document.getElementById("autoRefreshBtn").addEventListener("click",()=>{autoRefresh=!autoRefresh;const btn=document.getElementById("autoRefreshBtn");btn.textContent="自动刷新: "+(autoRefresh?"开":"关");btn.className=autoRefresh?"ar-on":"ar-off"});
 load();startAutoRefresh();
 <\/script></body></html>`;
 }
@@ -3328,25 +3881,34 @@ load();startAutoRefresh();
 function loginHtml() {
   return `<!DOCTYPE html>
 <html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
-<title>团队AI Coding监控 - 登录</title>
+<title>团队AI Coding监控 - ACCESS</title>
+${PIXEL_FONT}
 <style>
-:root{--bg:#0a0a0a;--card:#141414;--border:#2a2a2a;--text:#e5e5e5;--dim:#999;--accent:#7c6ef0;--red:#f87171}
-*{margin:0;padding:0;box-sizing:border-box}
-body{font-family:-apple-system,BlinkMacSystemFont,sans-serif;background:var(--bg);color:var(--text);display:flex;justify-content:center;align-items:center;height:100vh}
-.login{background:var(--card);border:1px solid var(--border);border-radius:10px;padding:32px;width:320px}
-.login h2{font-size:18px;margin-bottom:20px;text-align:center}
-.login input{width:100%;padding:10px 14px;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:14px;margin-bottom:12px;outline:none}
-.login input:focus{border-color:var(--accent)}
-.login button{width:100%;padding:10px;background:var(--accent);color:#fff;border:none;border-radius:6px;font-size:14px;cursor:pointer}
-.login button:hover{opacity:.9}
-.login .err{color:var(--red);font-size:12px;margin-bottom:10px;display:none}
+${PIXEL_THEME}
+body{display:flex;justify-content:center;align-items:center;height:100vh;padding:20px}
+.wrap{width:100%;max-width:380px}
+.brand{text-align:center;margin-bottom:20px}
+.brand .t{font-family:var(--font-pixel);font-size:15px;color:var(--accent);text-shadow:var(--glow);letter-spacing:1px}
+.brand .s{font-family:'VT323',monospace;font-size:17px;color:var(--dim);margin-top:10px;letter-spacing:3px}
+.term{padding:30px 28px}
+.term .hd{font-family:'VT323',monospace;font-size:16px;color:var(--green);margin-bottom:18px;border-bottom:1px dashed var(--border);padding-bottom:12px;letter-spacing:1px}
+.term label{display:block;font-family:'VT323',monospace;font-size:15px;color:var(--dim);margin-bottom:6px;letter-spacing:2px}
+.term input{width:100%;padding:12px;background:var(--bg);border:2px solid var(--border);color:var(--accent);font-size:18px;font-family:'VT323',monospace;letter-spacing:3px;outline:none;margin-bottom:20px}
+.term input:focus{border-color:var(--accent);box-shadow:var(--glow)}
+.term button{width:100%;padding:13px;background:var(--accent);color:var(--bg);border:none;font-family:var(--font-pixel);font-size:11px;letter-spacing:1px;cursor:pointer;box-shadow:4px 4px 0 0 var(--magenta);transition:transform .08s,box-shadow .08s}
+.term button:hover{transform:translate(-2px,-2px);box-shadow:6px 6px 0 0 var(--magenta)}
+.term button:active{transform:translate(2px,2px);box-shadow:1px 1px 0 0 var(--magenta)}
+.err{color:var(--red);font-family:'VT323',monospace;font-size:15px;margin-bottom:14px;display:none;border-left:3px solid var(--red);padding-left:10px;letter-spacing:1px}
 </style></head><body>
-<div class="login">
-<h2>团队AI Coding监控</h2>
-<div class="err" id="err">密码错误</div>
-<input type="password" id="pw" placeholder="请输入密码" autofocus>
-<button onclick="doLogin()">登录</button>
-</div>
+<div class="wrap">
+<div class="brand"><div class="t glitch">CODING MONITOR</div><div class="s">// ACCESS TERMINAL</div></div>
+<div class="term">
+<div class="hd">&gt; SYSTEM READY_</div>
+<div class="err" id="err">&gt; ACCESS DENIED · 密码错误</div>
+<label>PASSWORD</label>
+<input type="password" id="pw" placeholder="••••••••" autofocus>
+<button onclick="doLogin()">CONNECT<span class="cursor"></span></button>
+</div></div>
 <script>
 document.getElementById("pw").addEventListener("keydown",e=>{if(e.key==="Enter")doLogin()});
 async function doLogin(){const pw=document.getElementById("pw").value;const r=await fetch("/api/login",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({password:pw})});if(r.ok){window.location.reload()}else{document.getElementById("err").style.display="block"}}
@@ -3356,22 +3918,35 @@ async function doLogin(){const pw=document.getElementById("pw").value;const r=aw
 // ─── Personal Usage Page HTML ─────────────────────────────────────────────────
 function personalUsageLandingHtml() {
   return `<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
-<title>我的用量</title><style>
-:root{--bg:#0a0a0a;--card:#141414;--border:#2a2a2a;--text:#e5e5e5;--dim:#999;--accent:#7c6ef0}
-body{font-family:-apple-system,BlinkMacSystemFont,sans-serif;background:var(--bg);color:var(--text);display:flex;justify-content:center;align-items:center;height:100vh;margin:0}
-.box{background:var(--card);border:1px solid var(--border);border-radius:10px;padding:32px;width:400px}
-h2{font-size:18px;margin-bottom:16px;text-align:center}
-input{width:100%;padding:10px 14px;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:13px;font-family:monospace;outline:none;margin-bottom:12px}
-input:focus{border-color:var(--accent)}
-button{width:100%;padding:10px;background:var(--accent);color:#fff;border:none;border-radius:6px;font-size:14px;cursor:pointer}
-button:hover{opacity:.9}
-.note{font-size:11px;color:var(--dim);text-align:center;margin-top:12px}
+<title>我的用量</title>
+${PIXEL_FONT}
+<style>
+${PIXEL_THEME}
+body{display:flex;justify-content:center;align-items:center;height:100vh;padding:20px;margin:0}
+.wrap{width:100%;max-width:440px}
+.brand{text-align:center;margin-bottom:20px}
+.brand .t{font-family:var(--font-pixel);font-size:14px;color:var(--accent);text-shadow:var(--glow);letter-spacing:1px}
+.brand .s{font-family:'VT323',monospace;font-size:16px;color:var(--dim);margin-top:10px;letter-spacing:3px}
+.term{padding:30px 28px}
+.term .hd{font-family:'VT323',monospace;font-size:15px;color:var(--green);margin-bottom:16px;border-bottom:1px dashed var(--border);padding-bottom:10px;letter-spacing:1px}
+.term label{display:block;font-family:'VT323',monospace;font-size:15px;color:var(--dim);margin-bottom:6px;letter-spacing:2px}
+.term input{width:100%;padding:12px;background:var(--bg);border:2px solid var(--border);color:var(--accent);font-size:15px;font-family:'VT323',monospace;letter-spacing:2px;outline:none;margin-bottom:18px}
+.term input:focus{border-color:var(--accent);box-shadow:var(--glow)}
+.term button{width:100%;padding:12px;background:var(--accent);color:var(--bg);border:none;font-family:var(--font-pixel);font-size:11px;letter-spacing:1px;cursor:pointer;box-shadow:4px 4px 0 0 var(--magenta);transition:transform .08s,box-shadow .08s}
+.term button:hover{transform:translate(-2px,-2px);box-shadow:6px 6px 0 0 var(--magenta)}
+.term button:active{transform:translate(2px,2px);box-shadow:1px 1px 0 0 var(--magenta)}
+.note{font-family:'VT323',monospace;font-size:14px;color:var(--dim);text-align:center;margin-top:16px;letter-spacing:1px}
+.note code{color:var(--accent)}
 </style></head><body>
-<div class="box"><h2>我的用量</h2>
-<input type="text" id="key" placeholder="输入你的虚拟Key (jx-...)" autofocus>
-<button onclick="go()">查看</button>
-<div class="note">也可以直接访问 /usage/你的虚拟Key</div>
-</div>
+<div class="wrap">
+<div class="brand"><div class="t glitch">MY USAGE</div><div class="s">// QUERY TERMINAL</div></div>
+<div class="term">
+<div class="hd">&gt; INSERT VIRTUAL KEY_</div>
+<label>KEY</label>
+<input type="text" id="key" placeholder="jx-xxxxxxxx" autofocus>
+<button onclick="go()">EXECUTE<span class="cursor"></span></button>
+<div class="note">或直接访问 <code>/usage/你的虚拟Key</code></div>
+</div></div>
 <script>
 document.getElementById('key').addEventListener('keydown',e=>{if(e.key==='Enter')go()});
 function go(){const k=document.getElementById('key').value.trim();if(k)location.href='/my-usage?key='+encodeURIComponent(k)}
@@ -3381,32 +3956,46 @@ function go(){const k=document.getElementById('key').value.trim();if(k)location.
 function personalUsageHtml(virtualKey) {
   return `<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
 <title>我的用量 - 团队AI Coding监控</title>
+${PIXEL_FONT}
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js"><\/script>
 <style>
-:root{--bg:#0a0a0a;--card:#141414;--border:#2a2a2a;--text:#e5e5e5;--dim:#999;--accent:#7c6ef0;--blue:#5ba3f5;--green:#34d399;--orange:#fbbf24;--red:#f87171}
-*{margin:0;padding:0;box-sizing:border-box}
-body{font-family:-apple-system,BlinkMacSystemFont,sans-serif;background:var(--bg);color:var(--text);padding:20px 24px}
-h1{font-size:18px;margin-bottom:4px}.meta{font-size:12px;color:var(--dim);margin-bottom:20px}
-select{background:var(--card);color:var(--text);border:1px solid var(--border);padding:4px 8px;border-radius:4px;font-size:12px}
-.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:10px;margin-bottom:20px}
-.card{background:var(--card);border:1px solid var(--border);border-radius:8px;padding:14px 16px}
-.card .l{font-size:12px;color:var(--dim);margin-bottom:4px}.card .v{font-size:22px;font-weight:700;font-variant-numeric:tabular-nums}
-.box{background:var(--card);border:1px solid var(--border);border-radius:8px;padding:16px;margin-bottom:14px}
-.box h3{font-size:12px;color:var(--dim);margin-bottom:10px}
+${PIXEL_THEME}
+body{padding:22px 26px}
+.top,.meta,.box{animation:boot-in .45s ease-out both}
+.top{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-bottom:6px}
+.top h1{font-family:var(--font-pixel);font-size:16px;color:var(--accent);text-shadow:0 0 14px rgba(34,233,255,.7),0 0 4px rgba(34,233,255,.9);letter-spacing:1px;line-height:1.6}
+.top h1::after{content:"";display:block;width:110px;height:3px;margin-top:8px;background:linear-gradient(90deg,var(--accent),var(--magenta),transparent);box-shadow:0 0 8px var(--accent)}
+.top .sub{font-family:'Pixelify Sans',monospace;font-weight:500;font-size:15px;color:var(--dim);letter-spacing:1px;margin-top:8px}
+select{font-family:'VT323',monospace;font-size:15px;background:var(--card);color:var(--text);border:2px solid var(--border);padding:5px 10px;letter-spacing:1px;cursor:pointer}
+select:focus{border-color:var(--accent)}
+.meta{font-family:'VT323',monospace;font-size:15px;color:var(--dim);margin-bottom:18px;letter-spacing:1px;border-left:3px solid var(--accent);padding:2px 0 2px 10px}
+.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px;margin-bottom:20px}
+.card{background:linear-gradient(180deg,var(--card2),var(--card));border:2px solid var(--border);padding:16px 16px 14px;position:relative;overflow:hidden;transition:transform .12s,border-color .12s,box-shadow .12s}
+.card::after{content:"";position:absolute;top:0;left:0;right:0;height:2px;background:linear-gradient(90deg,var(--accent),var(--magenta));opacity:.9}
+.card:hover{transform:translate(-3px,-3px);border-color:var(--accent);box-shadow:5px 5px 0 0 var(--accent),-3px -3px 0 0 var(--magenta),var(--glow)}
+.card .l{font-family:'Pixelify Sans',monospace;font-weight:600;font-size:14px;color:var(--dim);margin-bottom:8px;letter-spacing:1px;text-transform:uppercase}
+.card .v{font-size:15px}
+.box{position:relative;background:var(--card);border:2px solid var(--border);padding:16px;margin-bottom:14px}
+.box::before,.box::after{content:"";position:absolute;width:12px;height:12px;border:2px solid var(--accent);pointer-events:none;opacity:.6}
+.box::before{top:-2px;left:-2px;border-right:0;border-bottom:0}.box::after{bottom:-2px;right:-2px;border-left:0;border-top:0}
+.box h3{font-family:'Pixelify Sans',monospace;font-weight:600;font-size:15px;color:var(--accent);margin-bottom:10px;letter-spacing:1px;text-transform:uppercase;text-shadow:0 0 8px rgba(34,233,255,.5)}
+.box h3::before{content:"// ";color:var(--magenta)}
 .box canvas{max-height:220px}
 table{width:100%;border-collapse:collapse}
-th{text-align:left;padding:6px 12px;font-size:11px;color:var(--dim);border-bottom:1px solid var(--border)}
+th{text-align:left;padding:6px 12px;font-family:'Pixelify Sans',monospace;font-weight:600;font-size:13px;color:#b4bcd9;border-bottom:2px solid var(--accent);letter-spacing:1px;text-transform:uppercase}
 td{padding:6px 12px;font-size:13px;border-bottom:1px solid var(--border)}.n{text-align:right;font-variant-numeric:tabular-nums}
-.progress{width:100%;height:8px;background:var(--border);border-radius:4px;overflow:hidden;margin-top:6px}
-.progress-bar{height:100%;border-radius:4px;transition:width .3s}
+tbody tr:hover td{background:rgba(0,229,255,.05)}
+.tag{font-family:var(--font-pixel);font-size:9px;background:rgba(0,229,255,.15);color:var(--accent);padding:2px 6px}
 </style></head><body>
-<h1>我的用量统计 <span style="float:right;font-size:12px"><select id="profileSel" onchange="switchProfile(this.value)"><option value="all">全部可用方案</option></select></span></h1>
+<div class="top"><div><h1 class="glitch">MY USAGE</h1><div class="sub">我的用量统计</div></div><select id="profileSel" onchange="switchProfile(this.value)"><option value="all">全部可用方案</option></select></div>
 <div class="meta" id="meta">加载中...</div>
 <div class="cards" id="cards"></div>
 <div class="box"><h3>今日24小时趋势</h3><canvas id="hourChart"></canvas></div>
 <div class="box"><h3>近7天趋势</h3><canvas id="trendChart"></canvas></div>
 <div class="box"><h3>今日模型用量</h3><table id="modelTable"><thead><tr><th>模型</th><th class="n">请求数</th><th class="n">输入</th><th class="n">输出</th><th class="n">合计</th></tr></thead><tbody></tbody></table></div>
 <script>
+${PIXEL_JS}
+Chart.defaults.color='#9aa0c8';Chart.defaults.font.family="'Pixelify Sans',monospace";Chart.defaults.font.size=11;
 const VK='${escJs(virtualKey)}';
 let D=null,C={h:null,t:null},currentProfile='all';
 const fmtT=n=>n.toLocaleString("zh-CN");
@@ -3429,22 +4018,23 @@ function render(){
   const q=D.quota,t=D.today;
   const pct=q.limit>0?Math.min(100,Math.round(q.used/q.limit*100)):0;
   const color=pct>90?'var(--red)':pct>70?'var(--orange)':'var(--green)';
-  document.getElementById('meta').innerHTML=D.username+' | 方案: '+D.profile+(q.limit>0?' | <span style="color:'+color+';font-weight:600">'+pct+'% 已用</span>'+(q.autoAdjusted?' <span style="font-size:10px;background:rgba(124,110,240,.15);color:var(--accent);padding:1px 6px;border-radius:3px">自动调整</span>':''):' | 无配额限制');
+  document.getElementById('meta').innerHTML=D.username+' · 方案: '+D.profile+(q.limit>0?' · <span style="color:'+color+'">'+pct+'% 已用</span> '+hpBar(pct,16)+(q.autoAdjusted?' <span class="tag">AUTO</span>':''):' · 无配额限制');
   document.getElementById('cards').innerHTML=
-    '<div class="card"><div class="l">今日用量</div><div class="v" style="color:var(--accent)">'+fmtT(t.total)+'</div></div>'+
-    '<div class="card"><div class="l">今日请求</div><div class="v" style="color:var(--blue)">'+fmtT(t.requests)+'</div></div>'+
-    '<div class="card"><div class="l">今日输入</div><div class="v" style="color:var(--green)">'+fmtT(t.input)+'</div></div>'+
-    '<div class="card"><div class="l">今日输出</div><div class="v" style="color:var(--orange)">'+fmtT(t.output)+'</div></div>'+
-    (q.limit>0?'<div class="card"><div class="l">剩余额度</div><div class="v" style="color:'+color+'">'+fmtT(q.remaining)+'</div><div class="progress"><div class="progress-bar" style="width:'+pct+'%;background:'+color+'"></div></div></div>'+
-    '<div class="card"><div class="l">每日限额</div><div class="v" style="color:var(--dim)">'+fmtT(q.limit)+'</div></div>':'');
+    '<div class="card"><div class="l">今日用量</div><div class="v" data-cu="'+t.total+'" data-cu-k style="color:var(--accent)">0</div></div>'+
+    '<div class="card"><div class="l">今日请求</div><div class="v" data-cu="'+t.requests+'" data-cu-k style="color:var(--blue)">0</div></div>'+
+    '<div class="card"><div class="l">今日输入</div><div class="v" data-cu="'+t.input+'" data-cu-k style="color:var(--green)">0</div></div>'+
+    '<div class="card"><div class="l">今日输出</div><div class="v" data-cu="'+t.output+'" data-cu-k style="color:var(--orange)">0</div></div>'+
+    (q.limit>0?'<div class="card"><div class="l">剩余额度</div><div class="v" data-cu="'+q.remaining+'" data-cu-k style="color:'+color+'">0</div><div style="margin-top:8px">'+hpBar(pct,16)+'</div></div>'+
+    '<div class="card"><div class="l">每日限额</div><div class="v" data-cu="'+q.limit+'" data-cu-k style="color:var(--dim)">0</div></div>':'');
+  runCountUps(document.getElementById('cards'));
   // Hourly chart
   const hrs=[];for(let i=0;i<24;i++)hrs.push(i.toString().padStart(2,"0")+":00");
   const hData=hrs.map((_,i)=>{const h=D.hourly[i.toString().padStart(2,"0")]||{};return{req:h.requests||0,tokens:(h.inputTokens||0)+(h.outputTokens||0)}});
   if(C.h)C.h.destroy();
-  C.h=new Chart(document.getElementById("hourChart"),{type:"bar",data:{labels:hrs,datasets:[{label:"Token",data:hData.map(d=>d.tokens),backgroundColor:"#7c6ef0cc",borderRadius:3},{label:"请求数",data:hData.map(d=>d.req),backgroundColor:"#5ba3f5cc",borderRadius:3}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{labels:{color:"#999",font:{size:10}}}},scales:{x:{ticks:{color:"#666",font:{size:9},maxRotation:0,autoSkip:true,maxTicksLimit:12},grid:{display:false}},y:{ticks:{color:"#666",callback:v=>fmtTk(v)},grid:{color:"#1a1a1a"}}}}});
+  C.h=new Chart(document.getElementById("hourChart"),{type:"bar",data:{labels:hrs,datasets:[{label:"Token",data:hData.map(d=>d.tokens),backgroundColor:"#00e5ffcc",borderRadius:3},{label:"请求数",data:hData.map(d=>d.req),backgroundColor:"#29e7ffcc",borderRadius:3}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{labels:{color:"#9aa0c8",font:{size:10}}}},scales:{x:{ticks:{color:"#6f6f8f",font:{size:9},maxRotation:0,autoSkip:true,maxTicksLimit:12},grid:{display:false}},y:{ticks:{color:"#6f6f8f",callback:v=>fmtTk(v)},grid:{color:"rgba(0,229,255,.08)"}}}}});
   // Trend chart
   if(C.t)C.t.destroy();
-  C.t=new Chart(document.getElementById("trendChart"),{type:"line",data:{labels:D.trend.map(d=>d.date.slice(5)),datasets:[{label:"输入",data:D.trend.map(d=>d.input),borderColor:"#34d399",backgroundColor:"rgba(52,211,153,.12)",fill:true,tension:.4,pointRadius:3,borderWidth:2},{label:"输出",data:D.trend.map(d=>d.output),borderColor:"#f87171",backgroundColor:"rgba(248,113,113,.12)",fill:true,tension:.4,pointRadius:3,borderWidth:2}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{labels:{color:"#999",font:{size:10}}}},scales:{x:{ticks:{color:"#666"},grid:{display:false}},y:{ticks:{color:"#666",callback:v=>fmtTk(v)},grid:{color:"#1a1a1a"}}}}});
+  C.t=new Chart(document.getElementById("trendChart"),{type:"line",data:{labels:D.trend.map(d=>d.date.slice(5)),datasets:[{label:"输入",data:D.trend.map(d=>d.input),borderColor:"#00ff88",backgroundColor:"rgba(0,255,136,.12)",fill:true,tension:.4,pointRadius:3,borderWidth:2},{label:"输出",data:D.trend.map(d=>d.output),borderColor:"#ff3860",backgroundColor:"rgba(255,56,96,.12)",fill:true,tension:.4,pointRadius:3,borderWidth:2}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{labels:{color:"#9aa0c8",font:{size:10}}}},scales:{x:{ticks:{color:"#6f6f8f"},grid:{display:false}},y:{ticks:{color:"#6f6f8f",callback:v=>fmtTk(v)},grid:{color:"rgba(0,229,255,.08)"}}}}});
   // Model table
   const mt=document.querySelector("#modelTable tbody");
   const models=Object.entries(D.models||{}).sort((a,b)=>(b[1].inputTokens+b[1].outputTokens)-(a[1].inputTokens+a[1].outputTokens));
@@ -3501,9 +4091,9 @@ function applySettings(formData) {
     const oldSuffix = editingProfile.suffix;
     if (nextSuffix !== oldSuffix) {
       editingProfile.suffix = nextSuffix;
-      if (store._profiles?.[oldSuffix] && !store._profiles[nextSuffix]) {
-        store._profiles[nextSuffix] = store._profiles[oldSuffix];
-        delete store._profiles[oldSuffix];
+      // Rename the profile column across all usage tables.
+      for (const table of ["users", "usage_daily", "usage_daily_model", "usage_daily_hourly", "usage_model", "usage_hourly", "errors"]) {
+        db.prepare(`UPDATE ${table} SET profile = ? WHERE profile = ?`).run(nextSuffix, oldSuffix);
       }
     }
   }
@@ -3535,7 +4125,7 @@ function applySettings(formData) {
   if (formData.aqMaxIncrease) config.autoQuotaAdjust.maxIncreaseFactor = Math.max(1.1, parseFloat(formData.aqMaxIncrease) || 2.0);
   if (formData.aqMaxQuota) config.autoQuotaAdjust.maxAutoQuota = parseInt(formData.aqMaxQuota, 10) || 10000000;
   if (formData.aqCooldown) config.autoQuotaAdjust.cooldownDays = Math.max(1, parseInt(formData.aqCooldown, 10) || 3);
-  store._lastQuotaEval = null; // Reset eval date so new config takes effect immediately
+  setMeta("lastQuotaEval", ""); // Reset eval date so new config takes effect immediately
 
   // Update retryable status codes
   if (formData.retryableStatusCodes) {
@@ -3621,7 +4211,6 @@ function applySettings(formData) {
   // Persist to config.json
   config.proxy = { ...gProxy };
   saveConfig(config);
-  saveStore();
   reloadAllRuntimes();
 
   console.log(`[CONFIG] Settings saved to profile "${editingProfileName}"`);
@@ -3633,7 +4222,7 @@ const server = http.createServer((req, res) => {
   res.setHeader("X-Frame-Options", "DENY");
   res.setHeader("Referrer-Policy", "strict-origin-when-cross-origin");
   res.setHeader("X-XSS-Protection", "0");
-  res.setHeader("Content-Security-Policy", "default-src 'self'; script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'");
+  res.setHeader("Content-Security-Policy", "default-src 'self'; script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; img-src 'self' data:; connect-src 'self'");
   if (isSecureRequest(req)) {
     res.setHeader("Strict-Transport-Security", "max-age=31536000; includeSubDomains");
   }
@@ -3982,7 +4571,7 @@ const server = http.createServer((req, res) => {
       const targetSuffix = normalizeProfileSuffix(profileSuffix);
       const targetRt = runtimes[targetSuffix];
       if (targetRt) {
-        const s = getProfileStore(targetSuffix);
+        const s = loadProfileSnapshot(targetSuffix);
         data = sanitizeStore(s);
         data.profileView = targetRt.profileName;
         data.profileSuffix = targetSuffix;
@@ -4007,13 +4596,11 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  // Clear errors
+    // Clear errors
   if (req.method === "POST" && req.url === "/api/clear-errors") {
     if (!checkAuth(req)) { res.writeHead(401); res.end("Unauthorized"); return; }
     if (!checkCsrf(req)) { res.writeHead(403); res.end("CSRF validation failed"); return; }
-    store.errors = [];
-    for (const ps of Object.values(store._profiles || {})) ps.errors = [];
-    saveStore();
+    db.prepare("DELETE FROM errors").run();
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ ok: true }));
     return;
@@ -4137,11 +4724,18 @@ const server = http.createServer((req, res) => {
       return;
     }
     try {
+      const payload = getPersonalUsageData(apiKey, profileSuffix);
       res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
-      res.end(JSON.stringify(getPersonalUsageData(apiKey, profileSuffix), null, 2));
+      res.end(JSON.stringify(payload, null, 2));
     } catch (err) {
-      res.writeHead(err.statusCode || 400, { "Content-Type": "application/json; charset=utf-8" });
-      res.end(JSON.stringify({ error: err.message }));
+      if (!res.headersSent) {
+        res.writeHead(err.statusCode || 400, { "Content-Type": "application/json; charset=utf-8" });
+        res.end(JSON.stringify({ error: err.message }));
+      } else {
+        // Headers already sent — can't change status, just end the response.
+        console.error(`[my-usage] 响应已开始但出错: ${err.message}`);
+        if (!res.writableEnded) res.end();
+      }
     }
     return;
   }
@@ -4184,14 +4778,14 @@ server.requestTimeout = serverTimeout;
 server.headersTimeout = 120000;
 server.keepAliveTimeout = 65000;
 
-process.on("SIGINT", () => { saveStore(); process.exit(0); });
-process.on("SIGTERM", () => { saveStore(); process.exit(0); });
+process.on("SIGINT", () => { try { db?.close(); } catch {} process.exit(0); });
+process.on("SIGTERM", () => { try { db?.close(); } catch {} process.exit(0); });
 process.on("uncaughtException", (err) => {
   if (err.code === "EPIPE" || err.code === "ECONNRESET") {
     console.error(`[WARN] ${err.code} ignored, client disconnected`);
     return;
   }
   console.error("[FATAL] Uncaught exception:", err);
-  saveStore();
+  try { db?.close(); } catch {}
   process.exit(1);
 });

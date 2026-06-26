@@ -18,6 +18,22 @@ let defaultUpstream;
 let glmUpstream;
 let openaiUpstream;
 const upstreamHits = [];
+const slowStreamCloseWaiters = [];
+
+function waitForSlowStreamClose(timeoutMs = 2000) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error("slow upstream stream was not closed")), timeoutMs);
+    slowStreamCloseWaiters.push(() => {
+      clearTimeout(timer);
+      resolve();
+    });
+  });
+}
+
+function notifySlowStreamClose() {
+  const waiter = slowStreamCloseWaiters.shift();
+  if (waiter) waiter();
+}
 
 function listen(server) {
   return new Promise((resolve, reject) => {
@@ -82,7 +98,69 @@ function makeOpenAIUpstream() {
       });
 
       if (parsed?.stream) {
+        const firstContent = parsed.messages?.[0]?.content;
+        const firstText = typeof firstContent === "string" ? firstContent : "";
         res.writeHead(200, { "Content-Type": "text/event-stream" });
+        if (firstText === "slow-stream") {
+          const keepAlive = setInterval(() => {
+            res.write(": keep-alive\n\n");
+          }, 50);
+          res.on("close", () => {
+            clearInterval(keepAlive);
+            notifySlowStreamClose();
+          });
+          res.write(`data: ${JSON.stringify({
+            id: "chatcmpl-slow",
+            object: "chat.completion.chunk",
+            model: parsed.model,
+            choices: [{ index: 0, delta: { content: "partial" } }],
+            usage: null,
+          })}\n\n`);
+          return;
+        }
+        if (firstText === "tool-stream") {
+          res.write(`data: ${JSON.stringify({
+            id: "chatcmpl-tool",
+            object: "chat.completion.chunk",
+            model: parsed.model,
+            choices: [{
+              index: 0,
+              delta: {
+                tool_calls: [{
+                  index: 0,
+                  id: "call_tool_1",
+                  type: "function",
+                  function: { name: "run_shell", arguments: "{\"cmd\"" },
+                }],
+              },
+            }],
+            usage: null,
+          })}\n\n`);
+          res.write(`data: ${JSON.stringify({
+            id: "chatcmpl-tool",
+            object: "chat.completion.chunk",
+            model: parsed.model,
+            choices: [{
+              index: 0,
+              delta: {
+                tool_calls: [{
+                  index: 0,
+                  function: { arguments: ":\"pwd\"}" },
+                }],
+              },
+            }],
+            usage: null,
+          })}\n\n`);
+          res.write(`data: ${JSON.stringify({
+            id: "chatcmpl-tool",
+            object: "chat.completion.chunk",
+            model: parsed.model,
+            choices: [],
+            usage: { prompt_tokens: 4, completion_tokens: 2, total_tokens: 6 },
+          })}\n\n`);
+          res.end("data: [DONE]\n\n");
+          return;
+        }
         res.write(`data: ${JSON.stringify({
           id: "chatcmpl-test",
           object: "chat.completion.chunk",
@@ -138,6 +216,55 @@ async function request(method, pathname, { key = "jx-shared-user", body } = {}) 
   return { status: res.status, text, json };
 }
 
+async function openAndAbortStreamingResponse(pathname, body, { key = "jx-shared-user" } = {}) {
+  await new Promise((resolve, reject) => {
+    const payload = JSON.stringify(body);
+    const req = http.request({
+      hostname: "127.0.0.1",
+      port: appPort,
+      path: pathname,
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${key}`,
+        "content-type": "application/json",
+        "content-length": Buffer.byteLength(payload),
+      },
+    });
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      req.destroy();
+      reject(new Error("stream did not start"));
+    }, 2000);
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve();
+    };
+    req.on("response", (res) => {
+      res.once("data", () => {
+        res.destroy();
+        req.destroy();
+        finish();
+      });
+      res.on("error", finish);
+    });
+    req.on("error", (err) => {
+      if (settled) return;
+      if (err.code === "ECONNRESET") finish();
+      else {
+        settled = true;
+        clearTimeout(timer);
+        reject(err);
+      }
+    });
+    req.write(payload);
+    req.end();
+  });
+}
+
 function assertInlineScriptsCompile(html) {
   const scripts = [...html.matchAll(/<script([^>]*)>([\s\S]*?)<\/script>/gi)];
   for (const [, attrs, code] of scripts) {
@@ -183,6 +310,9 @@ before(async () => {
   appPort = await freePort();
 
   fs.copyFileSync(sourceServer, path.join(tmpDir, "server.mjs"));
+  // Expose the project's node_modules (better-sqlite3 native addon) to the spawned
+  // server running in tmpDir. ESM bare-specifier resolution walks parent dirs.
+  fs.symlinkSync(path.join(repoRoot, "node_modules"), path.join(tmpDir, "node_modules"), "dir");
   fs.writeFileSync(path.join(tmpDir, "data.json"), JSON.stringify({
     users: {},
     daily: {},
@@ -207,6 +337,7 @@ before(async () => {
         dailyTokenLimit: null,
         users: {
           "jx-shared-user": { key: "real-coding-key", disabled: false, dailyTokenLimit: null },
+          "jx-coding-only": { key: "real-coding-key", disabled: false, dailyTokenLimit: null },
         },
       },
       GLM: {
@@ -253,6 +384,7 @@ before(async () => {
       "jx-shared-user": { username: "Shared User", expiresAt: null, disabled: false },
       "jx-unassigned": { username: "Unassigned User", expiresAt: null, disabled: false },
       "jx-disabled-user": { username: "Disabled User", expiresAt: null, disabled: false },
+      "jx-coding-only": { username: "Coding Only", expiresAt: null, disabled: false },
     },
     proxy: {
       timeout: 10000,
@@ -347,6 +479,25 @@ describe("personal usage profile access", () => {
   });
 });
 
+describe("/api/my-usage error handling (ERR_HTTP_HEADERS_SENT regression)", () => {
+  it("returns 403 instead of crashing when a user with partial access requests an inaccessible profile", async () => {
+    // jx-coding-only has access to the default "coding" profile but not to "glm".
+    // Previously, writeHead(200) ran before getPersonalUsageData() threw, causing
+    // a FATAL ERR_HTTP_HEADERS_SENT crash. This request must now return a clean 403.
+    const res = await request("GET", "/api/my-usage?profile=glm", { key: "jx-coding-only" });
+
+    assert.equal(res.status, 403);
+    assert.match(res.json.error, /not allowed/i);
+  });
+
+  it("still serves the profile the partial user can access", async () => {
+    const res = await request("GET", "/api/my-usage?profile=coding", { key: "jx-coding-only" });
+
+    assert.equal(res.status, 200);
+    assert.equal(res.json.username, "Coding Only");
+  });
+});
+
 describe("OpenAI transparent proxy support", () => {
   it("proxies chat completions with model aliases and records OpenAI non-stream usage", async () => {
     upstreamHits.length = 0;
@@ -388,6 +539,27 @@ describe("OpenAI transparent proxy support", () => {
     assert.equal(upstreamHits[0].body.model, "gpt-5");
   });
 
+  it("serves OpenAI models locally without forwarding discovery probes upstream", async () => {
+    upstreamHits.length = 0;
+
+    const res = await request("GET", "/openai/v1/models");
+
+    assert.equal(res.status, 200);
+    assert.equal(res.json.object, "list");
+    assert.deepEqual(res.json.data.map((model) => model.id).sort(), ["gpt-5", "gpt-5-mini"]);
+    assert.equal(upstreamHits.length, 0);
+  });
+
+  it("blocks unsupported OpenAI proxy endpoints before they can reach upstream", async () => {
+    upstreamHits.length = 0;
+
+    const res = await request("GET", "/openai/v1/usage");
+
+    assert.equal(res.status, 404);
+    assert.match(res.json.error, /Unsupported OpenAI\/Codex proxy endpoint/);
+    assert.equal(upstreamHits.length, 0);
+  });
+
   it("injects OpenAI stream usage options and records final streaming usage", async () => {
     upstreamHits.length = 0;
 
@@ -409,6 +581,23 @@ describe("OpenAI transparent proxy support", () => {
     assert.equal(usage.status, 200);
     assert.equal(usage.json.today.total, 28);
     assert.equal(usage.json.models["gpt-5-mini"].total, 5);
+  });
+
+  it("cancels upstream streaming requests when the client disconnects", async () => {
+    upstreamHits.length = 0;
+
+    const upstreamClosed = waitForSlowStreamClose();
+    await openAndAbortStreamingResponse("/openai/v1/chat/completions", {
+      model: "codex-fast",
+      messages: [{ role: "user", content: "slow-stream" }],
+      stream: true,
+    });
+    await upstreamClosed;
+
+    assert.equal(upstreamHits.length, 1);
+    assert.equal(upstreamHits[0].path, "/compatible-mode/v1/chat/completions");
+    assert.equal(upstreamHits[0].body.model, "gpt-5-mini");
+    assert.deepEqual(upstreamHits[0].body.stream_options, { include_usage: true });
   });
 
   it("rejects OpenAI profile access when the user has no real key for that profile", async () => {
@@ -522,6 +711,44 @@ describe("OpenAI Responses to Chat Completions adapter", () => {
     assert.equal(usage.status, 200);
     assert.equal(usage.json.today.total, 16);
     assert.equal(usage.json.models["qwen3.6-plus"].total, 5);
+  });
+
+  it("converts streamed chat tool calls to responses function-call events", async () => {
+    upstreamHits.length = 0;
+
+    const res = await request("POST", "/aliyun-openai/v1/responses", {
+      body: {
+        model: "codex-pro",
+        input: "tool-stream",
+        stream: true,
+        tools: [{
+          type: "function",
+          name: "run_shell",
+          parameters: {
+            type: "object",
+            properties: { cmd: { type: "string" } },
+            required: ["cmd"],
+          },
+        }],
+      },
+    });
+
+    assert.equal(res.status, 200);
+    assert.match(res.text, /event: response\.output_item\.added/);
+    assert.match(res.text, /"type":"function_call"/);
+    assert.match(res.text, /"call_id":"call_tool_1"/);
+    assert.match(res.text, /"name":"run_shell"/);
+    assert.match(res.text, /event: response\.function_call_arguments\.delta/);
+    assert.match(res.text, /event: response\.function_call_arguments\.done/);
+    assert.match(res.text, /\\"cmd\\":\\"pwd\\"/);
+    assert.match(res.text, /event: response\.output_item\.done/);
+    assert.match(res.text, /event: response\.completed/);
+    assert.equal(upstreamHits.length, 1);
+    assert.equal(upstreamHits[0].body.tools[0].function.name, "run_shell");
+
+    const usage = await request("GET", "/api/my-usage?profile=aliyun-openai");
+    assert.equal(usage.status, 200);
+    assert.equal(usage.json.models["glm-5"].total, 17);
   });
 });
 

@@ -6,6 +6,10 @@ docs
 *.md
 .DS_Store
 data.json
+data.json.migrated
+data.db
+data.db-shm
+data.db-wal
 config.json
 start.sh
 start.bat

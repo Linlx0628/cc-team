@@ -6,5 +6,8 @@ services:
       - "6789:6789"
     volumes:
       - ./config.json:/app/config.json
+      - ./data.db:/app/data.db
+      # Kept only for the one-time data.json -> data.db migration on first boot.
+      # After confirming the migration log, this line can be removed.
       - ./data.json:/app/data.json
     restart: unless-stopped

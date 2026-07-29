@@ -90,9 +90,9 @@
           <p>支持方案级和成员级配额，自动增长额度可覆盖高强度使用场景。</p>
         </article>
         <article>
-          <p class="label">协议</p>
-          <h3>Claude Code 与 Codex</h3>
-          <p>同一套配置支持 Anthropic 和 OpenAI-compatible 方案，并可处理 Responses 兼容模式。</p>
+          <p class="label">客户端</p>
+          <h3>Claude Code 专用</h3>
+          <p>围绕 Anthropic Messages 请求路径设计，别名、配额和统计行为保持一致。</p>
         </article>
         <article>
           <p class="label">稳定性</p>
@@ -142,7 +142,7 @@ start.bat</code></pre>
       </div>
       <div class="connect-card">
         <h3>客户端接入</h3>
-        <pre class="code-block"><code>export ANTHROPIC_BASE_URL="http://localhost:6789/v1"
+        <pre class="code-block"><code>export ANTHROPIC_BASE_URL="http://localhost:6789"
 export ANTHROPIC_API_KEY="jx-your-virtual-key"</code></pre>
       </div>
     </div>
@@ -157,7 +157,7 @@ export ANTHROPIC_API_KEY="jx-your-virtual-key"</code></pre>
       <div class="architecture">
         <div>
           <p class="label">Clients</p>
-          <strong>Claude Code, Codex, Cursor, Windsurf</strong>
+          <strong>Claude Code</strong>
         </div>
         <div>
           <p class="label">CC Team gateway</p>
@@ -165,7 +165,7 @@ export ANTHROPIC_API_KEY="jx-your-virtual-key"</code></pre>
         </div>
         <div>
           <p class="label">Upstreams</p>
-          <strong>OpenAI, Anthropic, GLM, DeepSeek, Qwen</strong>
+          <strong>Anthropic Messages 兼容上游</strong>
         </div>
       </div>
       <div class="page-links">

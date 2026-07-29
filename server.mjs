@@ -50,7 +50,9 @@ function loadConfig() {
   return JSON.parse(fs.readFileSync(configPath, "utf-8"));
 }
 function saveConfig(cfg) {
-  fs.writeFileSync(configPath, JSON.stringify(cfg, null, 2), "utf-8");
+  const tempPath = `${configPath}.tmp`;
+  fs.writeFileSync(tempPath, JSON.stringify(cfg, null, 2), "utf-8");
+  fs.renameSync(tempPath, configPath);
 }
 
 const config = loadConfig();
@@ -58,11 +60,27 @@ const { port } = config;
 const dashboardPassword = config.dashboardPassword || "";
 const dataPath = path.join(__dirname, "data.json");
 const dbPath = path.join(__dirname, "data.db");
+const backupDir = path.join(__dirname, "backups");
 const RESERVED_SUFFIXES = new Set(["dashboard", "settings", "api", "health", "usage", "my-usage", "v1", "login", "logout", "favicon", "robots", "js", "css"]);
 const PROFILE_SUFFIX_RE = /^[a-z0-9_-]{2,20}$/;
-const API_PROTOCOLS = new Set(["anthropic", "openai"]);
-const OPENAI_STREAM_USAGE_DEFAULT = true;
-const RESPONSES_ADAPTERS = new Set(["none", "chat_completions"]);
+
+function backupTimestamp() {
+  return new Date().toISOString().replace(/[:.]/g, "-");
+}
+
+function backupFileSync(source, label, reason) {
+  if (!fs.existsSync(source)) return null;
+  fs.mkdirSync(backupDir, { recursive: true });
+  const target = path.join(backupDir, `${backupTimestamp()}-${reason}-${label}`);
+  fs.copyFileSync(source, target);
+  return target;
+}
+
+function backupDatabaseSync(reason) {
+  if (!db || !fs.existsSync(dbPath)) return null;
+  db.pragma("wal_checkpoint(FULL)");
+  return backupFileSync(dbPath, "data.db", reason);
+}
 
 function normalizeProfileSuffix(value) {
   return String(value || "")
@@ -97,28 +115,6 @@ function validateProfileSuffix(suffix, currentProfileName = null) {
     }
   }
   return sfx;
-}
-
-function normalizeApiProtocol(value) {
-  const protocol = String(value || "anthropic").trim().toLowerCase();
-  return API_PROTOCOLS.has(protocol) ? protocol : "anthropic";
-}
-
-function validateApiProtocol(value) {
-  const protocol = String(value || "anthropic").trim().toLowerCase();
-  if (!API_PROTOCOLS.has(protocol)) throw new Error("接口协议只能是 anthropic 或 openai");
-  return protocol;
-}
-
-function normalizeResponsesAdapter(value) {
-  const adapter = String(value || "none").trim().toLowerCase();
-  return RESPONSES_ADAPTERS.has(adapter) ? adapter : "none";
-}
-
-function validateResponsesAdapter(value) {
-  const adapter = String(value || "none").trim().toLowerCase();
-  if (!RESPONSES_ADAPTERS.has(adapter)) throw new Error("Responses 兼容模式只能是 none 或 chat_completions");
-  return adapter;
 }
 
 function legacyDefaultModelAliases(defaultModels = {}) {
@@ -160,18 +156,11 @@ function parseModelAliasesInput(value) {
 }
 
 function getProfileModelAliases(profile) {
-  const explicitAliases = normalizeModelAliases(profile?.modelAliases || {});
-  if (normalizeApiProtocol(profile?.apiProtocol) === "openai") return explicitAliases;
-  return {
-    ...legacyDefaultModelAliases(profile?.defaultModels || {}),
-    ...explicitAliases,
-  };
+  return normalizeModelAliases(profile?.modelAliases || {});
 }
 
 function getConfigurableModelAliases(profile) {
-  const aliases = normalizeModelAliases(profile?.modelAliases || {});
-  if (normalizeApiProtocol(profile?.apiProtocol) !== "openai") return aliases;
-  return Object.fromEntries(Object.entries(aliases).filter(([alias]) => !/^jx-(sonnet|opus|haiku)$/i.test(alias)));
+  return normalizeModelAliases(profile?.modelAliases || {});
 }
 
 function formatModelAliasesInput(aliases = {}) {
@@ -197,61 +186,66 @@ if (!config.profiles) {
   saveConfig(config);
 }
 
-// Auto-migrate: ensure every profile has defaultModels and non-empty allowedModels
-(function migrateDefaultModels() {
-  let migrated = false;
-  for (const pname of Object.keys(config.profiles)) {
-    const p = config.profiles[pname];
-    if (!p.defaultModels) {
-      const firstModel = (Array.isArray(p.allowedModels) && p.allowedModels.length > 0)
-        ? p.allowedModels[0] : null;
-      p.defaultModels = {
-        sonnet: firstModel || "claude-sonnet-4-6",
-        opus: firstModel || "claude-opus-4-5",
-        haiku: firstModel || "claude-haiku-4-5",
-      };
-      migrated = true;
-    }
-    if (!Array.isArray(p.allowedModels) || p.allowedModels.length === 0) {
-      p.allowedModels = [
-        p.defaultModels.sonnet,
-        p.defaultModels.opus,
-        p.defaultModels.haiku,
-      ];
-      migrated = true;
-    }
-  }
-  if (migrated) { saveConfig(config); console.log("[MIGRATE] Added defaultModels to existing profiles"); }
-})();
+const removedOpenAIProfileSuffixes = [];
+const removedOpenAIUserKeys = new Set();
 
-// Auto-migrate: add API protocol and generic model aliases.
-(function migrateProfileProtocolsAndAliases() {
-  let migrated = false;
-  for (const pname of Object.keys(config.profiles)) {
-    const p = config.profiles[pname];
-    const protocol = normalizeApiProtocol(p.apiProtocol);
-    if (p.apiProtocol !== protocol) {
-      p.apiProtocol = protocol;
-      migrated = true;
+// One-way migration: the project now supports Anthropic Messages only.
+(function migrateProfilesToAnthropicOnly() {
+  const openAIProfiles = Object.entries(config.profiles)
+    .filter(([, profile]) => String(profile.apiProtocol || "anthropic").toLowerCase() === "openai");
+  let migrated = openAIProfiles.length > 0;
+  if (openAIProfiles.length > 0) {
+    backupFileSync(configPath, "config.json", "remove-openai");
+    for (const [name, profile] of openAIProfiles) {
+      removedOpenAIProfileSuffixes.push(normalizeProfileSuffix(profile.suffix));
+      for (const key of Object.keys(profile.users || {})) removedOpenAIUserKeys.add(key);
+      delete config.profiles[name];
     }
-    if (p.openaiStreamUsage === undefined) {
-      p.openaiStreamUsage = OPENAI_STREAM_USAGE_DEFAULT;
-      migrated = true;
+  }
+
+  if (Object.keys(config.profiles).length === 0) {
+    config.profiles["默认方案"] = {
+      suffix: "default",
+      isDefault: true,
+      upstream: "",
+      allowedModels: [],
+      modelAliases: {},
+      dailyTokenLimit: null,
+      users: {},
+    };
+    migrated = true;
+  }
+
+  for (const profile of Object.values(config.profiles)) {
+    const explicitAliases = normalizeModelAliases(profile.modelAliases || {});
+    const aliases = { ...legacyDefaultModelAliases(profile.defaultModels || {}), ...explicitAliases };
+    if (JSON.stringify(profile.modelAliases || {}) !== JSON.stringify(aliases)) migrated = true;
+    profile.modelAliases = aliases;
+    if (!Array.isArray(profile.allowedModels)) profile.allowedModels = [];
+    for (const target of Object.values(aliases)) {
+      if (target && !profile.allowedModels.includes(target)) profile.allowedModels.push(target);
     }
-    const adapter = protocol === "openai" ? normalizeResponsesAdapter(p.responsesAdapter) : "none";
-    if (p.responsesAdapter !== adapter) {
-      p.responsesAdapter = adapter;
-      migrated = true;
+    for (const field of ["defaultModels", "apiProtocol", "openaiStreamUsage", "responsesAdapter"]) {
+      if (field in profile) {
+        delete profile[field];
+        migrated = true;
+      }
     }
-    const mergedAliases = protocol === "openai" ? getConfigurableModelAliases(p) : getProfileModelAliases(p);
-    const currentAliases = normalizeModelAliases(p.modelAliases || {});
-    const mergedJson = JSON.stringify(mergedAliases);
-    if (JSON.stringify(currentAliases) !== mergedJson) {
-      p.modelAliases = mergedAliases;
+  }
+
+  const assignedKeys = new Set(Object.values(config.profiles).flatMap((profile) => Object.keys(profile.users || {})));
+  for (const key of removedOpenAIUserKeys) {
+    if (!assignedKeys.has(key) && config.users?.[key]) {
+      delete config.users[key];
       migrated = true;
     }
   }
-  if (migrated) { saveConfig(config); console.log("[MIGRATE] Added apiProtocol/modelAliases to profiles"); }
+
+  if (migrated) {
+    delete config.activeProfile;
+    saveConfig(config);
+    console.log(`[MIGRATE] Simplified Claude aliases and removed ${openAIProfiles.length} OpenAI profile(s)`);
+  }
 })();
 
 // Auto-migrate: separate global users from profile-specific keys
@@ -377,17 +371,12 @@ function listProfiles() {
     name,
     suffix: normalizeProfileSuffix(config.profiles[name].suffix),
     isDefault: !!config.profiles[name].isDefault,
-    apiProtocol: normalizeApiProtocol(config.profiles[name].apiProtocol),
     upstream: config.profiles[name].upstream,
     userCount: Object.keys(config.profiles[name].users || {}).length,
     allowedModels: config.profiles[name].allowedModels || [],
-    defaultModels: config.profiles[name].defaultModels || {},
     modelAliases: getConfigurableModelAliases(config.profiles[name]),
-    openaiStreamUsage: config.profiles[name].openaiStreamUsage !== false,
-    responsesAdapter: normalizeApiProtocol(config.profiles[name].apiProtocol) === "openai"
-      ? normalizeResponsesAdapter(config.profiles[name].responsesAdapter)
-      : "none",
     dailyTokenLimit: config.profiles[name].dailyTokenLimit || 0,
+    configured: !!config.profiles[name].upstream,
   }));
 }
 
@@ -487,17 +476,11 @@ function createProfileRuntime(profileName, profile) {
     profileName,
     suffix: normalizeProfileSuffix(profile.suffix),
     isDefault: !!profile.isDefault,
-    apiProtocol: normalizeApiProtocol(profile.apiProtocol),
     upstream: profile.upstream,
     upstreamUrl,
     users: { ...(profile.users || {}) },
     allowedModels: profile.allowedModels || [],
-    defaultModels: profile.defaultModels || { sonnet: "claude-sonnet-4-6", opus: "claude-opus-4-5", haiku: "claude-haiku-4-5" },
     modelAliases: getProfileModelAliases(profile),
-    openaiStreamUsage: profile.openaiStreamUsage !== false,
-    responsesAdapter: normalizeApiProtocol(profile.apiProtocol) === "openai"
-      ? normalizeResponsesAdapter(profile.responsesAdapter)
-      : "none",
     globalUsers: { ...(config.users || {}) },
     breaker: new CircuitBreaker({
       failureThreshold: (config.proxy || {}).circuitBreakerFailures || 5,
@@ -510,8 +493,13 @@ function createProfileRuntime(profileName, profile) {
 function initAllRuntimes() {
   for (const key of Object.keys(runtimes)) delete runtimes[key];
   for (const [name, profile] of Object.entries(config.profiles)) {
+    if (!profile.upstream) continue;
     const suffix = normalizeProfileSuffix(profile.suffix);
-    runtimes[suffix] = createProfileRuntime(name, profile);
+    try {
+      runtimes[suffix] = createProfileRuntime(name, profile);
+    } catch (err) {
+      console.warn(`[RUNTIME] Skipped unconfigured profile "${name}": ${err.message}`);
+    }
   }
   console.log(`[RUNTIME] Initialized ${Object.keys(runtimes).length} profile(s): ${Object.values(runtimes).map(r => `"${r.profileName}"(${JSON.stringify(r.suffix)})`).join(", ")}`);
 }
@@ -980,6 +968,173 @@ function migrateFromJsonIfNeeded() {
   }
 }
 
+const REQUEST_DATA_TABLES = ["users", "usage_daily", "usage_daily_model", "usage_daily_hourly", "usage_model", "usage_hourly", "errors", "quota_adjust_history"];
+
+function legacyProfileData(raw = {}) {
+  return {
+    users: raw.users || {},
+    daily: raw.daily || {},
+    dailyModels: raw.dailyModels || {},
+    dailyHourly: raw.dailyHourly || {},
+    models: raw.models || {},
+    hourly: raw.hourly || {},
+    errors: Array.isArray(raw.errors) ? raw.errors : [],
+  };
+}
+
+function normalizeLegacyImportData(raw) {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) throw new Error("data.json 顶层必须是对象");
+  if (raw._profiles !== undefined && (!raw._profiles || typeof raw._profiles !== "object" || Array.isArray(raw._profiles))) {
+    throw new Error("_profiles 必须是对象");
+  }
+  const profiles = {};
+  for (const [suffix, value] of Object.entries(raw._profiles || {})) {
+    if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error(`方案 ${suffix} 的数据格式无效`);
+    profiles[String(suffix)] = legacyProfileData(value);
+  }
+  const topLevelFields = ["users", "daily", "dailyModels", "dailyHourly", "models", "hourly", "errors"];
+  const hasTopLevel = topLevelFields.some((key) => Array.isArray(raw[key]) ? raw[key].length > 0 : Object.keys(raw[key] || {}).length > 0);
+  if (hasTopLevel) {
+    let source = getDefaultProfileSuffix() || "default";
+    if (profiles[source]) source = "top-level";
+    profiles[source] = legacyProfileData(raw);
+  }
+  if (Object.keys(profiles).length === 0) throw new Error("文件中没有可导入的统计数据");
+  return {
+    profiles,
+    quotaAdjustHistory: Array.isArray(raw.quotaAdjustHistory) ? raw.quotaAdjustHistory : [],
+    lastQuotaEval: raw._lastQuotaEval || null,
+  };
+}
+
+function legacyImportHash(raw) {
+  return crypto.createHash("sha256").update(JSON.stringify(raw)).digest("hex");
+}
+
+function summarizeLegacyImport(normalized) {
+  const userKeys = new Set();
+  const dates = new Set();
+  let requests = 0;
+  let records = 0;
+  for (const ps of Object.values(normalized.profiles)) {
+    let profileRequests = 0;
+    let dailyRequests = 0;
+    for (const [key, user] of Object.entries(ps.users || {})) {
+      userKeys.add(key);
+      profileRequests += Number(user.totalRequests) || 0;
+      records++;
+    }
+    for (const [date, rows] of Object.entries(ps.daily || {})) {
+      dates.add(date);
+      for (const [key, row] of Object.entries(rows || {})) {
+        userKeys.add(key);
+        dailyRequests += Number(row.requests) || 0;
+        records++;
+      }
+    }
+    requests += profileRequests || dailyRequests;
+    for (const date of Object.keys(ps.dailyModels || {})) dates.add(date);
+    for (const date of Object.keys(ps.dailyHourly || {})) dates.add(date);
+    for (const date of Object.keys(ps.hourly || {})) dates.add(date);
+    records += Object.keys(ps.models || {}).length + (ps.errors || []).length;
+  }
+  const orderedDates = [...dates].filter((date) => /^\d{4}-\d{2}-\d{2}$/.test(date)).sort();
+  return {
+    users: userKeys.size,
+    requests,
+    records,
+    minDate: orderedDates[0] || null,
+    maxDate: orderedDates.at(-1) || null,
+  };
+}
+
+function writeLegacyData(normalized, profileMap) {
+  for (const [sourceSuffix, ps] of Object.entries(normalized.profiles)) {
+    const suffix = normalizeProfileSuffix(profileMap[sourceSuffix]);
+    if (!suffix) continue;
+    for (const [key, user] of Object.entries(ps.users || {})) {
+      db.prepare(`INSERT INTO users (profile,user_key,name,total_input,total_output,total_requests,cache_creation,cache_read,last_active)
+        VALUES (?,?,?,?,?,?,?,?,?) ON CONFLICT(profile,user_key) DO UPDATE SET
+          name=excluded.name, total_input=total_input+excluded.total_input, total_output=total_output+excluded.total_output,
+          total_requests=total_requests+excluded.total_requests, cache_creation=cache_creation+excluded.cache_creation,
+          cache_read=cache_read+excluded.cache_read, last_active=excluded.last_active`)
+        .run(suffix, key, user.name || key.slice(0, 8), user.totalInputTokens || 0, user.totalOutputTokens || 0, user.totalRequests || 0, user.cacheCreationTokens || 0, user.cacheReadTokens || 0, user.lastActive || null);
+    }
+    for (const [date, rows] of Object.entries(ps.daily || {})) {
+      for (const [key, row] of Object.entries(rows || {})) {
+        db.prepare(`INSERT INTO usage_daily (profile,date,user_key,input_tokens,output_tokens,requests,cache_creation,cache_read) VALUES (?,?,?,?,?,?,?,?)
+          ON CONFLICT(profile,date,user_key) DO UPDATE SET input_tokens=input_tokens+excluded.input_tokens, output_tokens=output_tokens+excluded.output_tokens,
+          requests=requests+excluded.requests, cache_creation=cache_creation+excluded.cache_creation, cache_read=cache_read+excluded.cache_read`)
+          .run(suffix, date, key, row.inputTokens || 0, row.outputTokens || 0, row.requests || 0, row.cacheCreationTokens || 0, row.cacheReadTokens || 0);
+      }
+    }
+    for (const [model, row] of Object.entries(ps.models || {})) {
+      db.prepare(`INSERT INTO usage_model (profile,model,tokens,requests) VALUES (?,?,?,?)
+        ON CONFLICT(profile,model) DO UPDATE SET tokens=tokens+excluded.tokens, requests=requests+excluded.requests`)
+        .run(suffix, model, row.tokens || 0, row.requests || 0);
+    }
+    for (const [date, hours] of Object.entries(ps.hourly || {})) {
+      for (const [hour, row] of Object.entries(hours || {})) {
+        db.prepare(`INSERT INTO usage_hourly (profile,date,hour,requests,input_tokens,output_tokens,cache_creation,cache_read) VALUES (?,?,?,?,?,?,?,?)
+          ON CONFLICT(profile,date,hour) DO UPDATE SET requests=requests+excluded.requests, input_tokens=input_tokens+excluded.input_tokens,
+          output_tokens=output_tokens+excluded.output_tokens, cache_creation=cache_creation+excluded.cache_creation, cache_read=cache_read+excluded.cache_read`)
+          .run(suffix, date, hour, row.requests || 0, row.inputTokens || 0, row.outputTokens || 0, row.cacheCreationTokens || 0, row.cacheReadTokens || 0);
+      }
+    }
+    for (const [date, users] of Object.entries(ps.dailyModels || {})) {
+      for (const [key, models] of Object.entries(users || {})) {
+        for (const [model, row] of Object.entries(models || {})) {
+          db.prepare(`INSERT INTO usage_daily_model (profile,date,user_key,model,input_tokens,output_tokens,requests) VALUES (?,?,?,?,?,?,?)
+            ON CONFLICT(profile,date,user_key,model) DO UPDATE SET input_tokens=input_tokens+excluded.input_tokens,
+            output_tokens=output_tokens+excluded.output_tokens, requests=requests+excluded.requests`)
+            .run(suffix, date, key, model, row.inputTokens || 0, row.outputTokens || 0, row.requests || 0);
+        }
+      }
+    }
+    for (const [date, users] of Object.entries(ps.dailyHourly || {})) {
+      for (const [key, hours] of Object.entries(users || {})) {
+        for (const [hour, row] of Object.entries(hours || {})) {
+          db.prepare(`INSERT INTO usage_daily_hourly (profile,date,user_key,hour,requests,input_tokens,output_tokens,cache_creation,cache_read) VALUES (?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(profile,date,user_key,hour) DO UPDATE SET requests=requests+excluded.requests, input_tokens=input_tokens+excluded.input_tokens,
+            output_tokens=output_tokens+excluded.output_tokens, cache_creation=cache_creation+excluded.cache_creation, cache_read=cache_read+excluded.cache_read`)
+            .run(suffix, date, key, hour, row.requests || 0, row.inputTokens || 0, row.outputTokens || 0, row.cacheCreationTokens || 0, row.cacheReadTokens || 0);
+        }
+      }
+    }
+    for (const error of ps.errors || []) {
+      stmts.insertError.run({
+        profile: suffix,
+        time: error.time || new Date().toISOString(),
+        userName: error.user || error.userName || "",
+        key: error.userKey || "unknown",
+        statusCode: error.statusCode || 0,
+        error: error.error || "",
+        path: error.path || "",
+        model: error.model || "unknown",
+      });
+    }
+  }
+  for (const row of normalized.quotaAdjustHistory || []) {
+    const date = row.date || cnDate();
+    stmts.insertQuotaAdjust.run({
+      user: row.user || row.userKey || "unknown",
+      username: row.username || row.userName || "",
+      date,
+      oldQuota: row.oldQuota || 0,
+      newQuota: row.newQuota || 0,
+      hitRate: row.hitRate || 0,
+      avgDailyUsage: row.avgDailyUsage || 0,
+      time: row.time || `${date}T00:00:00.000Z`,
+    });
+  }
+  if (normalized.lastQuotaEval) stmts.upsertMeta.run({ k: "lastQuotaEval", v: normalized.lastQuotaEval });
+}
+
+function clearRequestData() {
+  for (const table of REQUEST_DATA_TABLES) db.prepare(`DELETE FROM ${table}`).run();
+  db.prepare("DELETE FROM kv_meta").run();
+}
+
 // ── Meta helpers (kv_meta: _lastQuotaEval) ──
 function getMeta(key, fallback = null) {
   const row = db.prepare("SELECT value FROM kv_meta WHERE key=?").get(key);
@@ -1025,6 +1180,27 @@ function loadProfileSnapshot(suffix) {
 
 initDb();
 migrateFromJsonIfNeeded();
+
+function removeLegacyOpenAIData() {
+  const suffixes = removedOpenAIProfileSuffixes.filter(Boolean);
+  if (suffixes.length === 0) return;
+  db.pragma("wal_checkpoint(FULL)");
+  backupFileSync(dbPath, "data.db", "remove-openai");
+  const placeholders = suffixes.map(() => "?").join(",");
+  const removedKeys = db.prepare(`SELECT DISTINCT user_key FROM users WHERE profile IN (${placeholders})`).all(...suffixes).map((row) => row.user_key);
+  const tx = db.transaction(() => {
+    for (const table of ["users", "usage_daily", "usage_daily_model", "usage_daily_hourly", "usage_model", "usage_hourly", "errors"]) {
+      db.prepare(`DELETE FROM ${table} WHERE profile IN (${placeholders})`).run(...suffixes);
+    }
+    for (const key of removedKeys) {
+      if (!config.users?.[key]) db.prepare("DELETE FROM quota_adjust_history WHERE user_key=?").run(key);
+    }
+  });
+  tx();
+  console.log(`[MIGRATE] Removed persisted data for ${suffixes.length} OpenAI profile(s)`);
+}
+
+removeLegacyOpenAIData();
 
 // Aggregate all profiles for "all profiles" view, assembled via SQL GROUP BY.
 // Returns the same nested shape as loadProfileSnapshot so sanitizeStore and the
@@ -1143,11 +1319,6 @@ function previewList(values, fallback = "none") {
 }
 
 function modelNotAllowedMessage(model, runtime) {
-  if (runtime?.apiProtocol === "openai") {
-    const aliases = Object.keys(runtime.modelAliases || {});
-    const aliasHint = aliases.length > 0 ? ` Configured aliases: ${previewList(aliases)}.` : "";
-    return `Model "${model}" is not allowed for OpenAI/Codex profile "${runtime.profileName}". Allowed models: ${previewList(runtime.allowedModels)}.${aliasHint} Configure Codex to use an allowed model, or add a model alias such as gpt-5.5=<real model>.`;
-  }
   return `Model "${model}" is not allowed. Use jx-sonnet/jx-opus/jx-haiku or a model from the allowed list.`;
 }
 
@@ -1227,72 +1398,14 @@ function resolveModel(model, _rt) {
   for (const [name, target] of Object.entries(aliases)) {
     if (name.toLowerCase() === alias) return target;
   }
-  const dm = runtime.defaultModels || {};
-  if (alias === "jx-sonnet") return dm.sonnet || model;
-  if (alias === "jx-opus")   return dm.opus   || model;
-  if (alias === "jx-haiku")  return dm.haiku  || model;
   return model;
 }
 
-function isOpenAIChatCompletionsPath(reqUrl) {
+function isUnsupportedOpenAIPath(reqUrl) {
   const pathname = new URL(reqUrl || "/", "http://localhost").pathname;
-  return pathname === "/v1/chat/completions" || pathname.endsWith("/chat/completions");
-}
-
-function isOpenAIResponsesPath(reqUrl) {
-  const pathname = new URL(reqUrl || "/", "http://localhost").pathname;
-  return pathname === "/v1/responses" || pathname.endsWith("/responses");
-}
-
-function isOpenAIModelsPath(reqUrl) {
-  const pathname = new URL(reqUrl || "/", "http://localhost").pathname;
-  return pathname === "/v1/models" || pathname.endsWith("/models");
-}
-
-function isAllowedOpenAIProxyPath(reqUrl, method) {
-  const upperMethod = String(method || "GET").toUpperCase();
-  if (isOpenAIModelsPath(reqUrl)) return upperMethod === "GET" || upperMethod === "HEAD";
-  if (upperMethod !== "POST") return false;
-  return isOpenAIResponsesPath(reqUrl) || isOpenAIChatCompletionsPath(reqUrl);
-}
-
-function validateProxyTarget(runtime, reqUrl, method) {
-  if (runtime?.apiProtocol !== "openai") return { allowed: true };
-  if (isAllowedOpenAIProxyPath(reqUrl, method)) return { allowed: true };
-  const pathname = new URL(reqUrl || "/", "http://localhost").pathname;
-  return {
-    allowed: false,
-    statusCode: 404,
-    message: `Unsupported OpenAI/Codex proxy endpoint ${String(method || "GET").toUpperCase()} ${pathname}. Allowed endpoints: POST /v1/responses, POST /v1/chat/completions, and local GET /v1/models.`,
-  };
-}
-
-function shouldAdaptOpenAIResponses(runtime, reqUrl) {
-  return runtime?.apiProtocol === "openai" &&
-    runtime.responsesAdapter === "chat_completions" &&
-    isOpenAIResponsesPath(reqUrl);
-}
-
-function shouldServeLocalOpenAIModels(runtime, reqUrl) {
-  return runtime?.apiProtocol === "openai" &&
-    isOpenAIModelsPath(reqUrl);
-}
-
-function ensureOpenAIStreamUsage(body, runtime, reqUrl) {
-  if (runtime.apiProtocol !== "openai" || runtime.openaiStreamUsage === false || !isOpenAIChatCompletionsPath(reqUrl)) {
-    return body;
-  }
-  try {
-    const parsed = sanitizeJson(JSON.parse(body.toString()));
-    if (!parsed.stream) return body;
-    const opts = parsed.stream_options && typeof parsed.stream_options === "object" && !Array.isArray(parsed.stream_options)
-      ? parsed.stream_options
-      : {};
-    parsed.stream_options = { ...opts, include_usage: true };
-    return Buffer.from(JSON.stringify(parsed));
-  } catch {
-    return body;
-  }
+  return pathname === "/v1/responses" || pathname.endsWith("/responses") ||
+    pathname === "/v1/chat/completions" || pathname.endsWith("/chat/completions") ||
+    pathname === "/v1/models" || pathname.endsWith("/models");
 }
 
 function mergeUsageCounters(target, source) {
@@ -1320,238 +1433,15 @@ function usageHasTokens(usage = {}) {
   return !!((usage.input_tokens || 0) > 0 || (usage.output_tokens || 0) > 0 || (usage.prompt_tokens || 0) > 0 || (usage.completion_tokens || 0) > 0 || (usage.total_tokens || 0) > 0);
 }
 
-function usageToResponsesUsage(usage = {}) {
-  const toTokenNumber = (value) => {
-    if (value === undefined || value === null || value === "") return 0;
-    const n = Number(value);
-    return Number.isFinite(n) ? n : 0;
-  };
-  const input = toTokenNumber(usage.input_tokens ?? usage.prompt_tokens);
-  let output = toTokenNumber(usage.output_tokens ?? usage.completion_tokens);
-  const explicitTotal = toTokenNumber(usage.total_tokens);
-  if (!input && !output && explicitTotal) output = explicitTotal;
-  return {
-    input_tokens: input,
-    output_tokens: output,
-    total_tokens: explicitTotal || input + output,
-  };
-}
-
-function extractTextContent(content) {
-  if (content === undefined || content === null) return "";
-  if (typeof content === "string") return content;
-  if (Array.isArray(content)) {
-    return content.map((part) => {
-      if (part === undefined || part === null) return "";
-      if (typeof part === "string") return part;
-      if (typeof part !== "object") return String(part);
-      if (typeof part.text === "string") return part.text;
-      if (typeof part.input_text === "string") return part.input_text;
-      if (typeof part.output_text === "string") return part.output_text;
-      if (typeof part.refusal === "string") return part.refusal;
-      if (typeof part.content === "string") return part.content;
-      return "";
-    }).join("");
-  }
-  if (typeof content === "object") {
-    if (typeof content.text === "string") return content.text;
-    if (typeof content.input_text === "string") return content.input_text;
-    if (typeof content.output_text === "string") return content.output_text;
-    if (typeof content.content === "string") return content.content;
-  }
-  return String(content);
-}
-
-function normalizeChatRole(role) {
-  const r = String(role || "user").toLowerCase();
-  if (r === "developer") return "system";
-  if (["system", "user", "assistant", "tool"].includes(r)) return r;
-  return "user";
-}
-
-function responsesInputToChatMessages(input, instructions) {
-  const messages = [];
-  const systemText = extractTextContent(instructions).trim();
-  if (systemText) messages.push({ role: "system", content: systemText });
-
-  const addMessage = (role, content, extra = {}) => {
-    const text = extractTextContent(content);
-    messages.push({ role: normalizeChatRole(role), content: text, ...extra });
-  };
-
-  if (typeof input === "string") {
-    addMessage("user", input);
-  } else if (Array.isArray(input)) {
-    const looseText = [];
-    for (const item of input) {
-      if (typeof item === "string") {
-        looseText.push(item);
-        continue;
-      }
-      if (!item || typeof item !== "object") continue;
-      if (item.type === "function_call_output") {
-        messages.push({
-          role: "tool",
-          tool_call_id: item.call_id || item.id || "call_0",
-          content: extractTextContent(item.output),
-        });
-        continue;
-      }
-      if (item.type === "function_call") {
-        messages.push({
-          role: "assistant",
-          content: "",
-          tool_calls: [{
-            id: item.call_id || item.id || "call_0",
-            type: "function",
-            function: {
-              name: item.name || "unknown",
-              arguments: typeof item.arguments === "string" ? item.arguments : JSON.stringify(item.arguments || {}),
-            },
-          }],
-        });
-        continue;
-      }
-      if (item.role || item.type === "message") {
-        addMessage(item.role || "user", item.content ?? item.text ?? item.input_text ?? item.output_text ?? "");
-        continue;
-      }
-      looseText.push(extractTextContent(item.content ?? item.text ?? item.input_text ?? item.output_text ?? item));
-    }
-    if (looseText.length > 0) addMessage("user", looseText.filter(Boolean).join("\n"));
-  } else if (input && typeof input === "object") {
-    if (input.role || input.type === "message") addMessage(input.role || "user", input.content ?? input.text ?? "");
-    else addMessage("user", input.content ?? input.text ?? input.input_text ?? "");
-  }
-
-  if (messages.length === 0) messages.push({ role: "user", content: "" });
-  return messages;
-}
-
-function convertResponsesToolsToChatTools(tools) {
-  if (!Array.isArray(tools)) return undefined;
-  const converted = [];
-  for (const tool of tools) {
-    if (!tool || typeof tool !== "object") continue;
-    if (tool.type !== "function") continue;
-    if (tool.function && typeof tool.function === "object") {
-      converted.push({ type: "function", function: tool.function });
-      continue;
-    }
-    if (!tool.name) continue;
-    const fn = { name: tool.name };
-    if (tool.description) fn.description = tool.description;
-    if (tool.parameters) fn.parameters = tool.parameters;
-    if (tool.strict !== undefined) fn.strict = tool.strict;
-    converted.push({ type: "function", function: fn });
-  }
-  return converted.length > 0 ? converted : undefined;
-}
-
-function convertResponsesToolChoiceToChat(toolChoice) {
-  if (!toolChoice || typeof toolChoice === "string") return toolChoice;
-  if (toolChoice.type === "function" && toolChoice.name) {
-    return { type: "function", function: { name: toolChoice.name } };
-  }
-  return toolChoice;
-}
-
-function responsesRequestToChatCompletions(parsed, forceStream = false) {
-  const chat = {
-    model: parsed.model,
-    messages: Array.isArray(parsed.messages)
-      ? parsed.messages.map((m) => ({ ...m, role: normalizeChatRole(m.role) }))
-      : responsesInputToChatMessages(parsed.input, parsed.instructions),
-  };
-  const passthrough = [
-    "temperature",
-    "top_p",
-    "frequency_penalty",
-    "presence_penalty",
-    "stop",
-    "user",
-    "metadata",
-    "parallel_tool_calls",
-  ];
-  for (const key of passthrough) {
-    if (parsed[key] !== undefined) chat[key] = parsed[key];
-  }
-  const maxTokens = parsed.max_tokens ?? parsed.max_completion_tokens ?? parsed.max_output_tokens;
-  if (maxTokens !== undefined) chat.max_tokens = maxTokens;
-  const tools = convertResponsesToolsToChatTools(parsed.tools);
-  if (tools) chat.tools = tools;
-  const toolChoice = convertResponsesToolChoiceToChat(parsed.tool_choice);
-  if (toolChoice !== undefined) chat.tool_choice = toolChoice;
-  chat.stream = forceStream || !!parsed.stream;
-  if (chat.stream) {
-    const opts = parsed.stream_options && typeof parsed.stream_options === "object" && !Array.isArray(parsed.stream_options)
-      ? parsed.stream_options
-      : {};
-    chat.stream_options = { ...opts, include_usage: true };
-  }
-  return chat;
-}
-
-function convertChatToolCallsToResponsesOutput(toolCalls) {
-  if (!Array.isArray(toolCalls)) return [];
-  return toolCalls.map((call, index) => ({
-    type: "function_call",
-    id: call.id || `fc_${index}`,
-    call_id: call.id || `call_${index}`,
-    name: call.function?.name || call.name || "unknown",
-    arguments: call.function?.arguments || call.arguments || "{}",
-    status: "completed",
-  }));
-}
-
-function chatCompletionToResponse(chat, fallbackModel) {
-  const choice = Array.isArray(chat.choices) ? chat.choices[0] : null;
-  const message = choice?.message || {};
-  const text = extractTextContent(message.content);
-  const output = [];
-  if (text || !message.tool_calls) {
-    output.push({
-      type: "message",
-      role: "assistant",
-      content: [{ type: "output_text", text }],
-    });
-  }
-  output.push(...convertChatToolCallsToResponsesOutput(message.tool_calls));
-  const usage = usageToResponsesUsage(chat.usage || {});
-  return {
-    id: chat.id || `resp_${crypto.randomBytes(12).toString("hex")}`,
-    object: "response",
-    created_at: chat.created || Math.floor(Date.now() / 1000),
-    status: "completed",
-    model: chat.model || fallbackModel,
-    output,
-    output_text: text,
-    usage,
-  };
-}
-
-function localOpenAIModels(runtime) {
-  const ids = Array.from(new Set((runtime.allowedModels || []).filter((m) => m && m !== "*")));
-  if (ids.length === 0) {
-    for (const target of Object.values(runtime.modelAliases || {})) {
-      if (target && !ids.includes(target)) ids.push(target);
-    }
-  }
-  return {
-    object: "list",
-    data: ids.map((id) => ({ id, object: "model", created: 0, owned_by: "cc-team" })),
-  };
-}
-
-
 // ─── Timezone Helpers (UTC+8 北京时间) ────────────────────────────────────────
-function cnNow() {
-  const d = new Date();
-  const utc = d.getTime() + d.getTimezoneOffset() * 60000;
-  return new Date(utc + 8 * 3600000);
-}
+function cnNow(now = Date.now()) { return new Date(now + 8 * 3600000); }
 function cnDate() { return cnNow().toISOString().slice(0, 10); }
-function cnHour() { return cnNow().getHours().toString().padStart(2, "0"); }
+function cnHour() { return cnNow().toISOString().slice(11, 13); }
+function secondsUntilNextCnMidnight(now = Date.now()) {
+  const shifted = new Date(now + 8 * 3600000);
+  const nextShiftedMidnight = Date.UTC(shifted.getUTCFullYear(), shifted.getUTCMonth(), shifted.getUTCDate() + 1);
+  return Math.max(1, Math.ceil((nextShiftedMidnight - 8 * 3600000 - now) / 1000));
+}
 
 function recordUsage(apiKey, usage, model, suffix, _rt) {
   const runtime = _rt || runtimes[normalizeProfileSuffix(suffix)] || rt;
@@ -1647,9 +1537,7 @@ function evaluateAutoQuotaAdjustments() {
   // Collect last P dates (excluding today)
   const dates = [];
   for (let i = 1; i <= period; i++) {
-    const d = new Date(cnNow().getTime() - i * 86400000);
-    const utc = d.getTime() + d.getTimezoneOffset() * 60000;
-    dates.push(new Date(utc + 8 * 3600000).toISOString().slice(0, 10));
+    dates.push(new Date(cnNow().getTime() - i * 86400000).toISOString().slice(0, 10));
   }
 
   const profile = config.profiles[getDefaultProfileName()];
@@ -2054,6 +1942,11 @@ function sendUpstream(body, reqUrl, reqMethod, reqHeaders, timeout, _rt, clientS
 }
 
 function proxyRequest(req, res) {
+  if (isUnsupportedOpenAIPath(req.url)) {
+    res.writeHead(404, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ error: "OpenAI endpoints are not supported. Use the Anthropic Messages API with Claude Code." }));
+    return;
+  }
   // Resolve which profile this request targets
   const resolvedProfile = resolveProfile(req.url);
   if (resolvedProfile.error) {
@@ -2062,6 +1955,11 @@ function proxyRequest(req, res) {
     return;
   }
   const { suffix, runtime, strippedUrl } = resolvedProfile;
+  if (!runtime) {
+    res.writeHead(503, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ error: "No configured proxy profile. Open Settings to configure an Anthropic upstream." }));
+    return;
+  }
   const apiKey = getApiKey(req);
   const proxyStartTime = Date.now();
   let proxyPhase = "init";
@@ -2070,9 +1968,9 @@ function proxyRequest(req, res) {
   // Global IP rate limit
   const clientIp = getClientIp(req);
   if (!checkIpRateLimit(clientIp)) {
-    res.writeHead(429, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ error: "IP rate limit exceeded. Please slow down." }));
-    console.log(`[限流] IP ${clientIp} 超过全局速率限制`);
+    res.writeHead(429, { "Content-Type": "application/json", "Retry-After": "60" });
+    res.end(JSON.stringify({ error: "IP rate limit exceeded. Please slow down.", type: "ip_rate_limit_exceeded" }));
+    recordError(apiKey, 429, `ip_rate_limit_exceeded: ${clientIp}`, req.url, "unknown", suffix, runtime);
     return;
   }
 
@@ -2112,25 +2010,6 @@ function proxyRequest(req, res) {
     res.writeHead(403, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ error: earlyAccess.reason }));
     console.log(`[拦截] ${apiKey.slice(0, 8)}**** profile=${runtime.profileName} ${req.method} ${targetUrl} ${earlyAccess.reason}`);
-    return;
-  }
-
-  // OpenAI/Codex model discovery is served locally to prevent client probes from touching upstream billing endpoints.
-  if (shouldServeLocalOpenAIModels(runtime, targetUrl) && ["GET", "HEAD"].includes(String(req.method || "GET").toUpperCase())) {
-    res.writeHead(200, { "Content-Type": "application/json", "X-Proxy-Local": "models" });
-    if (req.method === "HEAD") res.end();
-    else res.end(JSON.stringify(localOpenAIModels(runtime)));
-    console.log(`[本地] ${getUserName(apiKey, runtime)} profile=${runtime.profileName} ${req.method} ${targetUrl} 返回模型列表，不转发上游`);
-    return;
-  }
-
-  const targetValidation = validateProxyTarget(runtime, targetUrl, req.method);
-  if (!targetValidation.allowed) {
-    const status = targetValidation.statusCode || 404;
-    res.writeHead(status, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ error: targetValidation.message }));
-    recordError(apiKey, status, targetValidation.message, targetUrl, "unknown", suffix, runtime);
-    console.log(`[拦截] ${getUserName(apiKey, runtime)} profile=${runtime.profileName} ${req.method} ${targetUrl} 不转发上游`);
     return;
   }
 
@@ -2185,33 +2064,32 @@ function proxyRequest(req, res) {
       return;
     }
 
-    // Concurrency check
-    if (!tryAcquireConcurrency(userKey)) {
-      res.writeHead(429, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: "Too many concurrent requests. Please try again later." }));
-      return;
-    }
-    // Rate limit check
-    if (!checkAndRecordRate(userKey)) {
-      releaseConcurrency(userKey);
-      res.writeHead(429, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: "Rate limit exceeded. Please slow down." }));
-      return;
-    }
-
-    // Token quota check
+    // Quota and rate checks happen before a concurrency slot is occupied.
     const quota = checkTokenQuota(apiKey, suffix, runtime);
     if (!quota.allowed) {
       const reqHost = req.headers.host || `localhost:${port}`;
       const usageUrl = `http://${reqHost}/usage/${apiKey}`;
-      res.writeHead(429, { "Content-Type": "application/json", "Retry-After": "86400" });
+      const retryAfter = secondsUntilNextCnMidnight();
+      res.writeHead(429, { "Content-Type": "application/json", "Retry-After": String(retryAfter) });
       res.end(JSON.stringify({
         error: `今日Token额度已用完。已用: ${quota.used.toLocaleString()}, 限额: ${quota.limit.toLocaleString()}。额度将于北京时间次日凌晨重置。查看用量详情: ${usageUrl}`,
         type: "quota_exceeded",
         quota: { used: quota.used, limit: quota.limit, remaining: quota.remaining, source: quota.source },
         usageUrl,
       }));
-      console.log(`[配额] ${getUserName(apiKey, runtime)} 今日额度已用完 [${quota.source}] (已用: ${quota.used.toLocaleString()} / 限额: ${quota.limit.toLocaleString()})`);
+      recordError(apiKey, 429, `quota_exceeded: ${quota.used}/${quota.limit}, retry in ${retryAfter}s`, req.url, reqModel, suffix, runtime);
+      return;
+    }
+    if (!checkAndRecordRate(userKey)) {
+      res.writeHead(429, { "Content-Type": "application/json", "Retry-After": "60" });
+      res.end(JSON.stringify({ error: "Rate limit exceeded. Please slow down.", type: "rate_limit_exceeded" }));
+      recordError(apiKey, 429, "rate_limit_exceeded", req.url, reqModel, suffix, runtime);
+      return;
+    }
+    if (!tryAcquireConcurrency(userKey)) {
+      res.writeHead(429, { "Content-Type": "application/json", "Retry-After": "1" });
+      res.end(JSON.stringify({ error: "Too many concurrent requests. Please try again later.", type: "concurrency_exceeded" }));
+      recordError(apiKey, 429, "concurrency_exceeded", req.url, reqModel, suffix, runtime);
       return;
     }
 
@@ -2232,28 +2110,13 @@ function proxyRequest(req, res) {
       const isStreamRequest = (req.headers["accept"] || "").includes("text/event-stream") ||
         (function() { try { return JSON.parse(body.toString()).stream; } catch { return false; } })();
 
-      const useResponsesAdapter = shouldAdaptOpenAIResponses(runtime, targetUrl);
-
-      if (isStreamRequest && !useResponsesAdapter) {
-        body = ensureOpenAIStreamUsage(body, runtime, strippedUrl || req.url);
-        reqHeaders["content-length"] = body.length;
-      }
-
       proxyPhase = isStreamRequest ? "streaming-proxy" : "json-proxy";
       const timeout = isStreamRequest ? gProxy.streamTimeout : gProxy.timeout;
 
       if (isStreamRequest) {
-        if (useResponsesAdapter) {
-          await handleOpenAIResponsesAdapterStreamingProxy(req, res, body, reqHeaders, apiKey, reqModel, timeout, reqSource, runtime, suffix, clientState);
-        } else {
-          await handleStreamingProxy(req, res, body, reqHeaders, apiKey, reqModel, timeout, reqSource, runtime, suffix, strippedUrl, clientState);
-        }
+        await handleStreamingProxy(req, res, body, reqHeaders, apiKey, reqModel, timeout, reqSource, runtime, suffix, strippedUrl, clientState);
       } else {
-        if (useResponsesAdapter) {
-          await handleOpenAIResponsesAdapterJsonProxy(req, res, body, reqHeaders, apiKey, reqModel, timeout, reqSource, runtime, suffix, clientState);
-        } else {
-          await handleJsonProxy(req, res, body, reqHeaders, apiKey, reqModel, timeout, reqSource, runtime, suffix, strippedUrl, clientState);
-        }
+        await handleJsonProxy(req, res, body, reqHeaders, apiKey, reqModel, timeout, reqSource, runtime, suffix, strippedUrl, clientState);
       }
     } catch (err) {
       if (isClientAbortError(err)) {
@@ -2276,487 +2139,6 @@ function proxyRequest(req, res) {
       res.writeHead(413, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ error: "Request body too large" }));
     }
-  });
-}
-
-function writeSseEvent(res, event, payload) {
-  res.write(`event: ${event}\n`);
-  res.write(`data: ${JSON.stringify(payload)}\n\n`);
-}
-
-async function handleOpenAIResponsesAdapterJsonProxy(req, res, body, reqHeaders, apiKey, reqModel, timeout, reqSource, _rt, suffix, clientState) {
-  const runtime = _rt || rt;
-  let parsed;
-  try {
-    parsed = sanitizeJson(JSON.parse(body.toString()));
-  } catch {
-    res.writeHead(400, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ error: "Invalid JSON request body" }));
-    return;
-  }
-
-  const chatPayload = responsesRequestToChatCompletions(parsed, false);
-  const chatBody = Buffer.from(JSON.stringify(chatPayload));
-  const chatHeaders = { ...reqHeaders, "content-type": "application/json", "content-length": chatBody.length };
-  let lastError = null;
-
-  for (let attempt = 0; attempt <= gProxy.maxRetries; attempt++) {
-    try {
-      throwIfClientAborted(clientState);
-      const upRes = await sendUpstream(chatBody, "/v1/chat/completions", "POST", chatHeaders, timeout, runtime, clientState);
-      const text = upRes.body.toString();
-
-      if (upRes.statusCode < 500) {
-        runtime.breaker.recordSuccess();
-      }
-
-      if (gProxy.retryableStatusCodes.includes(upRes.statusCode) && attempt < gProxy.maxRetries) {
-        const baseDelay = Math.min(gProxy.retryDelay * Math.pow(2, attempt), 10000);
-        const delay = Math.round(jitter(baseDelay));
-        console.log(`[重试] ${getUserName(apiKey, runtime)} ${upRes.statusCode} model=${reqModel} responses→chat 第${attempt + 1}/${gProxy.maxRetries}次 ${delay}ms后重试`);
-        recordError(apiKey, upRes.statusCode, `Retryable adapter error (attempt ${attempt + 1}/${gProxy.maxRetries})`, req.url, reqModel, suffix, runtime);
-        await sleepWithClientAbort(delay, clientState);
-        continue;
-      }
-
-      if (upRes.statusCode >= 400) {
-        let errMsg = text.slice(0, 200);
-        try {
-          const json = JSON.parse(text);
-          errMsg = json.error?.message || json.message || errMsg;
-        } catch {}
-        recordError(apiKey, upRes.statusCode, errMsg, req.url, reqModel, suffix, runtime);
-        if (upRes.statusCode >= 500) runtime.breaker.recordFailure();
-        const respHeaders = { ...upRes.headers };
-        delete respHeaders["content-encoding"];
-        delete respHeaders["content-length"];
-        res.writeHead(upRes.statusCode, respHeaders);
-        res.end(text);
-        return;
-      }
-
-      let chatJson;
-      try {
-        chatJson = JSON.parse(text);
-      } catch {
-        console.log(`[响应] ${getUserName(apiKey, runtime)} adapter 上游返回非JSON body[0:300]=${text.slice(0, 300).replace(/\n/g, "\\n")}`);
-        res.writeHead(upRes.statusCode, { "Content-Type": "text/plain" });
-        res.end(text);
-        return;
-      }
-
-      const responseJson = chatCompletionToResponse(chatJson, reqModel);
-      if (usageHasTokens(responseJson.usage)) {
-        recordUsage(apiKey, responseJson.usage, responseJson.model || reqModel, suffix, runtime);
-        console.log(`[Token] ${getUserName(apiKey, runtime)} [${reqSource}] model=${responseJson.model || reqModel} 输入=${responseJson.usage.input_tokens || 0} 输出=${responseJson.usage.output_tokens || 0} responses→chat`);
-      } else {
-        console.log(`[响应] ${getUserName(apiKey, runtime)} adapter 200 OK 但无usage字段 model=${responseJson.model || reqModel}`);
-      }
-
-      const respHeaders = { ...upRes.headers, "content-type": "application/json" };
-      delete respHeaders["content-encoding"];
-      delete respHeaders["content-length"];
-      if (attempt > 0) respHeaders["x-proxy-retry"] = String(attempt);
-      res.writeHead(upRes.statusCode, respHeaders);
-      res.end(JSON.stringify(responseJson));
-      return;
-    } catch (err) {
-      if (isClientAbortError(err)) {
-        console.log(`[取消] ${getUserName(apiKey, runtime)} adapter JSON 客户端断开 model=${reqModel}`);
-        return;
-      }
-      lastError = err;
-      runtime.breaker.recordFailure();
-      if (attempt < gProxy.maxRetries) {
-        const baseDelay = Math.min(gProxy.retryDelay * Math.pow(2, attempt), 10000);
-        const delay = Math.round(jitter(baseDelay));
-        console.log(`[重试] ${getUserName(apiKey, runtime)} adapter 网络错误 model=${reqModel} 第${attempt + 1}/${gProxy.maxRetries}次 ${delay}ms后重试`);
-        await sleepWithClientAbort(delay, clientState);
-      }
-    }
-  }
-
-  const finalStatus = lastError?.isTimeout ? 504 : 502;
-  const finalLabel = lastError?.isTimeout ? "Gateway Timeout" : "Bad Gateway";
-  recordError(apiKey, finalStatus, `${finalLabel} adapter after ${gProxy.maxRetries} retries: ${lastError?.message}`, req.url, reqModel, suffix, runtime);
-  if (!res.headersSent) {
-    res.writeHead(finalStatus, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ error: `Proxy ${finalLabel} after ${gProxy.maxRetries} retries. Please try again later.` }));
-  }
-}
-
-async function handleOpenAIResponsesAdapterStreamingProxy(req, res, body, reqHeaders, apiKey, reqModel, timeout, reqSource, _rt, suffix, clientState) {
-  const runtime = _rt || rt;
-  throwIfClientAborted(clientState);
-  let parsed;
-  try {
-    parsed = sanitizeJson(JSON.parse(body.toString()));
-  } catch {
-    res.writeHead(400, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ error: "Invalid JSON request body" }));
-    return;
-  }
-
-  const chatPayload = responsesRequestToChatCompletions(parsed, true);
-  const chatBody = Buffer.from(JSON.stringify(chatPayload));
-  const chatHeaders = {
-    ...reqHeaders,
-    accept: "text/event-stream",
-    "content-type": "application/json",
-    "content-length": chatBody.length,
-  };
-  const opts = {
-    hostname: runtime.upstreamUrl.hostname,
-    port: runtime.upstreamUrl.port || (runtime.upstreamUrl.protocol === "https:" ? 443 : 80),
-    path: buildUpstreamPath("/v1/chat/completions", runtime),
-    method: "POST",
-    headers: chatHeaders,
-    agent: runtime.agent,
-  };
-  const transport = runtime.upstreamUrl.protocol === "https:" ? https : http;
-
-  await new Promise((resolve) => {
-    let clientGone = !!clientState?.aborted;
-    let resolved = false;
-    let cleanupUpstream = () => {};
-    let cleanupClientAbort = () => {};
-    const responseId = `resp_${crypto.randomBytes(12).toString("hex")}`;
-    const createdAt = Math.floor(Date.now() / 1000);
-    let model = reqModel;
-    let buf = "";
-    let rawSample = "";
-    let sseDataLines = 0;
-	    let completed = false;
-	    const usage = { input_tokens: 0, output_tokens: 0 };
-	    const textParts = [];
-	    const outputItems = [];
-	    const toolCalls = new Map();
-	    let nextOutputIndex = 0;
-	    const messageItemId = "msg_0";
-	    let messageOutputIndex = null;
-	    let messageStarted = false;
-	    let messageDone = false;
-
-	    const buildMessageItem = (text, status = "in_progress") => ({
-	      id: messageItemId,
-	      type: "message",
-	      status,
-	      role: "assistant",
-	      content: [{ type: "output_text", text }],
-	    });
-	    const buildToolCallItem = (tool, status = "in_progress") => ({
-	      id: tool.itemId,
-	      type: "function_call",
-	      status,
-	      call_id: tool.callId,
-	      name: tool.name || "unknown",
-	      arguments: tool.arguments,
-	    });
-	    const ensureMessageItem = () => {
-	      if (messageStarted) return;
-	      messageStarted = true;
-	      messageOutputIndex = nextOutputIndex++;
-	      if (!clientGone) {
-	        writeSseEvent(res, "response.output_item.added", {
-	          type: "response.output_item.added",
-	          output_index: messageOutputIndex,
-	          item: buildMessageItem(""),
-	        });
-	        writeSseEvent(res, "response.content_part.added", {
-	          type: "response.content_part.added",
-	          item_id: messageItemId,
-	          output_index: messageOutputIndex,
-	          content_index: 0,
-	          part: { type: "output_text", text: "" },
-	        });
-	      }
-	    };
-	    const finishMessageItem = () => {
-	      if (!messageStarted || messageDone) return;
-	      messageDone = true;
-	      const outputText = textParts.join("");
-	      const messageItem = buildMessageItem(outputText, "completed");
-	      outputItems[messageOutputIndex] = messageItem;
-	      if (!clientGone) {
-	        writeSseEvent(res, "response.output_text.done", {
-	          type: "response.output_text.done",
-	          item_id: messageItemId,
-	          output_index: messageOutputIndex,
-	          content_index: 0,
-	          text: outputText,
-	        });
-	        writeSseEvent(res, "response.content_part.done", {
-	          type: "response.content_part.done",
-	          item_id: messageItemId,
-	          output_index: messageOutputIndex,
-	          content_index: 0,
-	          part: { type: "output_text", text: outputText },
-	        });
-	        writeSseEvent(res, "response.output_item.done", {
-	          type: "response.output_item.done",
-	          output_index: messageOutputIndex,
-	          item: messageItem,
-	        });
-	      }
-	    };
-	    const ensureToolCall = (call) => {
-	      const chatIndex = Number.isInteger(call?.index) ? call.index : toolCalls.size;
-	      const key = String(chatIndex);
-	      let tool = toolCalls.get(key);
-	      if (!tool) {
-	        const callId = call?.id || `call_${chatIndex}`;
-	        tool = {
-	          chatIndex,
-	          outputIndex: nextOutputIndex++,
-	          itemId: callId,
-	          callId,
-	          name: "",
-	          arguments: "",
-	          started: false,
-	          done: false,
-	        };
-	        toolCalls.set(key, tool);
-	      }
-	      if (call?.id && !tool.started) {
-	        tool.itemId = call.id;
-	        tool.callId = call.id;
-	      }
-	      if (call?.function?.name) tool.name = call.function.name;
-	      if (!tool.started) {
-	        tool.started = true;
-	        if (!clientGone) {
-	          writeSseEvent(res, "response.output_item.added", {
-	            type: "response.output_item.added",
-	            output_index: tool.outputIndex,
-	            item: buildToolCallItem(tool),
-	          });
-	        }
-	      }
-	      return tool;
-	    };
-	    const handleToolCallDelta = (call) => {
-	      if (!call || typeof call !== "object") return;
-	      const tool = ensureToolCall(call);
-	      const argDelta = typeof call.function?.arguments === "string" ? call.function.arguments : "";
-	      if (!argDelta) return;
-	      tool.arguments += argDelta;
-	      if (!clientGone) {
-	        writeSseEvent(res, "response.function_call_arguments.delta", {
-	          type: "response.function_call_arguments.delta",
-	          item_id: tool.itemId,
-	          output_index: tool.outputIndex,
-	          delta: argDelta,
-	        });
-	      }
-	    };
-	    const finishToolCalls = () => {
-	      for (const tool of [...toolCalls.values()].sort((a, b) => a.outputIndex - b.outputIndex)) {
-	        if (tool.done) continue;
-	        tool.done = true;
-	        const item = buildToolCallItem(tool, "completed");
-	        outputItems[tool.outputIndex] = item;
-	        if (!clientGone) {
-	          writeSseEvent(res, "response.function_call_arguments.done", {
-	            type: "response.function_call_arguments.done",
-	            item_id: tool.itemId,
-	            output_index: tool.outputIndex,
-	            arguments: tool.arguments,
-	          });
-	          writeSseEvent(res, "response.output_item.done", {
-	            type: "response.output_item.done",
-	            output_index: tool.outputIndex,
-	            item,
-	          });
-	        }
-	      }
-	    };
-
-	    const safeResolve = () => {
-	      if (!resolved) {
-	        resolved = true;
-        cleanupClientAbort();
-        cleanupUpstream();
-        resolve();
-      }
-    };
-	    const finishStream = () => {
-	      if (completed) return;
-	      completed = true;
-	      const outputText = textParts.join("");
-	      const responseUsage = usageToResponsesUsage(usage);
-	      if (!messageStarted && toolCalls.size === 0) ensureMessageItem();
-	      finishMessageItem();
-	      finishToolCalls();
-	      const finalOutput = outputItems.filter(Boolean);
-	      if (!clientGone) {
-	        writeSseEvent(res, "response.completed", {
-	          type: "response.completed",
-	          response: {
-	            id: responseId,
-            object: "response",
-	            created_at: createdAt,
-	            status: "completed",
-	            model,
-	            output: finalOutput,
-	            output_text: outputText,
-	            usage: responseUsage,
-	          },
-	        });
-      }
-      if (usageHasTokens(responseUsage)) {
-        recordUsage(apiKey, responseUsage, model, suffix, runtime);
-        console.log(`[Token] ${getUserName(apiKey, runtime)} [${reqSource}] model=${model} 输入=${responseUsage.input_tokens || 0} 输出=${responseUsage.output_tokens || 0} responses→chat`);
-      } else {
-        console.log(`[响应] ${getUserName(apiKey, runtime)} adapter 流结束 无usage数据 model=${model} sse行数=${sseDataLines} 原始数据[0:200]=${rawSample.slice(0, 200).replace(/\n/g, "\\n")}`);
-      }
-      if (!clientGone) res.end();
-      safeResolve();
-    };
-
-    const upReq = transport.request(opts, (upRes) => {
-      if (upRes.statusCode >= 400) {
-        const h = { ...upRes.headers };
-        delete h["transfer-encoding"];
-        delete h["content-encoding"];
-        delete h["content-length"];
-        res.writeHead(upRes.statusCode, h);
-        let errBuf = "";
-        upRes.on("data", (c) => {
-          if (clientGone) return;
-          errBuf += c.toString();
-          res.write(c);
-        });
-        upRes.on("end", () => {
-          recordError(apiKey, upRes.statusCode, errBuf.slice(0, 200), req.url, reqModel, suffix, runtime);
-          if (upRes.statusCode >= 500) runtime.breaker.recordFailure();
-          else runtime.breaker.recordSuccess();
-          if (!clientGone) res.end();
-          safeResolve();
-        });
-        return;
-      }
-
-      runtime.breaker.recordSuccess();
-      res.writeHead(upRes.statusCode, {
-        "content-type": "text/event-stream",
-        "cache-control": "no-cache",
-        "connection": "keep-alive",
-      });
-	      writeSseEvent(res, "response.created", {
-	        type: "response.created",
-	        response: {
-	          id: responseId,
-          object: "response",
-          created_at: createdAt,
-          status: "in_progress",
-          model,
-	          output: [],
-	        },
-	      });
-
-	      res.on("error", () => {
-	        clientGone = true;
-        upReq.destroy(makeClientAbortError("response-error"));
-        safeResolve();
-      });
-
-      const handleDataLine = (jsonStr) => {
-        if (jsonStr === "[DONE]") {
-          finishStream();
-          return;
-        }
-        sseDataLines++;
-        let d;
-        try {
-          d = JSON.parse(jsonStr);
-        } catch {
-          return;
-        }
-        if (sseDataLines <= 3) console.log(`[SSE] ${getUserName(apiKey, runtime)} adapter 第${sseDataLines}条 类型=${d.object || d.type || "chunk"} 字段=${Object.keys(d).join(",")}`);
-        if (d.model) model = d.model;
-	        if (d.usage) mergeUsageCounters(usage, d.usage);
-	        for (const choice of d.choices || []) {
-	          const delta = choice.delta || {};
-	          if (typeof delta.content === "string" && delta.content) {
-	            ensureMessageItem();
-	            textParts.push(delta.content);
-	            if (!clientGone) {
-	              writeSseEvent(res, "response.output_text.delta", {
-	                type: "response.output_text.delta",
-	                item_id: messageItemId,
-	                output_index: messageOutputIndex,
-	                content_index: 0,
-	                delta: delta.content,
-	              });
-	            }
-	          }
-	          for (const call of delta.tool_calls || []) {
-	            handleToolCallDelta(call);
-	          }
-	          if (choice.message?.content) {
-	            const text = extractTextContent(choice.message.content);
-	            if (text) {
-	              ensureMessageItem();
-	              textParts.push(text);
-	            }
-	          }
-	        }
-	      };
-
-      upRes.on("data", (chunk) => {
-        if (clientGone || completed) return;
-        const text = chunk.toString();
-        if (rawSample.length < 500) rawSample += text;
-        buf += text;
-        const lines = buf.split("\n");
-        buf = lines.pop() || "";
-        for (const line of lines) {
-          if (!line.trim()) continue;
-          if (!line.startsWith("data:")) continue;
-          handleDataLine(line.slice(5).trim());
-        }
-      });
-
-      upRes.on("end", () => {
-        if (completed) return;
-        if (buf.trim().startsWith("data:")) {
-          handleDataLine(buf.trim().slice(5).trim());
-        }
-        finishStream();
-      });
-    });
-    cleanupUpstream = setActiveUpstreamRequest(clientState, upReq);
-    cleanupClientAbort = addClientAbortListener(clientState, (reason) => {
-      clientGone = true;
-      upReq.destroy(makeClientAbortError(reason));
-      safeResolve();
-    });
-
-    upReq.setTimeout(timeout, () => {
-      upReq.destroy(new Error(`Upstream stream timeout (${timeout}ms)`));
-    });
-    upReq.on("error", (err) => {
-      if (isClientAbortError(err) || clientState?.aborted) {
-        console.log(`[取消] ${getUserName(apiKey, runtime)} adapter 流式客户端断开 model=${reqModel}`);
-        safeResolve();
-        return;
-      }
-      runtime.breaker.recordFailure();
-      const isTimeout = err.message.includes("timeout");
-      const status = isTimeout ? 504 : 502;
-      const label = isTimeout ? "Gateway Timeout" : "Bad Gateway";
-      recordError(apiKey, status, `${label}: ${err.message}`, req.url, reqModel, suffix, runtime);
-      if (!res.headersSent && !clientGone) {
-        res.writeHead(status, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: `Proxy ${label}. Please try again later.` }));
-      } else if (!clientGone && !completed) {
-        finishStream();
-      }
-      safeResolve();
-    });
-
-    upReq.write(chatBody);
-    upReq.end();
   });
 }
 
@@ -3057,15 +2439,9 @@ function getPublicSettings() {
   const defaultProfile = config.profiles[getDefaultProfileName()];
   return {
     upstream: defaultProfile?.upstream || "",
-    apiProtocol: normalizeApiProtocol(defaultProfile?.apiProtocol),
     proxy: { ...gProxy },
     allowedModels: defaultProfile?.allowedModels || [],
-    defaultModels: { ...(defaultProfile?.defaultModels || {}) },
     modelAliases: getConfigurableModelAliases(defaultProfile || {}),
-    openaiStreamUsage: defaultProfile?.openaiStreamUsage !== false,
-    responsesAdapter: normalizeApiProtocol(defaultProfile?.apiProtocol) === "openai"
-      ? normalizeResponsesAdapter(defaultProfile?.responsesAdapter)
-      : "none",
     profileUsers: profileAssignments[defaultSuffix] || {},
     profileAssignments,
     globalUsers,
@@ -3121,7 +2497,6 @@ function settingsHtml(errorMsg) {
 <td><label style="display:inline-flex;align-items:center;gap:4px;margin:0;cursor:pointer"><input type="checkbox" name="pu_dis_${escHtml(k)}" ${profileDisabled ? "checked" : ""} style="width:auto;accent-color:var(--orange)"><span style="font-size:11px;color:${profileDisabled ? "var(--orange)" : "var(--dim)"}">${profileDisabled ? "已禁用" : "正常"}</span></label></td></tr>`;
   }).join("");
 
-  const dm = s.defaultModels || {};
   const aliasesText = formatModelAliasesInput(s.modelAliases || {});
   const settingsJson = JSON.stringify(s).replace(/</g, "\\x3c");
 
@@ -3176,6 +2551,12 @@ td{padding:8px;border-bottom:1px solid #ecece8;font-size:12px}
 .status{display:inline-flex;align-items:center;padding:3px 8px;border-radius:4px;font-size:11px;font-weight:550}
 .status-ok{background:var(--accent-soft);color:var(--green)}.status-warn{background:#fbf3db;color:var(--orange)}.status-err{background:#fdebec;color:var(--red)}
 .note{font-size:11px;color:var(--dim);margin-top:7px;line-height:1.55}
+.import-tools{display:flex;align-items:end;gap:10px;flex-wrap:wrap}.import-tools>div{flex:1;min-width:220px}.import-tools .btn{margin-bottom:1px}
+.import-preview{display:none;margin-top:14px;padding-top:14px;border-top:1px solid var(--border)}.import-preview.open{display:block}
+.import-summary{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px;margin-bottom:12px}.import-stat{padding:10px;background:var(--surface-subtle);border-radius:5px}.import-stat b{display:block;font-size:16px;font-variant-numeric:tabular-nums}.import-stat span{font-size:10px;color:var(--dim)}
+.mapping-row{display:grid;grid-template-columns:minmax(120px,1fr) 28px minmax(180px,1fr);align-items:center;gap:8px;margin-top:7px}.mapping-arrow{text-align:center;color:var(--dim)}
+.danger-section{border-color:#efc9c4;background:#fffdfc}.danger-copy{display:flex;align-items:center;justify-content:space-between;gap:18px}.danger-copy strong{display:block;font-size:13px;color:var(--red);margin-bottom:3px}
+.inline-status{min-height:18px;margin-top:9px;font-size:11px;color:var(--dim)}.inline-status.error{color:var(--red)}.inline-status.ok{color:var(--green)}
 .presets{display:flex;gap:6px;flex-wrap:wrap;margin-top:8px}
 .preset{font-size:11px;padding:5px 9px;border-radius:4px;border:1px solid var(--border);background:var(--surface);color:var(--dim);cursor:pointer;font-family:var(--font-body)}
 .preset:hover{border-color:var(--border-strong);background:var(--surface-subtle);color:var(--text)}
@@ -3187,7 +2568,7 @@ td{padding:8px;border-bottom:1px solid #ecece8;font-size:12px}
 .modal-hd h3{font-size:15px;font-weight:650}.modal-close{background:none;border:none;color:var(--dim);font-size:12px;cursor:pointer;padding:5px 7px}.modal-close:hover{color:var(--text);background:var(--surface-subtle)}
 .modal-body{padding:18px 20px;overflow-y:auto;flex:1}
 @media(max-width:900px){.row3{grid-template-columns:1fr 1fr}.main{padding:24px}}
-@media(max-width:680px){body{overflow:auto;height:auto}.layout{flex-direction:column;height:auto;min-height:100vh}.sidebar{width:100%;min-width:0;max-height:none;border-right:0;border-bottom:1px solid var(--border)}.sidebar-list{display:flex;gap:6px;overflow-x:auto}.pl-item{min-width:210px;margin:0}.main{overflow:visible;padding:22px 16px}.row,.row3{grid-template-columns:1fr}.modal{width:100%;max-height:90vh}.section{padding:15px;overflow-x:auto}}
+@media(max-width:680px){body{overflow:auto;height:auto}.layout{flex-direction:column;height:auto;min-height:100vh}.sidebar{width:100%;min-width:0;max-height:none;border-right:0;border-bottom:1px solid var(--border)}.sidebar-list{display:flex;gap:6px;overflow-x:auto}.pl-item{min-width:210px;margin:0}.main{overflow:visible;padding:22px 16px}.row,.row3{grid-template-columns:1fr}.modal{width:100%;max-height:90vh}.section{padding:15px;overflow-x:auto}.import-summary{grid-template-columns:1fr 1fr}.mapping-row{grid-template-columns:1fr}.mapping-arrow{display:none}.danger-copy{align-items:flex-start;flex-direction:column}}
 </style></head><body data-theme="editorial-light">
 <div class="layout">
 <div class="sidebar">
@@ -3213,62 +2594,34 @@ ${errDiv}
 <input type="hidden" name="profileName" id="profileNameInput" value="${escHtml(initialProfile.name || "")}">
 <input type="hidden" name="profileSuffix" id="profileSuffixInput" value="${escHtml(initialSuffix)}">
 
-<h2>上游代理 <span class="status ${s.circuitBreaker.state === 'CLOSED' ? 'status-ok' : s.circuitBreaker.state === 'HALF_OPEN' ? 'status-warn' : 'status-err'}">${s.circuitBreaker.state === 'CLOSED' ? '正常' : s.circuitBreaker.state === 'HALF_OPEN' ? '探测中' : '熔断中'}</span></h2>
+<h2>上游代理 <span class="status ${s.circuitBreaker.state === 'CLOSED' ? 'status-ok' : s.circuitBreaker.state === 'OPEN' ? 'status-err' : 'status-warn'}">${s.circuitBreaker.state === 'CLOSED' ? '正常' : s.circuitBreaker.state === 'HALF_OPEN' ? '探测中' : s.circuitBreaker.state === 'OPEN' ? '熔断中' : '未配置'}</span></h2>
 <div class="section">
-<div class="row3">
-<div><label>接口协议<span class="req">*</span></label><select name="apiProtocol" id="apiProtocolSelect" onchange="updateProtocolFields()"><option value="anthropic" ${s.apiProtocol === "anthropic" ? "selected" : ""}>Anthropic / Claude Code</option><option value="openai" ${s.apiProtocol === "openai" ? "selected" : ""}>OpenAI-compatible / Codex</option></select></div>
+<div class="row">
 <div><label>上游 API 地址<span class="req">*</span></label><input type="text" name="upstream" value="${s.upstream}" placeholder="https://open.bigmodel.cn/api/anthropic"></div>
 <div><label>URL 后缀 <span style="font-size:11px;color:var(--dim);font-weight:400">(所有方案必填)</span></label><input type="text" name="suffix" id="suffixInput" value="${escHtml(initialSuffix)}" placeholder="如: glm" oninput="updateAccessUrl()"></div>
-</div>
-<label style="display:flex;align-items:center;gap:6px;margin-top:12px"><input type="checkbox" name="openaiStreamUsage" id="openaiStreamUsageInput" ${s.openaiStreamUsage ? "checked" : ""} style="width:auto"> OpenAI 流式请求自动请求 usage 统计</label>
-<div id="responsesAdapterRow" style="margin-top:12px">
-<label>Responses 兼容模式</label>
-<select name="responsesAdapter" id="responsesAdapterSelect" onchange="updateAccessUrl()">
-  <option value="none" ${s.responsesAdapter === "none" ? "selected" : ""}>透明转发 /v1/responses</option>
-  <option value="chat_completions" ${s.responsesAdapter === "chat_completions" ? "selected" : ""}>将 /v1/responses 转为 /v1/chat/completions</option>
-</select>
-<div class="note">所有 OpenAI 方案的 /v1/models 都由本平台按允许模型列表本地返回，避免客户端探测打到上游。上游只有 Chat Completions、没有 Responses 端点时启用此兼容模式。</div>
 </div>
 <div class="note" id="accessUrlPreview" style="margin-top:8px;color:var(--green)">接入地址: http://&lt;host&gt;:6789/v1</div>
 <div class="presets">
   <span style="font-size:11px;color:var(--dim);line-height:24px">快速填充：</span>
-  <button type="button" class="preset" onclick="fillUpstream('anthropic','https://open.bigmodel.cn/api/anthropic')">智谱 GLM Anthropic</button>
-  <button type="button" class="preset" onclick="fillUpstream('anthropic','https://api.anthropic.com')">Anthropic</button>
-  <button type="button" class="preset" onclick="fillUpstream('openai','https://api.openai.com/v1')">OpenAI</button>
-  <button type="button" class="preset" onclick="fillUpstream('anthropic','https://api.deepseek.com/anthropic')">DeepSeek Anthropic</button>
-  <button type="button" class="preset" onclick="fillUpstream('openai','https://api.deepseek.com/v1')">DeepSeek OpenAI</button>
-  <button type="button" class="preset" onclick="fillUpstream('openai','https://dashscope.aliyuncs.com/compatible-mode/v1')">阿里百炼 OpenAI</button>
-  <button type="button" class="preset" onclick="fillUpstream('openai','https://coding.dashscope.aliyuncs.com/v1','chat_completions')">阿里 Coding OpenAI</button>
-  <button type="button" class="preset" onclick="fillUpstream('anthropic','https://token-plan.cn-beijing.maas.aliyuncs.com/apps/anthropic')">阿里Token Plan</button>
+  <button type="button" class="preset" onclick="fillUpstream('https://open.bigmodel.cn/api/anthropic')">智谱 GLM</button>
+  <button type="button" class="preset" onclick="fillUpstream('https://api.anthropic.com')">Anthropic</button>
+  <button type="button" class="preset" onclick="fillUpstream('https://api.deepseek.com/anthropic')">DeepSeek</button>
+  <button type="button" class="preset" onclick="fillUpstream('https://token-plan.cn-beijing.maas.aliyuncs.com/apps/anthropic')">阿里 Token Plan</button>
 </div>
-<div class="note" style="margin-top:8px">状态：${s.circuitBreaker.state === 'CLOSED' ? '正常运行' : s.circuitBreaker.state === 'HALF_OPEN' ? '探测恢复中...' : '熔断中(' + Math.ceil(s.circuitBreaker.cooldownRemaining / 1000) + 's)'} | 失败 ${s.circuitBreaker.failureCount} | 成功 ${s.circuitBreaker.totalSuccesses} | 失败 ${s.circuitBreaker.totalFailures}</div>
+<div class="note" style="margin-top:8px">状态：${s.circuitBreaker.state === 'CLOSED' ? '正常运行' : s.circuitBreaker.state === 'HALF_OPEN' ? '探测恢复中' : s.circuitBreaker.state === 'OPEN' ? '熔断中(' + Math.ceil(s.circuitBreaker.cooldownRemaining / 1000) + 's)' : '等待配置上游'} | 失败 ${s.circuitBreaker.failureCount} | 成功 ${s.circuitBreaker.totalSuccesses} | 失败 ${s.circuitBreaker.totalFailures}</div>
 </div>
 
-<h2><span id="modelConfigTitle">模型配置</span> <span id="modelConfigHint" style="font-size:11px;color:var(--dim);font-weight:400"></span></h2>
+<h2>模型别名</h2>
 <div class="section">
-<div id="anthropicAliasFields">
-<div class="row3">
-<div><label>jx-sonnet → 实际模型<span class="req">*</span></label><input type="text" name="defaultModels_sonnet" value="${dm.sonnet || ''}" placeholder="如: deepseek-v4-pro"></div>
-<div><label>jx-opus → 实际模型<span class="req">*</span></label><input type="text" name="defaultModels_opus" value="${dm.opus || ''}" placeholder="如: deepseek-v4-pro"></div>
-<div><label>jx-haiku → 实际模型<span class="req">*</span></label><input type="text" name="defaultModels_haiku" value="${dm.haiku || ''}" placeholder="如: deepseek-v4-flash"></div>
-</div>
+<label>通用模型别名 (每行 alias=实际模型，可选)</label>
+<textarea name="modelAliases" id="modelAliasesInput" rows="5" placeholder="jx-sonnet=glm-5.1&#10;jx-opus=glm-5.1&#10;jx-haiku=glm-5.1">${escHtml(aliasesText)}</textarea>
+<div class="note">Claude Code 使用的 jx-sonnet、jx-opus、jx-haiku 与其他自定义别名都在此统一配置。留空表示直接使用请求中的模型名。</div>
 <div class="presets">
   <span style="font-size:11px;color:var(--dim);line-height:24px">快速填充：</span>
-  <button type="button" class="preset" onclick="fillDefaults('deepseek-v4-pro','deepseek-v4-pro','deepseek-v4-flash')">DeepSeek</button>
-  <button type="button" class="preset" onclick="fillDefaults('claude-sonnet-4-6','claude-opus-4-5','claude-haiku-4-5')">Anthropic Claude</button>
-  <button type="button" class="preset" onclick="fillDefaults('glm-5.1','glm-5.1','glm-5.1')">智谱 GLM</button>
-  <button type="button" class="preset" onclick="fillDefaults('qwen-max','qwen-max','qwen-plus')">通义千问</button>
-</div>
-</div>
-<div id="openaiModelFields" style="display:none">
-<div class="note" style="margin-top:0;color:var(--green)">Codex/OpenAI 请求会携带真实 model，网关不需要配置 sonnet/opus/haiku 三档模型。下方只需要放行真实模型；模型别名是可选项。</div>
-</div>
-<label id="modelAliasesLabel">可选模型别名（每行 alias=实际模型）</label>
-<textarea name="modelAliases" id="modelAliasesInput" rows="4" placeholder="codex-main=gpt-5&#10;codex-fast=gpt-5-mini">${escHtml(aliasesText)}</textarea>
-<div class="note" id="modelAliasesNote">用于自定义别名映射到真实模型；留空表示客户端直接使用真实模型名。</div>
-<div class="presets" id="openaiAliasPresets">
-  <span style="font-size:11px;color:var(--dim);line-height:24px">快速填充：</span>
-  <button type="button" class="preset" onclick="fillOpenAIAliases()">Codex OpenAI</button>
+  <button type="button" class="preset" onclick="fillAliases('deepseek-v4-pro','deepseek-v4-pro','deepseek-v4-flash')">DeepSeek</button>
+  <button type="button" class="preset" onclick="fillAliases('claude-sonnet-4-6','claude-opus-4-5','claude-haiku-4-5')">Anthropic Claude</button>
+  <button type="button" class="preset" onclick="fillAliases('glm-5.1','glm-5.1','glm-5.1')">智谱 GLM</button>
+  <button type="button" class="preset" onclick="fillAliases('qwen-max','qwen-max','qwen-plus')">通义千问</button>
 </div>
 </div>
 
@@ -3276,7 +2629,7 @@ ${errDiv}
 <div class="section">
 <label>可用模型列表 (逗号分隔，至少1个)<span class="req">*必填</span></label>
 <input type="text" name="allowedModels" id="allowedModelsInput" value="${(s.allowedModels || []).join(",")}" placeholder="必填，如: deepseek-v4-pro, deepseek-v4-flash" required>
-<div class="note" id="allowedModelsNote">不在列表中的模型请求将被拦截返回403。Anthropic 三档别名映射的目标模型会自动添加到此列表。</div>
+<div class="note" id="allowedModelsNote">不在列表中的模型请求将被拦截返回403。所有别名目标模型会自动添加到此列表。</div>
 </div>
 
 <h2>超时 & 重试</h2>
@@ -3333,6 +2686,30 @@ ${errDiv}
 ${((() => { const qa = stmts.quotaAdjustRecent.all(); return qa.length > 0 ? `<h4 style="font-size:13px;color:var(--accent);margin:16px 0 8px">调整历史</h4><table style="width:100%;border-collapse:collapse;font-size:12px"><thead><tr><th style="text-align:left;padding:4px 8px;border-bottom:1px solid var(--border)">时间</th><th style="text-align:left;padding:4px 8px;border-bottom:1px solid var(--border)">用户</th><th style="text-align:right;padding:4px 8px;border-bottom:1px solid var(--border)">旧配额</th><th style="text-align:right;padding:4px 8px;border-bottom:1px solid var(--border)">新配额</th><th style="text-align:right;padding:4px 8px;border-bottom:1px solid var(--border)">命中率</th><th style="text-align:right;padding:4px 8px;border-bottom:1px solid var(--border)">日均用量</th></tr></thead><tbody>${qa.map(h => `<tr><td style="padding:4px 8px">${h.date}</td><td style="padding:4px 8px">${h.user_name || h.user_key.slice(0, 8)}</td><td style="text-align:right;padding:4px 8px">${(h.old_quota || 0).toLocaleString()}</td><td style="text-align:right;padding:4px 8px;color:var(--green)">${(h.new_quota || 0).toLocaleString()}</td><td style="text-align:right;padding:4px 8px">${Math.round((h.hit_rate || 0) * 100)}%</td><td style="text-align:right;padding:4px 8px">${(h.avg_daily_usage || 0).toLocaleString()}</td></tr>`).join("")}</tbody></table>` : '<div class="note" style="margin-top:8px">暂无自动调整记录</div>'; })())}
 </div>
 
+<h2>旧数据导入</h2>
+<div class="section">
+<div class="import-tools">
+  <div><label for="dataImportFile">data.json 文件</label><input type="file" id="dataImportFile" accept="application/json,.json"></div>
+  <button type="button" class="btn btn-outline" onclick="previewDataImport()">预览文件</button>
+</div>
+<div class="note">仅导入统计、错误和配额历史，不会覆盖当前配置。执行前必须确认每个来源方案的去向。</div>
+<div class="import-preview" id="dataImportPreview">
+  <div class="import-summary" id="dataImportSummary"></div>
+  <div id="dataImportMappings"></div>
+  <div class="row" style="margin-top:14px">
+    <div><label for="dataImportMode">导入方式</label><select id="dataImportMode" onchange="toggleImportPassword()"><option value="merge">合并现有数据</option><option value="replace">替换全部请求数据</option></select></div>
+    <div id="dataImportPasswordWrap" style="display:none"><label for="dataImportPassword">后台密码</label><input type="password" id="dataImportPassword" autocomplete="current-password" placeholder="替换模式需要验证密码"></div>
+  </div>
+  <div style="display:flex;justify-content:flex-end;margin-top:12px"><button type="button" class="btn btn-primary" onclick="applyDataImport()">执行导入</button></div>
+  <div class="inline-status" id="dataImportStatus" role="status"></div>
+</div>
+</div>
+
+<h2 style="color:var(--red)">危险操作</h2>
+<div class="section danger-section">
+  <div class="danger-copy"><div><strong>清空全部数据</strong><div class="note" style="margin:0">清除方案、用户、密钥、配额、统计、错误和导入记录。系统端口、后台密码与代理参数会保留，执行前自动创建备份。</div></div><button type="button" class="btn btn-danger" id="dataClearButton" onclick="openDataClearModal()">清空全部数据</button></div>
+</div>
+
 <div class="actions">
 <button type="button" class="btn btn-outline" onclick="location.href='/dashboard'">取消</button>
 <button type="submit" class="btn btn-primary">保存设置</button>
@@ -3375,26 +2752,30 @@ ${s.profiles.map(p => `<option value="${escHtml(p.suffix)}" ${p.suffix === initi
 <div class="modal" style="max-width:640px">
 <div class="modal-hd"><h3>新增方案</h3><button class="modal-close" onclick="closeProfileModal()">关闭</button></div>
 <div class="modal-body">
-<div class="row3">
+<div class="row">
 <div><label>方案名称<span class="req">*</span></label><input type="text" id="newProfileName" placeholder="如: GLM 项目组"></div>
 <div><label>URL 后缀<span class="req">*</span></label><input type="text" id="newProfileSuffix" placeholder="如: glm"></div>
-<div><label>接口协议<span class="req">*</span></label><select id="newProfileProtocol" onchange="updateNewProfileFields()"><option value="anthropic">Anthropic / Claude Code</option><option value="openai">OpenAI-compatible / Codex</option></select></div>
-</div>
-<div id="newProfileResponsesAdapterRow" style="display:none">
-<label>Responses 兼容模式</label>
-<select id="newProfileResponsesAdapter">
-  <option value="none">透明转发 /v1/responses</option>
-  <option value="chat_completions">将 /v1/responses 转为 /v1/chat/completions</option>
-</select>
 </div>
 <label>上游 API 地址<span class="req">*</span></label><input type="text" id="newProfileUpstream" value="${escHtml(initialProfile.upstream || s.upstream || "")}" placeholder="https://open.bigmodel.cn/api/anthropic">
 <label>允许模型</label><input type="text" id="newProfileModels" value="${escHtml((initialProfile.allowedModels || s.allowedModels || []).join(","))}" placeholder="glm-5.1,qwen-max">
-<label>模型别名（每行 alias=实际模型，可选）</label><textarea id="newProfileAliases" rows="3" placeholder="codex-main=gpt-5&#10;codex-fast=gpt-5-mini"></textarea>
+<label>模型别名（每行 alias=实际模型，可选）</label><textarea id="newProfileAliases" rows="3" placeholder="jx-sonnet=glm-5.1&#10;jx-opus=glm-5.1&#10;jx-haiku=glm-5.1"></textarea>
 <div class="note">创建后会出现在左侧方案列表。默认入口可在左侧点击“设为默认”。</div>
 <div style="margin-top:16px;display:flex;justify-content:flex-end;gap:8px">
 <button type="button" class="btn btn-outline btn-sm" onclick="closeProfileModal()">取消</button>
 <button type="button" class="btn btn-primary btn-sm" onclick="createProfile()">创建方案</button>
 </div>
+</div>
+</div>
+</div>
+<div class="modal-overlay" id="dataClearModal">
+<div class="modal" style="max-width:480px">
+<div class="modal-hd"><h3>确认清空全部数据</h3><button class="modal-close" onclick="closeDataClearModal()">关闭</button></div>
+<div class="modal-body">
+  <div style="font-size:13px;line-height:1.65">此操作会删除所有方案、用户、密钥、配额和请求历史。系统会先创建本地备份，但当前配置将立即进入未配置状态。</div>
+  <label for="dataClearPassword">后台密码</label>
+  <input type="password" id="dataClearPassword" autocomplete="current-password" placeholder="输入后台密码以确认">
+  <div class="inline-status" id="dataClearStatus" role="status"></div>
+  <div style="display:flex;justify-content:flex-end;gap:8px;margin-top:14px"><button type="button" class="btn btn-outline" onclick="closeDataClearModal()">取消</button><button type="button" class="btn btn-danger" onclick="clearAllData()">确认清空</button></div>
 </div>
 </div>
 </div>
@@ -3405,34 +2786,60 @@ document.getElementById('csrfToken').value=getCsrf();
 function csrfHeaders(h){h=h||{};h['x-csrf-token']=getCsrf();return h}
 function h(v){return String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
 function aliasText(aliases){return Object.entries(aliases||{}).map(([a,m])=>a+'='+m).join('\\n')}
-function currentProtocol(){return document.getElementById('apiProtocolSelect').value||'anthropic'}
-function updateProtocolFields(){
-  const protocol=currentProtocol();
-  const streamRow=document.getElementById('openaiStreamUsageInput')?.closest('label');
-  if(streamRow)streamRow.style.display=protocol==='openai'?'flex':'none';
-  const adapterRow=document.getElementById('responsesAdapterRow');
-  if(adapterRow)adapterRow.style.display=protocol==='openai'?'block':'none';
-  const anthropicFields=document.getElementById('anthropicAliasFields');
-  const openaiFields=document.getElementById('openaiModelFields');
-  const openaiPresets=document.getElementById('openaiAliasPresets');
-  if(anthropicFields)anthropicFields.style.display=protocol==='openai'?'none':'block';
-  if(openaiFields)openaiFields.style.display=protocol==='openai'?'block':'none';
-  if(openaiPresets)openaiPresets.style.display=protocol==='openai'?'flex':'none';
-  const title=document.getElementById('modelConfigTitle');
-  const hint=document.getElementById('modelConfigHint');
-  if(title)title.textContent=protocol==='openai'?'OpenAI / Codex 模型':'Claude 模型别名';
-  if(hint)hint.textContent=protocol==='openai'?'真实模型直传，可选 alias':'jx-sonnet / jx-opus / jx-haiku';
-  const aliasLabel=document.getElementById('modelAliasesLabel');
-  if(aliasLabel)aliasLabel.textContent=protocol==='openai'?'可选模型别名（每行 alias=实际模型）':'通用模型别名（每行 alias=实际模型，可选）';
-  const aliasNote=document.getElementById('modelAliasesNote');
-  if(aliasNote)aliasNote.textContent=protocol==='openai'?'Codex 可直接使用真实模型名；只有需要自定义短名称时才填写这里。':'jx-* 三个别名由上方字段生成；这里可额外增加自定义别名。';
-  const allowed=document.getElementById('allowedModelsInput');
-  if(allowed)allowed.placeholder=protocol==='openai'?'必填，如: gpt-5, qwen3-coder-plus, glm-5':'必填，如: deepseek-v4-pro, deepseek-v4-flash';
-  const allowedNote=document.getElementById('allowedModelsNote');
-  if(allowedNote)allowedNote.textContent=protocol==='openai'?'Codex/OpenAI 请求中的 model 必须在此列表中；留空不会放行。':'不在列表中的模型请求将被拦截返回403。Anthropic 三档别名映射的目标模型会自动添加到此列表。';
-  const up=document.querySelector('[name=upstream]');
-  if(up)up.placeholder=protocol==='openai'?'https://api.openai.com/v1 或 compatible-mode/v1':'https://open.bigmodel.cn/api/anthropic';
-  updateAccessUrl();
+let pendingImportData=null;
+let pendingImportPreview=null;
+function setImportStatus(message,type){const el=document.getElementById('dataImportStatus');el.textContent=message||'';el.className='inline-status '+(type||'')}
+async function previewDataImport(){
+  const file=document.getElementById('dataImportFile').files[0];
+  if(!file){setImportStatus('请选择 data.json 文件','error');return}
+  setImportStatus('正在解析文件','');
+  try{
+    pendingImportData=JSON.parse(await file.text());
+    const r=await fetch('/api/data-import/preview',{method:'POST',headers:csrfHeaders({'Content-Type':'application/json'}),body:JSON.stringify({data:pendingImportData})});
+    const result=await r.json();
+    if(!r.ok)throw new Error(result.error||'预览失败');
+    pendingImportPreview=result;
+    const summary=result.summary||{};
+    document.getElementById('dataImportSummary').innerHTML=[['用户',summary.users||0],['请求',summary.requests||0],['记录',summary.records||0],['日期',summary.minDate&&summary.maxDate?summary.minDate+' 至 '+summary.maxDate:'无日期']].map(function(item){return '<div class="import-stat"><b>'+h(item[1])+'</b><span>'+h(item[0])+'</span></div>'}).join('');
+    document.getElementById('dataImportMappings').innerHTML=(result.sourceProfiles||[]).map(function(source){
+      const options=['<option value="">请选择目标方案</option>'].concat(SETTINGS.profiles.map(function(profile){return '<option value="'+h(profile.suffix)+'" '+(source.matchedTarget===profile.suffix?'selected':'')+'>'+h(profile.name)+' /'+h(profile.suffix)+'</option>'})).concat(['<option value="skip">跳过此来源</option>']);
+      return '<div class="mapping-row"><code>'+h(source.suffix)+'</code><span class="mapping-arrow">到</span><select class="data-import-map" data-source="'+h(source.suffix)+'">'+options.join('')+'</select></div>';
+    }).join('');
+    document.getElementById('dataImportPreview').classList.add('open');
+    setImportStatus((result.warnings||[]).join('；')||'预览完成，请确认方案映射','ok');
+  }catch(error){pendingImportData=null;pendingImportPreview=null;document.getElementById('dataImportPreview').classList.remove('open');setImportStatus(error.message||'文件格式无效','error')}
+}
+function toggleImportPassword(){document.getElementById('dataImportPasswordWrap').style.display=document.getElementById('dataImportMode').value==='replace'?'block':'none'}
+async function applyDataImport(){
+  if(!pendingImportData||!pendingImportPreview){setImportStatus('请先预览文件','error');return}
+  const profileMap={};
+  document.querySelectorAll('.data-import-map').forEach(function(select){profileMap[select.dataset.source]=select.value});
+  if(Object.values(profileMap).some(function(value){return !value})){setImportStatus('请完成所有方案映射，或明确选择跳过','error');return}
+  const mode=document.getElementById('dataImportMode').value;
+  const password=document.getElementById('dataImportPassword').value;
+  if(mode==='replace'&&!password){setImportStatus('替换模式需要输入后台密码','error');return}
+  setImportStatus('正在导入，请勿关闭页面','');
+  try{
+    const r=await fetch('/api/data-import/apply',{method:'POST',headers:csrfHeaders({'Content-Type':'application/json'}),body:JSON.stringify({data:pendingImportData,sourceHash:pendingImportPreview.sourceHash,mode:mode,profileMap:profileMap,password:password})});
+    const result=await r.json();
+    if(!r.ok)throw new Error(result.error||'导入失败');
+    setImportStatus('导入完成','ok');
+  }catch(error){setImportStatus(error.message||'导入失败','error')}
+}
+function openDataClearModal(){const modal=document.getElementById('dataClearModal');modal.classList.add('open');document.getElementById('dataClearPassword').value='';document.getElementById('dataClearStatus').textContent='';document.getElementById('dataClearPassword').focus()}
+function closeDataClearModal(){document.getElementById('dataClearModal').classList.remove('open')}
+document.getElementById('dataClearModal').addEventListener('click',function(event){if(event.target===this)closeDataClearModal()});
+async function clearAllData(){
+  const password=document.getElementById('dataClearPassword').value;
+  const status=document.getElementById('dataClearStatus');
+  if(!password){status.textContent='请输入后台密码';status.className='inline-status error';return}
+  status.textContent='正在创建备份并清空数据';status.className='inline-status';
+  try{
+    const r=await fetch('/api/data-clear',{method:'POST',headers:csrfHeaders({'Content-Type':'application/json'}),body:JSON.stringify({password:password})});
+    const result=await r.json();
+    if(!r.ok)throw new Error(result.error||'清空失败');
+    location.reload();
+  }catch(error){status.textContent=error.message||'清空失败';status.className='inline-status error'}
 }
 function openUserModal(){const sfx=document.getElementById('profileSuffixInput').value||SETTINGS.selectedProfileSuffix;document.getElementById('userProfileSel').value=sfx;renderProfileUsers(sfx);document.getElementById('userModal').classList.add('open')}
 function closeUserModal(){document.getElementById('userModal').classList.remove('open')}
@@ -3449,30 +2856,19 @@ function updateAccessUrl(){
   const sfx=document.getElementById('suffixInput').value.trim();
   const p=SETTINGS.profiles.find(x=>x.name===editingProfileName);
   const defaultNote=p&&p.isDefault?' <span style="color:var(--green)">默认入口也可用 http://&lt;host&gt;:6789/v1</span>':'';
-  const protocol=currentProtocol();
-  const endpoint=protocol==='openai'?'/v1/responses 或 /v1/chat/completions':'/v1/messages';
-  const adapter=document.getElementById('responsesAdapterSelect')?.value||'none';
-  const adapterNote=protocol==='openai'&&adapter==='chat_completions'?' <span style="color:var(--orange)">已启用 Responses→Chat 适配</span>':'';
-  document.getElementById('accessUrlPreview').innerHTML='接入地址: http://&lt;host&gt;:6789/'+h(sfx)+endpoint+defaultNote+adapterNote;
+  document.getElementById('accessUrlPreview').innerHTML='接入地址: http://&lt;host&gt;:6789/'+h(sfx)+'/v1/messages'+defaultNote;
 }
-updateProtocolFields();
+updateAccessUrl();
 async function editProfile(n){
   const p=SETTINGS.profiles.find(x=>x.name===n);
   if(!p)return;
   editingProfileName=n;
   const fm=document.forms.settingsForm;
-  fm.apiProtocol.value=p.apiProtocol||'anthropic';
   fm.upstream.value=p.upstream||'';
   document.getElementById('suffixInput').value=p.suffix||'';
   document.getElementById('profileNameInput').value=p.name||'';
   if(p.allowedModels)fm.allowedModels.value=p.allowedModels.join(', ');
-  fm.defaultModels_sonnet.value=p.defaultModels?.sonnet||'';
-  fm.defaultModels_opus.value=p.defaultModels?.opus||'';
-  fm.defaultModels_haiku.value=p.defaultModels?.haiku||'';
   if(fm.modelAliases)fm.modelAliases.value=aliasText(p.modelAliases||{});
-  const osu=document.getElementById('openaiStreamUsageInput');
-  if(osu)osu.checked=p.openaiStreamUsage!==false;
-  if(fm.responsesAdapter)fm.responsesAdapter.value=p.responsesAdapter||'none';
   if(fm.profileQuota)fm.profileQuota.value=p.dailyTokenLimit||0;
   document.querySelectorAll('.pl-item').forEach(el=>el.classList.remove('active'));
   const el=document.getElementById('pl-'+n);
@@ -3480,24 +2876,19 @@ async function editProfile(n){
   document.getElementById('profileSuffixInput').value=p.suffix||'';
   const userSel=document.getElementById('userProfileSel');
   if(userSel){userSel.value=p.suffix||'';renderProfileUsers(p.suffix||'')}
-  updateProtocolFields();
+  updateAccessUrl();
 }
 async function createProfile(){
   const name=document.getElementById('newProfileName').value.trim();
   const suffix=document.getElementById('newProfileSuffix').value.trim();
-  const apiProtocol=document.getElementById('newProfileProtocol').value;
   const upstream=document.getElementById('newProfileUpstream').value.trim();
   const models=document.getElementById('newProfileModels').value.trim();
   const modelAliases=document.getElementById('newProfileAliases').value.trim();
-  const responsesAdapter=document.getElementById('newProfileResponsesAdapter').value||'none';
   if(!name||!suffix||!upstream){alert('方案名称、URL 后缀和上游 API 地址必填');return}
   const fm=document.forms.settingsForm;
   const r=await fetch('/api/profile/save',{method:'POST',headers:csrfHeaders({'Content-Type':'application/json'}),body:JSON.stringify({
-    profile:name,suffix:suffix,apiProtocol:apiProtocol,upstream:upstream,allowedModels:models||fm.allowedModels.value,
-    defaultModels:apiProtocol==='anthropic'?{sonnet:fm.defaultModels_sonnet.value,opus:fm.defaultModels_opus.value,haiku:fm.defaultModels_haiku.value}:undefined,
-    modelAliases:modelAliases,
-    openaiStreamUsage:true,
-    responsesAdapter:apiProtocol==='openai'?responsesAdapter:'none'
+    profile:name,suffix:suffix,upstream:upstream,allowedModels:models||fm.allowedModels.value,
+    modelAliases:modelAliases
   })});
   if(r.ok)location.reload();else{const e=await r.json();alert('创建失败: '+e.error)}
 }
@@ -3579,32 +2970,12 @@ function addGlobalUser(){
   for(const p of SETTINGS.profiles){if(!SETTINGS.profileAssignments[p.suffix])SETTINGS.profileAssignments[p.suffix]={}}
   renderProfileUsers(document.getElementById('userProfileSel').value);
 }
-function fillDefaults(s,o,h){
-  document.querySelector('[name=defaultModels_sonnet]').value=s;
-  document.querySelector('[name=defaultModels_opus]').value=o;
-  document.querySelector('[name=defaultModels_haiku]').value=h;
+function fillAliases(s,o,h){
+  document.forms.settingsForm.modelAliases.value='jx-sonnet='+s+'\\njx-opus='+o+'\\njx-haiku='+h;
 }
-function fillOpenAIAliases(){
-  const fm=document.forms.settingsForm;
-  fm.apiProtocol.value='openai';
-  fm.modelAliases.value='codex-main=gpt-5\\ncodex-fast=gpt-5-mini';
-  if(fm.responsesAdapter)fm.responsesAdapter.value='none';
-  updateProtocolFields();
-}
-function fillUpstream(protocol,url,responsesAdapter){
-  document.forms.settingsForm.apiProtocol.value=protocol;
+function fillUpstream(url){
   document.querySelector('[name=upstream]').value=url;
-  const adapter=document.getElementById('responsesAdapterSelect');
-  if(adapter)adapter.value=protocol==='openai'?(responsesAdapter||'none'):'none';
-  updateProtocolFields();
 }
-function updateNewProfileFields(){
-  const protocol=document.getElementById('newProfileProtocol').value;
-  const row=document.getElementById('newProfileResponsesAdapterRow');
-  if(row)row.style.display=protocol==='openai'?'block':'none';
-  if(protocol!=='openai')document.getElementById('newProfileResponsesAdapter').value='none';
-}
-updateNewProfileFields();
 document.addEventListener("keydown",e=>{if(e.key==="Enter"&&e.target.tagName!=="TEXTAREA"&&e.target.tagName!=="INPUT")e.preventDefault()});
 </script>
 </body></html>`;
@@ -3930,19 +3301,6 @@ function applySettings(formData) {
   const editingProfile = config.profiles[editingProfileName];
   if (!editingProfile) throw new Error(`Profile "${editingProfileName}" not found`);
 
-  if (formData.apiProtocol !== undefined) {
-    editingProfile.apiProtocol = validateApiProtocol(formData.apiProtocol);
-  }
-  if (formData.openaiStreamUsage !== undefined || formData.apiProtocol !== undefined) {
-    editingProfile.openaiStreamUsage = formData.openaiStreamUsage === "on" || formData.openaiStreamUsage === true;
-  }
-  if (formData.responsesAdapter !== undefined || formData.apiProtocol !== undefined) {
-    const protocol = normalizeApiProtocol(editingProfile.apiProtocol);
-    editingProfile.responsesAdapter = protocol === "openai"
-      ? validateResponsesAdapter(formData.responsesAdapter || "none")
-      : "none";
-  }
-
   if (formData.upstream && formData.upstream !== editingProfile.upstream) {
     if (!/^https?:\/\/[^\s]+/.test(formData.upstream)) throw new Error("Invalid upstream URL");
     editingProfile.upstream = formData.upstream.trim();
@@ -4006,11 +3364,6 @@ function applySettings(formData) {
     if (editingProfile.allowedModels.length === 0) throw new Error("至少需要设置 1 个允许模型");
   }
 
-  // Update default model mappings (jx-* aliases)
-  if (!editingProfile.defaultModels) editingProfile.defaultModels = {};
-  if (formData.defaultModels_sonnet) editingProfile.defaultModels.sonnet = formData.defaultModels_sonnet.trim();
-  if (formData.defaultModels_opus)   editingProfile.defaultModels.opus   = formData.defaultModels_opus.trim();
-  if (formData.defaultModels_haiku)  editingProfile.defaultModels.haiku  = formData.defaultModels_haiku.trim();
   if (formData.modelAliases !== undefined) {
     const parsedAliases = parseModelAliasesInput(formData.modelAliases);
     editingProfile.modelAliases = parsedAliases;
@@ -4077,6 +3430,66 @@ function applySettings(formData) {
   reloadAllRuntimes();
 
   console.log(`[CONFIG] Settings saved to profile "${editingProfileName}"`);
+}
+
+function getImportPreview(raw) {
+  const normalized = normalizeLegacyImportData(raw);
+  const availableSuffixes = new Set(listProfiles().map((profile) => profile.suffix));
+  const sourceProfiles = Object.keys(normalized.profiles).map((suffix) => ({
+    suffix,
+    matchedTarget: availableSuffixes.has(normalizeProfileSuffix(suffix)) ? normalizeProfileSuffix(suffix) : null,
+  }));
+  const warnings = sourceProfiles
+    .filter((profile) => !profile.matchedTarget)
+    .map((profile) => `来源方案 ${profile.suffix} 未自动匹配，请选择目标方案或跳过`);
+  return { summary: summarizeLegacyImport(normalized), sourceProfiles, warnings, sourceHash: legacyImportHash(raw) };
+}
+
+function resolveImportProfileMap(normalized, requestedMap = {}) {
+  const availableSuffixes = new Set(listProfiles().map((profile) => profile.suffix));
+  const resolved = {};
+  for (const source of Object.keys(normalized.profiles)) {
+    const requested = requestedMap[source];
+    if (requested === "skip" || requested === null) {
+      resolved[source] = "";
+      continue;
+    }
+    const target = normalizeProfileSuffix(requested || (availableSuffixes.has(normalizeProfileSuffix(source)) ? source : ""));
+    if (!target) throw new Error(`来源方案 ${source} 尚未映射`);
+    if (!availableSuffixes.has(target)) throw new Error(`目标方案 ${target} 不存在`);
+    resolved[source] = target;
+  }
+  if (!Object.values(resolved).some(Boolean)) throw new Error("至少需要导入一个来源方案");
+  return resolved;
+}
+
+function clearInMemoryRequestState() {
+  for (const state of [userConcurrent, userRateBucket, ipRateBucket]) {
+    for (const key of Object.keys(state)) delete state[key];
+  }
+}
+
+function resetConfigToUnconfiguredState() {
+  const preserved = {
+    port: config.port,
+    dashboardPassword: config.dashboardPassword,
+    proxy: { ...(config.proxy || {}) },
+  };
+  for (const key of Object.keys(config)) delete config[key];
+  Object.assign(config, preserved, {
+    users: {},
+    profiles: {
+      "默认方案": {
+        suffix: "default",
+        isDefault: true,
+        upstream: "",
+        allowedModels: [],
+        modelAliases: {},
+        dailyTokenLimit: null,
+        users: {},
+      },
+    },
+  });
 }
 
 const server = http.createServer((req, res) => {
@@ -4168,6 +3581,109 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+  if (req.method === "POST" && req.url === "/api/data-import/preview") {
+    if (!checkAuth(req)) { res.writeHead(401); res.end("Unauthorized"); return; }
+    if (!checkCsrf(req)) { res.writeHead(403); res.end("CSRF validation failed"); return; }
+    readBody(req, 50_000_000).then((buf) => {
+      try {
+        const { data } = JSON.parse(buf.toString());
+        const preview = getImportPreview(data);
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify(preview));
+      } catch (err) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: err.message }));
+      }
+    }).catch(() => {
+      res.writeHead(413, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Request too large" }));
+    });
+    return;
+  }
+
+  if (req.method === "POST" && req.url === "/api/data-import/apply") {
+    if (!checkAuth(req)) { res.writeHead(401); res.end("Unauthorized"); return; }
+    if (!checkCsrf(req)) { res.writeHead(403); res.end("CSRF validation failed"); return; }
+    readBody(req, 50_000_000).then((buf) => {
+      try {
+        const payload = JSON.parse(buf.toString());
+        if (!['merge', 'replace'].includes(payload.mode)) throw new Error("导入模式必须是 merge 或 replace");
+        if (payload.mode === "replace" && (!dashboardPassword || !timingSafeEqual(payload.password || "", dashboardPassword))) {
+          res.writeHead(401, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "密码错误" }));
+          return;
+        }
+        const actualHash = legacyImportHash(payload.data);
+        if (!payload.sourceHash || !timingSafeEqual(payload.sourceHash, actualHash)) throw new Error("文件指纹不匹配，请重新预览");
+        if (getMeta(`dataImport:${actualHash}`)) {
+          res.writeHead(409, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "该文件已经导入" }));
+          return;
+        }
+        const normalized = normalizeLegacyImportData(payload.data);
+        const profileMap = resolveImportProfileMap(normalized, payload.profileMap || {});
+        if (payload.mode === "replace") backupDatabaseSync("data-import-replace");
+        const tx = db.transaction(() => {
+          if (payload.mode === "replace") clearRequestData();
+          writeLegacyData(normalized, profileMap);
+          stmts.upsertMeta.run({ k: `dataImport:${actualHash}`, v: new Date().toISOString() });
+        });
+        tx();
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: true, summary: summarizeLegacyImport(normalized) }));
+      } catch (err) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: err.message }));
+      }
+    }).catch(() => {
+      res.writeHead(413, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Request too large" }));
+    });
+    return;
+  }
+
+  if (req.method === "POST" && req.url === "/api/data-clear") {
+    if (!checkAuth(req)) { res.writeHead(401); res.end("Unauthorized"); return; }
+    if (!checkCsrf(req)) { res.writeHead(403); res.end("CSRF validation failed"); return; }
+    readBody(req, 10_000).then((buf) => {
+      try {
+        const { password } = JSON.parse(buf.toString());
+        if (!dashboardPassword || !timingSafeEqual(password || "", dashboardPassword)) {
+          res.writeHead(401, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "密码错误" }));
+          return;
+        }
+        backupFileSync(configPath, "config.json", "data-clear");
+        backupDatabaseSync("data-clear");
+        const previousConfig = JSON.parse(JSON.stringify(config));
+        const tx = db.transaction(() => {
+          clearRequestData();
+          resetConfigToUnconfiguredState();
+          try {
+            saveConfig(config);
+          } catch (err) {
+            for (const key of Object.keys(config)) delete config[key];
+            Object.assign(config, previousConfig);
+            throw err;
+          }
+        });
+        tx();
+        clearInMemoryRequestState();
+        reloadAllRuntimes();
+        console.log("[DATA] All configuration and request data cleared");
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: true }));
+      } catch (err) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: err.message }));
+      }
+    }).catch(() => {
+      res.writeHead(413, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Request too large" }));
+    });
+    return;
+  }
+
   // Settings save (form POST from settings page)
   if (req.method === "POST" && req.url === "/api/settings-save") {
     if (!checkAuth(req)) {
@@ -4250,29 +3766,20 @@ const server = http.createServer((req, res) => {
     if (!checkCsrf(req)) { res.writeHead(403); res.end("CSRF validation failed"); return; }
     readBody(req).then(buf => {
       try {
-        const { profile, upstream, allowedModels, defaultModels, suffix, apiProtocol, modelAliases, openaiStreamUsage, responsesAdapter } = JSON.parse(buf.toString());
+        const { profile, upstream, allowedModels, suffix, modelAliases } = JSON.parse(buf.toString());
         const name = (profile || "").trim();
         if (!name) throw new Error("Profile name required");
         if (config.profiles[name]) throw new Error(`方案 "${name}" 已存在`);
         const sfx = validateProfileSuffix(suffix, name);
-        const protocol = validateApiProtocol(apiProtocol || "anthropic");
-        const nextDefaultModels = defaultModels || { ...rt.defaultModels };
         const aliases = parseModelAliasesInput(modelAliases);
-        const runtimeAliases = protocol === "anthropic"
-          ? { ...legacyDefaultModelAliases(nextDefaultModels), ...aliases }
-          : aliases;
-        const models = allowedModels ? allowedModels.split(",").map(s => s.trim()).filter(Boolean) : [...rt.allowedModels];
-        for (const m of Object.values(runtimeAliases)) {
+        const models = allowedModels ? allowedModels.split(",").map(s => s.trim()).filter(Boolean) : [...(rt?.allowedModels || [])];
+        for (const m of Object.values(aliases)) {
           if (m && !models.includes(m)) models.push(m);
         }
         config.profiles[name] = {
-          upstream: upstream || rt.upstream,
-          apiProtocol: protocol,
+          upstream: upstream || rt?.upstream || "",
           allowedModels: models,
-          defaultModels: nextDefaultModels,
           modelAliases: aliases,
-          openaiStreamUsage: openaiStreamUsage !== false,
-          responsesAdapter: protocol === "openai" ? validateResponsesAdapter(responsesAdapter || "none") : "none",
           users: {},
           suffix: sfx,
           isDefault: false,
@@ -4333,9 +3840,6 @@ const server = http.createServer((req, res) => {
         const formData = {};
         if (updates.profileName) formData.profileName = updates.profileName;
         if (updates.profileSuffix) formData.profileSuffix = updates.profileSuffix;
-        if (updates.apiProtocol) formData.apiProtocol = updates.apiProtocol;
-        if (updates.openaiStreamUsage !== undefined) formData.openaiStreamUsage = updates.openaiStreamUsage;
-        if (updates.responsesAdapter !== undefined) formData.responsesAdapter = updates.responsesAdapter;
         if (updates.upstream) formData.upstream = updates.upstream;
         if (updates.proxy) {
           Object.assign(formData, {
@@ -4352,11 +3856,6 @@ const server = http.createServer((req, res) => {
         }
         if (updates.allowedModels) {
           formData.allowedModels = Array.isArray(updates.allowedModels) ? updates.allowedModels.join(",") : updates.allowedModels;
-        }
-        if (updates.defaultModels) {
-          if (updates.defaultModels.sonnet) formData.defaultModels_sonnet = updates.defaultModels.sonnet;
-          if (updates.defaultModels.opus)   formData.defaultModels_opus   = updates.defaultModels.opus;
-          if (updates.defaultModels.haiku)  formData.defaultModels_haiku  = updates.defaultModels.haiku;
         }
         if (updates.modelAliases !== undefined) {
           formData.modelAliases = updates.modelAliases;
@@ -4481,9 +3980,17 @@ const server = http.createServer((req, res) => {
         for (const pname of Object.keys(config.profiles)) {
           delete config.profiles[pname].users[key];
         }
-        saveConfig(config);
+        const tx = db.transaction(() => {
+          for (const table of ["users", "usage_daily", "usage_daily_model", "usage_daily_hourly", "errors", "quota_adjust_history"]) {
+            db.prepare(`DELETE FROM ${table} WHERE user_key=?`).run(key);
+          }
+          saveConfig(config);
+        });
+        tx();
+        delete userConcurrent[key];
+        delete userRateBucket[key];
         reloadAllRuntimes();
-        console.log(`[USER] Deleted global user: ${key}`);
+        console.log(`[USER] Deleted global user and history: ${key.slice(0, 8)}****`);
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ ok: true }));
       } catch (err) {
@@ -4553,7 +4060,7 @@ const server = http.createServer((req, res) => {
   // Personal usage page
   if (req.method === "GET" && req.url.startsWith("/usage/")) {
     const vk = decodeURIComponent(req.url.slice(7).split("?")[0]);
-    if (!vk || (!rt.users[vk] && !rt.globalUsers[vk])) {
+    if (!rt || !vk || (!rt.users[vk] && !rt.globalUsers[vk])) {
       res.writeHead(404, { "Content-Type": "text/html; charset=utf-8" });
       res.end("<h1>Key不存在</h1><p>请检查你的虚拟Key是否正确。</p>");
       return;
@@ -4565,7 +4072,7 @@ const server = http.createServer((req, res) => {
   if (req.method === "GET" && req.url.startsWith("/my-usage")) {
     const url = new URL(req.url, `http://${req.headers.host}`);
     const vk = url.searchParams.get("key");
-    if (!vk || (!rt.users[vk] && !rt.globalUsers[vk])) {
+    if (!rt || !vk || (!rt.users[vk] && !rt.globalUsers[vk])) {
       res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
       res.end(personalUsageLandingHtml());
       return;
@@ -4611,8 +4118,8 @@ const server = http.createServer((req, res) => {
       status: "ok",
       uptime: Math.floor(process.uptime()),
       activeConnections: activeConns,
-      upstream: rt.upstream,
-      circuitBreaker: rt.breaker.status(),
+      upstream: rt?.upstream || "",
+      circuitBreaker: rt?.breaker?.status() || { state: "UNCONFIGURED" },
     }));
     return;
   }
@@ -4631,7 +4138,7 @@ server.listen(port, "0.0.0.0", () => {
   console.log(`[团队AI Coding监控] http://0.0.0.0:${port}  Dashboard: http://localhost:${port}/dashboard`);
   console.log(`[团队AI Coding监控] Profiles: ${Object.values(runtimes).map(r => `"${r.profileName}"(${JSON.stringify(r.suffix)})→${r.upstream.replace("https://","").replace("http://","").split("/")[0]}`).join(", ")}`);
   console.log(`[团队AI Coding监控] Settings: http://localhost:${port}/settings`);
-  console.log(`[团队AI Coding监控] Users: ${Object.values(rt.globalUsers).map(u => u.username || "").join(", ")}`);
+  console.log(`[团队AI Coding监控] Users: ${Object.values(rt?.globalUsers || {}).map(u => u.username || "").join(", ")}`);
 });
 
 // Server timeouts

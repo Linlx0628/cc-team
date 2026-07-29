@@ -9,9 +9,9 @@ data.json.migrated
 data.db
 data.db-shm
 data.db-wal
+backups/
 
 # Worktree temporary directories
 .claude/*
 .spec-workflow/*
-
 

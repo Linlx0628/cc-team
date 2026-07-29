@@ -464,7 +464,7 @@ describe("personal usage profile access", () => {
 
     assert.equal(res.status, 200);
     assert.equal(res.json.profile, "全部可用方案");
-    assert.deepEqual(res.json.availableProfiles.map((profile) => profile.suffix).sort(), ["aliyun-openai", "coding", "glm", "openai"]);
+    assert.deepEqual(res.json.availableProfiles.map((profile) => profile.suffix).sort(), ["coding", "glm"]);
     assert.equal(res.json.today.total, 45);
   });
 
@@ -505,260 +505,6 @@ describe("/api/my-usage error handling (ERR_HTTP_HEADERS_SENT regression)", () =
   });
 });
 
-describe("OpenAI transparent proxy support", () => {
-  it("proxies chat completions with model aliases and records OpenAI non-stream usage", async () => {
-    upstreamHits.length = 0;
-
-    const res = await request("POST", "/openai/v1/chat/completions", {
-      body: {
-        model: "codex-main",
-        messages: [{ role: "user", content: "hello" }],
-      },
-    });
-
-    assert.equal(res.status, 200);
-    assert.equal(upstreamHits.length, 1);
-    assert.equal(upstreamHits[0].upstream, "openai");
-    assert.equal(upstreamHits[0].path, "/compatible-mode/v1/chat/completions");
-    assert.equal(upstreamHits[0].authorization, "Bearer real-openai-key");
-    assert.equal(upstreamHits[0].body.model, "gpt-5");
-
-    const usage = await request("GET", "/api/my-usage?profile=openai");
-    assert.equal(usage.status, 200);
-    assert.equal(usage.json.today.total, 11);
-    assert.equal(usage.json.models["gpt-5"].total, 11);
-  });
-
-  it("proxies responses endpoint with real model names unchanged", async () => {
-    upstreamHits.length = 0;
-
-    const res = await request("POST", "/openai/v1/responses", {
-      body: {
-        model: "gpt-5",
-        input: "hello",
-      },
-    });
-
-    assert.equal(res.status, 200);
-    assert.equal(upstreamHits.length, 1);
-    assert.equal(upstreamHits[0].upstream, "openai");
-    assert.equal(upstreamHits[0].path, "/compatible-mode/v1/responses");
-    assert.equal(upstreamHits[0].body.model, "gpt-5");
-  });
-
-  it("serves OpenAI models locally without forwarding discovery probes upstream", async () => {
-    upstreamHits.length = 0;
-
-    const res = await request("GET", "/openai/v1/models");
-
-    assert.equal(res.status, 200);
-    assert.equal(res.json.object, "list");
-    assert.deepEqual(res.json.data.map((model) => model.id).sort(), ["gpt-5", "gpt-5-mini"]);
-    assert.equal(upstreamHits.length, 0);
-  });
-
-  it("blocks unsupported OpenAI proxy endpoints before they can reach upstream", async () => {
-    upstreamHits.length = 0;
-
-    const res = await request("GET", "/openai/v1/usage");
-
-    assert.equal(res.status, 404);
-    assert.match(res.json.error, /Unsupported OpenAI\/Codex proxy endpoint/);
-    assert.equal(upstreamHits.length, 0);
-  });
-
-  it("injects OpenAI stream usage options and records final streaming usage", async () => {
-    upstreamHits.length = 0;
-
-    const res = await request("POST", "/openai/v1/chat/completions", {
-      body: {
-        model: "codex-fast",
-        messages: [{ role: "user", content: "stream" }],
-        stream: true,
-      },
-    });
-
-    assert.equal(res.status, 200);
-    assert.match(res.text, /data: \[DONE\]/);
-    assert.equal(upstreamHits.length, 1);
-    assert.deepEqual(upstreamHits[0].body.stream_options, { include_usage: true });
-    assert.equal(upstreamHits[0].body.model, "gpt-5-mini");
-
-    const usage = await request("GET", "/api/my-usage?profile=openai");
-    assert.equal(usage.status, 200);
-    assert.equal(usage.json.today.total, 28);
-    assert.equal(usage.json.models["gpt-5-mini"].total, 5);
-  });
-
-  it("cancels upstream streaming requests when the client disconnects", async () => {
-    upstreamHits.length = 0;
-
-    const upstreamClosed = waitForSlowStreamClose();
-    await openAndAbortStreamingResponse("/openai/v1/chat/completions", {
-      model: "codex-fast",
-      messages: [{ role: "user", content: "slow-stream" }],
-      stream: true,
-    });
-    await upstreamClosed;
-
-    assert.equal(upstreamHits.length, 1);
-    assert.equal(upstreamHits[0].path, "/compatible-mode/v1/chat/completions");
-    assert.equal(upstreamHits[0].body.model, "gpt-5-mini");
-    assert.deepEqual(upstreamHits[0].body.stream_options, { include_usage: true });
-  });
-
-  it("rejects OpenAI profile access when the user has no real key for that profile", async () => {
-    upstreamHits.length = 0;
-
-    const res = await request("POST", "/openai/v1/responses", {
-      key: "jx-unassigned",
-      body: {
-        model: "gpt-5",
-        input: "hello",
-      },
-    });
-
-    assert.equal(res.status, 403);
-    assert.match(res.json.error, /not allowed/i);
-    assert.equal(upstreamHits.length, 0);
-  });
-
-  it("uses OpenAI-specific copy when rejecting disallowed OpenAI models", async () => {
-    upstreamHits.length = 0;
-
-    const res = await request("POST", "/openai/v1/responses", {
-      body: {
-        model: "gpt-5.5",
-        input: "hello",
-      },
-    });
-
-    assert.equal(res.status, 403);
-    assert.match(res.json.error, /allowed models/i);
-    assert.match(res.json.error, /gpt-5/);
-    assert.doesNotMatch(res.json.error, /jx-sonnet|jx-opus|jx-haiku/);
-    assert.equal(upstreamHits.length, 0);
-  });
-});
-
-describe("OpenAI Responses to Chat Completions adapter", () => {
-  it("serves local models for adapter profiles from allowed models", async () => {
-    upstreamHits.length = 0;
-
-    const res = await request("GET", "/aliyun-openai/v1/models");
-
-    assert.equal(res.status, 200);
-    assert.equal(res.json.object, "list");
-    assert.deepEqual(res.json.data.map((model) => model.id).sort(), ["glm-5", "qwen3.6-plus", "qwen3.7-plus"]);
-    assert.equal(upstreamHits.length, 0);
-  });
-
-  it("converts non-stream responses requests to chat completions and records usage", async () => {
-    upstreamHits.length = 0;
-
-    const res = await request("POST", "/aliyun-openai/v1/responses", {
-      body: {
-        model: "codex-pro",
-        instructions: "follow policy",
-        input: "hello",
-        max_output_tokens: 16,
-        temperature: 0.2,
-      },
-    });
-
-    assert.equal(res.status, 200);
-    assert.equal(upstreamHits.length, 1);
-    assert.equal(upstreamHits[0].path, "/compatible-mode/v1/chat/completions");
-    assert.equal(upstreamHits[0].authorization, "Bearer real-aliyun-key");
-    assert.equal(upstreamHits[0].body.model, "glm-5");
-    assert.deepEqual(upstreamHits[0].body.messages, [
-      { role: "system", content: "follow policy" },
-      { role: "user", content: "hello" },
-    ]);
-    assert.equal(upstreamHits[0].body.max_tokens, 16);
-    assert.equal(upstreamHits[0].body.temperature, 0.2);
-    assert.equal(res.json.object, "response");
-    assert.equal(res.json.model, "glm-5");
-    assert.equal(res.json.output_text, "chat answer");
-    assert.deepEqual(res.json.usage, { input_tokens: 7, output_tokens: 4, total_tokens: 11 });
-
-    const usage = await request("GET", "/api/my-usage?profile=aliyun-openai");
-    assert.equal(usage.status, 200);
-    assert.equal(usage.json.today.total, 11);
-    assert.equal(usage.json.models["glm-5"].total, 11);
-  });
-
-  it("converts streaming responses requests to responses SSE events and records final usage", async () => {
-    upstreamHits.length = 0;
-
-    const res = await request("POST", "/aliyun-openai/v1/responses", {
-      body: {
-        model: "codex-min",
-        input: [{ role: "user", content: "stream" }],
-        stream: true,
-      },
-    });
-
-    assert.equal(res.status, 200);
-    assert.match(res.text, /event: response\.created/);
-    assert.match(res.text, /event: response\.output_item\.added/);
-    assert.match(res.text, /event: response\.content_part\.added/);
-    assert.match(res.text, /event: response\.output_text\.delta/);
-    assert.match(res.text, /"delta":"hello"/);
-    assert.match(res.text, /event: response\.content_part\.done/);
-    assert.match(res.text, /event: response\.output_item\.done/);
-    assert.match(res.text, /event: response\.completed/);
-    assert.equal(upstreamHits.length, 1);
-    assert.equal(upstreamHits[0].path, "/compatible-mode/v1/chat/completions");
-    assert.equal(upstreamHits[0].body.model, "qwen3.6-plus");
-    assert.equal(upstreamHits[0].body.stream, true);
-    assert.deepEqual(upstreamHits[0].body.stream_options, { include_usage: true });
-
-    const usage = await request("GET", "/api/my-usage?profile=aliyun-openai");
-    assert.equal(usage.status, 200);
-    assert.equal(usage.json.today.total, 16);
-    assert.equal(usage.json.models["qwen3.6-plus"].total, 5);
-  });
-
-  it("converts streamed chat tool calls to responses function-call events", async () => {
-    upstreamHits.length = 0;
-
-    const res = await request("POST", "/aliyun-openai/v1/responses", {
-      body: {
-        model: "codex-pro",
-        input: "tool-stream",
-        stream: true,
-        tools: [{
-          type: "function",
-          name: "run_shell",
-          parameters: {
-            type: "object",
-            properties: { cmd: { type: "string" } },
-            required: ["cmd"],
-          },
-        }],
-      },
-    });
-
-    assert.equal(res.status, 200);
-    assert.match(res.text, /event: response\.output_item\.added/);
-    assert.match(res.text, /"type":"function_call"/);
-    assert.match(res.text, /"call_id":"call_tool_1"/);
-    assert.match(res.text, /"name":"run_shell"/);
-    assert.match(res.text, /event: response\.function_call_arguments\.delta/);
-    assert.match(res.text, /event: response\.function_call_arguments\.done/);
-    assert.match(res.text, /\\"cmd\\":\\"pwd\\"/);
-    assert.match(res.text, /event: response\.output_item\.done/);
-    assert.match(res.text, /event: response\.completed/);
-    assert.equal(upstreamHits.length, 1);
-    assert.equal(upstreamHits[0].body.tools[0].function.name, "run_shell");
-
-    const usage = await request("GET", "/api/my-usage?profile=aliyun-openai");
-    assert.equal(usage.status, 200);
-    assert.equal(usage.json.models["glm-5"].total, 17);
-  });
-});
-
 describe("management and usage pages", () => {
   it("renders every public UI with the shared editorial light theme", async () => {
     const pages = await Promise.all([
@@ -795,26 +541,27 @@ describe("management and usage pages", () => {
     assert.equal(res.status, 200);
     assert.match(res.text, /新增方案/);
     assert.match(res.text, /设为默认/);
-    assert.match(res.text, /接口协议/);
     assert.match(res.text, /模型别名/);
+    assert.doesNotMatch(res.text, /OpenAI-compatible|Responses 兼容模式|defaultModels_sonnet/);
     assert.match(res.text, /userProfileSel/);
+    for (const controlId of ["dataImportFile", "dataImportPreview", "dataImportMode", "dataImportPassword", "dataClearButton", "dataClearModal", "dataClearPassword"]) {
+      assert.match(res.text, new RegExp(`id=["']${controlId}["']`));
+    }
     assertInlineScriptsCompile(res.text);
   });
 
-  it("returns OpenAI protocol fields in settings API", async () => {
+  it("returns only generic model aliases in settings API", async () => {
     const res = await request("GET", "/api/settings", { key: null });
 
     assert.equal(res.status, 200);
-    const openai = res.json.profiles.find((profile) => profile.suffix === "openai");
-    assert.equal(openai.apiProtocol, "openai");
-    assert.equal(openai.modelAliases["codex-main"], "gpt-5");
-    assert.equal(openai.modelAliases["codex-fast"], "gpt-5-mini");
-    assert.equal(openai.modelAliases["jx-sonnet"], undefined);
-    assert.equal(openai.openaiStreamUsage, true);
-    assert.equal(openai.responsesAdapter, "none");
-    const aliyun = res.json.profiles.find((profile) => profile.suffix === "aliyun-openai");
-    assert.equal(aliyun.apiProtocol, "openai");
-    assert.equal(aliyun.responsesAdapter, "chat_completions");
+    assert.deepEqual(res.json.profiles.map((profile) => profile.suffix).sort(), ["coding", "glm"]);
+    const coding = res.json.profiles.find((profile) => profile.suffix === "coding");
+    assert.deepEqual(coding.modelAliases, {
+      "jx-sonnet": "coding-model",
+      "jx-opus": "coding-model",
+      "jx-haiku": "coding-model",
+    });
+    assert.equal(coding.apiProtocol, undefined);
   });
 
   it("renders dashboard profile center", async () => {
@@ -833,5 +580,40 @@ describe("management and usage pages", () => {
     assert.match(res.text, /全部可用方案/);
     assert.match(res.text, /profileSel/);
     assertInlineScriptsCompile(res.text);
+  });
+
+  it("migrates fixed Claude aliases into generic aliases and removes legacy protocol fields", async () => {
+    const persisted = JSON.parse(fs.readFileSync(path.join(tmpDir, "config.json"), "utf8"));
+    const coding = persisted.profiles["Coding Plan"];
+
+    assert.equal(coding.defaultModels, undefined);
+    assert.equal(coding.apiProtocol, undefined);
+    assert.equal(coding.openaiStreamUsage, undefined);
+    assert.equal(coding.responsesAdapter, undefined);
+    assert.deepEqual(coding.modelAliases, {
+      "jx-sonnet": "coding-model",
+      "jx-opus": "coding-model",
+      "jx-haiku": "coding-model",
+    });
+    assert.deepEqual(Object.keys(persisted.profiles).sort(), ["Coding Plan", "GLM"]);
+    const backups = fs.readdirSync(path.join(tmpDir, "backups"));
+    assert.ok(backups.some((name) => name.endsWith("remove-openai-config.json")));
+  });
+
+  it("rejects OpenAI endpoints without forwarding them upstream", async () => {
+    upstreamHits.length = 0;
+
+    const responses = await request("POST", "/v1/responses", {
+      body: { model: "coding-model", input: "hello" },
+    });
+    const chat = await request("POST", "/v1/chat/completions", {
+      body: { model: "coding-model", messages: [{ role: "user", content: "hello" }] },
+    });
+    const models = await request("GET", "/v1/models");
+
+    assert.equal(responses.status, 404);
+    assert.equal(chat.status, 404);
+    assert.equal(models.status, 404);
+    assert.equal(upstreamHits.length, 0);
   });
 });

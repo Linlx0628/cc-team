@@ -30,6 +30,13 @@ function waitForSlowStreamClose(timeoutMs = 2000) {
   });
 }
 
+function assertEditorialLightHtml(html) {
+  assert.match(html, /data-theme="editorial-light"/);
+  assert.match(html, /--canvas:\s*#f7f7f3/i);
+  assert.doesNotMatch(html, /Press Start 2P|Pixelify Sans|VT323|scanbar|glitch|pulse-glow|fx-spot/i);
+  assert.doesNotMatch(html, /\p{Extended_Pictographic}/u);
+}
+
 function notifySlowStreamClose() {
   const waiter = slowStreamCloseWaiters.shift();
   if (waiter) waiter();
@@ -753,6 +760,35 @@ describe("OpenAI Responses to Chat Completions adapter", () => {
 });
 
 describe("management and usage pages", () => {
+  it("renders every public UI with the shared editorial light theme", async () => {
+    const pages = await Promise.all([
+      request("GET", "/dashboard", { key: null }),
+      request("GET", "/settings", { key: null }),
+      request("GET", "/my-usage", { key: null }),
+      request("GET", "/usage/jx-shared-user", { key: null }),
+    ]);
+
+    for (const page of pages) {
+      assert.equal(page.status, 200);
+      assertEditorialLightHtml(page.text);
+      assertInlineScriptsCompile(page.text);
+    }
+  });
+
+  it("keeps application and documentation sources free of cyberpunk styling and emoji", () => {
+    const source = fs.readFileSync(sourceServer, "utf8");
+    const docs = ["index.html", "style.css", "script.js"]
+      .map((name) => fs.readFileSync(path.join(repoRoot, "docs", name), "utf8"))
+      .join("\n");
+    const bannedStyle = /Press Start 2P|Pixelify Sans|VT323|scanlines|grid-bg|glitch|pulse-glow|fx-spot/i;
+
+    assert.doesNotMatch(source, bannedStyle);
+    assert.doesNotMatch(docs, bannedStyle);
+    assert.doesNotMatch(source, /\p{Extended_Pictographic}/u);
+    assert.doesNotMatch(docs, /\p{Extended_Pictographic}/u);
+    assert.match(docs, /--canvas:\s*#f7f7f3/i);
+  });
+
   it("renders settings page controls for default alias and per-profile users", async () => {
     const res = await request("GET", "/settings", { key: null });
 

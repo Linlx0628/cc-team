@@ -1,73 +1,63 @@
-// Mobile menu toggle
-const navToggle = document.getElementById('nav-toggle');
-const mobileMenu = document.getElementById('mobile-menu');
+const navToggle = document.getElementById("nav-toggle");
+const navLinks = document.getElementById("nav-links");
 
-navToggle.addEventListener('click', () => {
-  mobileMenu.classList.toggle('open');
-});
-
-// Close mobile menu on link click
-mobileMenu.querySelectorAll('a').forEach(link => {
-  link.addEventListener('click', () => {
-    mobileMenu.classList.remove('open');
+if (navToggle && navLinks) {
+  navToggle.addEventListener("click", () => {
+    const open = navLinks.classList.toggle("open");
+    navToggle.setAttribute("aria-expanded", String(open));
   });
-});
 
-// Nav background on scroll
-const nav = document.getElementById('nav');
-window.addEventListener('scroll', () => {
-  if (window.scrollY > 10) {
-    nav.style.borderBottomColor = 'rgba(0,229,255,0.15)';
-  } else {
-    nav.style.borderBottomColor = '';
-  }
-});
-
-// Smooth scroll offset for fixed nav
-document.querySelectorAll('a[href^="#"]').forEach(anchor => {
-  anchor.addEventListener('click', (e) => {
-    const id = anchor.getAttribute('href');
-    if (id === '#') return;
-    e.preventDefault();
-    const target = document.querySelector(id);
-    if (!target) return;
-    const offset = 70;
-    const top = target.getBoundingClientRect().top + window.pageYOffset - offset;
-    window.scrollTo({ top, behavior: 'smooth' });
-  });
-});
-
-// Terminal copy on click
-document.querySelectorAll('.terminal-body').forEach(term => {
-  term.style.cursor = 'pointer';
-  term.title = '点击复制';
-  term.addEventListener('click', () => {
-    const text = term.innerText
-      .split('\n')
-      .filter(l => !l.startsWith('#') && l.trim())
-      .join('\n');
-    navigator.clipboard.writeText(text).then(() => {
-      const orig = term.title;
-      term.title = '已复制!';
-      setTimeout(() => { term.title = orig; }, 1500);
+  navLinks.querySelectorAll("a").forEach((link) => {
+    link.addEventListener("click", () => {
+      navLinks.classList.remove("open");
+      navToggle.setAttribute("aria-expanded", "false");
     });
   });
+}
+
+document.querySelectorAll('a[href^="#"]').forEach((anchor) => {
+  anchor.addEventListener("click", (event) => {
+    const id = anchor.getAttribute("href");
+    if (!id || id === "#") return;
+    const target = document.querySelector(id);
+    if (!target) return;
+    event.preventDefault();
+    const top = target.getBoundingClientRect().top + window.pageYOffset - 72;
+    window.scrollTo({ top, behavior: "smooth" });
+  });
 });
 
-// Intersection observer for fade-in
-const observer = new IntersectionObserver((entries) => {
-  entries.forEach(entry => {
-    if (entry.isIntersecting) {
-      entry.target.style.opacity = '1';
-      entry.target.style.transform = 'translateY(0)';
-      observer.unobserve(entry.target);
+document.querySelectorAll(".code-block").forEach((block) => {
+  block.tabIndex = 0;
+  block.title = "点击复制命令";
+  block.addEventListener("click", async () => {
+    const text = block.innerText.trim();
+    if (!text) return;
+    try {
+      await navigator.clipboard.writeText(text);
+      const previous = block.title;
+      block.title = "已复制";
+      window.setTimeout(() => {
+        block.title = previous;
+      }, 1200);
+    } catch {
+      block.title = "复制失败";
     }
   });
-}, { threshold: 0.1 });
-
-document.querySelectorAll('.pillar, .feature-card, .deploy-option, .terminal').forEach(el => {
-  el.style.opacity = '0';
-  el.style.transform = 'translateY(20px)';
-  el.style.transition = 'opacity 0.5s ease, transform 0.5s ease';
-  observer.observe(el);
 });
+
+const reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+if (!reduceMotion && "IntersectionObserver" in window) {
+  const observer = new IntersectionObserver((entries) => {
+    entries.forEach((entry) => {
+      if (!entry.isIntersecting) return;
+      entry.target.classList.add("is-visible");
+      observer.unobserve(entry.target);
+    });
+  }, { threshold: 0.12 });
+
+  document.querySelectorAll(".feature-grid article, .deploy-card, .connect-card, .architecture > div").forEach((element) => {
+    element.classList.add("reveal");
+    observer.observe(element);
+  });
+}

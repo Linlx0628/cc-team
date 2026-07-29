@@ -9,103 +9,39 @@ import Database from "better-sqlite3";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
-// ─── Cyberpunk Pixel Theme (shared by all pages) ─────────────────────────────
-// ponytail: :root tokens were copy-pasted into all 5 pages; centralized here so the
-// pixel theme lives in one place. Page-specific layout CSS still stays inline per page.
-const PIXEL_FONT = `<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Press+Start+2P&family=Pixelify+Sans:wght@400;500;600;700&family=VT323&display=swap" rel="stylesheet">`;
-
-const PIXEL_THEME = `
+// Shared editorial light theme for all server-rendered pages.
+const UI_THEME = `
 :root{
-  --bg:#080812;--bg2:#0e0e1c;--card:#11111e;--card2:#171730;--border:#2c2658;
-  --text:#eaeefc;--dim:#9aa3cc;--dim2:#7681a8;--grid:rgba(0,229,255,.07);
-  --accent:#22e9ff;--blue:#46c6ff;--green:#27ffae;--yellow:#ffd23f;--orange:#ff9f1c;--red:#ff5470;
-  --magenta:#ff3d9a;--purple:#b14eff;
-  --font-pixel:'Press Start 2P',monospace;
-  --font-body:'Pixelify Sans','VT323',monospace,system-ui;
-  --glow:0 0 16px rgba(34,233,255,.45);
+  color-scheme:light;
+  --canvas:#f7f7f3;--surface:#ffffff;--surface-subtle:#f1f1ec;--surface-hover:#ecece7;
+  --bg:var(--canvas);--bg2:var(--surface-subtle);--card:var(--surface);--card2:var(--surface);
+  --text:#181816;--dim:#686863;--dim2:#92928c;--border:#deded8;--border-strong:#c7c7c0;
+  --accent:#2f6e50;--accent-soft:#e7efe9;--blue:#456b5a;--green:#2f6e50;
+  --yellow:#956400;--orange:#9a6700;--red:#b42318;
+  --font-body:-apple-system,BlinkMacSystemFont,"SF Pro Text","PingFang SC","Microsoft YaHei","Segoe UI",sans-serif;
+  --font-mono:"SFMono-Regular",Consolas,"Liberation Mono",monospace;
 }
 *{margin:0;padding:0;box-sizing:border-box}
-::selection{background:var(--accent);color:var(--bg)}
-body{font-family:var(--font-body);font-weight:500;font-size:16px;background:var(--bg);color:var(--text);min-height:100vh;letter-spacing:.2px;position:relative;isolation:isolate}
-/* drifting neon aurora blobs (behind content, so text stays crisp) */
-body::before{content:"";position:fixed;inset:-15%;z-index:-1;pointer-events:none;filter:blur(70px);
-  background:radial-gradient(40% 38% at 18% 26%,rgba(34,233,255,.20),transparent 70%),radial-gradient(42% 42% at 82% 18%,rgba(255,61,154,.16),transparent 70%),radial-gradient(48% 48% at 60% 86%,rgba(177,78,255,.16),transparent 70%);
-  animation:blob 24s ease-in-out infinite alternate}
-/* synthwave perspective floor receding at the bottom edge */
-html::after{content:"";position:fixed;left:-25%;right:-25%;bottom:0;height:40vh;z-index:1;pointer-events:none;opacity:.4;
-  background-image:linear-gradient(rgba(34,233,255,.5) 1px,transparent 1px),linear-gradient(90deg,rgba(34,233,255,.5) 1px,transparent 1px);
-  background-size:46px 46px;transform:perspective(320px) rotateX(62deg);transform-origin:bottom center;
-  -webkit-mask-image:linear-gradient(transparent 45%,#000 90%);mask-image:linear-gradient(transparent 45%,#000 90%);
-  animation:floor 5s linear infinite}
-/* mouse HUD spotlight (position updated by PIXEL_JS) */
-.fx-spot{position:fixed;inset:0;z-index:3;pointer-events:none;mix-blend-mode:screen}
-/* breathing neon edge on chart panels */
-.box{animation:pulse-glow 3.6s ease-in-out infinite}
-/* faint scanlines + soft vignette — kept light so text stays readable */
-body::after{content:"";position:fixed;inset:0;z-index:2;pointer-events:none;
-  background:repeating-linear-gradient(0deg,rgba(0,0,0,0) 0 3px,rgba(0,0,0,.05) 3px 4px),radial-gradient(ellipse at center,transparent 62%,rgba(0,0,0,.34) 100%)}
-/* moving CRT scan band sweeping the viewport */
-html::before{content:"";position:fixed;left:0;right:0;top:0;height:150px;z-index:3;pointer-events:none;
-  background:linear-gradient(180deg,transparent,rgba(34,233,255,.04) 55%,rgba(34,233,255,.11) 90%,transparent);
-  animation:scanbar 7s linear infinite}
-/* stat numbers: chunky pixel, glowing in their own color */
-.card .v{font-family:var(--font-pixel);font-variant-numeric:tabular-nums;line-height:1.5;letter-spacing:0;text-shadow:0 0 10px currentColor,0 0 2px currentColor}
-.display,.title-pixel{font-family:var(--font-pixel);letter-spacing:.5px;line-height:1.4}
-/* segmented HP/MP bar */
-.hp{display:inline-flex;gap:2px;height:13px;vertical-align:middle}
-.hp>i{width:7px;height:100%;background:#1c1735;display:block}
-.hp>i.on{background:var(--green);box-shadow:0 0 6px var(--green)}
-.hp.warn>i.on{background:var(--yellow);box-shadow:0 0 6px var(--yellow)}
-.hp.crit>i.on{background:var(--red);box-shadow:0 0 6px var(--red)}
-/* pixel status LED */
-.led{display:inline-block;width:10px;height:10px;vertical-align:middle;background:var(--dim2);margin-right:5px}
-.led.on{background:var(--green);box-shadow:0 0 8px var(--green);animation:blink 2.4s steps(1) infinite}
-.led.warn{background:var(--orange);box-shadow:0 0 8px var(--orange);animation:pulse-led 1.8s ease-in-out infinite}
-.led.err{background:var(--red);box-shadow:0 0 8px var(--red);animation:pulse-led 1.1s ease-in-out infinite}
-/* glitch title on hover */
-.glitch{cursor:default}
-.glitch:hover{animation:glitch .32s steps(2) 2}
-/* HUD corner brackets */
-.hud{position:relative}
-.hud::before,.hud::after{content:"";position:absolute;width:11px;height:11px;border:2px solid var(--accent);pointer-events:none;opacity:.65;z-index:1}
-.hud::before{top:-2px;left:-2px;border-right:0;border-bottom:0}
-.hud::after{bottom:-2px;right:-2px;border-left:0;border-top:0}
-/* animated equalizer — "system active" pulse */
-.eq{display:inline-flex;gap:2px;align-items:flex-end;height:14px;vertical-align:-2px}
-.eq>i{width:3px;height:4px;background:var(--accent);box-shadow:0 0 5px var(--accent);animation:eq 1s ease-in-out infinite}
-.eq>i:nth-child(2){animation-delay:.15s}.eq>i:nth-child(3){animation-delay:.3s}.eq>i:nth-child(4){animation-delay:.45s}
-/* terminal panel */
-.term{background:var(--card);border:2px solid var(--accent);box-shadow:6px 6px 0 0 var(--accent),var(--glow);padding:34px;position:relative}
-.term .cursor{display:inline-block;width:.6em;height:1.05em;background:var(--accent);vertical-align:-3px;margin-left:3px;animation:blink 1.05s steps(1) infinite}
-.boot{animation:boot-in .5s ease-out both}
-@keyframes grid-drift{from{background-position:0 0,0 0}to{background-position:44px 44px,44px 44px}}
-@keyframes scanbar{0%{transform:translateY(-150px)}100%{transform:translateY(100vh)}}
-@keyframes eq{0%,100%{height:4px}50%{height:14px}}
-@keyframes blink{0%,49%{opacity:1}50%,100%{opacity:0}}
-@keyframes pulse-led{0%,100%{opacity:1}50%{opacity:.3}}
-@keyframes glitch{0%{text-shadow:0 0 transparent}20%{text-shadow:-2px 0 var(--magenta),2px 0 var(--accent)}40%{text-shadow:2px 0 var(--magenta),-2px 0 var(--accent);transform:translateX(1px)}60%{text-shadow:0 0 var(--accent)}100%{text-shadow:0 0 transparent;transform:translateX(0)}}
-@keyframes boot-in{from{opacity:0;transform:translateY(12px)}to{opacity:1;transform:translateY(0)}}
-@keyframes blob{from{transform:translate3d(-3%,-2%,0) scale(1)}to{transform:translate3d(4%,3%,0) scale(1.1)}}
-@keyframes floor{from{background-position:0 0}to{background-position:0 46px}}
-@keyframes pulse-glow{0%,100%{box-shadow:0 0 0 0 rgba(34,233,255,0)}50%{box-shadow:0 0 16px 1px rgba(34,233,255,.16)}}
-@media (prefers-reduced-motion: reduce){*,*::before,*::after{animation:none!important;transition:none!important}}
+html{background:var(--canvas);scroll-behavior:smooth}
+body{font-family:var(--font-body);font-weight:400;font-size:14px;background:var(--canvas);color:var(--text);min-height:100vh;line-height:1.5;letter-spacing:0}
+button,input,select,textarea{font:inherit;letter-spacing:0}
+button,a,input,select,textarea{transition:border-color .18s ease,background-color .18s ease,color .18s ease,opacity .18s ease,transform .18s ease}
+button:active,.btn:active{transform:translateY(1px)}
+:focus-visible{outline:3px solid rgba(47,110,80,.2);outline-offset:2px}
+::selection{background:#dbe8df;color:var(--text)}
+.led{display:inline-block;width:7px;height:7px;border-radius:50%;vertical-align:middle;background:var(--dim2);margin-right:7px}
+.led.on{background:var(--green)}.led.warn{background:var(--orange)}.led.err{background:var(--red)}
+.quota-progress{display:inline-block;width:92px;height:6px;vertical-align:middle;overflow:hidden;border-radius:2px;background:var(--surface-subtle);margin-left:7px}
+.quota-progress>i{display:block;height:100%;background:var(--green)}
+.quota-progress.warn>i{background:var(--orange)}.quota-progress.crit>i{background:var(--red)}
+@media (prefers-reduced-motion:reduce){*,*::before,*::after{scroll-behavior:auto!important;transition:none!important}}
 `;
 
-// ponytail: shared JS helpers for the fun data-viz (count-up, segmented HP bar).
-// Kept free of template-literal interpolation so it can sit inside any page's <script>.
-const PIXEL_JS = `
-function _cuFmt(n,k){if(k){if(n>=1e6)return(n/1e6).toFixed(1)+'M';if(n>=1e3)return(n/1e3).toFixed(1)+'k';return ''+n}return n.toLocaleString('zh-CN')}
-function countUp(el,to,k){if(!el)return;var from=Number(el.dataset.cur||0),st=performance.now();
-  function step(t){var p=Math.min(1,(t-st)/600);var e=1-Math.pow(1-p,3);el.textContent=_cuFmt(Math.round(from+(to-from)*e),k);if(p<1)requestAnimationFrame(step);else el.dataset.cur=to;}
-  requestAnimationFrame(step);}
-function runCountUps(root){(root||document).querySelectorAll('[data-cu]').forEach(function(el){countUp(el,Number(el.dataset.cu),el.hasAttribute('data-cu-k'))})}
-function hpBar(pct,segs){segs=segs||20;var on=Math.round(pct/100*segs);var cls=pct>90?'crit':pct>70?'warn':'';
-  var s='<span class="hp '+cls+'">';for(var i=0;i<segs;i++){s+='<i class="'+(i<on?'on':'')+'"></i>';}return s+'</span>';}
-// mouse HUD spotlight — creates .fx-spot once and tracks the cursor (rAF-throttled)
-(function(){var d=document,b=d.body;if(!b)return;var s=d.createElement('div');s.className='fx-spot';b.appendChild(s);
-  var pend=false,x=0,y=0;d.addEventListener('mousemove',function(e){x=e.clientX;y=e.clientY;if(!pend){pend=true;requestAnimationFrame(function(){s.style.background='radial-gradient(260px circle at '+x+'px '+y+'px,rgba(34,233,255,.10),transparent 70%)';pend=false})}},{passive:true})})();
+const UI_HELPERS = `
+function formatCompact(n){if(n>=1e6)return(n/1e6).toFixed(1)+'M';if(n>=1e3)return(n/1e3).toFixed(1)+'k';return Number(n).toLocaleString('zh-CN')}
+function quotaBar(pct){var value=Math.max(0,Math.min(100,Number(pct)||0));var cls=value>90?'crit':value>70?'warn':'';return '<span class="quota-progress '+cls+'" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="'+value+'"><i style="width:'+value+'%"></i></span>'}
+function runCountUps(root){(root||document).querySelectorAll('[data-cu]').forEach(function(el){var raw=Number(el.dataset.cu)||0;el.textContent=el.hasAttribute('data-cu-k')?formatCompact(raw):raw.toLocaleString('zh-CN');el.dataset.cur=String(raw)})}
+function hpBar(pct){return quotaBar(pct)}
 `;
 
 // ─── Config ──────────────────────────────────────────────────────────────────
@@ -3147,7 +3083,7 @@ function getPublicSettings() {
 // ─── Settings Page HTML ──────────────────────────────────────────────────────
 function settingsHtml(errorMsg) {
   const s = getPublicSettings();
-  const errDiv = errorMsg ? `<div style="background:rgba(255,56,96,.12);color:var(--red);padding:10px 14px;border-radius:6px;margin-bottom:16px;font-size:13px">${errorMsg}</div>` : "";
+  const errDiv = errorMsg ? `<div style="background:#fff2f0;color:var(--red);border:1px solid #f1c8c2;padding:10px 14px;border-radius:6px;margin-bottom:16px;font-size:13px">${errorMsg}</div>` : "";
 
   // Global users table rows
   const initialSuffix = s.selectedProfileSuffix || getDefaultProfileSuffix();
@@ -3164,7 +3100,7 @@ function settingsHtml(errorMsg) {
 <td><input type="text" name="gu_un_${escHtml(k)}" value="${escHtml(username)}" style="width:100%;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:4px 8px;border-radius:4px;font-size:12px" placeholder="用户名"></td>
 <td><input type="datetime-local" name="gu_ex_${escHtml(k)}" value="${escHtml(expiresAt)}" style="width:100%;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:3px 6px;border-radius:4px;font-size:11px;font-family:monospace;color-scheme:dark" title="留空=永不过期"></td>
 <td><label style="display:inline-flex;align-items:center;gap:4px;margin:0;cursor:pointer"><input type="checkbox" name="gu_dis_${escHtml(k)}" ${disabled ? "checked" : ""} style="width:auto;accent-color:var(--red)"><span style="font-size:11px;color:${disabled ? "var(--red)" : "var(--dim)"}">${disabled ? "已禁用" : "正常"}</span></label></td>
-<td><button type="button" onclick="deleteGlobalUser('${escJs(k)}')" style="background:rgba(255,56,96,.15);color:var(--red);border:none;padding:2px 8px;border-radius:4px;cursor:pointer;font-size:11px">删除</button></td></tr>`;
+<td><button type="button" onclick="deleteGlobalUser('${escJs(k)}')" style="background:#fff2f0;color:var(--red);border:1px solid #f1c8c2;padding:2px 8px;border-radius:4px;cursor:pointer;font-size:11px">删除</button></td></tr>`;
   }).join("");
 
   // Profile user rows (key assignment)
@@ -3191,98 +3127,71 @@ function settingsHtml(errorMsg) {
 
   return `<!DOCTYPE html>
 <html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
-<title>代理设置 - 团队AI Coding监控</title>
-${PIXEL_FONT}
+<title>设置 - CC Team</title>
 <style>
-${PIXEL_THEME}
+${UI_THEME}
 body{padding:0;overflow:hidden;height:100vh}
 .layout{display:flex;height:100vh}
-.sidebar{width:240px;min-width:240px;background:var(--card);border-right:1px solid var(--border);display:flex;flex-direction:column;overflow:hidden}
-.sidebar-hd{padding:16px 14px 10px;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between}
-.sidebar-hd h1{font-size:16px;margin:0;white-space:nowrap}
-.sidebar-hd a{color:var(--dim);font-size:11px;text-decoration:none}
-.sidebar-hd a:hover{color:var(--accent)}
-.sidebar-list{flex:1;overflow-y:auto;padding:8px}
-.sidebar-list::-webkit-scrollbar{width:4px}
-.sidebar-list::-webkit-scrollbar-thumb{background:var(--border);border-radius:2px}
-.sidebar-ft{padding:10px;border-top:1px solid var(--border)}
-.pl-item{background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:10px 12px;margin-bottom:8px;position:relative;transition:border-color .15s}
-.pl-item:hover{border-color:var(--dim)}
-.pl-item.active{border-color:var(--accent);background:rgba(0,229,255,.08)}
-.pl-name{font-size:14px;font-weight:600;margin-bottom:2px}
-.pl-host{font-size:11px;color:var(--dim);font-family:monospace;word-break:break-all;margin-bottom:2px}
+.sidebar{width:260px;min-width:260px;background:var(--surface);border-right:1px solid var(--border);display:flex;flex-direction:column;overflow:hidden}
+.sidebar-hd{min-height:64px;padding:16px 18px;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between;gap:12px}
+.sidebar-hd h1{font-size:17px;font-weight:650;white-space:nowrap}
+.sidebar-hd a{color:var(--dim);font-size:12px;text-decoration:none;white-space:nowrap}
+.sidebar-hd a:hover{color:var(--text)}
+.sidebar-list{flex:1;overflow-y:auto;padding:12px}
+.sidebar-ft{padding:12px;border-top:1px solid var(--border);background:var(--surface)}
+.pl-item{background:transparent;border:1px solid transparent;border-radius:6px;padding:11px 12px;margin-bottom:4px;position:relative;cursor:pointer}
+.pl-item:hover{background:var(--surface-subtle)}
+.pl-item.active{border-color:var(--border);background:var(--accent-soft)}
+.pl-name{font-size:13px;font-weight:600;margin-bottom:3px;padding-right:74px}
+.pl-host{font-size:11px;color:var(--dim);font-family:var(--font-mono);word-break:break-all;margin-bottom:3px}
 .pl-users{font-size:11px;color:var(--dim)}
-.pl-actions{display:none;position:absolute;top:8px;right:8px;gap:4px}
-.pl-item:hover .pl-actions{display:flex}
-.pl-item.active .pl-actions{display:flex}
-.pl-activate{font-size:10px;padding:2px 8px;border-radius:4px;border:1px solid var(--accent);background:rgba(0,229,255,.15);color:var(--accent);cursor:pointer;white-space:nowrap}
-.pl-activate:hover{background:var(--accent);color:#fff}
-.pl-delete{font-size:12px;padding:1px 6px;border:none;background:none;color:var(--dim);cursor:pointer;border-radius:3px}
-.pl-delete:hover{background:rgba(255,56,96,.15);color:var(--red)}
-.pl-badge{font-size:10px;padding:2px 8px;border-radius:4px;background:rgba(0,229,255,.2);color:var(--accent);white-space:nowrap}
-.main{flex:1;overflow-y:auto;padding:20px 28px}
-.main::-webkit-scrollbar{width:6px}
-.main::-webkit-scrollbar-thumb{background:var(--border);border-radius:3px}
-.main h2{font-size:14px;margin:20px 0 10px;padding-bottom:8px;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between}
+.pl-actions{display:none;position:absolute;top:8px;right:8px;gap:3px}
+.pl-item:hover .pl-actions,.pl-item.active .pl-actions{display:flex}
+.pl-activate,.pl-delete{font-size:10px;padding:3px 7px;border-radius:4px;border:1px solid var(--border);background:var(--surface);color:var(--dim);cursor:pointer;white-space:nowrap}
+.pl-activate:hover{border-color:var(--accent);color:var(--accent)}
+.pl-delete:hover{border-color:#e5b8b2;color:var(--red);background:#fff5f3}
+.pl-badge{font-size:10px;padding:2px 7px;border-radius:4px;background:var(--accent-soft);color:var(--accent);white-space:nowrap}
+.main{flex:1;overflow-y:auto;padding:28px clamp(24px,4vw,56px);scrollbar-gutter:stable}
+.main form{max-width:1180px;margin:0 auto}
+.main h2{font-size:16px;font-weight:650;margin:30px 0 10px;padding-bottom:10px;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between}
 .main h2:first-of-type{margin-top:0}
-.section{position:relative;background:var(--card);border:2px solid var(--border);padding:16px;margin-bottom:12px}
-.section::before{content:"";position:absolute;top:0;left:0;right:0;height:2px;background:linear-gradient(90deg,var(--accent),var(--magenta),transparent)}
-label{display:block;font-size:12px;color:var(--dim);margin-bottom:4px;margin-top:10px}
+.section{background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:18px;margin-bottom:14px}
+label{display:block;font-size:12px;font-weight:550;color:#4f4f4a;margin-bottom:5px;margin-top:12px}
 label:first-child{margin-top:0}
-input,select,textarea{width:100%;padding:8px 12px;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:13px;font-family:monospace;outline:none}
+input,select,textarea{width:100%;padding:9px 11px;background:var(--surface);border:1px solid var(--border-strong);border-radius:5px;color:var(--text);font-size:13px;font-family:var(--font-mono);outline:none}
+input:hover,select:hover,textarea:hover{border-color:#aaa9a2}
 input:focus,select:focus,textarea:focus{border-color:var(--accent)}
-.row{display:grid;grid-template-columns:1fr 1fr;gap:12px}
-.row3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px}
-.btn{padding:8px 20px;border:none;border-radius:6px;font-size:13px;cursor:pointer;font-weight:600}
-.btn-primary{background:var(--accent);color:#fff}
-.btn-primary:hover{opacity:.9}
-.btn-danger{background:rgba(255,56,96,.15);color:var(--red)}
-.btn-danger:hover{background:rgba(255,56,96,.25)}
-.btn-outline{background:transparent;border:1px solid var(--border);color:var(--text)}
-.btn-outline:hover{background:rgba(255,255,255,.04)}
-.btn-sm{padding:4px 12px;font-size:11px}
-.actions{margin-top:16px;display:flex;gap:8px;justify-content:flex-end;padding-bottom:40px}
+input[type=checkbox]{accent-color:var(--accent)}
+.row{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+.row3{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px}
+.btn{padding:8px 15px;border:1px solid transparent;border-radius:5px;font-size:12px;cursor:pointer;font-weight:600}
+.btn-primary{background:var(--text);color:#fff}.btn-primary:hover{background:#33332f}
+.btn-danger{background:#fff2f0;color:var(--red);border-color:#f1c8c2}.btn-danger:hover{background:#ffe8e5}
+.btn-outline{background:var(--surface);border-color:var(--border);color:var(--text)}.btn-outline:hover{background:var(--surface-subtle);border-color:var(--border-strong)}
+.btn-sm{padding:5px 10px;font-size:11px}
+.actions{position:sticky;bottom:0;margin:20px -12px 0;padding:14px 12px 18px;display:flex;gap:8px;justify-content:flex-end;background:rgba(247,247,243,.94);border-top:1px solid var(--border);backdrop-filter:blur(8px)}
 table{width:100%;border-collapse:collapse;margin-top:8px}
-th{text-align:left;padding:6px 8px;font-size:11px;color:var(--dim);border-bottom:1px solid var(--border)}
-td{padding:6px 8px;border-bottom:1px solid var(--border);font-size:12px}
-.status{display:inline-block;padding:2px 8px;border-radius:4px;font-size:11px}
-.status-ok{background:rgba(0,255,136,.15);color:var(--green)}
-.status-warn{background:rgba(255,159,28,.15);color:var(--orange)}
-.status-err{background:rgba(255,56,96,.15);color:var(--red)}
-.note{font-size:11px;color:var(--dim);margin-top:6px}
-.presets{display:flex;gap:6px;flex-wrap:wrap;margin-top:6px}
-.preset{font-size:11px;padding:4px 10px;border-radius:4px;border:1px solid var(--border);background:var(--bg);color:var(--dim);cursor:pointer;font-family:monospace}
-.preset:hover{border-color:var(--accent);color:var(--text)}
+th{text-align:left;padding:8px;font-size:11px;font-weight:600;color:var(--dim);border-bottom:1px solid var(--border);white-space:nowrap}
+td{padding:8px;border-bottom:1px solid #ecece8;font-size:12px}
+.status{display:inline-flex;align-items:center;padding:3px 8px;border-radius:4px;font-size:11px;font-weight:550}
+.status-ok{background:var(--accent-soft);color:var(--green)}.status-warn{background:#fbf3db;color:var(--orange)}.status-err{background:#fdebec;color:var(--red)}
+.note{font-size:11px;color:var(--dim);margin-top:7px;line-height:1.55}
+.presets{display:flex;gap:6px;flex-wrap:wrap;margin-top:8px}
+.preset{font-size:11px;padding:5px 9px;border-radius:4px;border:1px solid var(--border);background:var(--surface);color:var(--dim);cursor:pointer;font-family:var(--font-body)}
+.preset:hover{border-color:var(--border-strong);background:var(--surface-subtle);color:var(--text)}
 .req{color:var(--red);font-size:10px;margin-left:4px}
-.modal-overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:100;justify-content:center;align-items:center}
+.modal-overlay{display:none;position:fixed;inset:0;background:rgba(24,24,22,.35);z-index:100;justify-content:center;align-items:center;padding:20px}
 .modal-overlay.open{display:flex}
-.modal{background:var(--card);border:1px solid var(--border);border-radius:12px;width:90%;max-width:1100px;max-height:80vh;display:flex;flex-direction:column;box-shadow:0 20px 60px rgba(0,0,0,.5)}
+.modal{background:var(--surface);border:1px solid var(--border);border-radius:8px;width:90%;max-width:1100px;max-height:82vh;display:flex;flex-direction:column;box-shadow:0 18px 48px rgba(24,24,22,.12)}
 .modal-hd{padding:16px 20px;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between}
-.modal-hd h3{font-size:15px;margin:0}
-.modal-close{background:none;border:none;color:var(--dim);font-size:20px;cursor:pointer;padding:0 4px;line-height:1}
-.modal-close:hover{color:var(--text)}
-.modal-body{padding:16px 20px;overflow-y:auto;flex:1}
-.modal-body::-webkit-scrollbar{width:4px}
-.modal-body::-webkit-scrollbar-thumb{background:var(--border);border-radius:2px}
-@media(max-width:768px){.layout{flex-direction:column}.sidebar{width:100%;min-width:0;max-height:200px}.row3{grid-template-columns:1fr 1fr}}
-.pl-item,.section,.modal,.preset,.btn,input,select,textarea{border-radius:0!important}/*pixel: force sharp corners over inline modal styles*/
-.sidebar{border-right:2px solid var(--accent);box-shadow:var(--glow)}
-.sidebar-hd h1{font-family:var(--font-pixel);font-size:11px;color:var(--accent);letter-spacing:1px}
-.sidebar-hd a{font-family:'VT323',monospace;font-size:14px}
-.main h2{font-family:var(--font-pixel);font-size:11px;border-bottom:2px solid var(--accent);color:var(--text);letter-spacing:1px}
-.modal{border:2px solid var(--accent);box-shadow:8px 8px 0 0 var(--accent),var(--glow)}
-.modal-hd h3{font-family:var(--font-pixel);font-size:12px;color:var(--accent);letter-spacing:1px}
-.btn-primary{color:var(--bg);box-shadow:4px 4px 0 0 var(--magenta);transition:transform .08s,box-shadow .08s}
-.btn-primary:hover{transform:translate(-2px,-2px);box-shadow:6px 6px 0 0 var(--magenta);opacity:1}
-.btn-primary:active{transform:translate(2px,2px);box-shadow:1px 1px 0 0 var(--magenta)}
-input,select,textarea{font-family:'VT323',monospace;font-size:14px;letter-spacing:1px}
-input:focus,select:focus,textarea:focus{box-shadow:var(--glow)}
-label,.note,.pl-host,.pl-users,.preset,.status{font-family:'VT323',monospace}
-.pl-host,.preset{letter-spacing:.5px}
-</style></head><body>
+.modal-hd h3{font-size:15px;font-weight:650}.modal-close{background:none;border:none;color:var(--dim);font-size:12px;cursor:pointer;padding:5px 7px}.modal-close:hover{color:var(--text);background:var(--surface-subtle)}
+.modal-body{padding:18px 20px;overflow-y:auto;flex:1}
+@media(max-width:900px){.row3{grid-template-columns:1fr 1fr}.main{padding:24px}}
+@media(max-width:680px){body{overflow:auto;height:auto}.layout{flex-direction:column;height:auto;min-height:100vh}.sidebar{width:100%;min-width:0;max-height:none;border-right:0;border-bottom:1px solid var(--border)}.sidebar-list{display:flex;gap:6px;overflow-x:auto}.pl-item{min-width:210px;margin:0}.main{overflow:visible;padding:22px 16px}.row,.row3{grid-template-columns:1fr}.modal{width:100%;max-height:90vh}.section{padding:15px;overflow-x:auto}}
+</style></head><body data-theme="editorial-light">
 <div class="layout">
 <div class="sidebar">
-<div class="sidebar-hd"><h1>配置方案</h1><a href="/dashboard">← 面板</a></div>
+<div class="sidebar-hd"><h1>配置方案</h1><a href="/dashboard">返回面板</a></div>
 <div class="sidebar-list">${s.profiles.map(p => {
     const host = p.upstream.replace(/^https?:\/\//, "").replace(/\/.*/, "");
     const suffixLabel = '<span style="color:var(--accent);font-size:10px">/'+ escHtml(p.suffix)+'</span>' + (p.isDefault ? ' <span style="color:var(--green);font-size:10px">默认入口</span>' : '');
@@ -3292,10 +3201,10 @@ label,.note,.pl-host,.pl-users,.preset,.status{font-family:'VT323',monospace}
 <div class="pl-users">${p.userCount}位用户</div>
 <div class="pl-actions">
   ${!p.isDefault ? '<button class="pl-activate" onclick="event.stopPropagation();setDefaultProfile(\'' + escJs(p.name) + '\')">设为默认</button>' : ''}
-  ${!p.isDefault ? '<button class="pl-delete" onclick="event.stopPropagation();deleteProfile(\'' + escJs(p.name) + '\')">×</button>' : ''}
+  ${!p.isDefault ? '<button class="pl-delete" onclick="event.stopPropagation();deleteProfile(\'' + escJs(p.name) + '\')">删除</button>' : ''}
 </div></div>`;
   }).join("")}</div>
-<div class="sidebar-ft" style="display:flex;gap:6px"><button class="btn btn-outline btn-sm" onclick="openUserModal()" style="flex:1">用户管理</button><button class="btn btn-outline btn-sm" onclick="openProfileModal()" style="flex:1">+ 新增方案</button></div>
+<div class="sidebar-ft" style="display:flex;gap:6px"><button class="btn btn-outline btn-sm" onclick="openUserModal()" style="flex:1">用户管理</button><button class="btn btn-outline btn-sm" onclick="openProfileModal()" style="flex:1">新增方案</button></div>
 </div>
 <div class="main">
 ${errDiv}
@@ -3433,7 +3342,7 @@ ${((() => { const qa = stmts.quotaAdjustRecent.all(); return qa.length > 0 ? `<h
 </div>
 <div class="modal-overlay" id="userModal">
 <div class="modal">
-<div class="modal-hd"><h3>用户管理</h3><button class="modal-close" onclick="closeUserModal()">&times;</button></div>
+<div class="modal-hd"><h3>用户管理</h3><button class="modal-close" onclick="closeUserModal()">关闭</button></div>
 <div class="modal-body">
 <h4 style="font-size:13px;color:var(--accent);margin:0 0 8px">全局用户信息</h4>
 <table id="globalUsersTable">
@@ -3441,7 +3350,7 @@ ${((() => { const qa = stmts.quotaAdjustRecent.all(); return qa.length > 0 ? `<h
 <tbody>${globalUserRows}</tbody>
 </table>
 <div style="margin:12px 0 4px;display:flex;gap:8px;align-items:center">
-<button type="button" class="btn btn-outline btn-sm" onclick="addGlobalUser()">+ 添加用户</button>
+<button type="button" class="btn btn-outline btn-sm" onclick="addGlobalUser()">添加用户</button>
 <span class="note">虚拟Key自动生成（jx-开头24位随机码），点击可复制。失效时间留空=永不过期。</span>
 </div>
 <h4 style="font-size:13px;color:var(--accent);margin:16px 0 8px;display:flex;align-items:center;justify-content:space-between;gap:12px">
@@ -3464,7 +3373,7 @@ ${s.profiles.map(p => `<option value="${escHtml(p.suffix)}" ${p.suffix === initi
 </div>
 <div class="modal-overlay" id="profileModal">
 <div class="modal" style="max-width:640px">
-<div class="modal-hd"><h3>新增方案</h3><button class="modal-close" onclick="closeProfileModal()">&times;</button></div>
+<div class="modal-hd"><h3>新增方案</h3><button class="modal-close" onclick="closeProfileModal()">关闭</button></div>
 <div class="modal-body">
 <div class="row3">
 <div><label>方案名称<span class="req">*</span></label><input type="text" id="newProfileName" placeholder="如: GLM 项目组"></div>
@@ -3664,7 +3573,7 @@ function addGlobalUser(){
     +'<td><input type="text" name="gu_un_new_'+vk+'" placeholder="用户名" style="width:100%;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:4px 8px;border-radius:4px;font-size:12px"></td>'
     +'<td><input type="datetime-local" name="gu_ex_new_'+vk+'" style="width:100%;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:3px 6px;border-radius:4px;font-size:11px;color-scheme:dark"></td>'
     +'<td><label style="display:inline-flex;align-items:center;gap:4px;margin:0;cursor:pointer"><input type="checkbox" name="gu_dis_new_'+vk+'" style="width:auto;accent-color:var(--red)"><span style="font-size:11px;color:var(--dim)">正常</span></label></td>'
-    +'<td><button type="button" onclick="this.closest(\\'tr\\').remove()" style="background:rgba(255,56,96,.15);color:var(--red);border:none;padding:2px 8px;border-radius:4px;cursor:pointer;font-size:11px">删除</button></td>';
+    +'<td><button type="button" onclick="this.closest(\\'tr\\').remove()" style="background:#fff2f0;color:var(--red);border:1px solid #f1c8c2;padding:2px 8px;border-radius:4px;cursor:pointer;font-size:11px">删除</button></td>';
   tbody.appendChild(tr);
   SETTINGS.globalUsers[vk]={username:'',expiresAt:'',disabled:false};
   for(const p of SETTINGS.profiles){if(!SETTINGS.profileAssignments[p.suffix])SETTINGS.profileAssignments[p.suffix]={}}
@@ -3706,64 +3615,47 @@ function dashboardHtml() {
   return `<!DOCTYPE html>
 <html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
 <title>团队AI Coding监控</title>
-${PIXEL_FONT}
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js"><\/script>
 <style>
-${PIXEL_THEME}
-body{padding:22px 26px}
-.top,.meta,.tabs,.grid,.box,.sec{animation:boot-in .45s ease-out both}
-.top{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-bottom:6px}
-.top h1{font-family:var(--font-pixel);font-size:18px;color:var(--accent);text-shadow:0 0 14px rgba(34,233,255,.7),0 0 4px rgba(34,233,255,.9);letter-spacing:1px;line-height:1.6}
-.top h1::after{content:"";display:block;width:130px;height:3px;margin-top:8px;background:linear-gradient(90deg,var(--accent),var(--magenta),transparent);box-shadow:0 0 8px var(--accent)}
-.top .sub{font-family:'Pixelify Sans',monospace;font-weight:500;font-size:15px;color:var(--dim);letter-spacing:1px;margin-top:8px;display:flex;align-items:center;gap:7px}
-.top .sub b{color:var(--green);font-weight:600;letter-spacing:2px}
-.controls{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
-.controls select,.controls a,.controls button{font-family:'VT323',monospace;font-size:15px;background:var(--card);color:var(--text);border:2px solid var(--border);padding:5px 11px;cursor:pointer;letter-spacing:1px;text-decoration:none;line-height:1.4}
-.controls select:focus,.controls a:hover,.controls button:hover{border-color:var(--accent);color:var(--accent)}
-.controls .ar-on{border-color:var(--green);color:var(--green);box-shadow:0 0 8px rgba(0,255,136,.35)}
-.controls .ar-off{color:var(--dim)}
-.meta{font-family:'VT323',monospace;font-size:15px;color:var(--dim);margin-bottom:18px;letter-spacing:1px;border-left:3px solid var(--accent);padding:2px 0 2px 10px}
-.meta b{color:var(--accent);font-weight:400}
-.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px;margin-bottom:22px}
-.card{background:linear-gradient(180deg,var(--card2),var(--card));border:2px solid var(--border);padding:16px 16px 14px;position:relative;overflow:hidden;transition:transform .12s,border-color .12s,box-shadow .12s}
-.card::after{content:"";position:absolute;top:0;left:0;right:0;height:2px;background:linear-gradient(90deg,var(--accent),var(--magenta));opacity:.9}
-.card:hover{transform:translate(-3px,-3px);border-color:var(--accent);box-shadow:5px 5px 0 0 var(--accent),-3px -3px 0 0 var(--magenta),var(--glow)}
-.card .l{font-family:'Pixelify Sans',monospace;font-weight:600;font-size:14px;color:var(--dim);margin-bottom:8px;letter-spacing:1px;text-transform:uppercase}
-.card .v{font-size:15px}
-.tabs{display:flex;gap:4px;margin-bottom:16px;background:var(--card);border:2px solid var(--border);padding:3px;width:fit-content}
-.tab{padding:6px 16px;font-family:'VT323',monospace;font-size:15px;border:none;background:transparent;color:var(--dim);cursor:pointer;letter-spacing:1px}
-.tab:hover{color:var(--text)}
-.tab.on{background:var(--accent);color:var(--bg);font-weight:700}
-.grid{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-bottom:20px}
-.box{position:relative;background:var(--card);border:2px solid var(--border);padding:16px}
-.box::before,.box::after{content:"";position:absolute;width:12px;height:12px;border:2px solid var(--accent);pointer-events:none;opacity:.6}
-.box::before{top:-2px;left:-2px;border-right:0;border-bottom:0}.box::after{bottom:-2px;right:-2px;border-left:0;border-top:0}
-.box h3{font-family:'Pixelify Sans',monospace;font-weight:600;font-size:15px;color:var(--accent);margin-bottom:10px;letter-spacing:1px;text-transform:uppercase;text-shadow:0 0 8px rgba(34,233,255,.5)}
-.box h3::before{content:"// ";color:var(--magenta)}
-.box canvas{max-height:260px}
-.sec{background:var(--card);border:2px solid var(--border);overflow:hidden;margin-bottom:20px}
-.sec>h3{font-family:'Pixelify Sans',monospace;font-weight:600;font-size:15px;color:var(--accent);padding:12px 16px 0;margin:0;letter-spacing:1px;text-transform:uppercase;text-shadow:0 0 8px rgba(34,233,255,.5)}
-.sec-collapsible h3{display:flex;align-items:center;gap:6px;cursor:pointer;user-select:none;padding:12px 16px}
-.sec-collapsible h3:hover{color:var(--text)}
-.sec-toggle{display:inline-block;width:16px;font-size:10px;transition:transform .2s;flex-shrink:0;color:var(--accent)}
-.sec-toggle.open{transform:rotate(90deg)}
-.sec-hint{font-family:'VT323',monospace;font-size:13px;color:var(--dim);font-weight:400;margin-left:auto}
-.sec-body{display:none;padding:0 16px 12px}
-.sec-body.open{display:block}
-.sec-body table{margin-top:0}
-.sec-body .empty{padding:16px 0}
-table{width:100%;border-collapse:collapse}
-th{text-align:left;padding:8px 16px;font-family:'Pixelify Sans',monospace;font-weight:600;font-size:13px;color:#b4bcd9;border-bottom:2px solid var(--accent);letter-spacing:1px;text-transform:uppercase}
-td{padding:8px 16px;font-size:14px;border-bottom:1px solid var(--border)}
-tr:last-child td{border-bottom:none}tbody tr{transition:background .1s}tbody tr:hover td{background:rgba(0,229,255,.05)}
-.n{font-variant-numeric:tabular-nums;text-align:right}
-.hl{color:var(--accent);font-weight:600}
-code{font-family:'VT323',monospace;color:var(--accent);font-size:14px}
-.empty{font-family:'VT323',monospace;color:var(--dim);padding:24px;text-align:center;font-size:15px;letter-spacing:1px}
-@media(max-width:768px){.grid{grid-template-columns:1fr}.cards{grid-template-columns:1fr 1fr}}
-</style></head><body>
-<div class="top"><div><h1 class="glitch">CODING MONITOR</h1><div class="sub"><span class="eq"><i></i><i></i><i></i><i></i></span>团队 AI 用量监控 <b>// LIVE</b></div></div><div class="controls"><select id="profileSel" onchange="switchProfileView(this.value)"><option value="">全部方案</option></select><a href="/settings">设置</a><button id="autoRefreshBtn" class="ar-on">自动刷新: 开</button><button onclick="fetch('/api/logout',{method:'POST',headers:{'x-csrf-token':(document.cookie.match(/tm_csrf=([^;]+)/)||[])[1]||''}}).then(()=>location.reload())">退出</button></div></div>
-<div class="meta" id="meta">Loading...</div>
+${UI_THEME}
+body{padding:28px clamp(18px,3vw,44px) 48px}
+body>div{max-width:1440px;margin-left:auto;margin-right:auto}
+.top{display:flex;align-items:flex-start;justify-content:space-between;gap:24px;flex-wrap:wrap;margin-bottom:8px;padding-bottom:20px;border-bottom:1px solid var(--border)}
+.brand-mark{font-size:12px;font-weight:650;color:var(--accent);margin-bottom:14px}
+.top h1{font-size:28px;font-weight:650;line-height:1.15;margin-bottom:7px}
+.top .sub{font-size:12px;color:var(--dim);display:flex;align-items:center;gap:0}
+.controls{display:flex;gap:7px;align-items:center;flex-wrap:wrap}
+.controls select,.controls a,.controls button{font-size:12px;background:var(--surface);color:var(--text);border:1px solid var(--border);border-radius:5px;padding:7px 10px;cursor:pointer;text-decoration:none;line-height:1.3}
+.controls select:hover,.controls a:hover,.controls button:hover{border-color:var(--border-strong);background:var(--surface-subtle)}
+.controls .ar-on{border-color:#bdd0c3;color:var(--green);background:var(--accent-soft)}.controls .ar-off{color:var(--dim)}
+.meta{font-size:12px;color:var(--dim);margin:14px auto 18px}.meta b{color:var(--text);font-weight:550}
+.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:10px;margin-bottom:22px}
+.card{background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:15px 16px;min-height:92px}
+.card:first-child{border-top:2px solid var(--accent)}
+.card .l{font-size:11px;font-weight:550;color:var(--dim);margin-bottom:12px}
+.card .v{font-size:24px;line-height:1;font-weight:650;font-variant-numeric:tabular-nums;color:var(--text)!important}
+.tabs{display:flex;gap:2px;margin-bottom:14px;background:var(--surface-subtle);border:1px solid var(--border);border-radius:6px;padding:3px;width:fit-content}
+.tab{padding:6px 13px;font-size:12px;border:0;border-radius:4px;background:transparent;color:var(--dim);cursor:pointer}.tab:hover{color:var(--text)}.tab.on{background:var(--surface);color:var(--text);font-weight:600}
+.grid{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:12px;margin-bottom:18px}
+.box{background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:17px;min-width:0}
+.box h3,.sec>h3{font-size:13px;font-weight:650;color:var(--text);margin:0}.box h3{margin-bottom:12px}.box canvas{max-height:260px}
+.sec{background:var(--surface);border:1px solid var(--border);border-radius:6px;overflow-x:auto;margin-bottom:18px}
+.sec>h3{padding:15px 16px 10px}
+.sec-collapsible h3{display:flex;align-items:center;gap:9px;cursor:pointer;user-select:none;padding:14px 16px}.sec-collapsible h3:hover{background:var(--surface-subtle)}
+.sec-toggle{display:inline-block;width:8px;height:8px;border-right:1.5px solid var(--dim);border-bottom:1.5px solid var(--dim);transform:rotate(-45deg);transition:transform .18s;flex-shrink:0}.sec-toggle.open{transform:rotate(45deg)}
+.sec-hint{font-size:11px;color:var(--dim);font-weight:400;margin-left:auto}
+.sec-body{display:none;padding:0 16px 12px}.sec-body.open{display:block}.sec-body table{margin-top:0}
+.clear-btn{font-size:11px;background:#fff5f3;color:var(--red);border:1px solid #f1c8c2;border-radius:4px;padding:4px 9px;cursor:pointer;margin-left:8px}
+table{width:100%;border-collapse:collapse;min-width:720px}
+th{text-align:left;padding:9px 14px;font-weight:550;font-size:11px;color:var(--dim);border-bottom:1px solid var(--border);white-space:nowrap}
+td{padding:9px 14px;font-size:12px;border-bottom:1px solid #ecece8;white-space:nowrap}tr:last-child td{border-bottom:0}tbody tr:hover td{background:#fafaf7}
+.n{font-variant-numeric:tabular-nums;text-align:right}.hl{color:var(--accent);font-weight:600}
+.rank{display:inline-block;width:20px;color:var(--dim);font-variant-numeric:tabular-nums}code{font-family:var(--font-mono);color:var(--accent);font-size:11px}.empty{color:var(--dim);padding:24px;text-align:center;font-size:12px}
+@media(max-width:820px){.grid{grid-template-columns:1fr}.top{align-items:flex-start}.controls{width:100%}}
+@media(max-width:560px){body{padding:20px 14px 36px}.top h1{font-size:24px}.cards{grid-template-columns:1fr 1fr}.card{min-height:84px;padding:13px}.card .v{font-size:20px}.controls select{flex:1;min-width:150px}.box{padding:14px}}
+</style></head><body data-theme="editorial-light">
+<div class="top"><div><div class="brand-mark">CC Team</div><h1>团队用量</h1><div class="sub"><span class="led on"></span>监控服务运行中</div></div><div class="controls"><select id="profileSel" onchange="switchProfileView(this.value)"><option value="">全部方案</option></select><a href="/settings">设置</a><button id="autoRefreshBtn" class="ar-on">自动刷新：开</button><button onclick="fetch('/api/logout',{method:'POST',headers:{'x-csrf-token':(document.cookie.match(/tm_csrf=([^;]+)/)||[])[1]||''}}).then(()=>location.reload())">退出</button></div></div>
+<div class="meta" id="meta">正在加载数据</div>
 <div class="cards" id="cards"></div>
 <div class="sec" id="profileSummarySec" style="display:none"><h3>方案中心</h3><table><thead><tr><th>方案</th><th>入口</th><th>上游</th><th class="n">今日请求</th><th class="n">今日用量</th><th>状态</th></tr></thead><tbody id="profileSummaryBody"></tbody></table></div>
 <div class="tabs" id="tabs">
@@ -3781,19 +3673,19 @@ code{font-family:'VT323',monospace;color:var(--accent);font-size:14px}
 <div class="sec"><h3>用户用量明细</h3><table id="uTable"><thead>
 <tr><th>用户</th><th>状态</th><th class="n">请求数</th><th class="n">输入</th><th class="n">输出</th><th class="n">缓存写入</th><th class="n">缓存命中</th><th class="n">合计</th><th class="n">配额</th><th>最后活跃</th></tr>
 </thead><tbody></tbody></table></div>
-<div class="sec sec-collapsible" id="detailSec"><h3 onclick="toggleSec('detailSec')"><span class="sec-toggle" id="detailSecIcon">▶</span>明细记录<span class="sec-hint" id="detailHint"></span></h3><div class="sec-body" id="detailSecBody"><table id="dTable"><thead>
+<div class="sec sec-collapsible" id="detailSec"><h3 onclick="toggleSec('detailSec')"><span class="sec-toggle" id="detailSecIcon"></span>明细记录<span class="sec-hint" id="detailHint"></span></h3><div class="sec-body" id="detailSecBody"><table id="dTable"><thead>
 <tr><th>时间</th><th>用户</th><th class="n">请求数</th><th class="n">输入</th><th class="n">输出</th><th class="n">缓存写入</th><th class="n">缓存命中</th><th class="n">合计</th></tr>
 </thead><tbody></tbody></table></div></div>
-<div class="sec sec-collapsible" id="errorSec"><h3 onclick="toggleSec('errorSec')"><span class="sec-toggle" id="errorSecIcon">▶</span>错误记录<span id="errorCount" style="font-size:11px;color:var(--red);font-weight:400;margin-left:4px"></span><span class="sec-hint" id="errorHint" style="margin-left:auto"></span><button id="clearErrors" onclick="event.stopPropagation()" style="font-family:'VT323',monospace;font-size:14px;background:rgba(255,56,96,.15);color:var(--red);border:1px solid var(--red);padding:2px 10px;cursor:pointer;margin-left:8px;letter-spacing:1px">清除</button></h3><div class="sec-body" id="errorSecBody"><table id="eTable"><thead>
+<div class="sec sec-collapsible" id="errorSec"><h3 onclick="toggleSec('errorSec')"><span class="sec-toggle" id="errorSecIcon"></span>错误记录<span id="errorCount" style="font-size:11px;color:var(--red);font-weight:400;margin-left:4px"></span><span class="sec-hint" id="errorHint" style="margin-left:auto"></span><button id="clearErrors" class="clear-btn" onclick="event.stopPropagation()">清除</button></h3><div class="sec-body" id="errorSecBody"><table id="eTable"><thead>
 <tr><th>时间</th><th>用户</th><th class="n">状态码</th><th>模型</th><th>路径</th><th>错误信息</th></tr>
 </thead><tbody></tbody></table>
 <div id="errPages" style="padding:8px 0;text-align:right"></div></div></div>
 <script>
-${PIXEL_JS}
-Chart.defaults.color='#9aa0c8';Chart.defaults.font.family="'Pixelify Sans',monospace";Chart.defaults.font.size=11;
+${UI_HELPERS}
+Chart.defaults.color='#686863';Chart.defaults.font.family='-apple-system,BlinkMacSystemFont,"SF Pro Text","PingFang SC","Microsoft YaHei","Segoe UI",sans-serif';Chart.defaults.font.size=11;
 let D=null,P="day",C={t:null,p:null,m:null,h:null},errPage=1,autoRefresh=true,refreshTimer=null,currentProfile="all";
 const ERR_PAGE_SIZE=20;
-const COL=["#00e5ff","#ff2d95","#00ff88","#ffd23f","#b14eff","#ff3860","#29e7ff","#ff9f1c"];
+const COL=["#2f6e50","#181816","#8c8c84","#456b5a","#a7a79f","#b42318","#956400","#c7c7c0"];
 const escH=s=>String(s??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 const fmtT=n=>n.toLocaleString("zh-CN");
 const fmtTk=n=>{if(n>=1e6)return(n/1e6).toFixed(1)+"M";if(n>=1e3)return(n/1e3).toFixed(1)+"k";return n.toString()};
@@ -3802,14 +3694,14 @@ function ago(iso){if(!iso)return"-";const d=Date.now()-new Date(iso).getTime();c
 function wk(s){const d=new Date(s),day=d.getDay()||7,mon=new Date(d);mon.setDate(d.getDate()-day+1);return mon.toISOString().slice(0,10)}
 function grp(daily,p){const g={};for(const[day,ud]of Object.entries(daily)){const k=p==="week"?wk(day):p==="month"?day.slice(0,7):p==="year"?day.slice(0,4):day;if(!g[k])g[k]={};for(const[u,s]of Object.entries(ud)){if(!g[k][u])g[k][u]={inputTokens:0,outputTokens:0,requests:0,cacheCreationTokens:0,cacheReadTokens:0};g[k][u].inputTokens+=s.inputTokens;g[k][u].outputTokens+=s.outputTokens;g[k][u].requests+=s.requests;g[k][u].cacheCreationTokens+=(s.cacheCreationTokens||0);g[k][u].cacheReadTokens+=(s.cacheReadTokens||0)}}return g}
 function lbl(p,k){if(p==="day")return k.slice(5);if(p==="week")return k.slice(5)+" 周";if(p==="month")return k;return k+"年"}
-function c(l,v,cl,k){return'<div class="card"><div class="l">'+l+'</div><div class="v" data-cu="'+v+'"'+(k?' data-cu-k':'')+' style="color:'+cl+'">0</div></div>'}
+function c(l,v,cl,k){return'<div class="card"><div class="l">'+l+'</div><div class="v" data-cu="'+v+'"'+(k?' data-cu-k':'')+'>0</div></div>'}
 function switchProfileView(v){currentProfile=v||"all";load()}
 function render(){
   if(!D)return;
   // Populate profile dropdown
   const sel=document.getElementById("profileSel");
   if(sel.options.length<=1 && D.profiles){
-    sel.innerHTML='<option value="all">📊 全部方案</option>';
+    sel.innerHTML='<option value="all">全部方案</option>';
     for(const p of D.profiles){
       const sfx="/"+p.suffix+(p.isDefault?" · 默认入口":"");
       sel.innerHTML+='<option value="'+escH(p.suffix)+'">'+escH(p.name)+' '+sfx+'</option>';
@@ -3822,7 +3714,7 @@ function render(){
   document.getElementById("cards").innerHTML=c("今日用量",tIn+tOut,"var(--accent)",1)+c("今日请求",tR,"var(--blue)",1)+c("总用量",ti+to,"var(--green)",1)+c("总请求",tr,"var(--orange)",1)+c("今日错误",(Array.isArray(D.errors)?D.errors:[]).filter(e=>e.time&&e.time.startsWith(td)).length,"var(--red)",1);
   runCountUps(document.getElementById("cards"));
   const ps=document.getElementById("profileSummarySec"),psb=document.getElementById("profileSummaryBody");
-  if(currentProfile==="all"&&Array.isArray(D.profileSummaries)){ps.style.display="block";psb.innerHTML=D.profileSummaries.map(p=>{const st=p.breakerState||"UNKNOWN";const col=st==="CLOSED"?"var(--green)":st==="HALF_OPEN"?"var(--orange)":"var(--red)";const led=st==="CLOSED"?"on":st==="HALF_OPEN"?"warn":"err";const lbl=st==="CLOSED"?"正常":st==="HALF_OPEN"?"探测中":"熔断";return'<tr><td>'+escH(p.name)+(p.isDefault?' <span style="color:var(--green);font-family:var(--font-pixel);font-size:9px;vertical-align:middle">DEF</span>':'')+'</td><td><code>/'+escH(p.suffix)+'</code>'+(p.isDefault?' <span style="color:var(--dim)">/ <code>/v1</code></span>':'')+'</td><td style="font-size:13px;color:var(--dim);max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+escH((p.upstream||'').replace('https://','').replace('http://',''))+'</td><td class="n">'+fmtT(p.todayRequests||0)+'</td><td class="n hl">'+fmtT(p.todayTokens||0)+'</td><td><span class="led '+led+'"></span><span style="color:'+col+';font-size:13px">'+lbl+'</span></td></tr>'}).join('')}else{ps.style.display="none"}
+  if(currentProfile==="all"&&Array.isArray(D.profileSummaries)){ps.style.display="block";psb.innerHTML=D.profileSummaries.map(p=>{const st=p.breakerState||"UNKNOWN";const col=st==="CLOSED"?"var(--green)":st==="HALF_OPEN"?"var(--orange)":"var(--red)";const led=st==="CLOSED"?"on":st==="HALF_OPEN"?"warn":"err";const lbl=st==="CLOSED"?"正常":st==="HALF_OPEN"?"探测中":"熔断";return'<tr><td>'+escH(p.name)+(p.isDefault?' <span style="color:var(--green);font-size:11px;font-weight:600;vertical-align:middle">默认</span>':'')+'</td><td><code>/'+escH(p.suffix)+'</code>'+(p.isDefault?' <span style="color:var(--dim)"> / <code>/v1</code></span>':'')+'</td><td style="font-size:12px;color:var(--dim);max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+escH((p.upstream||'').replace('https://','').replace('http://',''))+'</td><td class="n">'+fmtT(p.todayRequests||0)+'</td><td class="n hl">'+fmtT(p.todayTokens||0)+'</td><td><span class="led '+led+'"></span><span style="color:'+col+';font-size:12px">'+lbl+'</span></td></tr>'}).join('')}else{ps.style.display="none"}
   const profileLabel=D.profileView||(currentProfile==="all"?"全部方案":"默认方案");
   const upstreamInfo=D.upstream?(" | 上游: "+D.upstream.replace("https://","").replace("http://","")):"";
   document.getElementById("meta").innerHTML='<span style="color:var(--accent);font-weight:600">方案: '+profileLabel+'</span>'+upstreamInfo+' &nbsp;|&nbsp; 更新于 '+(function(){const d=new Date();const utc=d.getTime()+d.getTimezoneOffset()*60000;return new Date(utc+8*3600000).toLocaleTimeString("zh-CN")})()+" (北京时间) | 每30秒刷新";
@@ -3830,13 +3722,13 @@ function render(){
   // Charts
   const g=grp(D.daily||{},P),keys=Object.keys(g).sort(),uks=Object.keys(D.users);
   if(C.t)C.t.destroy();if(C.p)C.p.destroy();if(C.m)C.m.destroy();if(C.h)C.h.destroy();
-  C.t=new Chart(document.getElementById("trend"),{type:"bar",data:{labels:keys.map(k=>lbl(P,k)),datasets:uks.map((u,i)=>({label:D.users[u].name,data:keys.map(k=>(g[k][u]||{}).inputTokens+(g[k][u]||{}).outputTokens||0),backgroundColor:COL[i%COL.length]+"cc",borderRadius:3,borderSkipped:false}))},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{labels:{color:"#9aa0c8",font:{size:11}}},tooltip:{callbacks:{label:ctx=>ctx.dataset.label+": "+fmtT(ctx.raw)}}},scales:{x:{stacked:true,ticks:{color:"#6f6f8f",font:{size:10}},grid:{color:"rgba(0,229,255,.08)"}},y:{stacked:true,ticks:{color:"#6f6f8f",callback:v=>fmtTk(v)},grid:{color:"rgba(0,229,255,.08)"}}}}});
+  C.t=new Chart(document.getElementById("trend"),{type:"bar",data:{labels:keys.map(k=>lbl(P,k)),datasets:uks.map((u,i)=>({label:D.users[u].name,data:keys.map(k=>(g[k][u]||{}).inputTokens+(g[k][u]||{}).outputTokens||0),backgroundColor:COL[i%COL.length]+"cc",borderRadius:3,borderSkipped:false}))},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{labels:{color:"#686863",font:{size:11}}},tooltip:{callbacks:{label:ctx=>ctx.dataset.label+": "+fmtT(ctx.raw)}}},scales:{x:{stacked:true,ticks:{color:"#686863",font:{size:10}},grid:{color:"rgba(24,24,22,.08)"}},y:{stacked:true,ticks:{color:"#686863",callback:v=>fmtTk(v)},grid:{color:"rgba(24,24,22,.08)"}}}}});
   const tot=uks.map(u=>{let t=0;for(const k of keys)t+=(g[k][u]||{}).inputTokens+(g[k][u]||{}).outputTokens||0;return t});
-  C.p=new Chart(document.getElementById("pie"),{type:"doughnut",data:{labels:uks.map(k=>D.users[k].name),datasets:[{data:tot,backgroundColor:uks.map((_,i)=>COL[i%COL.length]+"cc"),borderWidth:0}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{position:"right",labels:{color:"#9aa0c8",font:{size:11},padding:12}},tooltip:{callbacks:{label:ctx=>ctx.label+": "+fmtT(ctx.raw)+" tokens"}}},cutout:"55%"}});
+  C.p=new Chart(document.getElementById("pie"),{type:"doughnut",data:{labels:uks.map(k=>D.users[k].name),datasets:[{data:tot,backgroundColor:uks.map((_,i)=>COL[i%COL.length]+"cc"),borderWidth:0}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{position:"right",labels:{color:"#686863",font:{size:11},padding:12}},tooltip:{callbacks:{label:ctx=>ctx.label+": "+fmtT(ctx.raw)+" tokens"}}},cutout:"55%"}});
 
   // 模型分布
   const mods=D.models||{};const mNames=Object.keys(mods);
-  C.m=new Chart(document.getElementById("modelChart"),{type:"doughnut",data:{labels:mNames,datasets:[{data:mNames.map(m=>mods[m].tokens),backgroundColor:mNames.map((_,i)=>COL[i%COL.length]+"cc"),borderWidth:0}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{position:"right",labels:{color:"#9aa0c8",font:{size:11},padding:12}},tooltip:{callbacks:{label:ctx=>ctx.label+": "+fmtT(ctx.raw)+" tokens"}}},cutout:"55%"}});
+  C.m=new Chart(document.getElementById("modelChart"),{type:"doughnut",data:{labels:mNames,datasets:[{data:mNames.map(m=>mods[m].tokens),backgroundColor:mNames.map((_,i)=>COL[i%COL.length]+"cc"),borderWidth:0}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{position:"right",labels:{color:"#686863",font:{size:11},padding:12}},tooltip:{callbacks:{label:ctx=>ctx.label+": "+fmtT(ctx.raw)+" tokens"}}},cutout:"55%"}});
 
   // 24小时趋势图
   const hrs=[];for(let i=0;i<24;i++)hrs.push(i.toString().padStart(2,"0")+":00");
@@ -3844,12 +3736,12 @@ function render(){
   const hReq=hrs.map((_,i)=>{const h=todayHourly[i.toString().padStart(2,"0")];return typeof h==="object"?(h.requests||0):0});
   const hIn=hrs.map((_,i)=>{const h=todayHourly[i.toString().padStart(2,"0")];return typeof h==="object"?(h.inputTokens||0):0});
   const hOut=hrs.map((_,i)=>{const h=todayHourly[i.toString().padStart(2,"0")];return typeof h==="object"?(h.outputTokens||0):0});
-  C.h=new Chart(document.getElementById("hourChart"),{type:"line",data:{labels:hrs,datasets:[{label:"请求数",data:hReq,borderColor:"#29e7ff",backgroundColor:"rgba(41,231,255,.12)",fill:true,tension:.4,pointRadius:3,pointBackgroundColor:"#29e7ff",pointHoverRadius:6,borderWidth:2.5,yAxisID:"y"},{label:"输入",data:hIn,borderColor:"#b14eff",backgroundColor:"rgba(177,78,255,.12)",fill:true,tension:.4,pointRadius:3,pointBackgroundColor:"#b14eff",pointHoverRadius:6,borderWidth:2.5,yAxisID:"y1"},{label:"输出",data:hOut,borderColor:"#ff3860",backgroundColor:"rgba(255,56,96,.12)",fill:true,tension:.4,pointRadius:3,pointBackgroundColor:"#ff3860",pointHoverRadius:6,borderWidth:2.5,yAxisID:"y1"}]},options:{responsive:true,maintainAspectRatio:false,interaction:{mode:"index",intersect:false},plugins:{legend:{labels:{color:"#9aa0c8",font:{size:11},usePointStyle:true,pointStyle:"circle"}},tooltip:{callbacks:{label:ctx=>ctx.dataset.label+": "+fmtT(ctx.raw)}}},scales:{x:{ticks:{color:"#6f6f8f",font:{size:9},maxRotation:0,autoSkip:true,maxTicksLimit:12},grid:{display:false}},y:{type:"linear",position:"left",ticks:{color:"#29e7ff"},grid:{color:"rgba(0,229,255,.08)"},title:{display:true,text:"请求数",color:"#29e7ff",font:{size:10}}},y1:{type:"linear",position:"right",ticks:{color:"#b14eff",callback:v=>fmtTk(v)},grid:{drawOnChartArea:false},title:{display:true,text:"Tokens",color:"#b14eff",font:{size:10}}}}}});
+  C.h=new Chart(document.getElementById("hourChart"),{type:"line",data:{labels:hrs,datasets:[{label:"请求数",data:hReq,borderColor:"#2f6e50",backgroundColor:"rgba(47,110,80,.12)",fill:true,tension:.28,pointRadius:2,pointBackgroundColor:"#2f6e50",pointHoverRadius:4,borderWidth:2,yAxisID:"y"},{label:"输入",data:hIn,borderColor:"#181816",backgroundColor:"rgba(24,24,22,.08)",fill:true,tension:.28,pointRadius:2,pointBackgroundColor:"#181816",pointHoverRadius:4,borderWidth:2,yAxisID:"y1"},{label:"输出",data:hOut,borderColor:"#8c8c84",backgroundColor:"rgba(140,140,132,.12)",fill:true,tension:.28,pointRadius:2,pointBackgroundColor:"#8c8c84",pointHoverRadius:4,borderWidth:2,yAxisID:"y1"}]},options:{responsive:true,maintainAspectRatio:false,interaction:{mode:"index",intersect:false},plugins:{legend:{labels:{color:"#686863",font:{size:11},usePointStyle:true,pointStyle:"circle"}},tooltip:{callbacks:{label:ctx=>ctx.dataset.label+": "+fmtT(ctx.raw)}}},scales:{x:{ticks:{color:"#686863",font:{size:9},maxRotation:0,autoSkip:true,maxTicksLimit:12},grid:{display:false}},y:{type:"linear",position:"left",ticks:{color:"#2f6e50"},grid:{color:"rgba(24,24,22,.08)"},title:{display:true,text:"请求数",color:"#2f6e50",font:{size:10}}},y1:{type:"linear",position:"right",ticks:{color:"#181816",callback:v=>fmtTk(v)},grid:{drawOnChartArea:false},title:{display:true,text:"Tokens",color:"#181816",font:{size:10}}}}}});
 
   // User table
   const ut=document.querySelector("#uTable tbody");
   const ul=Object.entries(D.users).sort((a,b)=>(b[1].totalInputTokens+b[1].totalOutputTokens)-(a[1].totalInputTokens+a[1].totalOutputTokens));
-  if(!ul.length){ut.innerHTML='<tr><td colspan="10" class="empty">暂无数据</td></tr>'}else{ut.innerHTML=ul.map(([uk,u],idx)=>{const on=u.lastActive&&Date.now()-new Date(u.lastActive).getTime()<36e5;const uq=(D.userQuotas||{})[uk]||D.profileQuota||0;const td2=(D.daily||{})[td]||{};const tdu=td2[uk]||{inputTokens:0,outputTokens:0};const used=tdu.inputTokens+tdu.outputTokens;const qPct=uq>0?Math.min(100,Math.round(used/uq*100)):0;const medal=idx<3?['🥇','🥈','🥉'][idx]+' ':'<span style="display:inline-block;width:1.2em"></span>';const qCell=uq>0?'<span style="color:var(--accent);font-size:12px">'+qPct+'%</span> '+hpBar(qPct,12):'<span style="color:var(--dim)">-</span>';return'<tr><td>'+medal+u.name+'</td><td><span class="led '+(on?'on':'')+'"></span><span style="color:'+(on?'var(--green)':'var(--dim)')+';font-size:12px">'+(on?'在线':'离线')+'</span></td><td class="n">'+fmtT(u.totalRequests)+'</td><td class="n">'+fmtT(u.totalInputTokens)+'</td><td class="n">'+fmtT(u.totalOutputTokens)+'</td><td class="n">'+fmtT(u.cacheCreationTokens || 0)+'</td><td class="n">'+fmtT(u.cacheReadTokens || 0)+'</td><td class="n hl">'+fmtT(u.totalInputTokens+u.totalOutputTokens)+'</td><td class="n" style="white-space:nowrap">'+qCell+'</td><td style="font-size:12px;color:var(--dim)">'+ago(u.lastActive)+'</td></tr>'}).join("")}
+  if(!ul.length){ut.innerHTML='<tr><td colspan="10" class="empty">暂无数据</td></tr>'}else{ut.innerHTML=ul.map(([uk,u],idx)=>{const on=u.lastActive&&Date.now()-new Date(u.lastActive).getTime()<36e5;const uq=(D.userQuotas||{})[uk]||D.profileQuota||0;const td2=(D.daily||{})[td]||{};const tdu=td2[uk]||{inputTokens:0,outputTokens:0};const used=tdu.inputTokens+tdu.outputTokens;const qPct=uq>0?Math.min(100,Math.round(used/uq*100)):0;const rank='<span class="rank">'+(idx+1)+'.</span>';const qCell=uq>0?'<span style="color:var(--accent);font-size:12px">'+qPct+'%</span> '+quotaBar(qPct):'<span style="color:var(--dim)">-</span>';return'<tr><td>'+rank+escH(u.name)+'</td><td><span class="led '+(on?'on':'')+'"></span><span style="color:'+(on?'var(--green)':'var(--dim)')+';font-size:12px">'+(on?'在线':'离线')+'</span></td><td class="n">'+fmtT(u.totalRequests)+'</td><td class="n">'+fmtT(u.totalInputTokens)+'</td><td class="n">'+fmtT(u.totalOutputTokens)+'</td><td class="n">'+fmtT(u.cacheCreationTokens || 0)+'</td><td class="n">'+fmtT(u.cacheReadTokens || 0)+'</td><td class="n hl">'+fmtT(u.totalInputTokens+u.totalOutputTokens)+'</td><td class="n" style="white-space:nowrap">'+qCell+'</td><td style="font-size:12px;color:var(--dim)">'+ago(u.lastActive)+'</td></tr>'}).join("")}
 
   // Detail table
   const dt=document.querySelector("#dTable tbody");
@@ -3881,33 +3773,29 @@ load();startAutoRefresh();
 function loginHtml() {
   return `<!DOCTYPE html>
 <html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
-<title>团队AI Coding监控 - ACCESS</title>
-${PIXEL_FONT}
+<title>登录 - CC Team</title>
 <style>
-${PIXEL_THEME}
-body{display:flex;justify-content:center;align-items:center;height:100vh;padding:20px}
-.wrap{width:100%;max-width:380px}
-.brand{text-align:center;margin-bottom:20px}
-.brand .t{font-family:var(--font-pixel);font-size:15px;color:var(--accent);text-shadow:var(--glow);letter-spacing:1px}
-.brand .s{font-family:'VT323',monospace;font-size:17px;color:var(--dim);margin-top:10px;letter-spacing:3px}
-.term{padding:30px 28px}
-.term .hd{font-family:'VT323',monospace;font-size:16px;color:var(--green);margin-bottom:18px;border-bottom:1px dashed var(--border);padding-bottom:12px;letter-spacing:1px}
-.term label{display:block;font-family:'VT323',monospace;font-size:15px;color:var(--dim);margin-bottom:6px;letter-spacing:2px}
-.term input{width:100%;padding:12px;background:var(--bg);border:2px solid var(--border);color:var(--accent);font-size:18px;font-family:'VT323',monospace;letter-spacing:3px;outline:none;margin-bottom:20px}
-.term input:focus{border-color:var(--accent);box-shadow:var(--glow)}
-.term button{width:100%;padding:13px;background:var(--accent);color:var(--bg);border:none;font-family:var(--font-pixel);font-size:11px;letter-spacing:1px;cursor:pointer;box-shadow:4px 4px 0 0 var(--magenta);transition:transform .08s,box-shadow .08s}
-.term button:hover{transform:translate(-2px,-2px);box-shadow:6px 6px 0 0 var(--magenta)}
-.term button:active{transform:translate(2px,2px);box-shadow:1px 1px 0 0 var(--magenta)}
-.err{color:var(--red);font-family:'VT323',monospace;font-size:15px;margin-bottom:14px;display:none;border-left:3px solid var(--red);padding-left:10px;letter-spacing:1px}
-</style></head><body>
+${UI_THEME}
+body{display:flex;justify-content:center;align-items:center;min-height:100vh;padding:24px}
+.wrap{width:100%;max-width:390px}
+.brand{margin-bottom:22px}.brand .t{font-size:24px;font-weight:650;margin-bottom:7px}.brand .s{font-size:13px;color:var(--dim)}
+.term{background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:26px}
+.term .hd{font-size:13px;font-weight:600;margin-bottom:18px;color:var(--text)}
+.term label{display:block;font-size:12px;font-weight:550;color:var(--dim);margin-bottom:6px}
+.term input{width:100%;padding:11px 12px;background:var(--surface);border:1px solid var(--border-strong);border-radius:5px;color:var(--text);font-size:15px;outline:none;margin-bottom:18px}
+.term input:focus{border-color:var(--accent)}
+.term button{width:100%;padding:11px 12px;background:var(--text);color:#fff;border:none;border-radius:5px;font-size:13px;font-weight:600;cursor:pointer}
+.term button:hover{background:#33332f}
+.err{color:var(--red);background:#fff2f0;border:1px solid #f1c8c2;border-radius:5px;padding:9px 10px;font-size:12px;margin-bottom:14px;display:none}
+</style></head><body data-theme="editorial-light">
 <div class="wrap">
-<div class="brand"><div class="t glitch">CODING MONITOR</div><div class="s">// ACCESS TERMINAL</div></div>
+<div class="brand"><div class="t">CC Team</div><div class="s">团队 AI 编码用量网关</div></div>
 <div class="term">
-<div class="hd">&gt; SYSTEM READY_</div>
-<div class="err" id="err">&gt; ACCESS DENIED · 密码错误</div>
-<label>PASSWORD</label>
+<div class="hd">登录管理后台</div>
+<div class="err" id="err">密码错误，请重试。</div>
+<label>访问密码</label>
 <input type="password" id="pw" placeholder="••••••••" autofocus>
-<button onclick="doLogin()">CONNECT<span class="cursor"></span></button>
+<button onclick="doLogin()">登录</button>
 </div></div>
 <script>
 document.getElementById("pw").addEventListener("keydown",e=>{if(e.key==="Enter")doLogin()});
@@ -3919,32 +3807,22 @@ async function doLogin(){const pw=document.getElementById("pw").value;const r=aw
 function personalUsageLandingHtml() {
   return `<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
 <title>我的用量</title>
-${PIXEL_FONT}
 <style>
-${PIXEL_THEME}
-body{display:flex;justify-content:center;align-items:center;height:100vh;padding:20px;margin:0}
-.wrap{width:100%;max-width:440px}
-.brand{text-align:center;margin-bottom:20px}
-.brand .t{font-family:var(--font-pixel);font-size:14px;color:var(--accent);text-shadow:var(--glow);letter-spacing:1px}
-.brand .s{font-family:'VT323',monospace;font-size:16px;color:var(--dim);margin-top:10px;letter-spacing:3px}
-.term{padding:30px 28px}
-.term .hd{font-family:'VT323',monospace;font-size:15px;color:var(--green);margin-bottom:16px;border-bottom:1px dashed var(--border);padding-bottom:10px;letter-spacing:1px}
-.term label{display:block;font-family:'VT323',monospace;font-size:15px;color:var(--dim);margin-bottom:6px;letter-spacing:2px}
-.term input{width:100%;padding:12px;background:var(--bg);border:2px solid var(--border);color:var(--accent);font-size:15px;font-family:'VT323',monospace;letter-spacing:2px;outline:none;margin-bottom:18px}
-.term input:focus{border-color:var(--accent);box-shadow:var(--glow)}
-.term button{width:100%;padding:12px;background:var(--accent);color:var(--bg);border:none;font-family:var(--font-pixel);font-size:11px;letter-spacing:1px;cursor:pointer;box-shadow:4px 4px 0 0 var(--magenta);transition:transform .08s,box-shadow .08s}
-.term button:hover{transform:translate(-2px,-2px);box-shadow:6px 6px 0 0 var(--magenta)}
-.term button:active{transform:translate(2px,2px);box-shadow:1px 1px 0 0 var(--magenta)}
-.note{font-family:'VT323',monospace;font-size:14px;color:var(--dim);text-align:center;margin-top:16px;letter-spacing:1px}
-.note code{color:var(--accent)}
-</style></head><body>
+${UI_THEME}
+body{display:flex;justify-content:center;align-items:center;min-height:100vh;padding:24px;margin:0}
+.wrap{width:100%;max-width:440px}.brand{margin-bottom:22px}.brand .t{font-size:24px;font-weight:650;margin-bottom:7px}.brand .s{font-size:13px;color:var(--dim)}
+.term{background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:26px}.term .hd{font-size:13px;font-weight:600;margin-bottom:18px;color:var(--text)}
+.term label{display:block;font-size:12px;font-weight:550;color:var(--dim);margin-bottom:6px}.term input{width:100%;padding:11px 12px;background:var(--surface);border:1px solid var(--border-strong);border-radius:5px;color:var(--text);font-size:14px;font-family:var(--font-mono);outline:none;margin-bottom:18px}.term input:focus{border-color:var(--accent)}
+.term button{width:100%;padding:11px 12px;background:var(--text);color:#fff;border:none;border-radius:5px;font-size:13px;font-weight:600;cursor:pointer}.term button:hover{background:#33332f}
+.note{font-size:12px;color:var(--dim);text-align:center;margin-top:14px}.note code{color:var(--accent);font-family:var(--font-mono)}
+</style></head><body data-theme="editorial-light">
 <div class="wrap">
-<div class="brand"><div class="t glitch">MY USAGE</div><div class="s">// QUERY TERMINAL</div></div>
+<div class="brand"><div class="t">我的用量</div><div class="s">输入虚拟 Key 查看个人配额与消耗。</div></div>
 <div class="term">
-<div class="hd">&gt; INSERT VIRTUAL KEY_</div>
-<label>KEY</label>
+<div class="hd">查询个人用量</div>
+<label>虚拟 Key</label>
 <input type="text" id="key" placeholder="jx-xxxxxxxx" autofocus>
-<button onclick="go()">EXECUTE<span class="cursor"></span></button>
+<button onclick="go()">查看用量</button>
 <div class="note">或直接访问 <code>/usage/你的虚拟Key</code></div>
 </div></div>
 <script>
@@ -3956,46 +3834,31 @@ function go(){const k=document.getElementById('key').value.trim();if(k)location.
 function personalUsageHtml(virtualKey) {
   return `<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
 <title>我的用量 - 团队AI Coding监控</title>
-${PIXEL_FONT}
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js"><\/script>
 <style>
-${PIXEL_THEME}
-body{padding:22px 26px}
-.top,.meta,.box{animation:boot-in .45s ease-out both}
-.top{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-bottom:6px}
-.top h1{font-family:var(--font-pixel);font-size:16px;color:var(--accent);text-shadow:0 0 14px rgba(34,233,255,.7),0 0 4px rgba(34,233,255,.9);letter-spacing:1px;line-height:1.6}
-.top h1::after{content:"";display:block;width:110px;height:3px;margin-top:8px;background:linear-gradient(90deg,var(--accent),var(--magenta),transparent);box-shadow:0 0 8px var(--accent)}
-.top .sub{font-family:'Pixelify Sans',monospace;font-weight:500;font-size:15px;color:var(--dim);letter-spacing:1px;margin-top:8px}
-select{font-family:'VT323',monospace;font-size:15px;background:var(--card);color:var(--text);border:2px solid var(--border);padding:5px 10px;letter-spacing:1px;cursor:pointer}
-select:focus{border-color:var(--accent)}
-.meta{font-family:'VT323',monospace;font-size:15px;color:var(--dim);margin-bottom:18px;letter-spacing:1px;border-left:3px solid var(--accent);padding:2px 0 2px 10px}
-.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px;margin-bottom:20px}
-.card{background:linear-gradient(180deg,var(--card2),var(--card));border:2px solid var(--border);padding:16px 16px 14px;position:relative;overflow:hidden;transition:transform .12s,border-color .12s,box-shadow .12s}
-.card::after{content:"";position:absolute;top:0;left:0;right:0;height:2px;background:linear-gradient(90deg,var(--accent),var(--magenta));opacity:.9}
-.card:hover{transform:translate(-3px,-3px);border-color:var(--accent);box-shadow:5px 5px 0 0 var(--accent),-3px -3px 0 0 var(--magenta),var(--glow)}
-.card .l{font-family:'Pixelify Sans',monospace;font-weight:600;font-size:14px;color:var(--dim);margin-bottom:8px;letter-spacing:1px;text-transform:uppercase}
-.card .v{font-size:15px}
-.box{position:relative;background:var(--card);border:2px solid var(--border);padding:16px;margin-bottom:14px}
-.box::before,.box::after{content:"";position:absolute;width:12px;height:12px;border:2px solid var(--accent);pointer-events:none;opacity:.6}
-.box::before{top:-2px;left:-2px;border-right:0;border-bottom:0}.box::after{bottom:-2px;right:-2px;border-left:0;border-top:0}
-.box h3{font-family:'Pixelify Sans',monospace;font-weight:600;font-size:15px;color:var(--accent);margin-bottom:10px;letter-spacing:1px;text-transform:uppercase;text-shadow:0 0 8px rgba(34,233,255,.5)}
-.box h3::before{content:"// ";color:var(--magenta)}
-.box canvas{max-height:220px}
-table{width:100%;border-collapse:collapse}
-th{text-align:left;padding:6px 12px;font-family:'Pixelify Sans',monospace;font-weight:600;font-size:13px;color:#b4bcd9;border-bottom:2px solid var(--accent);letter-spacing:1px;text-transform:uppercase}
-td{padding:6px 12px;font-size:13px;border-bottom:1px solid var(--border)}.n{text-align:right;font-variant-numeric:tabular-nums}
-tbody tr:hover td{background:rgba(0,229,255,.05)}
-.tag{font-family:var(--font-pixel);font-size:9px;background:rgba(0,229,255,.15);color:var(--accent);padding:2px 6px}
-</style></head><body>
-<div class="top"><div><h1 class="glitch">MY USAGE</h1><div class="sub">我的用量统计</div></div><select id="profileSel" onchange="switchProfile(this.value)"><option value="all">全部可用方案</option></select></div>
+${UI_THEME}
+body{padding:28px clamp(18px,3vw,44px) 48px}
+body>div{max-width:1120px;margin-left:auto;margin-right:auto}
+.top{display:flex;align-items:flex-start;justify-content:space-between;gap:24px;flex-wrap:wrap;margin-bottom:14px;padding-bottom:20px;border-bottom:1px solid var(--border)}
+.top h1{font-size:28px;font-weight:650;line-height:1.15;margin-bottom:7px}.top .sub{font-size:12px;color:var(--dim)}
+select{font-size:12px;background:var(--surface);color:var(--text);border:1px solid var(--border);border-radius:5px;padding:7px 10px;cursor:pointer}select:hover{background:var(--surface-subtle)}select:focus{border-color:var(--accent)}
+.meta{font-size:12px;color:var(--dim);margin-bottom:18px}
+.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin-bottom:20px}
+.card{background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:15px 16px;min-height:88px}.card:first-child{border-top:2px solid var(--accent)}
+.card .l{font-size:11px;font-weight:550;color:var(--dim);margin-bottom:12px}.card .v{font-size:22px;line-height:1;font-weight:650;font-variant-numeric:tabular-nums;color:var(--text)!important}
+.box{background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:17px;margin-bottom:14px;overflow-x:auto}.box h3{font-size:13px;font-weight:650;color:var(--text);margin-bottom:12px}.box canvas{max-height:220px}
+table{width:100%;border-collapse:collapse;min-width:560px}th{text-align:left;padding:9px 12px;font-size:11px;font-weight:550;color:var(--dim);border-bottom:1px solid var(--border);white-space:nowrap}td{padding:9px 12px;font-size:12px;border-bottom:1px solid #ecece8;white-space:nowrap}.n{text-align:right;font-variant-numeric:tabular-nums}tbody tr:hover td{background:#fafaf7}.tag{font-size:10px;background:var(--accent-soft);color:var(--accent);padding:2px 6px;border-radius:4px}
+@media(max-width:560px){body{padding:20px 14px 36px}.top h1{font-size:24px}.cards{grid-template-columns:1fr 1fr}.card .v{font-size:20px}.box{padding:14px}}
+</style></head><body data-theme="editorial-light">
+<div class="top"><div><h1>我的用量</h1><div class="sub">查看个人配额、趋势和模型明细</div></div><select id="profileSel" onchange="switchProfile(this.value)"><option value="all">全部可用方案</option></select></div>
 <div class="meta" id="meta">加载中...</div>
 <div class="cards" id="cards"></div>
 <div class="box"><h3>今日24小时趋势</h3><canvas id="hourChart"></canvas></div>
 <div class="box"><h3>近7天趋势</h3><canvas id="trendChart"></canvas></div>
 <div class="box"><h3>今日模型用量</h3><table id="modelTable"><thead><tr><th>模型</th><th class="n">请求数</th><th class="n">输入</th><th class="n">输出</th><th class="n">合计</th></tr></thead><tbody></tbody></table></div>
 <script>
-${PIXEL_JS}
-Chart.defaults.color='#9aa0c8';Chart.defaults.font.family="'Pixelify Sans',monospace";Chart.defaults.font.size=11;
+${UI_HELPERS}
+Chart.defaults.color='#686863';Chart.defaults.font.family='-apple-system,BlinkMacSystemFont,"SF Pro Text","PingFang SC","Microsoft YaHei","Segoe UI",sans-serif';Chart.defaults.font.size=11;
 const VK='${escJs(virtualKey)}';
 let D=null,C={h:null,t:null},currentProfile='all';
 const fmtT=n=>n.toLocaleString("zh-CN");
@@ -4031,10 +3894,10 @@ function render(){
   const hrs=[];for(let i=0;i<24;i++)hrs.push(i.toString().padStart(2,"0")+":00");
   const hData=hrs.map((_,i)=>{const h=D.hourly[i.toString().padStart(2,"0")]||{};return{req:h.requests||0,tokens:(h.inputTokens||0)+(h.outputTokens||0)}});
   if(C.h)C.h.destroy();
-  C.h=new Chart(document.getElementById("hourChart"),{type:"bar",data:{labels:hrs,datasets:[{label:"Token",data:hData.map(d=>d.tokens),backgroundColor:"#00e5ffcc",borderRadius:3},{label:"请求数",data:hData.map(d=>d.req),backgroundColor:"#29e7ffcc",borderRadius:3}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{labels:{color:"#9aa0c8",font:{size:10}}}},scales:{x:{ticks:{color:"#6f6f8f",font:{size:9},maxRotation:0,autoSkip:true,maxTicksLimit:12},grid:{display:false}},y:{ticks:{color:"#6f6f8f",callback:v=>fmtTk(v)},grid:{color:"rgba(0,229,255,.08)"}}}}});
+  C.h=new Chart(document.getElementById("hourChart"),{type:"bar",data:{labels:hrs,datasets:[{label:"Token",data:hData.map(d=>d.tokens),backgroundColor:"#2f6e50cc",borderRadius:3},{label:"请求数",data:hData.map(d=>d.req),backgroundColor:"#181816cc",borderRadius:3}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{labels:{color:"#686863",font:{size:10}}}},scales:{x:{ticks:{color:"#686863",font:{size:9},maxRotation:0,autoSkip:true,maxTicksLimit:12},grid:{display:false}},y:{ticks:{color:"#686863",callback:v=>fmtTk(v)},grid:{color:"rgba(24,24,22,.08)"}}}}});
   // Trend chart
   if(C.t)C.t.destroy();
-  C.t=new Chart(document.getElementById("trendChart"),{type:"line",data:{labels:D.trend.map(d=>d.date.slice(5)),datasets:[{label:"输入",data:D.trend.map(d=>d.input),borderColor:"#00ff88",backgroundColor:"rgba(0,255,136,.12)",fill:true,tension:.4,pointRadius:3,borderWidth:2},{label:"输出",data:D.trend.map(d=>d.output),borderColor:"#ff3860",backgroundColor:"rgba(255,56,96,.12)",fill:true,tension:.4,pointRadius:3,borderWidth:2}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{labels:{color:"#9aa0c8",font:{size:10}}}},scales:{x:{ticks:{color:"#6f6f8f"},grid:{display:false}},y:{ticks:{color:"#6f6f8f",callback:v=>fmtTk(v)},grid:{color:"rgba(0,229,255,.08)"}}}}});
+  C.t=new Chart(document.getElementById("trendChart"),{type:"line",data:{labels:D.trend.map(d=>d.date.slice(5)),datasets:[{label:"输入",data:D.trend.map(d=>d.input),borderColor:"#2f6e50",backgroundColor:"rgba(47,110,80,.12)",fill:true,tension:.28,pointRadius:2,borderWidth:2},{label:"输出",data:D.trend.map(d=>d.output),borderColor:"#181816",backgroundColor:"rgba(24,24,22,.08)",fill:true,tension:.28,pointRadius:2,borderWidth:2}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{labels:{color:"#686863",font:{size:10}}}},scales:{x:{ticks:{color:"#686863"},grid:{display:false}},y:{ticks:{color:"#686863",callback:v=>fmtTk(v)},grid:{color:"rgba(24,24,22,.08)"}}}}});
   // Model table
   const mt=document.querySelector("#modelTable tbody");
   const models=Object.entries(D.models||{}).sort((a,b)=>(b[1].inputTokens+b[1].outputTokens)-(a[1].inputTokens+a[1].outputTokens));

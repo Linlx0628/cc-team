@@ -614,6 +614,40 @@ describe("management and usage pages", () => {
     assertInlineScriptsCompile(res.text);
   });
 
+  it("renders dashboard as an accessible single-screen workspace", async () => {
+    const res = await request("GET", "/dashboard", { key: null });
+
+    assert.equal(res.status, 200);
+    assert.match(res.text, /class="dashboard-shell"/);
+    assert.match(res.text, /class="command-bar"/);
+    assert.match(res.text, /class="metric-strip" id="cards"/);
+    assert.match(res.text, /class="chart-workspace"/);
+    assert.match(res.text, /class="chart-panel chart-trend"/);
+    assert.match(res.text, /class="chart-panel chart-users"/);
+    assert.match(res.text, /class="chart-panel chart-models"/);
+    assert.match(res.text, /class="chart-panel chart-hourly"/);
+    assert.match(res.text, /@media\(min-width:1280px\) and \(min-height:800px\)/);
+    assert.match(res.text, /height:100dvh/);
+    assert.match(res.text, /overflow:hidden/);
+    assert.match(res.text, /class="workspace-tabs" role="tablist"/);
+
+    for (const tab of ["users", "detail", "profiles", "errors"]) {
+      assert.match(res.text, new RegExp(`id="workspace-tab-${tab}"[^>]+role="tab"[^>]+aria-controls="workspace-panel-${tab}"`));
+      assert.match(res.text, new RegExp(`id="workspace-panel-${tab}"[^>]+role="tabpanel"[^>]+aria-labelledby="workspace-tab-${tab}"`));
+    }
+    assert.match(res.text, /id="workspace-tab-users"[^>]+aria-selected="true"/);
+    assert.match(res.text, /id="workspace-panel-users"[^>]*class="workspace-panel active"/);
+    assert.match(res.text, /id="profileSummarySec" class="workspace-panel-inner"/);
+    assert.match(res.text, /workspace-content>\[role=tabpanel\]/);
+    assert.match(res.text, /let activeWorkspaceTab="users"/);
+    assert.match(res.text, /function setWorkspaceTab\(/);
+    assert.match(res.text, /function handleWorkspaceTabKeydown\(/);
+    assert.match(res.text, /function renderWorkspaceSummaries\(/);
+    assert.match(res.text, /function doughnutLegend\(/);
+    assert.match(res.text, /function setErrorPage\(/);
+    assertInlineScriptsCompile(res.text);
+  });
+
   it("renders personal usage profile selector", async () => {
     const res = await request("GET", "/usage/jx-shared-user", { key: null });
 

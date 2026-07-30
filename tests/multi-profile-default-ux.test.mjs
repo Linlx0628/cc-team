@@ -596,6 +596,24 @@ describe("management and usage pages", () => {
     assertInlineScriptsCompile(res.text);
   });
 
+  it("renders the grouped detail ledger with filtering and pagination controls", async () => {
+    const res = await request("GET", "/dashboard", { key: null });
+
+    assert.equal(res.status, 200);
+    for (const controlId of ["detailQuery", "detailRange", "detailSort", "detailReset", "detailPages"]) {
+      assert.match(res.text, new RegExp(`id=["']${controlId}["']`));
+    }
+    assert.match(res.text, /class="sec-toggle open" id="detailSecIcon"/);
+    assert.match(res.text, /class="sec-body open" id="detailSecBody"/);
+    assert.match(res.text, /const DETAIL_PAGE_SIZE=10/);
+    assert.match(res.text, /function renderDetail\(/);
+    assert.match(res.text, /function maskDetailKey\(/);
+    assert.match(res.text, /groupingChanged=nextQuery!==detailQuery\|\|nextRange!==detailRange/);
+    assert.match(res.text, /expandedDetailPeriods\.clear\(\);detailInitialized=false/);
+    assert.match(res.text, /detail-sticky/);
+    assertInlineScriptsCompile(res.text);
+  });
+
   it("renders personal usage profile selector", async () => {
     const res = await request("GET", "/usage/jx-shared-user", { key: null });
 

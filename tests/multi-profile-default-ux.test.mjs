@@ -547,6 +547,16 @@ describe("management and usage pages", () => {
     for (const controlId of ["dataImportFile", "dataImportPreview", "dataImportMode", "dataImportPassword", "dataClearButton", "dataClearModal", "dataClearPassword"]) {
       assert.match(res.text, new RegExp(`id=["']${controlId}["']`));
     }
+    for (const viewId of ["dataManagementNav", "dataManagementView"]) {
+      assert.match(res.text, new RegExp(`id=["']${viewId}["']`));
+    }
+    const settingsFormStart = res.text.indexOf('id="settingsForm"');
+    const settingsFormEnd = res.text.indexOf("</form>", settingsFormStart);
+    const dataManagementView = res.text.indexOf('id="dataManagementView"');
+    assert.ok(settingsFormStart >= 0 && settingsFormEnd > settingsFormStart);
+    assert.ok(dataManagementView > settingsFormEnd, "global data management must render outside the profile form");
+    assert.match(res.text, /\.actions\{position:fixed;left:260px;right:0;bottom:0;/);
+    assert.match(res.text, /@media\(max-width:680px\)[\s\S]*?\.actions\{left:0;/);
     assertInlineScriptsCompile(res.text);
   });
 

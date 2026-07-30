@@ -2513,6 +2513,9 @@ body{padding:0;overflow:hidden;height:100vh}
 .sidebar-hd a{color:var(--dim);font-size:12px;text-decoration:none;white-space:nowrap}
 .sidebar-hd a:hover{color:var(--text)}
 .sidebar-list{flex:1;overflow-y:auto;padding:12px}
+.sidebar-global{padding:10px 12px;border-top:1px solid var(--border);background:var(--surface)}
+.sidebar-tool{display:block;width:100%;margin:0;text-align:left;font-family:var(--font-body)}
+.sidebar-tool .pl-name,.sidebar-tool .pl-users{display:block}.sidebar-tool .pl-name{padding-right:0}
 .sidebar-ft{padding:12px;border-top:1px solid var(--border);background:var(--surface)}
 .pl-item{background:transparent;border:1px solid transparent;border-radius:6px;padding:11px 12px;margin-bottom:4px;position:relative;cursor:pointer}
 .pl-item:hover{background:var(--surface-subtle)}
@@ -2527,7 +2530,9 @@ body{padding:0;overflow:hidden;height:100vh}
 .pl-delete:hover{border-color:#e5b8b2;color:var(--red);background:#fff5f3}
 .pl-badge{font-size:10px;padding:2px 7px;border-radius:4px;background:var(--accent-soft);color:var(--accent);white-space:nowrap}
 .main{flex:1;overflow-y:auto;padding:28px clamp(24px,4vw,56px);scrollbar-gutter:stable}
-.main form{max-width:1180px;margin:0 auto}
+.main form,#dataManagementView{max-width:1180px;margin:0 auto}
+#settingsForm{padding-bottom:72px}
+.view-intro{margin-bottom:24px}.view-intro h2{margin-bottom:7px}.view-intro p{color:var(--dim);font-size:12px;line-height:1.65}
 .main h2{font-size:16px;font-weight:650;margin:30px 0 10px;padding-bottom:10px;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between}
 .main h2:first-of-type{margin-top:0}
 .section{background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:18px;margin-bottom:14px}
@@ -2544,7 +2549,7 @@ input[type=checkbox]{accent-color:var(--accent)}
 .btn-danger{background:#fff2f0;color:var(--red);border-color:#f1c8c2}.btn-danger:hover{background:#ffe8e5}
 .btn-outline{background:var(--surface);border-color:var(--border);color:var(--text)}.btn-outline:hover{background:var(--surface-subtle);border-color:var(--border-strong)}
 .btn-sm{padding:5px 10px;font-size:11px}
-.actions{position:sticky;bottom:0;margin:20px -12px 0;padding:14px 12px 18px;display:flex;gap:8px;justify-content:flex-end;background:rgba(247,247,243,.94);border-top:1px solid var(--border);backdrop-filter:blur(8px)}
+.actions{position:fixed;left:260px;right:0;bottom:0;margin:0;padding:12px clamp(24px,4vw,56px) calc(12px + env(safe-area-inset-bottom));display:flex;gap:8px;justify-content:flex-end;background:rgba(255,255,255,.96);border-top:1px solid var(--border);backdrop-filter:blur(8px);z-index:40}
 table{width:100%;border-collapse:collapse;margin-top:8px}
 th{text-align:left;padding:8px;font-size:11px;font-weight:600;color:var(--dim);border-bottom:1px solid var(--border);white-space:nowrap}
 td{padding:8px;border-bottom:1px solid #ecece8;font-size:12px}
@@ -2568,7 +2573,7 @@ td{padding:8px;border-bottom:1px solid #ecece8;font-size:12px}
 .modal-hd h3{font-size:15px;font-weight:650}.modal-close{background:none;border:none;color:var(--dim);font-size:12px;cursor:pointer;padding:5px 7px}.modal-close:hover{color:var(--text);background:var(--surface-subtle)}
 .modal-body{padding:18px 20px;overflow-y:auto;flex:1}
 @media(max-width:900px){.row3{grid-template-columns:1fr 1fr}.main{padding:24px}}
-@media(max-width:680px){body{overflow:auto;height:auto}.layout{flex-direction:column;height:auto;min-height:100vh}.sidebar{width:100%;min-width:0;max-height:none;border-right:0;border-bottom:1px solid var(--border)}.sidebar-list{display:flex;gap:6px;overflow-x:auto}.pl-item{min-width:210px;margin:0}.main{overflow:visible;padding:22px 16px}.row,.row3{grid-template-columns:1fr}.modal{width:100%;max-height:90vh}.section{padding:15px;overflow-x:auto}.import-summary{grid-template-columns:1fr 1fr}.mapping-row{grid-template-columns:1fr}.mapping-arrow{display:none}.danger-copy{align-items:flex-start;flex-direction:column}}
+@media(max-width:680px){body{overflow:auto;height:auto}.layout{flex-direction:column;height:auto;min-height:100vh}.sidebar{width:100%;min-width:0;max-height:none;border-right:0;border-bottom:1px solid var(--border)}.sidebar-list{display:flex;gap:6px;overflow-x:auto}.sidebar-global{padding:8px 12px}.sidebar-tool{min-width:0}.pl-item{min-width:210px;margin:0}.main{overflow:visible;padding:22px 16px}.actions{left:0;padding-left:16px;padding-right:16px}.row,.row3{grid-template-columns:1fr}.modal{width:100%;max-height:90vh}.section{padding:15px;overflow-x:auto}.import-summary{grid-template-columns:1fr 1fr}.mapping-row{grid-template-columns:1fr}.mapping-arrow{display:none}.danger-copy{align-items:flex-start;flex-direction:column}}
 </style></head><body data-theme="editorial-light">
 <div class="layout">
 <div class="sidebar">
@@ -2585,6 +2590,7 @@ td{padding:8px;border-bottom:1px solid #ecece8;font-size:12px}
   ${!p.isDefault ? '<button class="pl-delete" onclick="event.stopPropagation();deleteProfile(\'' + escJs(p.name) + '\')">删除</button>' : ''}
 </div></div>`;
   }).join("")}</div>
+<div class="sidebar-global"><button type="button" class="pl-item sidebar-tool" id="dataManagementNav" onclick="openDataManagementView()"><span class="pl-name">全局数据管理</span><span class="pl-users">导入、备份与清空</span></button></div>
 <div class="sidebar-ft" style="display:flex;gap:6px"><button class="btn btn-outline btn-sm" onclick="openUserModal()" style="flex:1">用户管理</button><button class="btn btn-outline btn-sm" onclick="openProfileModal()" style="flex:1">新增方案</button></div>
 </div>
 <div class="main">
@@ -2686,6 +2692,18 @@ ${errDiv}
 ${((() => { const qa = stmts.quotaAdjustRecent.all(); return qa.length > 0 ? `<h4 style="font-size:13px;color:var(--accent);margin:16px 0 8px">调整历史</h4><table style="width:100%;border-collapse:collapse;font-size:12px"><thead><tr><th style="text-align:left;padding:4px 8px;border-bottom:1px solid var(--border)">时间</th><th style="text-align:left;padding:4px 8px;border-bottom:1px solid var(--border)">用户</th><th style="text-align:right;padding:4px 8px;border-bottom:1px solid var(--border)">旧配额</th><th style="text-align:right;padding:4px 8px;border-bottom:1px solid var(--border)">新配额</th><th style="text-align:right;padding:4px 8px;border-bottom:1px solid var(--border)">命中率</th><th style="text-align:right;padding:4px 8px;border-bottom:1px solid var(--border)">日均用量</th></tr></thead><tbody>${qa.map(h => `<tr><td style="padding:4px 8px">${h.date}</td><td style="padding:4px 8px">${h.user_name || h.user_key.slice(0, 8)}</td><td style="text-align:right;padding:4px 8px">${(h.old_quota || 0).toLocaleString()}</td><td style="text-align:right;padding:4px 8px;color:var(--green)">${(h.new_quota || 0).toLocaleString()}</td><td style="text-align:right;padding:4px 8px">${Math.round((h.hit_rate || 0) * 100)}%</td><td style="text-align:right;padding:4px 8px">${(h.avg_daily_usage || 0).toLocaleString()}</td></tr>`).join("")}</tbody></table>` : '<div class="note" style="margin-top:8px">暂无自动调整记录</div>'; })())}
 </div>
 
+<div class="actions">
+<button type="button" class="btn btn-outline" onclick="location.href='/dashboard'">取消</button>
+<button type="submit" class="btn btn-primary">保存设置</button>
+</div>
+</form>
+
+<div id="dataManagementView" hidden aria-hidden="true">
+<div class="view-intro">
+  <h2>全局数据管理</h2>
+  <p>此处操作作用于整个系统，不属于任何单一配置方案。导入前请确认来源方案映射，危险操作执行前会自动创建本地备份。</p>
+</div>
+
 <h2>旧数据导入</h2>
 <div class="section">
 <div class="import-tools">
@@ -2709,12 +2727,7 @@ ${((() => { const qa = stmts.quotaAdjustRecent.all(); return qa.length > 0 ? `<h
 <div class="section danger-section">
   <div class="danger-copy"><div><strong>清空全部数据</strong><div class="note" style="margin:0">清除方案、用户、密钥、配额、统计、错误和导入记录。系统端口、后台密码与代理参数会保留，执行前自动创建备份。</div></div><button type="button" class="btn btn-danger" id="dataClearButton" onclick="openDataClearModal()">清空全部数据</button></div>
 </div>
-
-<div class="actions">
-<button type="button" class="btn btn-outline" onclick="location.href='/dashboard'">取消</button>
-<button type="submit" class="btn btn-primary">保存设置</button>
 </div>
-</form>
 </div>
 </div>
 <div class="modal-overlay" id="userModal">
@@ -2859,9 +2872,27 @@ function updateAccessUrl(){
   document.getElementById('accessUrlPreview').innerHTML='接入地址: http://&lt;host&gt;:6789/'+h(sfx)+'/v1/messages'+defaultNote;
 }
 updateAccessUrl();
+function openDataManagementView(){
+  const form=document.getElementById('settingsForm');
+  const view=document.getElementById('dataManagementView');
+  form.hidden=true;
+  view.hidden=false;
+  view.setAttribute('aria-hidden','false');
+  document.querySelectorAll('.pl-item').forEach(function(el){el.classList.remove('active')});
+  document.getElementById('dataManagementNav').classList.add('active');
+}
+function showProfileSettings(){
+  const form=document.getElementById('settingsForm');
+  const view=document.getElementById('dataManagementView');
+  form.hidden=false;
+  view.hidden=true;
+  view.setAttribute('aria-hidden','true');
+  document.getElementById('dataManagementNav').classList.remove('active');
+}
 async function editProfile(n){
   const p=SETTINGS.profiles.find(x=>x.name===n);
   if(!p)return;
+  showProfileSettings();
   editingProfileName=n;
   const fm=document.forms.settingsForm;
   fm.upstream.value=p.upstream||'';

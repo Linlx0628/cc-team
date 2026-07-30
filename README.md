@@ -1,6 +1,8 @@
 # CC Team
 
-面向 Claude Code 团队的 Anthropic Messages 用量网关。CC Team 将请求透明转发到多个兼容上游，通过虚拟 Key 管理成员访问，并提供 Token 统计、每日配额、错误记录和可视化面板。
+面向 Claude Code 团队的 Anthropic Messages 用量网关。CC Team 将请求透明转发到多个兼容上游，通过虚拟 Key 管理成员访问，并提供 Token 统计、每日配额、错误记录和明亮极简的可视化工作台。
+
+项目只支持 Claude Code 使用的 Anthropic Messages 协议，不提供 OpenAI Chat Completions、Responses 或 Models 兼容接口。
 
 ![CC Team Dashboard](docs/Introduction.png)
 
@@ -12,7 +14,8 @@
 - 方案级与成员级每日配额，北京时间零点重置
 - 统一的 `alias=实际模型` 模型别名配置
 - 模型准入、并发限制、速率限制、重试和熔断保护
-- 管理员 Dashboard、设置页与成员个人用量页
+- 桌面单屏 Dashboard、设置页与成员个人用量页
+- Dashboard 内置用户用量、周期明细、方案中心和错误记录工作区
 - 从旧版 `data.json` 预览并导入历史数据
 - 创建本地备份后清空配置与请求数据
 
@@ -36,12 +39,21 @@ start.bat
 ```bash
 docker pull linlx/cc-team:latest
 
+mkdir -p cc-team-data/backups
+curl -fsSL https://raw.githubusercontent.com/Linlx0628/cc-team/master/config.example.json \
+  -o cc-team-data/config.json
+touch cc-team-data/data.db
+
 docker run -d \
   -p 6789:6789 \
-  -v cc-team-config:/app \
+  -v "$PWD/cc-team-data/config.json:/app/config.json" \
+  -v "$PWD/cc-team-data/data.db:/app/data.db" \
+  -v "$PWD/cc-team-data/backups:/app/backups" \
   --name cc-team \
   linlx/cc-team:latest
 ```
+
+不要把卷直接挂载到整个 `/app`，否则会覆盖镜像内的服务程序。升级容器时保留 `cc-team-data/` 即可。
 
 ### 直接运行
 
@@ -103,6 +115,8 @@ node server.mjs
 
 `modelAliases` 是唯一的模型映射入口。别名目标会自动加入 `allowedModels`；不需要别名时可直接使用真实模型名。
 
+`jx-sonnet`、`jx-opus` 和 `jx-haiku` 没有特殊的独立配置入口，它们与其他别名一样统一写入 `modelAliases`。
+
 ## 接入 Claude Code
 
 默认方案使用无后缀地址：
@@ -140,6 +154,8 @@ export ANTHROPIC_API_KEY="jx-your-virtual-key"
 
 ## 数据管理
 
+数据管理是设置页中的独立全局功能，不属于当前选中的单个方案。导入时可以将旧数据来源分别映射到现有方案；清空操作作用于整个系统。
+
 ### 导入旧版 data.json
 
 设置页的“旧数据导入”支持旧版顶层结构和 `_profiles` 多方案结构：
@@ -153,21 +169,28 @@ export ANTHROPIC_API_KEY="jx-your-virtual-key"
 
 ### 清空全部数据
 
-危险操作区要求输入后台密码。执行前会将 `config.json` 和 SQLite 复制到 Git 忽略的 `backups/`，然后清除方案、成员、密钥、配额、统计、错误和导入记录。端口、后台密码和代理参数保留。
+危险操作区要求输入后台密码。执行前会将 `config.json` 和 SQLite 复制到 Git 忽略的 `backups/`，然后清除全系统的方案、成员、密钥、配额、统计、错误和导入记录。端口、后台密码和代理参数保留，服务进入可继续访问设置页的未配置状态。
+
+## 从旧版本升级
+
+- 旧 `defaultModels` 会迁移为普通 `modelAliases`；已经存在的同名 `modelAliases` 优先。
+- `apiProtocol`、`openaiStreamUsage` 和 `responsesAdapter` 等旧协议字段会被移除。
+- OpenAI 协议方案不再受支持。升级时会先在 `backups/` 中备份 `config.json` 和 SQLite，再删除这些方案及其关联统计数据。
+- 如果仍需保留旧 OpenAI 方案，请在升级前备份整个数据目录，并继续使用支持该协议的旧版本。
 
 ## 页面
 
 | 页面 | 地址 | 说明 |
 | --- | --- | --- |
-| 管理面板 | `http://localhost:6789/dashboard` | 团队与方案用量统计 |
-| 设置 | `http://localhost:6789/settings` | 方案、成员、配额和数据管理 |
+| 管理面板 | `http://localhost:6789/dashboard` | 单屏查看指标、图表、用户、周期明细、方案和错误 |
+| 设置 | `http://localhost:6789/settings` | 方案、成员、配额与独立的全局数据管理 |
 | 个人用量 | `http://localhost:6789/usage/虚拟Key` | 指定成员的用量页面 |
 | Key 查询 | `http://localhost:6789/my-usage` | 输入虚拟 Key 查询 |
 | 健康检查 | `http://localhost:6789/health` | 服务与熔断状态 |
 
-## 管理 API
+## 主要接口
 
-所有写入接口都要求管理员登录和 CSRF 校验。
+Anthropic Messages 代理使用虚拟 Key 鉴权。管理类写入接口除登录外，均要求管理员会话和 CSRF 校验。
 
 | 端点 | 方法 | 说明 |
 | --- | --- | --- |
@@ -176,6 +199,7 @@ export ANTHROPIC_API_KEY="jx-your-virtual-key"
 | `/api/stats` | GET | 团队统计 |
 | `/api/my-usage` | GET | Bearer Key 对应的个人统计 |
 | `/api/settings` | GET / POST | 读取或更新设置 |
+| `/api/settings-save` | POST | 保存设置页表单 |
 | `/api/profile/save` | POST | 创建方案 |
 | `/api/profile/default` | POST | 设置默认方案 |
 | `/api/profile/delete` | POST | 删除方案 |
@@ -184,6 +208,8 @@ export ANTHROPIC_API_KEY="jx-your-virtual-key"
 | `/api/data-import/preview` | POST | 预览旧数据与方案映射 |
 | `/api/data-import/apply` | POST | 合并或替换导入 |
 | `/api/data-clear` | POST | 验证密码并清空全部数据 |
+
+`/v1/responses`、`/v1/chat/completions` 和 `/v1/models` 会明确返回不支持，不会转发到上游。
 
 ## 数据文件
 

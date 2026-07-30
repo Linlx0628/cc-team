@@ -9,103 +9,39 @@ import Database from "better-sqlite3";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
-// ─── Cyberpunk Pixel Theme (shared by all pages) ─────────────────────────────
-// ponytail: :root tokens were copy-pasted into all 5 pages; centralized here so the
-// pixel theme lives in one place. Page-specific layout CSS still stays inline per page.
-const PIXEL_FONT = `<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Press+Start+2P&family=Pixelify+Sans:wght@400;500;600;700&family=VT323&display=swap" rel="stylesheet">`;
-
-const PIXEL_THEME = `
+// Shared editorial light theme for all server-rendered pages.
+const UI_THEME = `
 :root{
-  --bg:#080812;--bg2:#0e0e1c;--card:#11111e;--card2:#171730;--border:#2c2658;
-  --text:#eaeefc;--dim:#9aa3cc;--dim2:#7681a8;--grid:rgba(0,229,255,.07);
-  --accent:#22e9ff;--blue:#46c6ff;--green:#27ffae;--yellow:#ffd23f;--orange:#ff9f1c;--red:#ff5470;
-  --magenta:#ff3d9a;--purple:#b14eff;
-  --font-pixel:'Press Start 2P',monospace;
-  --font-body:'Pixelify Sans','VT323',monospace,system-ui;
-  --glow:0 0 16px rgba(34,233,255,.45);
+  color-scheme:light;
+  --canvas:#f7f7f3;--surface:#ffffff;--surface-subtle:#f1f1ec;--surface-hover:#ecece7;
+  --bg:var(--canvas);--bg2:var(--surface-subtle);--card:var(--surface);--card2:var(--surface);
+  --text:#181816;--dim:#686863;--dim2:#92928c;--border:#deded8;--border-strong:#c7c7c0;
+  --accent:#2f6e50;--accent-soft:#e7efe9;--blue:#456b5a;--green:#2f6e50;
+  --yellow:#956400;--orange:#9a6700;--red:#b42318;
+  --font-body:-apple-system,BlinkMacSystemFont,"SF Pro Text","PingFang SC","Microsoft YaHei","Segoe UI",sans-serif;
+  --font-mono:"SFMono-Regular",Consolas,"Liberation Mono",monospace;
 }
 *{margin:0;padding:0;box-sizing:border-box}
-::selection{background:var(--accent);color:var(--bg)}
-body{font-family:var(--font-body);font-weight:500;font-size:16px;background:var(--bg);color:var(--text);min-height:100vh;letter-spacing:.2px;position:relative;isolation:isolate}
-/* drifting neon aurora blobs (behind content, so text stays crisp) */
-body::before{content:"";position:fixed;inset:-15%;z-index:-1;pointer-events:none;filter:blur(70px);
-  background:radial-gradient(40% 38% at 18% 26%,rgba(34,233,255,.20),transparent 70%),radial-gradient(42% 42% at 82% 18%,rgba(255,61,154,.16),transparent 70%),radial-gradient(48% 48% at 60% 86%,rgba(177,78,255,.16),transparent 70%);
-  animation:blob 24s ease-in-out infinite alternate}
-/* synthwave perspective floor receding at the bottom edge */
-html::after{content:"";position:fixed;left:-25%;right:-25%;bottom:0;height:40vh;z-index:1;pointer-events:none;opacity:.4;
-  background-image:linear-gradient(rgba(34,233,255,.5) 1px,transparent 1px),linear-gradient(90deg,rgba(34,233,255,.5) 1px,transparent 1px);
-  background-size:46px 46px;transform:perspective(320px) rotateX(62deg);transform-origin:bottom center;
-  -webkit-mask-image:linear-gradient(transparent 45%,#000 90%);mask-image:linear-gradient(transparent 45%,#000 90%);
-  animation:floor 5s linear infinite}
-/* mouse HUD spotlight (position updated by PIXEL_JS) */
-.fx-spot{position:fixed;inset:0;z-index:3;pointer-events:none;mix-blend-mode:screen}
-/* breathing neon edge on chart panels */
-.box{animation:pulse-glow 3.6s ease-in-out infinite}
-/* faint scanlines + soft vignette — kept light so text stays readable */
-body::after{content:"";position:fixed;inset:0;z-index:2;pointer-events:none;
-  background:repeating-linear-gradient(0deg,rgba(0,0,0,0) 0 3px,rgba(0,0,0,.05) 3px 4px),radial-gradient(ellipse at center,transparent 62%,rgba(0,0,0,.34) 100%)}
-/* moving CRT scan band sweeping the viewport */
-html::before{content:"";position:fixed;left:0;right:0;top:0;height:150px;z-index:3;pointer-events:none;
-  background:linear-gradient(180deg,transparent,rgba(34,233,255,.04) 55%,rgba(34,233,255,.11) 90%,transparent);
-  animation:scanbar 7s linear infinite}
-/* stat numbers: chunky pixel, glowing in their own color */
-.card .v{font-family:var(--font-pixel);font-variant-numeric:tabular-nums;line-height:1.5;letter-spacing:0;text-shadow:0 0 10px currentColor,0 0 2px currentColor}
-.display,.title-pixel{font-family:var(--font-pixel);letter-spacing:.5px;line-height:1.4}
-/* segmented HP/MP bar */
-.hp{display:inline-flex;gap:2px;height:13px;vertical-align:middle}
-.hp>i{width:7px;height:100%;background:#1c1735;display:block}
-.hp>i.on{background:var(--green);box-shadow:0 0 6px var(--green)}
-.hp.warn>i.on{background:var(--yellow);box-shadow:0 0 6px var(--yellow)}
-.hp.crit>i.on{background:var(--red);box-shadow:0 0 6px var(--red)}
-/* pixel status LED */
-.led{display:inline-block;width:10px;height:10px;vertical-align:middle;background:var(--dim2);margin-right:5px}
-.led.on{background:var(--green);box-shadow:0 0 8px var(--green);animation:blink 2.4s steps(1) infinite}
-.led.warn{background:var(--orange);box-shadow:0 0 8px var(--orange);animation:pulse-led 1.8s ease-in-out infinite}
-.led.err{background:var(--red);box-shadow:0 0 8px var(--red);animation:pulse-led 1.1s ease-in-out infinite}
-/* glitch title on hover */
-.glitch{cursor:default}
-.glitch:hover{animation:glitch .32s steps(2) 2}
-/* HUD corner brackets */
-.hud{position:relative}
-.hud::before,.hud::after{content:"";position:absolute;width:11px;height:11px;border:2px solid var(--accent);pointer-events:none;opacity:.65;z-index:1}
-.hud::before{top:-2px;left:-2px;border-right:0;border-bottom:0}
-.hud::after{bottom:-2px;right:-2px;border-left:0;border-top:0}
-/* animated equalizer — "system active" pulse */
-.eq{display:inline-flex;gap:2px;align-items:flex-end;height:14px;vertical-align:-2px}
-.eq>i{width:3px;height:4px;background:var(--accent);box-shadow:0 0 5px var(--accent);animation:eq 1s ease-in-out infinite}
-.eq>i:nth-child(2){animation-delay:.15s}.eq>i:nth-child(3){animation-delay:.3s}.eq>i:nth-child(4){animation-delay:.45s}
-/* terminal panel */
-.term{background:var(--card);border:2px solid var(--accent);box-shadow:6px 6px 0 0 var(--accent),var(--glow);padding:34px;position:relative}
-.term .cursor{display:inline-block;width:.6em;height:1.05em;background:var(--accent);vertical-align:-3px;margin-left:3px;animation:blink 1.05s steps(1) infinite}
-.boot{animation:boot-in .5s ease-out both}
-@keyframes grid-drift{from{background-position:0 0,0 0}to{background-position:44px 44px,44px 44px}}
-@keyframes scanbar{0%{transform:translateY(-150px)}100%{transform:translateY(100vh)}}
-@keyframes eq{0%,100%{height:4px}50%{height:14px}}
-@keyframes blink{0%,49%{opacity:1}50%,100%{opacity:0}}
-@keyframes pulse-led{0%,100%{opacity:1}50%{opacity:.3}}
-@keyframes glitch{0%{text-shadow:0 0 transparent}20%{text-shadow:-2px 0 var(--magenta),2px 0 var(--accent)}40%{text-shadow:2px 0 var(--magenta),-2px 0 var(--accent);transform:translateX(1px)}60%{text-shadow:0 0 var(--accent)}100%{text-shadow:0 0 transparent;transform:translateX(0)}}
-@keyframes boot-in{from{opacity:0;transform:translateY(12px)}to{opacity:1;transform:translateY(0)}}
-@keyframes blob{from{transform:translate3d(-3%,-2%,0) scale(1)}to{transform:translate3d(4%,3%,0) scale(1.1)}}
-@keyframes floor{from{background-position:0 0}to{background-position:0 46px}}
-@keyframes pulse-glow{0%,100%{box-shadow:0 0 0 0 rgba(34,233,255,0)}50%{box-shadow:0 0 16px 1px rgba(34,233,255,.16)}}
-@media (prefers-reduced-motion: reduce){*,*::before,*::after{animation:none!important;transition:none!important}}
+html{background:var(--canvas);scroll-behavior:smooth}
+body{font-family:var(--font-body);font-weight:400;font-size:14px;background:var(--canvas);color:var(--text);min-height:100vh;line-height:1.5;letter-spacing:0}
+button,input,select,textarea{font:inherit;letter-spacing:0}
+button,a,input,select,textarea{transition:border-color .18s ease,background-color .18s ease,color .18s ease,opacity .18s ease,transform .18s ease}
+button:active,.btn:active{transform:translateY(1px)}
+:focus-visible{outline:3px solid rgba(47,110,80,.2);outline-offset:2px}
+::selection{background:#dbe8df;color:var(--text)}
+.led{display:inline-block;width:7px;height:7px;border-radius:50%;vertical-align:middle;background:var(--dim2);margin-right:7px}
+.led.on{background:var(--green)}.led.warn{background:var(--orange)}.led.err{background:var(--red)}
+.quota-progress{display:inline-block;width:92px;height:6px;vertical-align:middle;overflow:hidden;border-radius:2px;background:var(--surface-subtle);margin-left:7px}
+.quota-progress>i{display:block;height:100%;background:var(--green)}
+.quota-progress.warn>i{background:var(--orange)}.quota-progress.crit>i{background:var(--red)}
+@media (prefers-reduced-motion:reduce){*,*::before,*::after{scroll-behavior:auto!important;transition:none!important}}
 `;
 
-// ponytail: shared JS helpers for the fun data-viz (count-up, segmented HP bar).
-// Kept free of template-literal interpolation so it can sit inside any page's <script>.
-const PIXEL_JS = `
-function _cuFmt(n,k){if(k){if(n>=1e6)return(n/1e6).toFixed(1)+'M';if(n>=1e3)return(n/1e3).toFixed(1)+'k';return ''+n}return n.toLocaleString('zh-CN')}
-function countUp(el,to,k){if(!el)return;var from=Number(el.dataset.cur||0),st=performance.now();
-  function step(t){var p=Math.min(1,(t-st)/600);var e=1-Math.pow(1-p,3);el.textContent=_cuFmt(Math.round(from+(to-from)*e),k);if(p<1)requestAnimationFrame(step);else el.dataset.cur=to;}
-  requestAnimationFrame(step);}
-function runCountUps(root){(root||document).querySelectorAll('[data-cu]').forEach(function(el){countUp(el,Number(el.dataset.cu),el.hasAttribute('data-cu-k'))})}
-function hpBar(pct,segs){segs=segs||20;var on=Math.round(pct/100*segs);var cls=pct>90?'crit':pct>70?'warn':'';
-  var s='<span class="hp '+cls+'">';for(var i=0;i<segs;i++){s+='<i class="'+(i<on?'on':'')+'"></i>';}return s+'</span>';}
-// mouse HUD spotlight — creates .fx-spot once and tracks the cursor (rAF-throttled)
-(function(){var d=document,b=d.body;if(!b)return;var s=d.createElement('div');s.className='fx-spot';b.appendChild(s);
-  var pend=false,x=0,y=0;d.addEventListener('mousemove',function(e){x=e.clientX;y=e.clientY;if(!pend){pend=true;requestAnimationFrame(function(){s.style.background='radial-gradient(260px circle at '+x+'px '+y+'px,rgba(34,233,255,.10),transparent 70%)';pend=false})}},{passive:true})})();
+const UI_HELPERS = `
+function formatCompact(n){if(n>=1e6)return(n/1e6).toFixed(1)+'M';if(n>=1e3)return(n/1e3).toFixed(1)+'k';return Number(n).toLocaleString('zh-CN')}
+function quotaBar(pct){var value=Math.max(0,Math.min(100,Number(pct)||0));var cls=value>90?'crit':value>70?'warn':'';return '<span class="quota-progress '+cls+'" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="'+value+'"><i style="width:'+value+'%"></i></span>'}
+function runCountUps(root){(root||document).querySelectorAll('[data-cu]').forEach(function(el){var raw=Number(el.dataset.cu)||0;el.textContent=el.hasAttribute('data-cu-k')?formatCompact(raw):raw.toLocaleString('zh-CN');el.dataset.cur=String(raw)})}
+function hpBar(pct){return quotaBar(pct)}
 `;
 
 // ─── Config ──────────────────────────────────────────────────────────────────
@@ -114,7 +50,9 @@ function loadConfig() {
   return JSON.parse(fs.readFileSync(configPath, "utf-8"));
 }
 function saveConfig(cfg) {
-  fs.writeFileSync(configPath, JSON.stringify(cfg, null, 2), "utf-8");
+  const tempPath = `${configPath}.tmp`;
+  fs.writeFileSync(tempPath, JSON.stringify(cfg, null, 2), "utf-8");
+  fs.renameSync(tempPath, configPath);
 }
 
 const config = loadConfig();
@@ -122,11 +60,27 @@ const { port } = config;
 const dashboardPassword = config.dashboardPassword || "";
 const dataPath = path.join(__dirname, "data.json");
 const dbPath = path.join(__dirname, "data.db");
+const backupDir = path.join(__dirname, "backups");
 const RESERVED_SUFFIXES = new Set(["dashboard", "settings", "api", "health", "usage", "my-usage", "v1", "login", "logout", "favicon", "robots", "js", "css"]);
 const PROFILE_SUFFIX_RE = /^[a-z0-9_-]{2,20}$/;
-const API_PROTOCOLS = new Set(["anthropic", "openai"]);
-const OPENAI_STREAM_USAGE_DEFAULT = true;
-const RESPONSES_ADAPTERS = new Set(["none", "chat_completions"]);
+
+function backupTimestamp() {
+  return new Date().toISOString().replace(/[:.]/g, "-");
+}
+
+function backupFileSync(source, label, reason) {
+  if (!fs.existsSync(source)) return null;
+  fs.mkdirSync(backupDir, { recursive: true });
+  const target = path.join(backupDir, `${backupTimestamp()}-${reason}-${label}`);
+  fs.copyFileSync(source, target);
+  return target;
+}
+
+function backupDatabaseSync(reason) {
+  if (!db || !fs.existsSync(dbPath)) return null;
+  db.pragma("wal_checkpoint(FULL)");
+  return backupFileSync(dbPath, "data.db", reason);
+}
 
 function normalizeProfileSuffix(value) {
   return String(value || "")
@@ -161,28 +115,6 @@ function validateProfileSuffix(suffix, currentProfileName = null) {
     }
   }
   return sfx;
-}
-
-function normalizeApiProtocol(value) {
-  const protocol = String(value || "anthropic").trim().toLowerCase();
-  return API_PROTOCOLS.has(protocol) ? protocol : "anthropic";
-}
-
-function validateApiProtocol(value) {
-  const protocol = String(value || "anthropic").trim().toLowerCase();
-  if (!API_PROTOCOLS.has(protocol)) throw new Error("接口协议只能是 anthropic 或 openai");
-  return protocol;
-}
-
-function normalizeResponsesAdapter(value) {
-  const adapter = String(value || "none").trim().toLowerCase();
-  return RESPONSES_ADAPTERS.has(adapter) ? adapter : "none";
-}
-
-function validateResponsesAdapter(value) {
-  const adapter = String(value || "none").trim().toLowerCase();
-  if (!RESPONSES_ADAPTERS.has(adapter)) throw new Error("Responses 兼容模式只能是 none 或 chat_completions");
-  return adapter;
 }
 
 function legacyDefaultModelAliases(defaultModels = {}) {
@@ -224,18 +156,11 @@ function parseModelAliasesInput(value) {
 }
 
 function getProfileModelAliases(profile) {
-  const explicitAliases = normalizeModelAliases(profile?.modelAliases || {});
-  if (normalizeApiProtocol(profile?.apiProtocol) === "openai") return explicitAliases;
-  return {
-    ...legacyDefaultModelAliases(profile?.defaultModels || {}),
-    ...explicitAliases,
-  };
+  return normalizeModelAliases(profile?.modelAliases || {});
 }
 
 function getConfigurableModelAliases(profile) {
-  const aliases = normalizeModelAliases(profile?.modelAliases || {});
-  if (normalizeApiProtocol(profile?.apiProtocol) !== "openai") return aliases;
-  return Object.fromEntries(Object.entries(aliases).filter(([alias]) => !/^jx-(sonnet|opus|haiku)$/i.test(alias)));
+  return normalizeModelAliases(profile?.modelAliases || {});
 }
 
 function formatModelAliasesInput(aliases = {}) {
@@ -261,61 +186,66 @@ if (!config.profiles) {
   saveConfig(config);
 }
 
-// Auto-migrate: ensure every profile has defaultModels and non-empty allowedModels
-(function migrateDefaultModels() {
-  let migrated = false;
-  for (const pname of Object.keys(config.profiles)) {
-    const p = config.profiles[pname];
-    if (!p.defaultModels) {
-      const firstModel = (Array.isArray(p.allowedModels) && p.allowedModels.length > 0)
-        ? p.allowedModels[0] : null;
-      p.defaultModels = {
-        sonnet: firstModel || "claude-sonnet-4-6",
-        opus: firstModel || "claude-opus-4-5",
-        haiku: firstModel || "claude-haiku-4-5",
-      };
-      migrated = true;
-    }
-    if (!Array.isArray(p.allowedModels) || p.allowedModels.length === 0) {
-      p.allowedModels = [
-        p.defaultModels.sonnet,
-        p.defaultModels.opus,
-        p.defaultModels.haiku,
-      ];
-      migrated = true;
-    }
-  }
-  if (migrated) { saveConfig(config); console.log("[MIGRATE] Added defaultModels to existing profiles"); }
-})();
+const removedOpenAIProfileSuffixes = [];
+const removedOpenAIUserKeys = new Set();
 
-// Auto-migrate: add API protocol and generic model aliases.
-(function migrateProfileProtocolsAndAliases() {
-  let migrated = false;
-  for (const pname of Object.keys(config.profiles)) {
-    const p = config.profiles[pname];
-    const protocol = normalizeApiProtocol(p.apiProtocol);
-    if (p.apiProtocol !== protocol) {
-      p.apiProtocol = protocol;
-      migrated = true;
+// One-way migration: the project now supports Anthropic Messages only.
+(function migrateProfilesToAnthropicOnly() {
+  const openAIProfiles = Object.entries(config.profiles)
+    .filter(([, profile]) => String(profile.apiProtocol || "anthropic").toLowerCase() === "openai");
+  let migrated = openAIProfiles.length > 0;
+  if (openAIProfiles.length > 0) {
+    backupFileSync(configPath, "config.json", "remove-openai");
+    for (const [name, profile] of openAIProfiles) {
+      removedOpenAIProfileSuffixes.push(normalizeProfileSuffix(profile.suffix));
+      for (const key of Object.keys(profile.users || {})) removedOpenAIUserKeys.add(key);
+      delete config.profiles[name];
     }
-    if (p.openaiStreamUsage === undefined) {
-      p.openaiStreamUsage = OPENAI_STREAM_USAGE_DEFAULT;
-      migrated = true;
+  }
+
+  if (Object.keys(config.profiles).length === 0) {
+    config.profiles["默认方案"] = {
+      suffix: "default",
+      isDefault: true,
+      upstream: "",
+      allowedModels: [],
+      modelAliases: {},
+      dailyTokenLimit: null,
+      users: {},
+    };
+    migrated = true;
+  }
+
+  for (const profile of Object.values(config.profiles)) {
+    const explicitAliases = normalizeModelAliases(profile.modelAliases || {});
+    const aliases = { ...legacyDefaultModelAliases(profile.defaultModels || {}), ...explicitAliases };
+    if (JSON.stringify(profile.modelAliases || {}) !== JSON.stringify(aliases)) migrated = true;
+    profile.modelAliases = aliases;
+    if (!Array.isArray(profile.allowedModels)) profile.allowedModels = [];
+    for (const target of Object.values(aliases)) {
+      if (target && !profile.allowedModels.includes(target)) profile.allowedModels.push(target);
     }
-    const adapter = protocol === "openai" ? normalizeResponsesAdapter(p.responsesAdapter) : "none";
-    if (p.responsesAdapter !== adapter) {
-      p.responsesAdapter = adapter;
-      migrated = true;
+    for (const field of ["defaultModels", "apiProtocol", "openaiStreamUsage", "responsesAdapter"]) {
+      if (field in profile) {
+        delete profile[field];
+        migrated = true;
+      }
     }
-    const mergedAliases = protocol === "openai" ? getConfigurableModelAliases(p) : getProfileModelAliases(p);
-    const currentAliases = normalizeModelAliases(p.modelAliases || {});
-    const mergedJson = JSON.stringify(mergedAliases);
-    if (JSON.stringify(currentAliases) !== mergedJson) {
-      p.modelAliases = mergedAliases;
+  }
+
+  const assignedKeys = new Set(Object.values(config.profiles).flatMap((profile) => Object.keys(profile.users || {})));
+  for (const key of removedOpenAIUserKeys) {
+    if (!assignedKeys.has(key) && config.users?.[key]) {
+      delete config.users[key];
       migrated = true;
     }
   }
-  if (migrated) { saveConfig(config); console.log("[MIGRATE] Added apiProtocol/modelAliases to profiles"); }
+
+  if (migrated) {
+    delete config.activeProfile;
+    saveConfig(config);
+    console.log(`[MIGRATE] Simplified Claude aliases and removed ${openAIProfiles.length} OpenAI profile(s)`);
+  }
 })();
 
 // Auto-migrate: separate global users from profile-specific keys
@@ -441,17 +371,12 @@ function listProfiles() {
     name,
     suffix: normalizeProfileSuffix(config.profiles[name].suffix),
     isDefault: !!config.profiles[name].isDefault,
-    apiProtocol: normalizeApiProtocol(config.profiles[name].apiProtocol),
     upstream: config.profiles[name].upstream,
     userCount: Object.keys(config.profiles[name].users || {}).length,
     allowedModels: config.profiles[name].allowedModels || [],
-    defaultModels: config.profiles[name].defaultModels || {},
     modelAliases: getConfigurableModelAliases(config.profiles[name]),
-    openaiStreamUsage: config.profiles[name].openaiStreamUsage !== false,
-    responsesAdapter: normalizeApiProtocol(config.profiles[name].apiProtocol) === "openai"
-      ? normalizeResponsesAdapter(config.profiles[name].responsesAdapter)
-      : "none",
     dailyTokenLimit: config.profiles[name].dailyTokenLimit || 0,
+    configured: !!config.profiles[name].upstream,
   }));
 }
 
@@ -551,17 +476,11 @@ function createProfileRuntime(profileName, profile) {
     profileName,
     suffix: normalizeProfileSuffix(profile.suffix),
     isDefault: !!profile.isDefault,
-    apiProtocol: normalizeApiProtocol(profile.apiProtocol),
     upstream: profile.upstream,
     upstreamUrl,
     users: { ...(profile.users || {}) },
     allowedModels: profile.allowedModels || [],
-    defaultModels: profile.defaultModels || { sonnet: "claude-sonnet-4-6", opus: "claude-opus-4-5", haiku: "claude-haiku-4-5" },
     modelAliases: getProfileModelAliases(profile),
-    openaiStreamUsage: profile.openaiStreamUsage !== false,
-    responsesAdapter: normalizeApiProtocol(profile.apiProtocol) === "openai"
-      ? normalizeResponsesAdapter(profile.responsesAdapter)
-      : "none",
     globalUsers: { ...(config.users || {}) },
     breaker: new CircuitBreaker({
       failureThreshold: (config.proxy || {}).circuitBreakerFailures || 5,
@@ -574,8 +493,13 @@ function createProfileRuntime(profileName, profile) {
 function initAllRuntimes() {
   for (const key of Object.keys(runtimes)) delete runtimes[key];
   for (const [name, profile] of Object.entries(config.profiles)) {
+    if (!profile.upstream) continue;
     const suffix = normalizeProfileSuffix(profile.suffix);
-    runtimes[suffix] = createProfileRuntime(name, profile);
+    try {
+      runtimes[suffix] = createProfileRuntime(name, profile);
+    } catch (err) {
+      console.warn(`[RUNTIME] Skipped unconfigured profile "${name}": ${err.message}`);
+    }
   }
   console.log(`[RUNTIME] Initialized ${Object.keys(runtimes).length} profile(s): ${Object.values(runtimes).map(r => `"${r.profileName}"(${JSON.stringify(r.suffix)})`).join(", ")}`);
 }
@@ -1044,6 +968,173 @@ function migrateFromJsonIfNeeded() {
   }
 }
 
+const REQUEST_DATA_TABLES = ["users", "usage_daily", "usage_daily_model", "usage_daily_hourly", "usage_model", "usage_hourly", "errors", "quota_adjust_history"];
+
+function legacyProfileData(raw = {}) {
+  return {
+    users: raw.users || {},
+    daily: raw.daily || {},
+    dailyModels: raw.dailyModels || {},
+    dailyHourly: raw.dailyHourly || {},
+    models: raw.models || {},
+    hourly: raw.hourly || {},
+    errors: Array.isArray(raw.errors) ? raw.errors : [],
+  };
+}
+
+function normalizeLegacyImportData(raw) {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) throw new Error("data.json 顶层必须是对象");
+  if (raw._profiles !== undefined && (!raw._profiles || typeof raw._profiles !== "object" || Array.isArray(raw._profiles))) {
+    throw new Error("_profiles 必须是对象");
+  }
+  const profiles = {};
+  for (const [suffix, value] of Object.entries(raw._profiles || {})) {
+    if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error(`方案 ${suffix} 的数据格式无效`);
+    profiles[String(suffix)] = legacyProfileData(value);
+  }
+  const topLevelFields = ["users", "daily", "dailyModels", "dailyHourly", "models", "hourly", "errors"];
+  const hasTopLevel = topLevelFields.some((key) => Array.isArray(raw[key]) ? raw[key].length > 0 : Object.keys(raw[key] || {}).length > 0);
+  if (hasTopLevel) {
+    let source = getDefaultProfileSuffix() || "default";
+    if (profiles[source]) source = "top-level";
+    profiles[source] = legacyProfileData(raw);
+  }
+  if (Object.keys(profiles).length === 0) throw new Error("文件中没有可导入的统计数据");
+  return {
+    profiles,
+    quotaAdjustHistory: Array.isArray(raw.quotaAdjustHistory) ? raw.quotaAdjustHistory : [],
+    lastQuotaEval: raw._lastQuotaEval || null,
+  };
+}
+
+function legacyImportHash(raw) {
+  return crypto.createHash("sha256").update(JSON.stringify(raw)).digest("hex");
+}
+
+function summarizeLegacyImport(normalized) {
+  const userKeys = new Set();
+  const dates = new Set();
+  let requests = 0;
+  let records = 0;
+  for (const ps of Object.values(normalized.profiles)) {
+    let profileRequests = 0;
+    let dailyRequests = 0;
+    for (const [key, user] of Object.entries(ps.users || {})) {
+      userKeys.add(key);
+      profileRequests += Number(user.totalRequests) || 0;
+      records++;
+    }
+    for (const [date, rows] of Object.entries(ps.daily || {})) {
+      dates.add(date);
+      for (const [key, row] of Object.entries(rows || {})) {
+        userKeys.add(key);
+        dailyRequests += Number(row.requests) || 0;
+        records++;
+      }
+    }
+    requests += profileRequests || dailyRequests;
+    for (const date of Object.keys(ps.dailyModels || {})) dates.add(date);
+    for (const date of Object.keys(ps.dailyHourly || {})) dates.add(date);
+    for (const date of Object.keys(ps.hourly || {})) dates.add(date);
+    records += Object.keys(ps.models || {}).length + (ps.errors || []).length;
+  }
+  const orderedDates = [...dates].filter((date) => /^\d{4}-\d{2}-\d{2}$/.test(date)).sort();
+  return {
+    users: userKeys.size,
+    requests,
+    records,
+    minDate: orderedDates[0] || null,
+    maxDate: orderedDates.at(-1) || null,
+  };
+}
+
+function writeLegacyData(normalized, profileMap) {
+  for (const [sourceSuffix, ps] of Object.entries(normalized.profiles)) {
+    const suffix = normalizeProfileSuffix(profileMap[sourceSuffix]);
+    if (!suffix) continue;
+    for (const [key, user] of Object.entries(ps.users || {})) {
+      db.prepare(`INSERT INTO users (profile,user_key,name,total_input,total_output,total_requests,cache_creation,cache_read,last_active)
+        VALUES (?,?,?,?,?,?,?,?,?) ON CONFLICT(profile,user_key) DO UPDATE SET
+          name=excluded.name, total_input=total_input+excluded.total_input, total_output=total_output+excluded.total_output,
+          total_requests=total_requests+excluded.total_requests, cache_creation=cache_creation+excluded.cache_creation,
+          cache_read=cache_read+excluded.cache_read, last_active=excluded.last_active`)
+        .run(suffix, key, user.name || key.slice(0, 8), user.totalInputTokens || 0, user.totalOutputTokens || 0, user.totalRequests || 0, user.cacheCreationTokens || 0, user.cacheReadTokens || 0, user.lastActive || null);
+    }
+    for (const [date, rows] of Object.entries(ps.daily || {})) {
+      for (const [key, row] of Object.entries(rows || {})) {
+        db.prepare(`INSERT INTO usage_daily (profile,date,user_key,input_tokens,output_tokens,requests,cache_creation,cache_read) VALUES (?,?,?,?,?,?,?,?)
+          ON CONFLICT(profile,date,user_key) DO UPDATE SET input_tokens=input_tokens+excluded.input_tokens, output_tokens=output_tokens+excluded.output_tokens,
+          requests=requests+excluded.requests, cache_creation=cache_creation+excluded.cache_creation, cache_read=cache_read+excluded.cache_read`)
+          .run(suffix, date, key, row.inputTokens || 0, row.outputTokens || 0, row.requests || 0, row.cacheCreationTokens || 0, row.cacheReadTokens || 0);
+      }
+    }
+    for (const [model, row] of Object.entries(ps.models || {})) {
+      db.prepare(`INSERT INTO usage_model (profile,model,tokens,requests) VALUES (?,?,?,?)
+        ON CONFLICT(profile,model) DO UPDATE SET tokens=tokens+excluded.tokens, requests=requests+excluded.requests`)
+        .run(suffix, model, row.tokens || 0, row.requests || 0);
+    }
+    for (const [date, hours] of Object.entries(ps.hourly || {})) {
+      for (const [hour, row] of Object.entries(hours || {})) {
+        db.prepare(`INSERT INTO usage_hourly (profile,date,hour,requests,input_tokens,output_tokens,cache_creation,cache_read) VALUES (?,?,?,?,?,?,?,?)
+          ON CONFLICT(profile,date,hour) DO UPDATE SET requests=requests+excluded.requests, input_tokens=input_tokens+excluded.input_tokens,
+          output_tokens=output_tokens+excluded.output_tokens, cache_creation=cache_creation+excluded.cache_creation, cache_read=cache_read+excluded.cache_read`)
+          .run(suffix, date, hour, row.requests || 0, row.inputTokens || 0, row.outputTokens || 0, row.cacheCreationTokens || 0, row.cacheReadTokens || 0);
+      }
+    }
+    for (const [date, users] of Object.entries(ps.dailyModels || {})) {
+      for (const [key, models] of Object.entries(users || {})) {
+        for (const [model, row] of Object.entries(models || {})) {
+          db.prepare(`INSERT INTO usage_daily_model (profile,date,user_key,model,input_tokens,output_tokens,requests) VALUES (?,?,?,?,?,?,?)
+            ON CONFLICT(profile,date,user_key,model) DO UPDATE SET input_tokens=input_tokens+excluded.input_tokens,
+            output_tokens=output_tokens+excluded.output_tokens, requests=requests+excluded.requests`)
+            .run(suffix, date, key, model, row.inputTokens || 0, row.outputTokens || 0, row.requests || 0);
+        }
+      }
+    }
+    for (const [date, users] of Object.entries(ps.dailyHourly || {})) {
+      for (const [key, hours] of Object.entries(users || {})) {
+        for (const [hour, row] of Object.entries(hours || {})) {
+          db.prepare(`INSERT INTO usage_daily_hourly (profile,date,user_key,hour,requests,input_tokens,output_tokens,cache_creation,cache_read) VALUES (?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(profile,date,user_key,hour) DO UPDATE SET requests=requests+excluded.requests, input_tokens=input_tokens+excluded.input_tokens,
+            output_tokens=output_tokens+excluded.output_tokens, cache_creation=cache_creation+excluded.cache_creation, cache_read=cache_read+excluded.cache_read`)
+            .run(suffix, date, key, hour, row.requests || 0, row.inputTokens || 0, row.outputTokens || 0, row.cacheCreationTokens || 0, row.cacheReadTokens || 0);
+        }
+      }
+    }
+    for (const error of ps.errors || []) {
+      stmts.insertError.run({
+        profile: suffix,
+        time: error.time || new Date().toISOString(),
+        userName: error.user || error.userName || "",
+        key: error.userKey || "unknown",
+        statusCode: error.statusCode || 0,
+        error: error.error || "",
+        path: error.path || "",
+        model: error.model || "unknown",
+      });
+    }
+  }
+  for (const row of normalized.quotaAdjustHistory || []) {
+    const date = row.date || cnDate();
+    stmts.insertQuotaAdjust.run({
+      user: row.user || row.userKey || "unknown",
+      username: row.username || row.userName || "",
+      date,
+      oldQuota: row.oldQuota || 0,
+      newQuota: row.newQuota || 0,
+      hitRate: row.hitRate || 0,
+      avgDailyUsage: row.avgDailyUsage || 0,
+      time: row.time || `${date}T00:00:00.000Z`,
+    });
+  }
+  if (normalized.lastQuotaEval) stmts.upsertMeta.run({ k: "lastQuotaEval", v: normalized.lastQuotaEval });
+}
+
+function clearRequestData() {
+  for (const table of REQUEST_DATA_TABLES) db.prepare(`DELETE FROM ${table}`).run();
+  db.prepare("DELETE FROM kv_meta").run();
+}
+
 // ── Meta helpers (kv_meta: _lastQuotaEval) ──
 function getMeta(key, fallback = null) {
   const row = db.prepare("SELECT value FROM kv_meta WHERE key=?").get(key);
@@ -1089,6 +1180,27 @@ function loadProfileSnapshot(suffix) {
 
 initDb();
 migrateFromJsonIfNeeded();
+
+function removeLegacyOpenAIData() {
+  const suffixes = removedOpenAIProfileSuffixes.filter(Boolean);
+  if (suffixes.length === 0) return;
+  db.pragma("wal_checkpoint(FULL)");
+  backupFileSync(dbPath, "data.db", "remove-openai");
+  const placeholders = suffixes.map(() => "?").join(",");
+  const removedKeys = db.prepare(`SELECT DISTINCT user_key FROM users WHERE profile IN (${placeholders})`).all(...suffixes).map((row) => row.user_key);
+  const tx = db.transaction(() => {
+    for (const table of ["users", "usage_daily", "usage_daily_model", "usage_daily_hourly", "usage_model", "usage_hourly", "errors"]) {
+      db.prepare(`DELETE FROM ${table} WHERE profile IN (${placeholders})`).run(...suffixes);
+    }
+    for (const key of removedKeys) {
+      if (!config.users?.[key]) db.prepare("DELETE FROM quota_adjust_history WHERE user_key=?").run(key);
+    }
+  });
+  tx();
+  console.log(`[MIGRATE] Removed persisted data for ${suffixes.length} OpenAI profile(s)`);
+}
+
+removeLegacyOpenAIData();
 
 // Aggregate all profiles for "all profiles" view, assembled via SQL GROUP BY.
 // Returns the same nested shape as loadProfileSnapshot so sanitizeStore and the
@@ -1207,11 +1319,6 @@ function previewList(values, fallback = "none") {
 }
 
 function modelNotAllowedMessage(model, runtime) {
-  if (runtime?.apiProtocol === "openai") {
-    const aliases = Object.keys(runtime.modelAliases || {});
-    const aliasHint = aliases.length > 0 ? ` Configured aliases: ${previewList(aliases)}.` : "";
-    return `Model "${model}" is not allowed for OpenAI/Codex profile "${runtime.profileName}". Allowed models: ${previewList(runtime.allowedModels)}.${aliasHint} Configure Codex to use an allowed model, or add a model alias such as gpt-5.5=<real model>.`;
-  }
   return `Model "${model}" is not allowed. Use jx-sonnet/jx-opus/jx-haiku or a model from the allowed list.`;
 }
 
@@ -1291,72 +1398,14 @@ function resolveModel(model, _rt) {
   for (const [name, target] of Object.entries(aliases)) {
     if (name.toLowerCase() === alias) return target;
   }
-  const dm = runtime.defaultModels || {};
-  if (alias === "jx-sonnet") return dm.sonnet || model;
-  if (alias === "jx-opus")   return dm.opus   || model;
-  if (alias === "jx-haiku")  return dm.haiku  || model;
   return model;
 }
 
-function isOpenAIChatCompletionsPath(reqUrl) {
+function isUnsupportedOpenAIPath(reqUrl) {
   const pathname = new URL(reqUrl || "/", "http://localhost").pathname;
-  return pathname === "/v1/chat/completions" || pathname.endsWith("/chat/completions");
-}
-
-function isOpenAIResponsesPath(reqUrl) {
-  const pathname = new URL(reqUrl || "/", "http://localhost").pathname;
-  return pathname === "/v1/responses" || pathname.endsWith("/responses");
-}
-
-function isOpenAIModelsPath(reqUrl) {
-  const pathname = new URL(reqUrl || "/", "http://localhost").pathname;
-  return pathname === "/v1/models" || pathname.endsWith("/models");
-}
-
-function isAllowedOpenAIProxyPath(reqUrl, method) {
-  const upperMethod = String(method || "GET").toUpperCase();
-  if (isOpenAIModelsPath(reqUrl)) return upperMethod === "GET" || upperMethod === "HEAD";
-  if (upperMethod !== "POST") return false;
-  return isOpenAIResponsesPath(reqUrl) || isOpenAIChatCompletionsPath(reqUrl);
-}
-
-function validateProxyTarget(runtime, reqUrl, method) {
-  if (runtime?.apiProtocol !== "openai") return { allowed: true };
-  if (isAllowedOpenAIProxyPath(reqUrl, method)) return { allowed: true };
-  const pathname = new URL(reqUrl || "/", "http://localhost").pathname;
-  return {
-    allowed: false,
-    statusCode: 404,
-    message: `Unsupported OpenAI/Codex proxy endpoint ${String(method || "GET").toUpperCase()} ${pathname}. Allowed endpoints: POST /v1/responses, POST /v1/chat/completions, and local GET /v1/models.`,
-  };
-}
-
-function shouldAdaptOpenAIResponses(runtime, reqUrl) {
-  return runtime?.apiProtocol === "openai" &&
-    runtime.responsesAdapter === "chat_completions" &&
-    isOpenAIResponsesPath(reqUrl);
-}
-
-function shouldServeLocalOpenAIModels(runtime, reqUrl) {
-  return runtime?.apiProtocol === "openai" &&
-    isOpenAIModelsPath(reqUrl);
-}
-
-function ensureOpenAIStreamUsage(body, runtime, reqUrl) {
-  if (runtime.apiProtocol !== "openai" || runtime.openaiStreamUsage === false || !isOpenAIChatCompletionsPath(reqUrl)) {
-    return body;
-  }
-  try {
-    const parsed = sanitizeJson(JSON.parse(body.toString()));
-    if (!parsed.stream) return body;
-    const opts = parsed.stream_options && typeof parsed.stream_options === "object" && !Array.isArray(parsed.stream_options)
-      ? parsed.stream_options
-      : {};
-    parsed.stream_options = { ...opts, include_usage: true };
-    return Buffer.from(JSON.stringify(parsed));
-  } catch {
-    return body;
-  }
+  return pathname === "/v1/responses" || pathname.endsWith("/responses") ||
+    pathname === "/v1/chat/completions" || pathname.endsWith("/chat/completions") ||
+    pathname === "/v1/models" || pathname.endsWith("/models");
 }
 
 function mergeUsageCounters(target, source) {
@@ -1384,238 +1433,15 @@ function usageHasTokens(usage = {}) {
   return !!((usage.input_tokens || 0) > 0 || (usage.output_tokens || 0) > 0 || (usage.prompt_tokens || 0) > 0 || (usage.completion_tokens || 0) > 0 || (usage.total_tokens || 0) > 0);
 }
 
-function usageToResponsesUsage(usage = {}) {
-  const toTokenNumber = (value) => {
-    if (value === undefined || value === null || value === "") return 0;
-    const n = Number(value);
-    return Number.isFinite(n) ? n : 0;
-  };
-  const input = toTokenNumber(usage.input_tokens ?? usage.prompt_tokens);
-  let output = toTokenNumber(usage.output_tokens ?? usage.completion_tokens);
-  const explicitTotal = toTokenNumber(usage.total_tokens);
-  if (!input && !output && explicitTotal) output = explicitTotal;
-  return {
-    input_tokens: input,
-    output_tokens: output,
-    total_tokens: explicitTotal || input + output,
-  };
-}
-
-function extractTextContent(content) {
-  if (content === undefined || content === null) return "";
-  if (typeof content === "string") return content;
-  if (Array.isArray(content)) {
-    return content.map((part) => {
-      if (part === undefined || part === null) return "";
-      if (typeof part === "string") return part;
-      if (typeof part !== "object") return String(part);
-      if (typeof part.text === "string") return part.text;
-      if (typeof part.input_text === "string") return part.input_text;
-      if (typeof part.output_text === "string") return part.output_text;
-      if (typeof part.refusal === "string") return part.refusal;
-      if (typeof part.content === "string") return part.content;
-      return "";
-    }).join("");
-  }
-  if (typeof content === "object") {
-    if (typeof content.text === "string") return content.text;
-    if (typeof content.input_text === "string") return content.input_text;
-    if (typeof content.output_text === "string") return content.output_text;
-    if (typeof content.content === "string") return content.content;
-  }
-  return String(content);
-}
-
-function normalizeChatRole(role) {
-  const r = String(role || "user").toLowerCase();
-  if (r === "developer") return "system";
-  if (["system", "user", "assistant", "tool"].includes(r)) return r;
-  return "user";
-}
-
-function responsesInputToChatMessages(input, instructions) {
-  const messages = [];
-  const systemText = extractTextContent(instructions).trim();
-  if (systemText) messages.push({ role: "system", content: systemText });
-
-  const addMessage = (role, content, extra = {}) => {
-    const text = extractTextContent(content);
-    messages.push({ role: normalizeChatRole(role), content: text, ...extra });
-  };
-
-  if (typeof input === "string") {
-    addMessage("user", input);
-  } else if (Array.isArray(input)) {
-    const looseText = [];
-    for (const item of input) {
-      if (typeof item === "string") {
-        looseText.push(item);
-        continue;
-      }
-      if (!item || typeof item !== "object") continue;
-      if (item.type === "function_call_output") {
-        messages.push({
-          role: "tool",
-          tool_call_id: item.call_id || item.id || "call_0",
-          content: extractTextContent(item.output),
-        });
-        continue;
-      }
-      if (item.type === "function_call") {
-        messages.push({
-          role: "assistant",
-          content: "",
-          tool_calls: [{
-            id: item.call_id || item.id || "call_0",
-            type: "function",
-            function: {
-              name: item.name || "unknown",
-              arguments: typeof item.arguments === "string" ? item.arguments : JSON.stringify(item.arguments || {}),
-            },
-          }],
-        });
-        continue;
-      }
-      if (item.role || item.type === "message") {
-        addMessage(item.role || "user", item.content ?? item.text ?? item.input_text ?? item.output_text ?? "");
-        continue;
-      }
-      looseText.push(extractTextContent(item.content ?? item.text ?? item.input_text ?? item.output_text ?? item));
-    }
-    if (looseText.length > 0) addMessage("user", looseText.filter(Boolean).join("\n"));
-  } else if (input && typeof input === "object") {
-    if (input.role || input.type === "message") addMessage(input.role || "user", input.content ?? input.text ?? "");
-    else addMessage("user", input.content ?? input.text ?? input.input_text ?? "");
-  }
-
-  if (messages.length === 0) messages.push({ role: "user", content: "" });
-  return messages;
-}
-
-function convertResponsesToolsToChatTools(tools) {
-  if (!Array.isArray(tools)) return undefined;
-  const converted = [];
-  for (const tool of tools) {
-    if (!tool || typeof tool !== "object") continue;
-    if (tool.type !== "function") continue;
-    if (tool.function && typeof tool.function === "object") {
-      converted.push({ type: "function", function: tool.function });
-      continue;
-    }
-    if (!tool.name) continue;
-    const fn = { name: tool.name };
-    if (tool.description) fn.description = tool.description;
-    if (tool.parameters) fn.parameters = tool.parameters;
-    if (tool.strict !== undefined) fn.strict = tool.strict;
-    converted.push({ type: "function", function: fn });
-  }
-  return converted.length > 0 ? converted : undefined;
-}
-
-function convertResponsesToolChoiceToChat(toolChoice) {
-  if (!toolChoice || typeof toolChoice === "string") return toolChoice;
-  if (toolChoice.type === "function" && toolChoice.name) {
-    return { type: "function", function: { name: toolChoice.name } };
-  }
-  return toolChoice;
-}
-
-function responsesRequestToChatCompletions(parsed, forceStream = false) {
-  const chat = {
-    model: parsed.model,
-    messages: Array.isArray(parsed.messages)
-      ? parsed.messages.map((m) => ({ ...m, role: normalizeChatRole(m.role) }))
-      : responsesInputToChatMessages(parsed.input, parsed.instructions),
-  };
-  const passthrough = [
-    "temperature",
-    "top_p",
-    "frequency_penalty",
-    "presence_penalty",
-    "stop",
-    "user",
-    "metadata",
-    "parallel_tool_calls",
-  ];
-  for (const key of passthrough) {
-    if (parsed[key] !== undefined) chat[key] = parsed[key];
-  }
-  const maxTokens = parsed.max_tokens ?? parsed.max_completion_tokens ?? parsed.max_output_tokens;
-  if (maxTokens !== undefined) chat.max_tokens = maxTokens;
-  const tools = convertResponsesToolsToChatTools(parsed.tools);
-  if (tools) chat.tools = tools;
-  const toolChoice = convertResponsesToolChoiceToChat(parsed.tool_choice);
-  if (toolChoice !== undefined) chat.tool_choice = toolChoice;
-  chat.stream = forceStream || !!parsed.stream;
-  if (chat.stream) {
-    const opts = parsed.stream_options && typeof parsed.stream_options === "object" && !Array.isArray(parsed.stream_options)
-      ? parsed.stream_options
-      : {};
-    chat.stream_options = { ...opts, include_usage: true };
-  }
-  return chat;
-}
-
-function convertChatToolCallsToResponsesOutput(toolCalls) {
-  if (!Array.isArray(toolCalls)) return [];
-  return toolCalls.map((call, index) => ({
-    type: "function_call",
-    id: call.id || `fc_${index}`,
-    call_id: call.id || `call_${index}`,
-    name: call.function?.name || call.name || "unknown",
-    arguments: call.function?.arguments || call.arguments || "{}",
-    status: "completed",
-  }));
-}
-
-function chatCompletionToResponse(chat, fallbackModel) {
-  const choice = Array.isArray(chat.choices) ? chat.choices[0] : null;
-  const message = choice?.message || {};
-  const text = extractTextContent(message.content);
-  const output = [];
-  if (text || !message.tool_calls) {
-    output.push({
-      type: "message",
-      role: "assistant",
-      content: [{ type: "output_text", text }],
-    });
-  }
-  output.push(...convertChatToolCallsToResponsesOutput(message.tool_calls));
-  const usage = usageToResponsesUsage(chat.usage || {});
-  return {
-    id: chat.id || `resp_${crypto.randomBytes(12).toString("hex")}`,
-    object: "response",
-    created_at: chat.created || Math.floor(Date.now() / 1000),
-    status: "completed",
-    model: chat.model || fallbackModel,
-    output,
-    output_text: text,
-    usage,
-  };
-}
-
-function localOpenAIModels(runtime) {
-  const ids = Array.from(new Set((runtime.allowedModels || []).filter((m) => m && m !== "*")));
-  if (ids.length === 0) {
-    for (const target of Object.values(runtime.modelAliases || {})) {
-      if (target && !ids.includes(target)) ids.push(target);
-    }
-  }
-  return {
-    object: "list",
-    data: ids.map((id) => ({ id, object: "model", created: 0, owned_by: "cc-team" })),
-  };
-}
-
-
 // ─── Timezone Helpers (UTC+8 北京时间) ────────────────────────────────────────
-function cnNow() {
-  const d = new Date();
-  const utc = d.getTime() + d.getTimezoneOffset() * 60000;
-  return new Date(utc + 8 * 3600000);
-}
+function cnNow(now = Date.now()) { return new Date(now + 8 * 3600000); }
 function cnDate() { return cnNow().toISOString().slice(0, 10); }
-function cnHour() { return cnNow().getHours().toString().padStart(2, "0"); }
+function cnHour() { return cnNow().toISOString().slice(11, 13); }
+function secondsUntilNextCnMidnight(now = Date.now()) {
+  const shifted = new Date(now + 8 * 3600000);
+  const nextShiftedMidnight = Date.UTC(shifted.getUTCFullYear(), shifted.getUTCMonth(), shifted.getUTCDate() + 1);
+  return Math.max(1, Math.ceil((nextShiftedMidnight - 8 * 3600000 - now) / 1000));
+}
 
 function recordUsage(apiKey, usage, model, suffix, _rt) {
   const runtime = _rt || runtimes[normalizeProfileSuffix(suffix)] || rt;
@@ -1711,9 +1537,7 @@ function evaluateAutoQuotaAdjustments() {
   // Collect last P dates (excluding today)
   const dates = [];
   for (let i = 1; i <= period; i++) {
-    const d = new Date(cnNow().getTime() - i * 86400000);
-    const utc = d.getTime() + d.getTimezoneOffset() * 60000;
-    dates.push(new Date(utc + 8 * 3600000).toISOString().slice(0, 10));
+    dates.push(new Date(cnNow().getTime() - i * 86400000).toISOString().slice(0, 10));
   }
 
   const profile = config.profiles[getDefaultProfileName()];
@@ -2118,6 +1942,11 @@ function sendUpstream(body, reqUrl, reqMethod, reqHeaders, timeout, _rt, clientS
 }
 
 function proxyRequest(req, res) {
+  if (isUnsupportedOpenAIPath(req.url)) {
+    res.writeHead(404, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ error: "OpenAI endpoints are not supported. Use the Anthropic Messages API with Claude Code." }));
+    return;
+  }
   // Resolve which profile this request targets
   const resolvedProfile = resolveProfile(req.url);
   if (resolvedProfile.error) {
@@ -2126,6 +1955,11 @@ function proxyRequest(req, res) {
     return;
   }
   const { suffix, runtime, strippedUrl } = resolvedProfile;
+  if (!runtime) {
+    res.writeHead(503, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ error: "No configured proxy profile. Open Settings to configure an Anthropic upstream." }));
+    return;
+  }
   const apiKey = getApiKey(req);
   const proxyStartTime = Date.now();
   let proxyPhase = "init";
@@ -2134,9 +1968,9 @@ function proxyRequest(req, res) {
   // Global IP rate limit
   const clientIp = getClientIp(req);
   if (!checkIpRateLimit(clientIp)) {
-    res.writeHead(429, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ error: "IP rate limit exceeded. Please slow down." }));
-    console.log(`[限流] IP ${clientIp} 超过全局速率限制`);
+    res.writeHead(429, { "Content-Type": "application/json", "Retry-After": "60" });
+    res.end(JSON.stringify({ error: "IP rate limit exceeded. Please slow down.", type: "ip_rate_limit_exceeded" }));
+    recordError(apiKey, 429, `ip_rate_limit_exceeded: ${clientIp}`, req.url, "unknown", suffix, runtime);
     return;
   }
 
@@ -2176,25 +2010,6 @@ function proxyRequest(req, res) {
     res.writeHead(403, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ error: earlyAccess.reason }));
     console.log(`[拦截] ${apiKey.slice(0, 8)}**** profile=${runtime.profileName} ${req.method} ${targetUrl} ${earlyAccess.reason}`);
-    return;
-  }
-
-  // OpenAI/Codex model discovery is served locally to prevent client probes from touching upstream billing endpoints.
-  if (shouldServeLocalOpenAIModels(runtime, targetUrl) && ["GET", "HEAD"].includes(String(req.method || "GET").toUpperCase())) {
-    res.writeHead(200, { "Content-Type": "application/json", "X-Proxy-Local": "models" });
-    if (req.method === "HEAD") res.end();
-    else res.end(JSON.stringify(localOpenAIModels(runtime)));
-    console.log(`[本地] ${getUserName(apiKey, runtime)} profile=${runtime.profileName} ${req.method} ${targetUrl} 返回模型列表，不转发上游`);
-    return;
-  }
-
-  const targetValidation = validateProxyTarget(runtime, targetUrl, req.method);
-  if (!targetValidation.allowed) {
-    const status = targetValidation.statusCode || 404;
-    res.writeHead(status, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ error: targetValidation.message }));
-    recordError(apiKey, status, targetValidation.message, targetUrl, "unknown", suffix, runtime);
-    console.log(`[拦截] ${getUserName(apiKey, runtime)} profile=${runtime.profileName} ${req.method} ${targetUrl} 不转发上游`);
     return;
   }
 
@@ -2249,33 +2064,32 @@ function proxyRequest(req, res) {
       return;
     }
 
-    // Concurrency check
-    if (!tryAcquireConcurrency(userKey)) {
-      res.writeHead(429, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: "Too many concurrent requests. Please try again later." }));
-      return;
-    }
-    // Rate limit check
-    if (!checkAndRecordRate(userKey)) {
-      releaseConcurrency(userKey);
-      res.writeHead(429, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: "Rate limit exceeded. Please slow down." }));
-      return;
-    }
-
-    // Token quota check
+    // Quota and rate checks happen before a concurrency slot is occupied.
     const quota = checkTokenQuota(apiKey, suffix, runtime);
     if (!quota.allowed) {
       const reqHost = req.headers.host || `localhost:${port}`;
       const usageUrl = `http://${reqHost}/usage/${apiKey}`;
-      res.writeHead(429, { "Content-Type": "application/json", "Retry-After": "86400" });
+      const retryAfter = secondsUntilNextCnMidnight();
+      res.writeHead(429, { "Content-Type": "application/json", "Retry-After": String(retryAfter) });
       res.end(JSON.stringify({
         error: `今日Token额度已用完。已用: ${quota.used.toLocaleString()}, 限额: ${quota.limit.toLocaleString()}。额度将于北京时间次日凌晨重置。查看用量详情: ${usageUrl}`,
         type: "quota_exceeded",
         quota: { used: quota.used, limit: quota.limit, remaining: quota.remaining, source: quota.source },
         usageUrl,
       }));
-      console.log(`[配额] ${getUserName(apiKey, runtime)} 今日额度已用完 [${quota.source}] (已用: ${quota.used.toLocaleString()} / 限额: ${quota.limit.toLocaleString()})`);
+      recordError(apiKey, 429, `quota_exceeded: ${quota.used}/${quota.limit}, retry in ${retryAfter}s`, req.url, reqModel, suffix, runtime);
+      return;
+    }
+    if (!checkAndRecordRate(userKey)) {
+      res.writeHead(429, { "Content-Type": "application/json", "Retry-After": "60" });
+      res.end(JSON.stringify({ error: "Rate limit exceeded. Please slow down.", type: "rate_limit_exceeded" }));
+      recordError(apiKey, 429, "rate_limit_exceeded", req.url, reqModel, suffix, runtime);
+      return;
+    }
+    if (!tryAcquireConcurrency(userKey)) {
+      res.writeHead(429, { "Content-Type": "application/json", "Retry-After": "1" });
+      res.end(JSON.stringify({ error: "Too many concurrent requests. Please try again later.", type: "concurrency_exceeded" }));
+      recordError(apiKey, 429, "concurrency_exceeded", req.url, reqModel, suffix, runtime);
       return;
     }
 
@@ -2296,28 +2110,13 @@ function proxyRequest(req, res) {
       const isStreamRequest = (req.headers["accept"] || "").includes("text/event-stream") ||
         (function() { try { return JSON.parse(body.toString()).stream; } catch { return false; } })();
 
-      const useResponsesAdapter = shouldAdaptOpenAIResponses(runtime, targetUrl);
-
-      if (isStreamRequest && !useResponsesAdapter) {
-        body = ensureOpenAIStreamUsage(body, runtime, strippedUrl || req.url);
-        reqHeaders["content-length"] = body.length;
-      }
-
       proxyPhase = isStreamRequest ? "streaming-proxy" : "json-proxy";
       const timeout = isStreamRequest ? gProxy.streamTimeout : gProxy.timeout;
 
       if (isStreamRequest) {
-        if (useResponsesAdapter) {
-          await handleOpenAIResponsesAdapterStreamingProxy(req, res, body, reqHeaders, apiKey, reqModel, timeout, reqSource, runtime, suffix, clientState);
-        } else {
-          await handleStreamingProxy(req, res, body, reqHeaders, apiKey, reqModel, timeout, reqSource, runtime, suffix, strippedUrl, clientState);
-        }
+        await handleStreamingProxy(req, res, body, reqHeaders, apiKey, reqModel, timeout, reqSource, runtime, suffix, strippedUrl, clientState);
       } else {
-        if (useResponsesAdapter) {
-          await handleOpenAIResponsesAdapterJsonProxy(req, res, body, reqHeaders, apiKey, reqModel, timeout, reqSource, runtime, suffix, clientState);
-        } else {
-          await handleJsonProxy(req, res, body, reqHeaders, apiKey, reqModel, timeout, reqSource, runtime, suffix, strippedUrl, clientState);
-        }
+        await handleJsonProxy(req, res, body, reqHeaders, apiKey, reqModel, timeout, reqSource, runtime, suffix, strippedUrl, clientState);
       }
     } catch (err) {
       if (isClientAbortError(err)) {
@@ -2340,487 +2139,6 @@ function proxyRequest(req, res) {
       res.writeHead(413, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ error: "Request body too large" }));
     }
-  });
-}
-
-function writeSseEvent(res, event, payload) {
-  res.write(`event: ${event}\n`);
-  res.write(`data: ${JSON.stringify(payload)}\n\n`);
-}
-
-async function handleOpenAIResponsesAdapterJsonProxy(req, res, body, reqHeaders, apiKey, reqModel, timeout, reqSource, _rt, suffix, clientState) {
-  const runtime = _rt || rt;
-  let parsed;
-  try {
-    parsed = sanitizeJson(JSON.parse(body.toString()));
-  } catch {
-    res.writeHead(400, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ error: "Invalid JSON request body" }));
-    return;
-  }
-
-  const chatPayload = responsesRequestToChatCompletions(parsed, false);
-  const chatBody = Buffer.from(JSON.stringify(chatPayload));
-  const chatHeaders = { ...reqHeaders, "content-type": "application/json", "content-length": chatBody.length };
-  let lastError = null;
-
-  for (let attempt = 0; attempt <= gProxy.maxRetries; attempt++) {
-    try {
-      throwIfClientAborted(clientState);
-      const upRes = await sendUpstream(chatBody, "/v1/chat/completions", "POST", chatHeaders, timeout, runtime, clientState);
-      const text = upRes.body.toString();
-
-      if (upRes.statusCode < 500) {
-        runtime.breaker.recordSuccess();
-      }
-
-      if (gProxy.retryableStatusCodes.includes(upRes.statusCode) && attempt < gProxy.maxRetries) {
-        const baseDelay = Math.min(gProxy.retryDelay * Math.pow(2, attempt), 10000);
-        const delay = Math.round(jitter(baseDelay));
-        console.log(`[重试] ${getUserName(apiKey, runtime)} ${upRes.statusCode} model=${reqModel} responses→chat 第${attempt + 1}/${gProxy.maxRetries}次 ${delay}ms后重试`);
-        recordError(apiKey, upRes.statusCode, `Retryable adapter error (attempt ${attempt + 1}/${gProxy.maxRetries})`, req.url, reqModel, suffix, runtime);
-        await sleepWithClientAbort(delay, clientState);
-        continue;
-      }
-
-      if (upRes.statusCode >= 400) {
-        let errMsg = text.slice(0, 200);
-        try {
-          const json = JSON.parse(text);
-          errMsg = json.error?.message || json.message || errMsg;
-        } catch {}
-        recordError(apiKey, upRes.statusCode, errMsg, req.url, reqModel, suffix, runtime);
-        if (upRes.statusCode >= 500) runtime.breaker.recordFailure();
-        const respHeaders = { ...upRes.headers };
-        delete respHeaders["content-encoding"];
-        delete respHeaders["content-length"];
-        res.writeHead(upRes.statusCode, respHeaders);
-        res.end(text);
-        return;
-      }
-
-      let chatJson;
-      try {
-        chatJson = JSON.parse(text);
-      } catch {
-        console.log(`[响应] ${getUserName(apiKey, runtime)} adapter 上游返回非JSON body[0:300]=${text.slice(0, 300).replace(/\n/g, "\\n")}`);
-        res.writeHead(upRes.statusCode, { "Content-Type": "text/plain" });
-        res.end(text);
-        return;
-      }
-
-      const responseJson = chatCompletionToResponse(chatJson, reqModel);
-      if (usageHasTokens(responseJson.usage)) {
-        recordUsage(apiKey, responseJson.usage, responseJson.model || reqModel, suffix, runtime);
-        console.log(`[Token] ${getUserName(apiKey, runtime)} [${reqSource}] model=${responseJson.model || reqModel} 输入=${responseJson.usage.input_tokens || 0} 输出=${responseJson.usage.output_tokens || 0} responses→chat`);
-      } else {
-        console.log(`[响应] ${getUserName(apiKey, runtime)} adapter 200 OK 但无usage字段 model=${responseJson.model || reqModel}`);
-      }
-
-      const respHeaders = { ...upRes.headers, "content-type": "application/json" };
-      delete respHeaders["content-encoding"];
-      delete respHeaders["content-length"];
-      if (attempt > 0) respHeaders["x-proxy-retry"] = String(attempt);
-      res.writeHead(upRes.statusCode, respHeaders);
-      res.end(JSON.stringify(responseJson));
-      return;
-    } catch (err) {
-      if (isClientAbortError(err)) {
-        console.log(`[取消] ${getUserName(apiKey, runtime)} adapter JSON 客户端断开 model=${reqModel}`);
-        return;
-      }
-      lastError = err;
-      runtime.breaker.recordFailure();
-      if (attempt < gProxy.maxRetries) {
-        const baseDelay = Math.min(gProxy.retryDelay * Math.pow(2, attempt), 10000);
-        const delay = Math.round(jitter(baseDelay));
-        console.log(`[重试] ${getUserName(apiKey, runtime)} adapter 网络错误 model=${reqModel} 第${attempt + 1}/${gProxy.maxRetries}次 ${delay}ms后重试`);
-        await sleepWithClientAbort(delay, clientState);
-      }
-    }
-  }
-
-  const finalStatus = lastError?.isTimeout ? 504 : 502;
-  const finalLabel = lastError?.isTimeout ? "Gateway Timeout" : "Bad Gateway";
-  recordError(apiKey, finalStatus, `${finalLabel} adapter after ${gProxy.maxRetries} retries: ${lastError?.message}`, req.url, reqModel, suffix, runtime);
-  if (!res.headersSent) {
-    res.writeHead(finalStatus, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ error: `Proxy ${finalLabel} after ${gProxy.maxRetries} retries. Please try again later.` }));
-  }
-}
-
-async function handleOpenAIResponsesAdapterStreamingProxy(req, res, body, reqHeaders, apiKey, reqModel, timeout, reqSource, _rt, suffix, clientState) {
-  const runtime = _rt || rt;
-  throwIfClientAborted(clientState);
-  let parsed;
-  try {
-    parsed = sanitizeJson(JSON.parse(body.toString()));
-  } catch {
-    res.writeHead(400, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ error: "Invalid JSON request body" }));
-    return;
-  }
-
-  const chatPayload = responsesRequestToChatCompletions(parsed, true);
-  const chatBody = Buffer.from(JSON.stringify(chatPayload));
-  const chatHeaders = {
-    ...reqHeaders,
-    accept: "text/event-stream",
-    "content-type": "application/json",
-    "content-length": chatBody.length,
-  };
-  const opts = {
-    hostname: runtime.upstreamUrl.hostname,
-    port: runtime.upstreamUrl.port || (runtime.upstreamUrl.protocol === "https:" ? 443 : 80),
-    path: buildUpstreamPath("/v1/chat/completions", runtime),
-    method: "POST",
-    headers: chatHeaders,
-    agent: runtime.agent,
-  };
-  const transport = runtime.upstreamUrl.protocol === "https:" ? https : http;
-
-  await new Promise((resolve) => {
-    let clientGone = !!clientState?.aborted;
-    let resolved = false;
-    let cleanupUpstream = () => {};
-    let cleanupClientAbort = () => {};
-    const responseId = `resp_${crypto.randomBytes(12).toString("hex")}`;
-    const createdAt = Math.floor(Date.now() / 1000);
-    let model = reqModel;
-    let buf = "";
-    let rawSample = "";
-    let sseDataLines = 0;
-	    let completed = false;
-	    const usage = { input_tokens: 0, output_tokens: 0 };
-	    const textParts = [];
-	    const outputItems = [];
-	    const toolCalls = new Map();
-	    let nextOutputIndex = 0;
-	    const messageItemId = "msg_0";
-	    let messageOutputIndex = null;
-	    let messageStarted = false;
-	    let messageDone = false;
-
-	    const buildMessageItem = (text, status = "in_progress") => ({
-	      id: messageItemId,
-	      type: "message",
-	      status,
-	      role: "assistant",
-	      content: [{ type: "output_text", text }],
-	    });
-	    const buildToolCallItem = (tool, status = "in_progress") => ({
-	      id: tool.itemId,
-	      type: "function_call",
-	      status,
-	      call_id: tool.callId,
-	      name: tool.name || "unknown",
-	      arguments: tool.arguments,
-	    });
-	    const ensureMessageItem = () => {
-	      if (messageStarted) return;
-	      messageStarted = true;
-	      messageOutputIndex = nextOutputIndex++;
-	      if (!clientGone) {
-	        writeSseEvent(res, "response.output_item.added", {
-	          type: "response.output_item.added",
-	          output_index: messageOutputIndex,
-	          item: buildMessageItem(""),
-	        });
-	        writeSseEvent(res, "response.content_part.added", {
-	          type: "response.content_part.added",
-	          item_id: messageItemId,
-	          output_index: messageOutputIndex,
-	          content_index: 0,
-	          part: { type: "output_text", text: "" },
-	        });
-	      }
-	    };
-	    const finishMessageItem = () => {
-	      if (!messageStarted || messageDone) return;
-	      messageDone = true;
-	      const outputText = textParts.join("");
-	      const messageItem = buildMessageItem(outputText, "completed");
-	      outputItems[messageOutputIndex] = messageItem;
-	      if (!clientGone) {
-	        writeSseEvent(res, "response.output_text.done", {
-	          type: "response.output_text.done",
-	          item_id: messageItemId,
-	          output_index: messageOutputIndex,
-	          content_index: 0,
-	          text: outputText,
-	        });
-	        writeSseEvent(res, "response.content_part.done", {
-	          type: "response.content_part.done",
-	          item_id: messageItemId,
-	          output_index: messageOutputIndex,
-	          content_index: 0,
-	          part: { type: "output_text", text: outputText },
-	        });
-	        writeSseEvent(res, "response.output_item.done", {
-	          type: "response.output_item.done",
-	          output_index: messageOutputIndex,
-	          item: messageItem,
-	        });
-	      }
-	    };
-	    const ensureToolCall = (call) => {
-	      const chatIndex = Number.isInteger(call?.index) ? call.index : toolCalls.size;
-	      const key = String(chatIndex);
-	      let tool = toolCalls.get(key);
-	      if (!tool) {
-	        const callId = call?.id || `call_${chatIndex}`;
-	        tool = {
-	          chatIndex,
-	          outputIndex: nextOutputIndex++,
-	          itemId: callId,
-	          callId,
-	          name: "",
-	          arguments: "",
-	          started: false,
-	          done: false,
-	        };
-	        toolCalls.set(key, tool);
-	      }
-	      if (call?.id && !tool.started) {
-	        tool.itemId = call.id;
-	        tool.callId = call.id;
-	      }
-	      if (call?.function?.name) tool.name = call.function.name;
-	      if (!tool.started) {
-	        tool.started = true;
-	        if (!clientGone) {
-	          writeSseEvent(res, "response.output_item.added", {
-	            type: "response.output_item.added",
-	            output_index: tool.outputIndex,
-	            item: buildToolCallItem(tool),
-	          });
-	        }
-	      }
-	      return tool;
-	    };
-	    const handleToolCallDelta = (call) => {
-	      if (!call || typeof call !== "object") return;
-	      const tool = ensureToolCall(call);
-	      const argDelta = typeof call.function?.arguments === "string" ? call.function.arguments : "";
-	      if (!argDelta) return;
-	      tool.arguments += argDelta;
-	      if (!clientGone) {
-	        writeSseEvent(res, "response.function_call_arguments.delta", {
-	          type: "response.function_call_arguments.delta",
-	          item_id: tool.itemId,
-	          output_index: tool.outputIndex,
-	          delta: argDelta,
-	        });
-	      }
-	    };
-	    const finishToolCalls = () => {
-	      for (const tool of [...toolCalls.values()].sort((a, b) => a.outputIndex - b.outputIndex)) {
-	        if (tool.done) continue;
-	        tool.done = true;
-	        const item = buildToolCallItem(tool, "completed");
-	        outputItems[tool.outputIndex] = item;
-	        if (!clientGone) {
-	          writeSseEvent(res, "response.function_call_arguments.done", {
-	            type: "response.function_call_arguments.done",
-	            item_id: tool.itemId,
-	            output_index: tool.outputIndex,
-	            arguments: tool.arguments,
-	          });
-	          writeSseEvent(res, "response.output_item.done", {
-	            type: "response.output_item.done",
-	            output_index: tool.outputIndex,
-	            item,
-	          });
-	        }
-	      }
-	    };
-
-	    const safeResolve = () => {
-	      if (!resolved) {
-	        resolved = true;
-        cleanupClientAbort();
-        cleanupUpstream();
-        resolve();
-      }
-    };
-	    const finishStream = () => {
-	      if (completed) return;
-	      completed = true;
-	      const outputText = textParts.join("");
-	      const responseUsage = usageToResponsesUsage(usage);
-	      if (!messageStarted && toolCalls.size === 0) ensureMessageItem();
-	      finishMessageItem();
-	      finishToolCalls();
-	      const finalOutput = outputItems.filter(Boolean);
-	      if (!clientGone) {
-	        writeSseEvent(res, "response.completed", {
-	          type: "response.completed",
-	          response: {
-	            id: responseId,
-            object: "response",
-	            created_at: createdAt,
-	            status: "completed",
-	            model,
-	            output: finalOutput,
-	            output_text: outputText,
-	            usage: responseUsage,
-	          },
-	        });
-      }
-      if (usageHasTokens(responseUsage)) {
-        recordUsage(apiKey, responseUsage, model, suffix, runtime);
-        console.log(`[Token] ${getUserName(apiKey, runtime)} [${reqSource}] model=${model} 输入=${responseUsage.input_tokens || 0} 输出=${responseUsage.output_tokens || 0} responses→chat`);
-      } else {
-        console.log(`[响应] ${getUserName(apiKey, runtime)} adapter 流结束 无usage数据 model=${model} sse行数=${sseDataLines} 原始数据[0:200]=${rawSample.slice(0, 200).replace(/\n/g, "\\n")}`);
-      }
-      if (!clientGone) res.end();
-      safeResolve();
-    };
-
-    const upReq = transport.request(opts, (upRes) => {
-      if (upRes.statusCode >= 400) {
-        const h = { ...upRes.headers };
-        delete h["transfer-encoding"];
-        delete h["content-encoding"];
-        delete h["content-length"];
-        res.writeHead(upRes.statusCode, h);
-        let errBuf = "";
-        upRes.on("data", (c) => {
-          if (clientGone) return;
-          errBuf += c.toString();
-          res.write(c);
-        });
-        upRes.on("end", () => {
-          recordError(apiKey, upRes.statusCode, errBuf.slice(0, 200), req.url, reqModel, suffix, runtime);
-          if (upRes.statusCode >= 500) runtime.breaker.recordFailure();
-          else runtime.breaker.recordSuccess();
-          if (!clientGone) res.end();
-          safeResolve();
-        });
-        return;
-      }
-
-      runtime.breaker.recordSuccess();
-      res.writeHead(upRes.statusCode, {
-        "content-type": "text/event-stream",
-        "cache-control": "no-cache",
-        "connection": "keep-alive",
-      });
-	      writeSseEvent(res, "response.created", {
-	        type: "response.created",
-	        response: {
-	          id: responseId,
-          object: "response",
-          created_at: createdAt,
-          status: "in_progress",
-          model,
-	          output: [],
-	        },
-	      });
-
-	      res.on("error", () => {
-	        clientGone = true;
-        upReq.destroy(makeClientAbortError("response-error"));
-        safeResolve();
-      });
-
-      const handleDataLine = (jsonStr) => {
-        if (jsonStr === "[DONE]") {
-          finishStream();
-          return;
-        }
-        sseDataLines++;
-        let d;
-        try {
-          d = JSON.parse(jsonStr);
-        } catch {
-          return;
-        }
-        if (sseDataLines <= 3) console.log(`[SSE] ${getUserName(apiKey, runtime)} adapter 第${sseDataLines}条 类型=${d.object || d.type || "chunk"} 字段=${Object.keys(d).join(",")}`);
-        if (d.model) model = d.model;
-	        if (d.usage) mergeUsageCounters(usage, d.usage);
-	        for (const choice of d.choices || []) {
-	          const delta = choice.delta || {};
-	          if (typeof delta.content === "string" && delta.content) {
-	            ensureMessageItem();
-	            textParts.push(delta.content);
-	            if (!clientGone) {
-	              writeSseEvent(res, "response.output_text.delta", {
-	                type: "response.output_text.delta",
-	                item_id: messageItemId,
-	                output_index: messageOutputIndex,
-	                content_index: 0,
-	                delta: delta.content,
-	              });
-	            }
-	          }
-	          for (const call of delta.tool_calls || []) {
-	            handleToolCallDelta(call);
-	          }
-	          if (choice.message?.content) {
-	            const text = extractTextContent(choice.message.content);
-	            if (text) {
-	              ensureMessageItem();
-	              textParts.push(text);
-	            }
-	          }
-	        }
-	      };
-
-      upRes.on("data", (chunk) => {
-        if (clientGone || completed) return;
-        const text = chunk.toString();
-        if (rawSample.length < 500) rawSample += text;
-        buf += text;
-        const lines = buf.split("\n");
-        buf = lines.pop() || "";
-        for (const line of lines) {
-          if (!line.trim()) continue;
-          if (!line.startsWith("data:")) continue;
-          handleDataLine(line.slice(5).trim());
-        }
-      });
-
-      upRes.on("end", () => {
-        if (completed) return;
-        if (buf.trim().startsWith("data:")) {
-          handleDataLine(buf.trim().slice(5).trim());
-        }
-        finishStream();
-      });
-    });
-    cleanupUpstream = setActiveUpstreamRequest(clientState, upReq);
-    cleanupClientAbort = addClientAbortListener(clientState, (reason) => {
-      clientGone = true;
-      upReq.destroy(makeClientAbortError(reason));
-      safeResolve();
-    });
-
-    upReq.setTimeout(timeout, () => {
-      upReq.destroy(new Error(`Upstream stream timeout (${timeout}ms)`));
-    });
-    upReq.on("error", (err) => {
-      if (isClientAbortError(err) || clientState?.aborted) {
-        console.log(`[取消] ${getUserName(apiKey, runtime)} adapter 流式客户端断开 model=${reqModel}`);
-        safeResolve();
-        return;
-      }
-      runtime.breaker.recordFailure();
-      const isTimeout = err.message.includes("timeout");
-      const status = isTimeout ? 504 : 502;
-      const label = isTimeout ? "Gateway Timeout" : "Bad Gateway";
-      recordError(apiKey, status, `${label}: ${err.message}`, req.url, reqModel, suffix, runtime);
-      if (!res.headersSent && !clientGone) {
-        res.writeHead(status, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: `Proxy ${label}. Please try again later.` }));
-      } else if (!clientGone && !completed) {
-        finishStream();
-      }
-      safeResolve();
-    });
-
-    upReq.write(chatBody);
-    upReq.end();
   });
 }
 
@@ -3121,15 +2439,9 @@ function getPublicSettings() {
   const defaultProfile = config.profiles[getDefaultProfileName()];
   return {
     upstream: defaultProfile?.upstream || "",
-    apiProtocol: normalizeApiProtocol(defaultProfile?.apiProtocol),
     proxy: { ...gProxy },
     allowedModels: defaultProfile?.allowedModels || [],
-    defaultModels: { ...(defaultProfile?.defaultModels || {}) },
     modelAliases: getConfigurableModelAliases(defaultProfile || {}),
-    openaiStreamUsage: defaultProfile?.openaiStreamUsage !== false,
-    responsesAdapter: normalizeApiProtocol(defaultProfile?.apiProtocol) === "openai"
-      ? normalizeResponsesAdapter(defaultProfile?.responsesAdapter)
-      : "none",
     profileUsers: profileAssignments[defaultSuffix] || {},
     profileAssignments,
     globalUsers,
@@ -3147,7 +2459,7 @@ function getPublicSettings() {
 // ─── Settings Page HTML ──────────────────────────────────────────────────────
 function settingsHtml(errorMsg) {
   const s = getPublicSettings();
-  const errDiv = errorMsg ? `<div style="background:rgba(255,56,96,.12);color:var(--red);padding:10px 14px;border-radius:6px;margin-bottom:16px;font-size:13px">${errorMsg}</div>` : "";
+  const errDiv = errorMsg ? `<div style="background:#fff2f0;color:var(--red);border:1px solid #f1c8c2;padding:10px 14px;border-radius:6px;margin-bottom:16px;font-size:13px">${errorMsg}</div>` : "";
 
   // Global users table rows
   const initialSuffix = s.selectedProfileSuffix || getDefaultProfileSuffix();
@@ -3162,9 +2474,9 @@ function settingsHtml(errorMsg) {
     return `<tr>
 <td><code style="font-size:11px;color:var(--accent);user-select:all;cursor:pointer" title="点击复制" onclick="navigator.clipboard.writeText('${escJs(k)}')">${escHtml(k)}</code></td>
 <td><input type="text" name="gu_un_${escHtml(k)}" value="${escHtml(username)}" style="width:100%;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:4px 8px;border-radius:4px;font-size:12px" placeholder="用户名"></td>
-<td><input type="datetime-local" name="gu_ex_${escHtml(k)}" value="${escHtml(expiresAt)}" style="width:100%;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:3px 6px;border-radius:4px;font-size:11px;font-family:monospace;color-scheme:dark" title="留空=永不过期"></td>
+<td><input type="datetime-local" name="gu_ex_${escHtml(k)}" value="${escHtml(expiresAt)}" onclick="openDateTimePicker(this)" style="width:100%;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:3px 6px;border-radius:4px;font-size:11px;font-family:monospace" title="留空=永不过期"></td>
 <td><label style="display:inline-flex;align-items:center;gap:4px;margin:0;cursor:pointer"><input type="checkbox" name="gu_dis_${escHtml(k)}" ${disabled ? "checked" : ""} style="width:auto;accent-color:var(--red)"><span style="font-size:11px;color:${disabled ? "var(--red)" : "var(--dim)"}">${disabled ? "已禁用" : "正常"}</span></label></td>
-<td><button type="button" onclick="deleteGlobalUser('${escJs(k)}')" style="background:rgba(255,56,96,.15);color:var(--red);border:none;padding:2px 8px;border-radius:4px;cursor:pointer;font-size:11px">删除</button></td></tr>`;
+<td><button type="button" onclick="deleteGlobalUser('${escJs(k)}')" style="background:#fff2f0;color:var(--red);border:1px solid #f1c8c2;padding:2px 8px;border-radius:4px;cursor:pointer;font-size:11px">删除</button></td></tr>`;
   }).join("");
 
   // Profile user rows (key assignment)
@@ -3185,104 +2497,88 @@ function settingsHtml(errorMsg) {
 <td><label style="display:inline-flex;align-items:center;gap:4px;margin:0;cursor:pointer"><input type="checkbox" name="pu_dis_${escHtml(k)}" ${profileDisabled ? "checked" : ""} style="width:auto;accent-color:var(--orange)"><span style="font-size:11px;color:${profileDisabled ? "var(--orange)" : "var(--dim)"}">${profileDisabled ? "已禁用" : "正常"}</span></label></td></tr>`;
   }).join("");
 
-  const dm = s.defaultModels || {};
   const aliasesText = formatModelAliasesInput(s.modelAliases || {});
   const settingsJson = JSON.stringify(s).replace(/</g, "\\x3c");
 
   return `<!DOCTYPE html>
 <html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
-<title>代理设置 - 团队AI Coding监控</title>
-${PIXEL_FONT}
+<title>设置 - CC Team</title>
 <style>
-${PIXEL_THEME}
+${UI_THEME}
 body{padding:0;overflow:hidden;height:100vh}
 .layout{display:flex;height:100vh}
-.sidebar{width:240px;min-width:240px;background:var(--card);border-right:1px solid var(--border);display:flex;flex-direction:column;overflow:hidden}
-.sidebar-hd{padding:16px 14px 10px;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between}
-.sidebar-hd h1{font-size:16px;margin:0;white-space:nowrap}
-.sidebar-hd a{color:var(--dim);font-size:11px;text-decoration:none}
-.sidebar-hd a:hover{color:var(--accent)}
-.sidebar-list{flex:1;overflow-y:auto;padding:8px}
-.sidebar-list::-webkit-scrollbar{width:4px}
-.sidebar-list::-webkit-scrollbar-thumb{background:var(--border);border-radius:2px}
-.sidebar-ft{padding:10px;border-top:1px solid var(--border)}
-.pl-item{background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:10px 12px;margin-bottom:8px;position:relative;transition:border-color .15s}
-.pl-item:hover{border-color:var(--dim)}
-.pl-item.active{border-color:var(--accent);background:rgba(0,229,255,.08)}
-.pl-name{font-size:14px;font-weight:600;margin-bottom:2px}
-.pl-host{font-size:11px;color:var(--dim);font-family:monospace;word-break:break-all;margin-bottom:2px}
+.sidebar{width:260px;min-width:260px;background:var(--surface);border-right:1px solid var(--border);display:flex;flex-direction:column;overflow:hidden}
+.sidebar-hd{min-height:64px;padding:16px 18px;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between;gap:12px}
+.sidebar-hd h1{font-size:17px;font-weight:650;white-space:nowrap}
+.sidebar-hd a{color:var(--dim);font-size:12px;text-decoration:none;white-space:nowrap}
+.sidebar-hd a:hover{color:var(--text)}
+.sidebar-list{flex:1;overflow-y:auto;padding:12px}
+.sidebar-global{padding:10px 12px;border-top:1px solid var(--border);background:var(--surface)}
+.sidebar-tool{display:block;width:100%;margin:0;text-align:left;font-family:var(--font-body)}
+.sidebar-tool .pl-name,.sidebar-tool .pl-users{display:block}.sidebar-tool .pl-name{padding-right:0}
+.sidebar-ft{padding:12px;border-top:1px solid var(--border);background:var(--surface)}
+.pl-item{background:transparent;border:1px solid transparent;border-radius:6px;padding:11px 12px;margin-bottom:4px;position:relative;cursor:pointer}
+.pl-item:hover{background:var(--surface-subtle)}
+.pl-item.active{border-color:var(--border);background:var(--accent-soft)}
+.pl-name{font-size:13px;font-weight:600;margin-bottom:3px;padding-right:74px}
+.pl-host{font-size:11px;color:var(--dim);font-family:var(--font-mono);word-break:break-all;margin-bottom:3px}
 .pl-users{font-size:11px;color:var(--dim)}
-.pl-actions{display:none;position:absolute;top:8px;right:8px;gap:4px}
-.pl-item:hover .pl-actions{display:flex}
-.pl-item.active .pl-actions{display:flex}
-.pl-activate{font-size:10px;padding:2px 8px;border-radius:4px;border:1px solid var(--accent);background:rgba(0,229,255,.15);color:var(--accent);cursor:pointer;white-space:nowrap}
-.pl-activate:hover{background:var(--accent);color:#fff}
-.pl-delete{font-size:12px;padding:1px 6px;border:none;background:none;color:var(--dim);cursor:pointer;border-radius:3px}
-.pl-delete:hover{background:rgba(255,56,96,.15);color:var(--red)}
-.pl-badge{font-size:10px;padding:2px 8px;border-radius:4px;background:rgba(0,229,255,.2);color:var(--accent);white-space:nowrap}
-.main{flex:1;overflow-y:auto;padding:20px 28px}
-.main::-webkit-scrollbar{width:6px}
-.main::-webkit-scrollbar-thumb{background:var(--border);border-radius:3px}
-.main h2{font-size:14px;margin:20px 0 10px;padding-bottom:8px;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between}
+.pl-actions{display:none;position:absolute;top:8px;right:8px;gap:3px}
+.pl-item:hover .pl-actions,.pl-item.active .pl-actions{display:flex}
+.pl-activate,.pl-delete{font-size:10px;padding:3px 7px;border-radius:4px;border:1px solid var(--border);background:var(--surface);color:var(--dim);cursor:pointer;white-space:nowrap}
+.pl-activate:hover{border-color:var(--accent);color:var(--accent)}
+.pl-delete:hover{border-color:#e5b8b2;color:var(--red);background:#fff5f3}
+.pl-badge{font-size:10px;padding:2px 7px;border-radius:4px;background:var(--accent-soft);color:var(--accent);white-space:nowrap}
+.main{flex:1;overflow-y:auto;padding:28px clamp(24px,4vw,56px);scrollbar-gutter:stable}
+.main form,#dataManagementView{max-width:1180px;margin:0 auto}
+#settingsForm{padding-bottom:72px}
+.view-intro{margin-bottom:24px}.view-intro h2{margin-bottom:7px}.view-intro p{color:var(--dim);font-size:12px;line-height:1.65}
+.main h2{font-size:16px;font-weight:650;margin:30px 0 10px;padding-bottom:10px;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between}
 .main h2:first-of-type{margin-top:0}
-.section{position:relative;background:var(--card);border:2px solid var(--border);padding:16px;margin-bottom:12px}
-.section::before{content:"";position:absolute;top:0;left:0;right:0;height:2px;background:linear-gradient(90deg,var(--accent),var(--magenta),transparent)}
-label{display:block;font-size:12px;color:var(--dim);margin-bottom:4px;margin-top:10px}
+.section{background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:18px;margin-bottom:14px}
+label{display:block;font-size:12px;font-weight:550;color:#4f4f4a;margin-bottom:5px;margin-top:12px}
 label:first-child{margin-top:0}
-input,select,textarea{width:100%;padding:8px 12px;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:13px;font-family:monospace;outline:none}
+input,select,textarea{width:100%;padding:9px 11px;background:var(--surface);border:1px solid var(--border-strong);border-radius:5px;color:var(--text);font-size:13px;font-family:var(--font-mono);outline:none}
+input:hover,select:hover,textarea:hover{border-color:#aaa9a2}
 input:focus,select:focus,textarea:focus{border-color:var(--accent)}
-.row{display:grid;grid-template-columns:1fr 1fr;gap:12px}
-.row3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px}
-.btn{padding:8px 20px;border:none;border-radius:6px;font-size:13px;cursor:pointer;font-weight:600}
-.btn-primary{background:var(--accent);color:#fff}
-.btn-primary:hover{opacity:.9}
-.btn-danger{background:rgba(255,56,96,.15);color:var(--red)}
-.btn-danger:hover{background:rgba(255,56,96,.25)}
-.btn-outline{background:transparent;border:1px solid var(--border);color:var(--text)}
-.btn-outline:hover{background:rgba(255,255,255,.04)}
-.btn-sm{padding:4px 12px;font-size:11px}
-.actions{margin-top:16px;display:flex;gap:8px;justify-content:flex-end;padding-bottom:40px}
+input[type=checkbox]{accent-color:var(--accent)}
+input[type=datetime-local]{color-scheme:light;cursor:pointer}
+.row{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+.row3{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px}
+.btn{padding:8px 15px;border:1px solid transparent;border-radius:5px;font-size:12px;cursor:pointer;font-weight:600}
+.btn-primary{background:var(--text);color:#fff}.btn-primary:hover{background:#33332f}
+.btn-danger{background:#fff2f0;color:var(--red);border-color:#f1c8c2}.btn-danger:hover{background:#ffe8e5}
+.btn-outline{background:var(--surface);border-color:var(--border);color:var(--text)}.btn-outline:hover{background:var(--surface-subtle);border-color:var(--border-strong)}
+.btn-sm{padding:5px 10px;font-size:11px}
+.actions{position:fixed;left:260px;right:0;bottom:0;margin:0;padding:12px clamp(24px,4vw,56px) calc(12px + env(safe-area-inset-bottom));display:flex;gap:8px;justify-content:flex-end;background:rgba(255,255,255,.96);border-top:1px solid var(--border);backdrop-filter:blur(8px);z-index:40}
 table{width:100%;border-collapse:collapse;margin-top:8px}
-th{text-align:left;padding:6px 8px;font-size:11px;color:var(--dim);border-bottom:1px solid var(--border)}
-td{padding:6px 8px;border-bottom:1px solid var(--border);font-size:12px}
-.status{display:inline-block;padding:2px 8px;border-radius:4px;font-size:11px}
-.status-ok{background:rgba(0,255,136,.15);color:var(--green)}
-.status-warn{background:rgba(255,159,28,.15);color:var(--orange)}
-.status-err{background:rgba(255,56,96,.15);color:var(--red)}
-.note{font-size:11px;color:var(--dim);margin-top:6px}
-.presets{display:flex;gap:6px;flex-wrap:wrap;margin-top:6px}
-.preset{font-size:11px;padding:4px 10px;border-radius:4px;border:1px solid var(--border);background:var(--bg);color:var(--dim);cursor:pointer;font-family:monospace}
-.preset:hover{border-color:var(--accent);color:var(--text)}
+th{text-align:left;padding:8px;font-size:11px;font-weight:600;color:var(--dim);border-bottom:1px solid var(--border);white-space:nowrap}
+td{padding:8px;border-bottom:1px solid #ecece8;font-size:12px}
+.status{display:inline-flex;align-items:center;padding:3px 8px;border-radius:4px;font-size:11px;font-weight:550}
+.status-ok{background:var(--accent-soft);color:var(--green)}.status-warn{background:#fbf3db;color:var(--orange)}.status-err{background:#fdebec;color:var(--red)}
+.note{font-size:11px;color:var(--dim);margin-top:7px;line-height:1.55}
+.import-tools{display:flex;align-items:end;gap:10px;flex-wrap:wrap}.import-tools>div{flex:1;min-width:220px}.import-tools .btn{margin-bottom:1px}
+.import-preview{display:none;margin-top:14px;padding-top:14px;border-top:1px solid var(--border)}.import-preview.open{display:block}
+.import-summary{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px;margin-bottom:12px}.import-stat{padding:10px;background:var(--surface-subtle);border-radius:5px}.import-stat b{display:block;font-size:16px;font-variant-numeric:tabular-nums}.import-stat span{font-size:10px;color:var(--dim)}
+.mapping-row{display:grid;grid-template-columns:minmax(120px,1fr) 28px minmax(180px,1fr);align-items:center;gap:8px;margin-top:7px}.mapping-arrow{text-align:center;color:var(--dim)}
+.danger-section{border-color:#efc9c4;background:#fffdfc}.danger-copy{display:flex;align-items:center;justify-content:space-between;gap:18px}.danger-copy strong{display:block;font-size:13px;color:var(--red);margin-bottom:3px}
+.inline-status{min-height:18px;margin-top:9px;font-size:11px;color:var(--dim)}.inline-status.error{color:var(--red)}.inline-status.ok{color:var(--green)}
+.presets{display:flex;gap:6px;flex-wrap:wrap;margin-top:8px}
+.preset{font-size:11px;padding:5px 9px;border-radius:4px;border:1px solid var(--border);background:var(--surface);color:var(--dim);cursor:pointer;font-family:var(--font-body)}
+.preset:hover{border-color:var(--border-strong);background:var(--surface-subtle);color:var(--text)}
 .req{color:var(--red);font-size:10px;margin-left:4px}
-.modal-overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:100;justify-content:center;align-items:center}
+.modal-overlay{display:none;position:fixed;inset:0;background:rgba(24,24,22,.35);z-index:100;justify-content:center;align-items:center;padding:20px}
 .modal-overlay.open{display:flex}
-.modal{background:var(--card);border:1px solid var(--border);border-radius:12px;width:90%;max-width:1100px;max-height:80vh;display:flex;flex-direction:column;box-shadow:0 20px 60px rgba(0,0,0,.5)}
+.modal{background:var(--surface);border:1px solid var(--border);border-radius:8px;width:90%;max-width:1100px;max-height:82vh;display:flex;flex-direction:column;box-shadow:0 18px 48px rgba(24,24,22,.12)}
 .modal-hd{padding:16px 20px;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between}
-.modal-hd h3{font-size:15px;margin:0}
-.modal-close{background:none;border:none;color:var(--dim);font-size:20px;cursor:pointer;padding:0 4px;line-height:1}
-.modal-close:hover{color:var(--text)}
-.modal-body{padding:16px 20px;overflow-y:auto;flex:1}
-.modal-body::-webkit-scrollbar{width:4px}
-.modal-body::-webkit-scrollbar-thumb{background:var(--border);border-radius:2px}
-@media(max-width:768px){.layout{flex-direction:column}.sidebar{width:100%;min-width:0;max-height:200px}.row3{grid-template-columns:1fr 1fr}}
-.pl-item,.section,.modal,.preset,.btn,input,select,textarea{border-radius:0!important}/*pixel: force sharp corners over inline modal styles*/
-.sidebar{border-right:2px solid var(--accent);box-shadow:var(--glow)}
-.sidebar-hd h1{font-family:var(--font-pixel);font-size:11px;color:var(--accent);letter-spacing:1px}
-.sidebar-hd a{font-family:'VT323',monospace;font-size:14px}
-.main h2{font-family:var(--font-pixel);font-size:11px;border-bottom:2px solid var(--accent);color:var(--text);letter-spacing:1px}
-.modal{border:2px solid var(--accent);box-shadow:8px 8px 0 0 var(--accent),var(--glow)}
-.modal-hd h3{font-family:var(--font-pixel);font-size:12px;color:var(--accent);letter-spacing:1px}
-.btn-primary{color:var(--bg);box-shadow:4px 4px 0 0 var(--magenta);transition:transform .08s,box-shadow .08s}
-.btn-primary:hover{transform:translate(-2px,-2px);box-shadow:6px 6px 0 0 var(--magenta);opacity:1}
-.btn-primary:active{transform:translate(2px,2px);box-shadow:1px 1px 0 0 var(--magenta)}
-input,select,textarea{font-family:'VT323',monospace;font-size:14px;letter-spacing:1px}
-input:focus,select:focus,textarea:focus{box-shadow:var(--glow)}
-label,.note,.pl-host,.pl-users,.preset,.status{font-family:'VT323',monospace}
-.pl-host,.preset{letter-spacing:.5px}
-</style></head><body>
+.modal-hd h3{font-size:15px;font-weight:650}.modal-close{background:none;border:none;color:var(--dim);font-size:12px;cursor:pointer;padding:5px 7px}.modal-close:hover{color:var(--text);background:var(--surface-subtle)}
+.modal-body{padding:18px 20px;overflow-y:auto;flex:1}
+@media(max-width:900px){.row3{grid-template-columns:1fr 1fr}.main{padding:24px}}
+@media(max-width:680px){body{overflow:auto;height:auto}.layout{flex-direction:column;height:auto;min-height:100vh}.sidebar{width:100%;min-width:0;max-height:none;border-right:0;border-bottom:1px solid var(--border)}.sidebar-list{display:flex;gap:6px;overflow-x:auto}.sidebar-global{padding:8px 12px}.sidebar-tool{min-width:0}.pl-item{min-width:210px;margin:0}.main{overflow:visible;padding:22px 16px}.actions{left:0;padding-left:16px;padding-right:16px}.row,.row3{grid-template-columns:1fr}.modal{width:100%;max-height:90vh}.section{padding:15px;overflow-x:auto}.import-summary{grid-template-columns:1fr 1fr}.mapping-row{grid-template-columns:1fr}.mapping-arrow{display:none}.danger-copy{align-items:flex-start;flex-direction:column}}
+</style></head><body data-theme="editorial-light">
 <div class="layout">
 <div class="sidebar">
-<div class="sidebar-hd"><h1>配置方案</h1><a href="/dashboard">← 面板</a></div>
+<div class="sidebar-hd"><h1>配置方案</h1><a href="/dashboard">返回面板</a></div>
 <div class="sidebar-list">${s.profiles.map(p => {
     const host = p.upstream.replace(/^https?:\/\//, "").replace(/\/.*/, "");
     const suffixLabel = '<span style="color:var(--accent);font-size:10px">/'+ escHtml(p.suffix)+'</span>' + (p.isDefault ? ' <span style="color:var(--green);font-size:10px">默认入口</span>' : '');
@@ -3292,10 +2588,11 @@ label,.note,.pl-host,.pl-users,.preset,.status{font-family:'VT323',monospace}
 <div class="pl-users">${p.userCount}位用户</div>
 <div class="pl-actions">
   ${!p.isDefault ? '<button class="pl-activate" onclick="event.stopPropagation();setDefaultProfile(\'' + escJs(p.name) + '\')">设为默认</button>' : ''}
-  ${!p.isDefault ? '<button class="pl-delete" onclick="event.stopPropagation();deleteProfile(\'' + escJs(p.name) + '\')">×</button>' : ''}
+  ${!p.isDefault ? '<button class="pl-delete" onclick="event.stopPropagation();deleteProfile(\'' + escJs(p.name) + '\')">删除</button>' : ''}
 </div></div>`;
   }).join("")}</div>
-<div class="sidebar-ft" style="display:flex;gap:6px"><button class="btn btn-outline btn-sm" onclick="openUserModal()" style="flex:1">用户管理</button><button class="btn btn-outline btn-sm" onclick="openProfileModal()" style="flex:1">+ 新增方案</button></div>
+<div class="sidebar-global"><button type="button" class="pl-item sidebar-tool" id="dataManagementNav" onclick="openDataManagementView()"><span class="pl-name">全局数据管理</span><span class="pl-users">导入、备份与清空</span></button></div>
+<div class="sidebar-ft" style="display:flex;gap:6px"><button class="btn btn-outline btn-sm" onclick="openUserModal()" style="flex:1">用户管理</button><button class="btn btn-outline btn-sm" onclick="openProfileModal()" style="flex:1">新增方案</button></div>
 </div>
 <div class="main">
 ${errDiv}
@@ -3304,62 +2601,34 @@ ${errDiv}
 <input type="hidden" name="profileName" id="profileNameInput" value="${escHtml(initialProfile.name || "")}">
 <input type="hidden" name="profileSuffix" id="profileSuffixInput" value="${escHtml(initialSuffix)}">
 
-<h2>上游代理 <span class="status ${s.circuitBreaker.state === 'CLOSED' ? 'status-ok' : s.circuitBreaker.state === 'HALF_OPEN' ? 'status-warn' : 'status-err'}">${s.circuitBreaker.state === 'CLOSED' ? '正常' : s.circuitBreaker.state === 'HALF_OPEN' ? '探测中' : '熔断中'}</span></h2>
+<h2>上游代理 <span class="status ${s.circuitBreaker.state === 'CLOSED' ? 'status-ok' : s.circuitBreaker.state === 'OPEN' ? 'status-err' : 'status-warn'}">${s.circuitBreaker.state === 'CLOSED' ? '正常' : s.circuitBreaker.state === 'HALF_OPEN' ? '探测中' : s.circuitBreaker.state === 'OPEN' ? '熔断中' : '未配置'}</span></h2>
 <div class="section">
-<div class="row3">
-<div><label>接口协议<span class="req">*</span></label><select name="apiProtocol" id="apiProtocolSelect" onchange="updateProtocolFields()"><option value="anthropic" ${s.apiProtocol === "anthropic" ? "selected" : ""}>Anthropic / Claude Code</option><option value="openai" ${s.apiProtocol === "openai" ? "selected" : ""}>OpenAI-compatible / Codex</option></select></div>
+<div class="row">
 <div><label>上游 API 地址<span class="req">*</span></label><input type="text" name="upstream" value="${s.upstream}" placeholder="https://open.bigmodel.cn/api/anthropic"></div>
 <div><label>URL 后缀 <span style="font-size:11px;color:var(--dim);font-weight:400">(所有方案必填)</span></label><input type="text" name="suffix" id="suffixInput" value="${escHtml(initialSuffix)}" placeholder="如: glm" oninput="updateAccessUrl()"></div>
-</div>
-<label style="display:flex;align-items:center;gap:6px;margin-top:12px"><input type="checkbox" name="openaiStreamUsage" id="openaiStreamUsageInput" ${s.openaiStreamUsage ? "checked" : ""} style="width:auto"> OpenAI 流式请求自动请求 usage 统计</label>
-<div id="responsesAdapterRow" style="margin-top:12px">
-<label>Responses 兼容模式</label>
-<select name="responsesAdapter" id="responsesAdapterSelect" onchange="updateAccessUrl()">
-  <option value="none" ${s.responsesAdapter === "none" ? "selected" : ""}>透明转发 /v1/responses</option>
-  <option value="chat_completions" ${s.responsesAdapter === "chat_completions" ? "selected" : ""}>将 /v1/responses 转为 /v1/chat/completions</option>
-</select>
-<div class="note">所有 OpenAI 方案的 /v1/models 都由本平台按允许模型列表本地返回，避免客户端探测打到上游。上游只有 Chat Completions、没有 Responses 端点时启用此兼容模式。</div>
 </div>
 <div class="note" id="accessUrlPreview" style="margin-top:8px;color:var(--green)">接入地址: http://&lt;host&gt;:6789/v1</div>
 <div class="presets">
   <span style="font-size:11px;color:var(--dim);line-height:24px">快速填充：</span>
-  <button type="button" class="preset" onclick="fillUpstream('anthropic','https://open.bigmodel.cn/api/anthropic')">智谱 GLM Anthropic</button>
-  <button type="button" class="preset" onclick="fillUpstream('anthropic','https://api.anthropic.com')">Anthropic</button>
-  <button type="button" class="preset" onclick="fillUpstream('openai','https://api.openai.com/v1')">OpenAI</button>
-  <button type="button" class="preset" onclick="fillUpstream('anthropic','https://api.deepseek.com/anthropic')">DeepSeek Anthropic</button>
-  <button type="button" class="preset" onclick="fillUpstream('openai','https://api.deepseek.com/v1')">DeepSeek OpenAI</button>
-  <button type="button" class="preset" onclick="fillUpstream('openai','https://dashscope.aliyuncs.com/compatible-mode/v1')">阿里百炼 OpenAI</button>
-  <button type="button" class="preset" onclick="fillUpstream('openai','https://coding.dashscope.aliyuncs.com/v1','chat_completions')">阿里 Coding OpenAI</button>
-  <button type="button" class="preset" onclick="fillUpstream('anthropic','https://token-plan.cn-beijing.maas.aliyuncs.com/apps/anthropic')">阿里Token Plan</button>
+  <button type="button" class="preset" onclick="fillUpstream('https://open.bigmodel.cn/api/anthropic')">智谱 GLM</button>
+  <button type="button" class="preset" onclick="fillUpstream('https://api.anthropic.com')">Anthropic</button>
+  <button type="button" class="preset" onclick="fillUpstream('https://api.deepseek.com/anthropic')">DeepSeek</button>
+  <button type="button" class="preset" onclick="fillUpstream('https://token-plan.cn-beijing.maas.aliyuncs.com/apps/anthropic')">阿里 Token Plan</button>
 </div>
-<div class="note" style="margin-top:8px">状态：${s.circuitBreaker.state === 'CLOSED' ? '正常运行' : s.circuitBreaker.state === 'HALF_OPEN' ? '探测恢复中...' : '熔断中(' + Math.ceil(s.circuitBreaker.cooldownRemaining / 1000) + 's)'} | 失败 ${s.circuitBreaker.failureCount} | 成功 ${s.circuitBreaker.totalSuccesses} | 失败 ${s.circuitBreaker.totalFailures}</div>
+<div class="note" style="margin-top:8px">状态：${s.circuitBreaker.state === 'CLOSED' ? '正常运行' : s.circuitBreaker.state === 'HALF_OPEN' ? '探测恢复中' : s.circuitBreaker.state === 'OPEN' ? '熔断中(' + Math.ceil(s.circuitBreaker.cooldownRemaining / 1000) + 's)' : '等待配置上游'} | 失败 ${s.circuitBreaker.failureCount} | 成功 ${s.circuitBreaker.totalSuccesses} | 失败 ${s.circuitBreaker.totalFailures}</div>
 </div>
 
-<h2><span id="modelConfigTitle">模型配置</span> <span id="modelConfigHint" style="font-size:11px;color:var(--dim);font-weight:400"></span></h2>
+<h2>模型别名</h2>
 <div class="section">
-<div id="anthropicAliasFields">
-<div class="row3">
-<div><label>jx-sonnet → 实际模型<span class="req">*</span></label><input type="text" name="defaultModels_sonnet" value="${dm.sonnet || ''}" placeholder="如: deepseek-v4-pro"></div>
-<div><label>jx-opus → 实际模型<span class="req">*</span></label><input type="text" name="defaultModels_opus" value="${dm.opus || ''}" placeholder="如: deepseek-v4-pro"></div>
-<div><label>jx-haiku → 实际模型<span class="req">*</span></label><input type="text" name="defaultModels_haiku" value="${dm.haiku || ''}" placeholder="如: deepseek-v4-flash"></div>
-</div>
+<label>通用模型别名 (每行 alias=实际模型，可选)</label>
+<textarea name="modelAliases" id="modelAliasesInput" rows="5" placeholder="jx-sonnet=glm-5.1&#10;jx-opus=glm-5.1&#10;jx-haiku=glm-5.1">${escHtml(aliasesText)}</textarea>
+<div class="note">Claude Code 使用的 jx-sonnet、jx-opus、jx-haiku 与其他自定义别名都在此统一配置。留空表示直接使用请求中的模型名。</div>
 <div class="presets">
   <span style="font-size:11px;color:var(--dim);line-height:24px">快速填充：</span>
-  <button type="button" class="preset" onclick="fillDefaults('deepseek-v4-pro','deepseek-v4-pro','deepseek-v4-flash')">DeepSeek</button>
-  <button type="button" class="preset" onclick="fillDefaults('claude-sonnet-4-6','claude-opus-4-5','claude-haiku-4-5')">Anthropic Claude</button>
-  <button type="button" class="preset" onclick="fillDefaults('glm-5.1','glm-5.1','glm-5.1')">智谱 GLM</button>
-  <button type="button" class="preset" onclick="fillDefaults('qwen-max','qwen-max','qwen-plus')">通义千问</button>
-</div>
-</div>
-<div id="openaiModelFields" style="display:none">
-<div class="note" style="margin-top:0;color:var(--green)">Codex/OpenAI 请求会携带真实 model，网关不需要配置 sonnet/opus/haiku 三档模型。下方只需要放行真实模型；模型别名是可选项。</div>
-</div>
-<label id="modelAliasesLabel">可选模型别名（每行 alias=实际模型）</label>
-<textarea name="modelAliases" id="modelAliasesInput" rows="4" placeholder="codex-main=gpt-5&#10;codex-fast=gpt-5-mini">${escHtml(aliasesText)}</textarea>
-<div class="note" id="modelAliasesNote">用于自定义别名映射到真实模型；留空表示客户端直接使用真实模型名。</div>
-<div class="presets" id="openaiAliasPresets">
-  <span style="font-size:11px;color:var(--dim);line-height:24px">快速填充：</span>
-  <button type="button" class="preset" onclick="fillOpenAIAliases()">Codex OpenAI</button>
+  <button type="button" class="preset" onclick="fillAliases('deepseek-v4-pro','deepseek-v4-pro','deepseek-v4-flash')">DeepSeek</button>
+  <button type="button" class="preset" onclick="fillAliases('claude-sonnet-4-6','claude-opus-4-5','claude-haiku-4-5')">Anthropic Claude</button>
+  <button type="button" class="preset" onclick="fillAliases('glm-5.1','glm-5.1','glm-5.1')">智谱 GLM</button>
+  <button type="button" class="preset" onclick="fillAliases('qwen-max','qwen-max','qwen-plus')">通义千问</button>
 </div>
 </div>
 
@@ -3367,7 +2636,7 @@ ${errDiv}
 <div class="section">
 <label>可用模型列表 (逗号分隔，至少1个)<span class="req">*必填</span></label>
 <input type="text" name="allowedModels" id="allowedModelsInput" value="${(s.allowedModels || []).join(",")}" placeholder="必填，如: deepseek-v4-pro, deepseek-v4-flash" required>
-<div class="note" id="allowedModelsNote">不在列表中的模型请求将被拦截返回403。Anthropic 三档别名映射的目标模型会自动添加到此列表。</div>
+<div class="note" id="allowedModelsNote">不在列表中的模型请求将被拦截返回403。所有别名目标模型会自动添加到此列表。</div>
 </div>
 
 <h2>超时 & 重试</h2>
@@ -3429,11 +2698,42 @@ ${((() => { const qa = stmts.quotaAdjustRecent.all(); return qa.length > 0 ? `<h
 <button type="submit" class="btn btn-primary">保存设置</button>
 </div>
 </form>
+
+<div id="dataManagementView" hidden aria-hidden="true">
+<div class="view-intro">
+  <h2>全局数据管理</h2>
+  <p>此处操作作用于整个系统，不属于任何单一配置方案。导入前请确认来源方案映射，危险操作执行前会自动创建本地备份。</p>
+</div>
+
+<h2>旧数据导入</h2>
+<div class="section">
+<div class="import-tools">
+  <div><label for="dataImportFile">data.json 文件</label><input type="file" id="dataImportFile" accept="application/json,.json"></div>
+  <button type="button" class="btn btn-outline" onclick="previewDataImport()">预览文件</button>
+</div>
+<div class="note">仅导入统计、错误和配额历史，不会覆盖当前配置。执行前必须确认每个来源方案的去向。</div>
+<div class="import-preview" id="dataImportPreview">
+  <div class="import-summary" id="dataImportSummary"></div>
+  <div id="dataImportMappings"></div>
+  <div class="row" style="margin-top:14px">
+    <div><label for="dataImportMode">导入方式</label><select id="dataImportMode" onchange="toggleImportPassword()"><option value="merge">合并现有数据</option><option value="replace">替换全部请求数据</option></select></div>
+    <div id="dataImportPasswordWrap" style="display:none"><label for="dataImportPassword">后台密码</label><input type="password" id="dataImportPassword" autocomplete="current-password" placeholder="替换模式需要验证密码"></div>
+  </div>
+  <div style="display:flex;justify-content:flex-end;margin-top:12px"><button type="button" class="btn btn-primary" onclick="applyDataImport()">执行导入</button></div>
+  <div class="inline-status" id="dataImportStatus" role="status"></div>
+</div>
+</div>
+
+<h2 style="color:var(--red)">危险操作</h2>
+<div class="section danger-section">
+  <div class="danger-copy"><div><strong>清空全部数据</strong><div class="note" style="margin:0">清除方案、用户、密钥、配额、统计、错误和导入记录。系统端口、后台密码与代理参数会保留，执行前自动创建备份。</div></div><button type="button" class="btn btn-danger" id="dataClearButton" onclick="openDataClearModal()">清空全部数据</button></div>
+</div>
+</div>
 </div>
 </div>
 <div class="modal-overlay" id="userModal">
 <div class="modal">
-<div class="modal-hd"><h3>用户管理</h3><button class="modal-close" onclick="closeUserModal()">&times;</button></div>
+<div class="modal-hd"><h3>用户管理</h3><button class="modal-close" onclick="closeUserModal()">关闭</button></div>
 <div class="modal-body">
 <h4 style="font-size:13px;color:var(--accent);margin:0 0 8px">全局用户信息</h4>
 <table id="globalUsersTable">
@@ -3441,7 +2741,7 @@ ${((() => { const qa = stmts.quotaAdjustRecent.all(); return qa.length > 0 ? `<h
 <tbody>${globalUserRows}</tbody>
 </table>
 <div style="margin:12px 0 4px;display:flex;gap:8px;align-items:center">
-<button type="button" class="btn btn-outline btn-sm" onclick="addGlobalUser()">+ 添加用户</button>
+<button type="button" class="btn btn-outline btn-sm" onclick="addGlobalUser()">添加用户</button>
 <span class="note">虚拟Key自动生成（jx-开头24位随机码），点击可复制。失效时间留空=永不过期。</span>
 </div>
 <h4 style="font-size:13px;color:var(--accent);margin:16px 0 8px;display:flex;align-items:center;justify-content:space-between;gap:12px">
@@ -3464,28 +2764,32 @@ ${s.profiles.map(p => `<option value="${escHtml(p.suffix)}" ${p.suffix === initi
 </div>
 <div class="modal-overlay" id="profileModal">
 <div class="modal" style="max-width:640px">
-<div class="modal-hd"><h3>新增方案</h3><button class="modal-close" onclick="closeProfileModal()">&times;</button></div>
+<div class="modal-hd"><h3>新增方案</h3><button class="modal-close" onclick="closeProfileModal()">关闭</button></div>
 <div class="modal-body">
-<div class="row3">
+<div class="row">
 <div><label>方案名称<span class="req">*</span></label><input type="text" id="newProfileName" placeholder="如: GLM 项目组"></div>
 <div><label>URL 后缀<span class="req">*</span></label><input type="text" id="newProfileSuffix" placeholder="如: glm"></div>
-<div><label>接口协议<span class="req">*</span></label><select id="newProfileProtocol" onchange="updateNewProfileFields()"><option value="anthropic">Anthropic / Claude Code</option><option value="openai">OpenAI-compatible / Codex</option></select></div>
-</div>
-<div id="newProfileResponsesAdapterRow" style="display:none">
-<label>Responses 兼容模式</label>
-<select id="newProfileResponsesAdapter">
-  <option value="none">透明转发 /v1/responses</option>
-  <option value="chat_completions">将 /v1/responses 转为 /v1/chat/completions</option>
-</select>
 </div>
 <label>上游 API 地址<span class="req">*</span></label><input type="text" id="newProfileUpstream" value="${escHtml(initialProfile.upstream || s.upstream || "")}" placeholder="https://open.bigmodel.cn/api/anthropic">
 <label>允许模型</label><input type="text" id="newProfileModels" value="${escHtml((initialProfile.allowedModels || s.allowedModels || []).join(","))}" placeholder="glm-5.1,qwen-max">
-<label>模型别名（每行 alias=实际模型，可选）</label><textarea id="newProfileAliases" rows="3" placeholder="codex-main=gpt-5&#10;codex-fast=gpt-5-mini"></textarea>
+<label>模型别名（每行 alias=实际模型，可选）</label><textarea id="newProfileAliases" rows="3" placeholder="jx-sonnet=glm-5.1&#10;jx-opus=glm-5.1&#10;jx-haiku=glm-5.1"></textarea>
 <div class="note">创建后会出现在左侧方案列表。默认入口可在左侧点击“设为默认”。</div>
 <div style="margin-top:16px;display:flex;justify-content:flex-end;gap:8px">
 <button type="button" class="btn btn-outline btn-sm" onclick="closeProfileModal()">取消</button>
 <button type="button" class="btn btn-primary btn-sm" onclick="createProfile()">创建方案</button>
 </div>
+</div>
+</div>
+</div>
+<div class="modal-overlay" id="dataClearModal">
+<div class="modal" style="max-width:480px">
+<div class="modal-hd"><h3>确认清空全部数据</h3><button class="modal-close" onclick="closeDataClearModal()">关闭</button></div>
+<div class="modal-body">
+  <div style="font-size:13px;line-height:1.65">此操作会删除所有方案、用户、密钥、配额和请求历史。系统会先创建本地备份，但当前配置将立即进入未配置状态。</div>
+  <label for="dataClearPassword">后台密码</label>
+  <input type="password" id="dataClearPassword" autocomplete="current-password" placeholder="输入后台密码以确认">
+  <div class="inline-status" id="dataClearStatus" role="status"></div>
+  <div style="display:flex;justify-content:flex-end;gap:8px;margin-top:14px"><button type="button" class="btn btn-outline" onclick="closeDataClearModal()">取消</button><button type="button" class="btn btn-danger" onclick="clearAllData()">确认清空</button></div>
 </div>
 </div>
 </div>
@@ -3496,34 +2800,61 @@ document.getElementById('csrfToken').value=getCsrf();
 function csrfHeaders(h){h=h||{};h['x-csrf-token']=getCsrf();return h}
 function h(v){return String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
 function aliasText(aliases){return Object.entries(aliases||{}).map(([a,m])=>a+'='+m).join('\\n')}
-function currentProtocol(){return document.getElementById('apiProtocolSelect').value||'anthropic'}
-function updateProtocolFields(){
-  const protocol=currentProtocol();
-  const streamRow=document.getElementById('openaiStreamUsageInput')?.closest('label');
-  if(streamRow)streamRow.style.display=protocol==='openai'?'flex':'none';
-  const adapterRow=document.getElementById('responsesAdapterRow');
-  if(adapterRow)adapterRow.style.display=protocol==='openai'?'block':'none';
-  const anthropicFields=document.getElementById('anthropicAliasFields');
-  const openaiFields=document.getElementById('openaiModelFields');
-  const openaiPresets=document.getElementById('openaiAliasPresets');
-  if(anthropicFields)anthropicFields.style.display=protocol==='openai'?'none':'block';
-  if(openaiFields)openaiFields.style.display=protocol==='openai'?'block':'none';
-  if(openaiPresets)openaiPresets.style.display=protocol==='openai'?'flex':'none';
-  const title=document.getElementById('modelConfigTitle');
-  const hint=document.getElementById('modelConfigHint');
-  if(title)title.textContent=protocol==='openai'?'OpenAI / Codex 模型':'Claude 模型别名';
-  if(hint)hint.textContent=protocol==='openai'?'真实模型直传，可选 alias':'jx-sonnet / jx-opus / jx-haiku';
-  const aliasLabel=document.getElementById('modelAliasesLabel');
-  if(aliasLabel)aliasLabel.textContent=protocol==='openai'?'可选模型别名（每行 alias=实际模型）':'通用模型别名（每行 alias=实际模型，可选）';
-  const aliasNote=document.getElementById('modelAliasesNote');
-  if(aliasNote)aliasNote.textContent=protocol==='openai'?'Codex 可直接使用真实模型名；只有需要自定义短名称时才填写这里。':'jx-* 三个别名由上方字段生成；这里可额外增加自定义别名。';
-  const allowed=document.getElementById('allowedModelsInput');
-  if(allowed)allowed.placeholder=protocol==='openai'?'必填，如: gpt-5, qwen3-coder-plus, glm-5':'必填，如: deepseek-v4-pro, deepseek-v4-flash';
-  const allowedNote=document.getElementById('allowedModelsNote');
-  if(allowedNote)allowedNote.textContent=protocol==='openai'?'Codex/OpenAI 请求中的 model 必须在此列表中；留空不会放行。':'不在列表中的模型请求将被拦截返回403。Anthropic 三档别名映射的目标模型会自动添加到此列表。';
-  const up=document.querySelector('[name=upstream]');
-  if(up)up.placeholder=protocol==='openai'?'https://api.openai.com/v1 或 compatible-mode/v1':'https://open.bigmodel.cn/api/anthropic';
-  updateAccessUrl();
+function openDateTimePicker(input){if(typeof input.showPicker==='function'){try{input.showPicker()}catch{}}}
+let pendingImportData=null;
+let pendingImportPreview=null;
+function setImportStatus(message,type){const el=document.getElementById('dataImportStatus');el.textContent=message||'';el.className='inline-status '+(type||'')}
+async function previewDataImport(){
+  const file=document.getElementById('dataImportFile').files[0];
+  if(!file){setImportStatus('请选择 data.json 文件','error');return}
+  setImportStatus('正在解析文件','');
+  try{
+    pendingImportData=JSON.parse(await file.text());
+    const r=await fetch('/api/data-import/preview',{method:'POST',headers:csrfHeaders({'Content-Type':'application/json'}),body:JSON.stringify({data:pendingImportData})});
+    const result=await r.json();
+    if(!r.ok)throw new Error(result.error||'预览失败');
+    pendingImportPreview=result;
+    const summary=result.summary||{};
+    document.getElementById('dataImportSummary').innerHTML=[['用户',summary.users||0],['请求',summary.requests||0],['记录',summary.records||0],['日期',summary.minDate&&summary.maxDate?summary.minDate+' 至 '+summary.maxDate:'无日期']].map(function(item){return '<div class="import-stat"><b>'+h(item[1])+'</b><span>'+h(item[0])+'</span></div>'}).join('');
+    document.getElementById('dataImportMappings').innerHTML=(result.sourceProfiles||[]).map(function(source){
+      const options=['<option value="">请选择目标方案</option>'].concat(SETTINGS.profiles.map(function(profile){return '<option value="'+h(profile.suffix)+'" '+(source.matchedTarget===profile.suffix?'selected':'')+'>'+h(profile.name)+' /'+h(profile.suffix)+'</option>'})).concat(['<option value="skip">跳过此来源</option>']);
+      return '<div class="mapping-row"><code>'+h(source.suffix)+'</code><span class="mapping-arrow">到</span><select class="data-import-map" data-source="'+h(source.suffix)+'">'+options.join('')+'</select></div>';
+    }).join('');
+    document.getElementById('dataImportPreview').classList.add('open');
+    setImportStatus((result.warnings||[]).join('；')||'预览完成，请确认方案映射','ok');
+  }catch(error){pendingImportData=null;pendingImportPreview=null;document.getElementById('dataImportPreview').classList.remove('open');setImportStatus(error.message||'文件格式无效','error')}
+}
+function toggleImportPassword(){document.getElementById('dataImportPasswordWrap').style.display=document.getElementById('dataImportMode').value==='replace'?'block':'none'}
+async function applyDataImport(){
+  if(!pendingImportData||!pendingImportPreview){setImportStatus('请先预览文件','error');return}
+  const profileMap={};
+  document.querySelectorAll('.data-import-map').forEach(function(select){profileMap[select.dataset.source]=select.value});
+  if(Object.values(profileMap).some(function(value){return !value})){setImportStatus('请完成所有方案映射，或明确选择跳过','error');return}
+  const mode=document.getElementById('dataImportMode').value;
+  const password=document.getElementById('dataImportPassword').value;
+  if(mode==='replace'&&!password){setImportStatus('替换模式需要输入后台密码','error');return}
+  setImportStatus('正在导入，请勿关闭页面','');
+  try{
+    const r=await fetch('/api/data-import/apply',{method:'POST',headers:csrfHeaders({'Content-Type':'application/json'}),body:JSON.stringify({data:pendingImportData,sourceHash:pendingImportPreview.sourceHash,mode:mode,profileMap:profileMap,password:password})});
+    const result=await r.json();
+    if(!r.ok)throw new Error(result.error||'导入失败');
+    setImportStatus('导入完成','ok');
+  }catch(error){setImportStatus(error.message||'导入失败','error')}
+}
+function openDataClearModal(){const modal=document.getElementById('dataClearModal');modal.classList.add('open');document.getElementById('dataClearPassword').value='';document.getElementById('dataClearStatus').textContent='';document.getElementById('dataClearPassword').focus()}
+function closeDataClearModal(){document.getElementById('dataClearModal').classList.remove('open')}
+document.getElementById('dataClearModal').addEventListener('click',function(event){if(event.target===this)closeDataClearModal()});
+async function clearAllData(){
+  const password=document.getElementById('dataClearPassword').value;
+  const status=document.getElementById('dataClearStatus');
+  if(!password){status.textContent='请输入后台密码';status.className='inline-status error';return}
+  status.textContent='正在创建备份并清空数据';status.className='inline-status';
+  try{
+    const r=await fetch('/api/data-clear',{method:'POST',headers:csrfHeaders({'Content-Type':'application/json'}),body:JSON.stringify({password:password})});
+    const result=await r.json();
+    if(!r.ok)throw new Error(result.error||'清空失败');
+    location.reload();
+  }catch(error){status.textContent=error.message||'清空失败';status.className='inline-status error'}
 }
 function openUserModal(){const sfx=document.getElementById('profileSuffixInput').value||SETTINGS.selectedProfileSuffix;document.getElementById('userProfileSel').value=sfx;renderProfileUsers(sfx);document.getElementById('userModal').classList.add('open')}
 function closeUserModal(){document.getElementById('userModal').classList.remove('open')}
@@ -3540,30 +2871,37 @@ function updateAccessUrl(){
   const sfx=document.getElementById('suffixInput').value.trim();
   const p=SETTINGS.profiles.find(x=>x.name===editingProfileName);
   const defaultNote=p&&p.isDefault?' <span style="color:var(--green)">默认入口也可用 http://&lt;host&gt;:6789/v1</span>':'';
-  const protocol=currentProtocol();
-  const endpoint=protocol==='openai'?'/v1/responses 或 /v1/chat/completions':'/v1/messages';
-  const adapter=document.getElementById('responsesAdapterSelect')?.value||'none';
-  const adapterNote=protocol==='openai'&&adapter==='chat_completions'?' <span style="color:var(--orange)">已启用 Responses→Chat 适配</span>':'';
-  document.getElementById('accessUrlPreview').innerHTML='接入地址: http://&lt;host&gt;:6789/'+h(sfx)+endpoint+defaultNote+adapterNote;
+  document.getElementById('accessUrlPreview').innerHTML='接入地址: http://&lt;host&gt;:6789/'+h(sfx)+'/v1/messages'+defaultNote;
 }
-updateProtocolFields();
+updateAccessUrl();
+function openDataManagementView(){
+  const form=document.getElementById('settingsForm');
+  const view=document.getElementById('dataManagementView');
+  form.hidden=true;
+  view.hidden=false;
+  view.setAttribute('aria-hidden','false');
+  document.querySelectorAll('.pl-item').forEach(function(el){el.classList.remove('active')});
+  document.getElementById('dataManagementNav').classList.add('active');
+}
+function showProfileSettings(){
+  const form=document.getElementById('settingsForm');
+  const view=document.getElementById('dataManagementView');
+  form.hidden=false;
+  view.hidden=true;
+  view.setAttribute('aria-hidden','true');
+  document.getElementById('dataManagementNav').classList.remove('active');
+}
 async function editProfile(n){
   const p=SETTINGS.profiles.find(x=>x.name===n);
   if(!p)return;
+  showProfileSettings();
   editingProfileName=n;
   const fm=document.forms.settingsForm;
-  fm.apiProtocol.value=p.apiProtocol||'anthropic';
   fm.upstream.value=p.upstream||'';
   document.getElementById('suffixInput').value=p.suffix||'';
   document.getElementById('profileNameInput').value=p.name||'';
   if(p.allowedModels)fm.allowedModels.value=p.allowedModels.join(', ');
-  fm.defaultModels_sonnet.value=p.defaultModels?.sonnet||'';
-  fm.defaultModels_opus.value=p.defaultModels?.opus||'';
-  fm.defaultModels_haiku.value=p.defaultModels?.haiku||'';
   if(fm.modelAliases)fm.modelAliases.value=aliasText(p.modelAliases||{});
-  const osu=document.getElementById('openaiStreamUsageInput');
-  if(osu)osu.checked=p.openaiStreamUsage!==false;
-  if(fm.responsesAdapter)fm.responsesAdapter.value=p.responsesAdapter||'none';
   if(fm.profileQuota)fm.profileQuota.value=p.dailyTokenLimit||0;
   document.querySelectorAll('.pl-item').forEach(el=>el.classList.remove('active'));
   const el=document.getElementById('pl-'+n);
@@ -3571,24 +2909,19 @@ async function editProfile(n){
   document.getElementById('profileSuffixInput').value=p.suffix||'';
   const userSel=document.getElementById('userProfileSel');
   if(userSel){userSel.value=p.suffix||'';renderProfileUsers(p.suffix||'')}
-  updateProtocolFields();
+  updateAccessUrl();
 }
 async function createProfile(){
   const name=document.getElementById('newProfileName').value.trim();
   const suffix=document.getElementById('newProfileSuffix').value.trim();
-  const apiProtocol=document.getElementById('newProfileProtocol').value;
   const upstream=document.getElementById('newProfileUpstream').value.trim();
   const models=document.getElementById('newProfileModels').value.trim();
   const modelAliases=document.getElementById('newProfileAliases').value.trim();
-  const responsesAdapter=document.getElementById('newProfileResponsesAdapter').value||'none';
   if(!name||!suffix||!upstream){alert('方案名称、URL 后缀和上游 API 地址必填');return}
   const fm=document.forms.settingsForm;
   const r=await fetch('/api/profile/save',{method:'POST',headers:csrfHeaders({'Content-Type':'application/json'}),body:JSON.stringify({
-    profile:name,suffix:suffix,apiProtocol:apiProtocol,upstream:upstream,allowedModels:models||fm.allowedModels.value,
-    defaultModels:apiProtocol==='anthropic'?{sonnet:fm.defaultModels_sonnet.value,opus:fm.defaultModels_opus.value,haiku:fm.defaultModels_haiku.value}:undefined,
-    modelAliases:modelAliases,
-    openaiStreamUsage:true,
-    responsesAdapter:apiProtocol==='openai'?responsesAdapter:'none'
+    profile:name,suffix:suffix,upstream:upstream,allowedModels:models||fm.allowedModels.value,
+    modelAliases:modelAliases
   })});
   if(r.ok)location.reload();else{const e=await r.json();alert('创建失败: '+e.error)}
 }
@@ -3662,40 +2995,20 @@ function addGlobalUser(){
   const vk=genVK();
   tr.innerHTML='<td><code style="font-size:11px;color:var(--accent);user-select:all">'+vk+'</code><input type="hidden" name="gu_new_'+vk+'" value="'+vk+'"></td>'
     +'<td><input type="text" name="gu_un_new_'+vk+'" placeholder="用户名" style="width:100%;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:4px 8px;border-radius:4px;font-size:12px"></td>'
-    +'<td><input type="datetime-local" name="gu_ex_new_'+vk+'" style="width:100%;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:3px 6px;border-radius:4px;font-size:11px;color-scheme:dark"></td>'
+    +'<td><input type="datetime-local" name="gu_ex_new_'+vk+'" onclick="openDateTimePicker(this)" style="width:100%;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:3px 6px;border-radius:4px;font-size:11px"></td>'
     +'<td><label style="display:inline-flex;align-items:center;gap:4px;margin:0;cursor:pointer"><input type="checkbox" name="gu_dis_new_'+vk+'" style="width:auto;accent-color:var(--red)"><span style="font-size:11px;color:var(--dim)">正常</span></label></td>'
-    +'<td><button type="button" onclick="this.closest(\\'tr\\').remove()" style="background:rgba(255,56,96,.15);color:var(--red);border:none;padding:2px 8px;border-radius:4px;cursor:pointer;font-size:11px">删除</button></td>';
+    +'<td><button type="button" onclick="this.closest(\\'tr\\').remove()" style="background:#fff2f0;color:var(--red);border:1px solid #f1c8c2;padding:2px 8px;border-radius:4px;cursor:pointer;font-size:11px">删除</button></td>';
   tbody.appendChild(tr);
   SETTINGS.globalUsers[vk]={username:'',expiresAt:'',disabled:false};
   for(const p of SETTINGS.profiles){if(!SETTINGS.profileAssignments[p.suffix])SETTINGS.profileAssignments[p.suffix]={}}
   renderProfileUsers(document.getElementById('userProfileSel').value);
 }
-function fillDefaults(s,o,h){
-  document.querySelector('[name=defaultModels_sonnet]').value=s;
-  document.querySelector('[name=defaultModels_opus]').value=o;
-  document.querySelector('[name=defaultModels_haiku]').value=h;
+function fillAliases(s,o,h){
+  document.forms.settingsForm.modelAliases.value='jx-sonnet='+s+'\\njx-opus='+o+'\\njx-haiku='+h;
 }
-function fillOpenAIAliases(){
-  const fm=document.forms.settingsForm;
-  fm.apiProtocol.value='openai';
-  fm.modelAliases.value='codex-main=gpt-5\\ncodex-fast=gpt-5-mini';
-  if(fm.responsesAdapter)fm.responsesAdapter.value='none';
-  updateProtocolFields();
-}
-function fillUpstream(protocol,url,responsesAdapter){
-  document.forms.settingsForm.apiProtocol.value=protocol;
+function fillUpstream(url){
   document.querySelector('[name=upstream]').value=url;
-  const adapter=document.getElementById('responsesAdapterSelect');
-  if(adapter)adapter.value=protocol==='openai'?(responsesAdapter||'none'):'none';
-  updateProtocolFields();
 }
-function updateNewProfileFields(){
-  const protocol=document.getElementById('newProfileProtocol').value;
-  const row=document.getElementById('newProfileResponsesAdapterRow');
-  if(row)row.style.display=protocol==='openai'?'block':'none';
-  if(protocol!=='openai')document.getElementById('newProfileResponsesAdapter').value='none';
-}
-updateNewProfileFields();
 document.addEventListener("keydown",e=>{if(e.key==="Enter"&&e.target.tagName!=="TEXTAREA"&&e.target.tagName!=="INPUT")e.preventDefault()});
 </script>
 </body></html>`;
@@ -3706,94 +3019,124 @@ function dashboardHtml() {
   return `<!DOCTYPE html>
 <html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
 <title>团队AI Coding监控</title>
-${PIXEL_FONT}
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js"><\/script>
 <style>
-${PIXEL_THEME}
-body{padding:22px 26px}
-.top,.meta,.tabs,.grid,.box,.sec{animation:boot-in .45s ease-out both}
-.top{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-bottom:6px}
-.top h1{font-family:var(--font-pixel);font-size:18px;color:var(--accent);text-shadow:0 0 14px rgba(34,233,255,.7),0 0 4px rgba(34,233,255,.9);letter-spacing:1px;line-height:1.6}
-.top h1::after{content:"";display:block;width:130px;height:3px;margin-top:8px;background:linear-gradient(90deg,var(--accent),var(--magenta),transparent);box-shadow:0 0 8px var(--accent)}
-.top .sub{font-family:'Pixelify Sans',monospace;font-weight:500;font-size:15px;color:var(--dim);letter-spacing:1px;margin-top:8px;display:flex;align-items:center;gap:7px}
-.top .sub b{color:var(--green);font-weight:600;letter-spacing:2px}
-.controls{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
-.controls select,.controls a,.controls button{font-family:'VT323',monospace;font-size:15px;background:var(--card);color:var(--text);border:2px solid var(--border);padding:5px 11px;cursor:pointer;letter-spacing:1px;text-decoration:none;line-height:1.4}
-.controls select:focus,.controls a:hover,.controls button:hover{border-color:var(--accent);color:var(--accent)}
-.controls .ar-on{border-color:var(--green);color:var(--green);box-shadow:0 0 8px rgba(0,255,136,.35)}
-.controls .ar-off{color:var(--dim)}
-.meta{font-family:'VT323',monospace;font-size:15px;color:var(--dim);margin-bottom:18px;letter-spacing:1px;border-left:3px solid var(--accent);padding:2px 0 2px 10px}
-.meta b{color:var(--accent);font-weight:400}
-.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px;margin-bottom:22px}
-.card{background:linear-gradient(180deg,var(--card2),var(--card));border:2px solid var(--border);padding:16px 16px 14px;position:relative;overflow:hidden;transition:transform .12s,border-color .12s,box-shadow .12s}
-.card::after{content:"";position:absolute;top:0;left:0;right:0;height:2px;background:linear-gradient(90deg,var(--accent),var(--magenta));opacity:.9}
-.card:hover{transform:translate(-3px,-3px);border-color:var(--accent);box-shadow:5px 5px 0 0 var(--accent),-3px -3px 0 0 var(--magenta),var(--glow)}
-.card .l{font-family:'Pixelify Sans',monospace;font-weight:600;font-size:14px;color:var(--dim);margin-bottom:8px;letter-spacing:1px;text-transform:uppercase}
-.card .v{font-size:15px}
-.tabs{display:flex;gap:4px;margin-bottom:16px;background:var(--card);border:2px solid var(--border);padding:3px;width:fit-content}
-.tab{padding:6px 16px;font-family:'VT323',monospace;font-size:15px;border:none;background:transparent;color:var(--dim);cursor:pointer;letter-spacing:1px}
-.tab:hover{color:var(--text)}
-.tab.on{background:var(--accent);color:var(--bg);font-weight:700}
-.grid{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-bottom:20px}
-.box{position:relative;background:var(--card);border:2px solid var(--border);padding:16px}
-.box::before,.box::after{content:"";position:absolute;width:12px;height:12px;border:2px solid var(--accent);pointer-events:none;opacity:.6}
-.box::before{top:-2px;left:-2px;border-right:0;border-bottom:0}.box::after{bottom:-2px;right:-2px;border-left:0;border-top:0}
-.box h3{font-family:'Pixelify Sans',monospace;font-weight:600;font-size:15px;color:var(--accent);margin-bottom:10px;letter-spacing:1px;text-transform:uppercase;text-shadow:0 0 8px rgba(34,233,255,.5)}
-.box h3::before{content:"// ";color:var(--magenta)}
-.box canvas{max-height:260px}
-.sec{background:var(--card);border:2px solid var(--border);overflow:hidden;margin-bottom:20px}
-.sec>h3{font-family:'Pixelify Sans',monospace;font-weight:600;font-size:15px;color:var(--accent);padding:12px 16px 0;margin:0;letter-spacing:1px;text-transform:uppercase;text-shadow:0 0 8px rgba(34,233,255,.5)}
-.sec-collapsible h3{display:flex;align-items:center;gap:6px;cursor:pointer;user-select:none;padding:12px 16px}
-.sec-collapsible h3:hover{color:var(--text)}
-.sec-toggle{display:inline-block;width:16px;font-size:10px;transition:transform .2s;flex-shrink:0;color:var(--accent)}
-.sec-toggle.open{transform:rotate(90deg)}
-.sec-hint{font-family:'VT323',monospace;font-size:13px;color:var(--dim);font-weight:400;margin-left:auto}
-.sec-body{display:none;padding:0 16px 12px}
-.sec-body.open{display:block}
-.sec-body table{margin-top:0}
-.sec-body .empty{padding:16px 0}
-table{width:100%;border-collapse:collapse}
-th{text-align:left;padding:8px 16px;font-family:'Pixelify Sans',monospace;font-weight:600;font-size:13px;color:#b4bcd9;border-bottom:2px solid var(--accent);letter-spacing:1px;text-transform:uppercase}
-td{padding:8px 16px;font-size:14px;border-bottom:1px solid var(--border)}
-tr:last-child td{border-bottom:none}tbody tr{transition:background .1s}tbody tr:hover td{background:rgba(0,229,255,.05)}
-.n{font-variant-numeric:tabular-nums;text-align:right}
-.hl{color:var(--accent);font-weight:600}
-code{font-family:'VT323',monospace;color:var(--accent);font-size:14px}
-.empty{font-family:'VT323',monospace;color:var(--dim);padding:24px;text-align:center;font-size:15px;letter-spacing:1px}
-@media(max-width:768px){.grid{grid-template-columns:1fr}.cards{grid-template-columns:1fr 1fr}}
-</style></head><body>
-<div class="top"><div><h1 class="glitch">CODING MONITOR</h1><div class="sub"><span class="eq"><i></i><i></i><i></i><i></i></span>团队 AI 用量监控 <b>// LIVE</b></div></div><div class="controls"><select id="profileSel" onchange="switchProfileView(this.value)"><option value="">全部方案</option></select><a href="/settings">设置</a><button id="autoRefreshBtn" class="ar-on">自动刷新: 开</button><button onclick="fetch('/api/logout',{method:'POST',headers:{'x-csrf-token':(document.cookie.match(/tm_csrf=([^;]+)/)||[])[1]||''}}).then(()=>location.reload())">退出</button></div></div>
-<div class="meta" id="meta">Loading...</div>
-<div class="cards" id="cards"></div>
-<div class="sec" id="profileSummarySec" style="display:none"><h3>方案中心</h3><table><thead><tr><th>方案</th><th>入口</th><th>上游</th><th class="n">今日请求</th><th class="n">今日用量</th><th>状态</th></tr></thead><tbody id="profileSummaryBody"></tbody></table></div>
-<div class="tabs" id="tabs">
-  <button class="tab on" data-p="day">按日</button>
-  <button class="tab" data-p="week">按周</button>
-  <button class="tab" data-p="month">按月</button>
-  <button class="tab" data-p="year">按年</button>
-</div>
-<div class="grid">
-  <div class="box"><h3>Token 用量趋势</h3><canvas id="trend"></canvas></div>
-  <div class="box"><h3>用户用量分布</h3><canvas id="pie"></canvas></div>
-  <div class="box"><h3>模型使用分布</h3><canvas id="modelChart"></canvas></div>
-  <div class="box"><h3>24 小时使用趋势 (今日)</h3><canvas id="hourChart"></canvas></div>
-</div>
-<div class="sec"><h3>用户用量明细</h3><table id="uTable"><thead>
-<tr><th>用户</th><th>状态</th><th class="n">请求数</th><th class="n">输入</th><th class="n">输出</th><th class="n">缓存写入</th><th class="n">缓存命中</th><th class="n">合计</th><th class="n">配额</th><th>最后活跃</th></tr>
-</thead><tbody></tbody></table></div>
-<div class="sec sec-collapsible" id="detailSec"><h3 onclick="toggleSec('detailSec')"><span class="sec-toggle" id="detailSecIcon">▶</span>明细记录<span class="sec-hint" id="detailHint"></span></h3><div class="sec-body" id="detailSecBody"><table id="dTable"><thead>
-<tr><th>时间</th><th>用户</th><th class="n">请求数</th><th class="n">输入</th><th class="n">输出</th><th class="n">缓存写入</th><th class="n">缓存命中</th><th class="n">合计</th></tr>
-</thead><tbody></tbody></table></div></div>
-<div class="sec sec-collapsible" id="errorSec"><h3 onclick="toggleSec('errorSec')"><span class="sec-toggle" id="errorSecIcon">▶</span>错误记录<span id="errorCount" style="font-size:11px;color:var(--red);font-weight:400;margin-left:4px"></span><span class="sec-hint" id="errorHint" style="margin-left:auto"></span><button id="clearErrors" onclick="event.stopPropagation()" style="font-family:'VT323',monospace;font-size:14px;background:rgba(255,56,96,.15);color:var(--red);border:1px solid var(--red);padding:2px 10px;cursor:pointer;margin-left:8px;letter-spacing:1px">清除</button></h3><div class="sec-body" id="errorSecBody"><table id="eTable"><thead>
-<tr><th>时间</th><th>用户</th><th class="n">状态码</th><th>模型</th><th>路径</th><th>错误信息</th></tr>
-</thead><tbody></tbody></table>
-<div id="errPages" style="padding:8px 0;text-align:right"></div></div></div>
+${UI_THEME}
+body{padding:16px clamp(14px,2vw,28px) 28px}
+.dashboard-shell{width:100%;max-width:1560px;margin:0 auto;display:grid;gap:10px;min-width:0}
+.command-bar{min-height:46px;display:flex;align-items:center;justify-content:space-between;gap:18px;padding-bottom:9px;border-bottom:1px solid var(--border);min-width:0}
+.command-brand{display:flex;align-items:center;gap:14px;min-width:0;white-space:nowrap}
+.brand-mark{font-size:13px;font-weight:700;color:var(--accent)}
+.command-title{font-size:16px;font-weight:650;line-height:1.2;padding-right:14px;border-right:1px solid var(--border)}
+.command-status{font-size:11px;color:var(--dim);display:flex;align-items:center;flex-shrink:0}
+.meta{font-size:11px;color:var(--dim);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0}.meta b{color:var(--text);font-weight:550}
+.controls{display:flex;gap:7px;align-items:center;flex-wrap:wrap}
+.controls select,.controls a,.controls button{font-size:12px;background:var(--surface);color:var(--text);border:1px solid var(--border);border-radius:5px;padding:7px 10px;cursor:pointer;text-decoration:none;line-height:1.3}
+.controls select:hover,.controls a:hover,.controls button:hover{border-color:var(--border-strong);background:var(--surface-subtle)}
+.controls .ar-on{border-color:#bdd0c3;color:var(--green);background:var(--accent-soft)}.controls .ar-off{color:var(--dim)}
+.metric-strip{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:8px;min-height:68px}
+.card{background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:10px 13px;min-height:68px;display:flex;flex-direction:column;justify-content:center}
+.card:first-child{border-top:2px solid var(--accent)}
+.card .l{font-size:10px;font-weight:600;color:var(--dim);margin-bottom:5px}
+.card .v{font-size:21px;line-height:1;font-weight:650;font-variant-numeric:tabular-nums;color:var(--text)!important}
+.chart-workspace{display:grid;grid-template-columns:minmax(0,1.55fr) minmax(0,.725fr) minmax(0,.725fr);grid-template-rows:repeat(2,minmax(0,1fr));gap:8px;min-height:280px;max-height:300px}
+.chart-panel{background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:10px 12px;min-width:0;min-height:0;display:flex;flex-direction:column;overflow:hidden}
+.chart-trend{grid-row:1/3}.chart-users{grid-column:2}.chart-models{grid-column:3}.chart-hourly{grid-column:2/4;grid-row:2}
+.chart-head{min-height:24px;display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:4px}.chart-head h2{font-size:12px;font-weight:650;color:var(--text);white-space:nowrap}
+.chart-canvas{position:relative;flex:1;min-height:0}.chart-canvas canvas{position:absolute!important;inset:0;width:100%!important;height:100%!important}
+.tabs{display:flex;gap:1px;background:var(--surface-subtle);border:1px solid var(--border);border-radius:5px;padding:2px;width:fit-content;flex-shrink:0}
+.tab{padding:3px 9px;font-size:10px;border:0;border-radius:3px;background:transparent;color:var(--dim);cursor:pointer}.tab:hover{color:var(--text)}.tab.on{background:var(--surface);color:var(--text);font-weight:600}
+.data-workspace{background:var(--surface);border:1px solid var(--border);border-radius:6px;display:flex;flex-direction:column;min-height:300px;min-width:0;overflow:hidden}
+.workspace-tabs{display:flex;align-items:stretch;gap:0;min-height:38px;border-bottom:1px solid var(--border);overflow-x:auto;scrollbar-width:thin}
+.workspace-tab{border:0;border-right:1px solid var(--border);background:transparent;color:var(--dim);padding:0 15px;font-size:12px;font-weight:550;white-space:nowrap;cursor:pointer}.workspace-tab:hover{background:var(--surface-subtle);color:var(--text)}.workspace-tab[aria-selected="true"]{background:var(--surface);color:var(--accent);box-shadow:inset 0 -2px var(--accent)}
+.workspace-tab-count{display:inline-block;margin-left:6px;color:var(--dim);font-size:10px;font-variant-numeric:tabular-nums}.workspace-tab[aria-selected="true"] .workspace-tab-count{color:var(--accent)}
+.workspace-content{position:relative;flex:1;min-height:0;min-width:0}.workspace-panel{display:none;height:100%;min-height:0;min-width:0}.workspace-panel.active{display:flex;flex-direction:column}.workspace-panel[hidden]{display:none}
+.workspace-panel-inner{height:100%;min-height:0;display:flex;flex-direction:column}
+.workspace-panel-head{min-height:36px;padding:7px 12px;display:flex;align-items:center;gap:9px;border-bottom:1px solid var(--border);font-size:12px}.workspace-panel-head strong{font-weight:650}.workspace-panel-summary{font-size:10px;color:var(--dim);margin-left:auto}.workspace-panel-scroll{flex:1;min-height:0;overflow:auto}
+.workspace-panel table{margin:0}.workspace-panel table thead th{position:sticky;top:0;z-index:3;background:#fafaf7}.workspace-panel table th:first-child,.workspace-panel table td:first-child{position:sticky;left:0;z-index:2;background:var(--surface)}.workspace-panel table thead th:first-child{z-index:4;background:#fafaf7}.workspace-panel table tbody tr:hover td:first-child{background:#fafaf7}
+.profile-current td{background:var(--accent-soft)!important}.profile-current td:first-child{background:var(--accent-soft)!important}.current-mark{color:var(--accent);font-size:10px;font-weight:650;margin-left:6px}
+.sec-toggle{display:none}.sec-hint{font-size:10px;color:var(--dim);font-weight:400}.sec-body{display:block;min-height:0}.sec-body.open{display:block}
+#detailSec,#detailSecBody,#errorSec{height:100%;min-height:0;display:flex;flex-direction:column}#errorSecBody{flex:1;min-height:0;overflow:auto}
+.clear-btn{font-size:11px;background:#fff5f3;color:var(--red);border:1px solid #f1c8c2;border-radius:4px;padding:4px 9px;cursor:pointer;margin-left:8px}
+.detail-tools{display:grid;grid-template-columns:minmax(220px,1.4fr) minmax(130px,.55fr) minmax(160px,.65fr) auto;gap:9px;align-items:end;padding:8px 12px}
+.detail-field label{display:block;font-size:10px;font-weight:600;color:var(--dim);margin-bottom:4px}
+.detail-field input,.detail-field select,.detail-reset{width:100%;height:30px;border:1px solid var(--border);border-radius:5px;background:var(--surface);color:var(--text);font-size:11px;padding:0 9px;outline:none}
+.detail-field input:hover,.detail-field select:hover,.detail-reset:hover{border-color:var(--border-strong);background:var(--surface-subtle)}.detail-field input:focus,.detail-field select:focus{border-color:var(--accent)}
+.detail-reset{width:auto;min-width:68px;cursor:pointer;font-weight:600}
+.detail-table-wrap{flex:1;min-height:0;overflow:auto;border-top:1px solid var(--border)}
+#dTable{min-width:860px}#dTable thead th{position:sticky;top:0;z-index:3;background:#fafaf7}
+#dTable .detail-sticky{position:sticky;left:0;z-index:2;background:var(--surface);min-width:220px}#dTable thead .detail-sticky{z-index:4;background:#fafaf7}
+#dTable .detail-group{cursor:pointer;outline:none}#dTable .detail-group td{background:var(--surface-subtle);font-weight:600;border-top:1px solid var(--border)}#dTable .detail-group .detail-sticky{background:var(--surface-subtle)}#dTable .detail-group:hover td,#dTable .detail-group:focus-visible td{background:#ecece7}
+#dTable tbody tr:not(.detail-group):hover .detail-sticky{background:#fafaf7}
+.detail-period{display:flex;align-items:center;gap:9px}.detail-period-toggle{display:inline-block;width:8px;height:8px;border-right:1.5px solid var(--dim);border-bottom:1.5px solid var(--dim);transform:rotate(-45deg);transition:transform .18s;flex-shrink:0}.detail-period-toggle.open{transform:rotate(45deg)}
+.detail-period-meta{font-size:10px;color:var(--dim);font-weight:400}.detail-user{display:flex;align-items:baseline;gap:8px;padding-left:17px}.detail-user-name{font-weight:550}.detail-key{font-family:var(--font-mono);font-size:10px;color:var(--dim)}.detail-share{display:block;font-size:10px;color:var(--dim);font-weight:400;margin-top:1px}
+.detail-pages{display:flex;align-items:center;justify-content:flex-end;gap:7px;padding:6px 12px;min-height:36px;border-top:1px solid var(--border)}.detail-pages span{font-size:11px;color:var(--dim);margin-right:3px}.detail-pages button{font-size:11px;background:var(--surface);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:3px 9px;cursor:pointer}.detail-pages button:hover:not(:disabled){border-color:var(--border-strong);background:var(--surface-subtle)}.detail-pages button:disabled{opacity:.4;cursor:default}
+table{width:100%;border-collapse:collapse;min-width:720px}
+th{text-align:left;padding:8px 12px;font-weight:550;font-size:10px;color:var(--dim);border-bottom:1px solid var(--border);white-space:nowrap}
+td{padding:8px 12px;font-size:11px;border-bottom:1px solid #ecece8;white-space:nowrap}tr:last-child td{border-bottom:0}tbody tr:hover td{background:#fafaf7}
+.n{font-variant-numeric:tabular-nums;text-align:right}.hl{color:var(--accent);font-weight:600}
+.rank{display:inline-block;width:20px;color:var(--dim);font-variant-numeric:tabular-nums}code{font-family:var(--font-mono);color:var(--accent);font-size:11px}.empty{color:var(--dim);padding:24px;text-align:center;font-size:12px}
+@media(min-width:1280px) and (min-height:800px){html,body{height:100%;overflow:hidden}body{padding:0}.dashboard-shell{height:100dvh;padding:12px 18px;grid-template-rows:46px 68px minmax(280px,300px) minmax(0,1fr);gap:8px}.command-bar{height:46px}.controls{flex-wrap:nowrap}.data-workspace{min-height:0}}
+@media(max-width:1279px), (max-height:799px){.dashboard-shell{height:auto}.chart-workspace{grid-template-columns:repeat(2,minmax(0,1fr));grid-template-rows:260px 220px 240px;max-height:none}.chart-trend{grid-column:1/3;grid-row:1}.chart-users{grid-column:1;grid-row:2}.chart-models{grid-column:2;grid-row:2}.chart-hourly{grid-column:1/3;grid-row:3}.data-workspace{height:auto;min-height:440px}.workspace-panel{min-height:400px}.workspace-panel.active{display:flex}}
+@media(max-width:820px){.command-bar{align-items:flex-start;flex-direction:column}.command-brand{width:100%;flex-wrap:wrap}.meta{order:3;width:100%;white-space:normal}.controls{width:100%}.chart-workspace{grid-template-columns:1fr;grid-template-rows:repeat(4,240px)}.chart-trend,.chart-users,.chart-models,.chart-hourly{grid-column:1;grid-row:auto}.detail-tools{grid-template-columns:1fr 1fr}.detail-search{grid-column:1/-1}.detail-reset{width:100%}.metric-strip{grid-template-columns:repeat(3,1fr)}}
+@media(max-width:560px){body{padding:12px 10px 24px}.command-title{border-right:0;padding-right:0}.command-status{width:100%}.controls select{flex:1;min-width:150px}.metric-strip{grid-template-columns:1fr 1fr}.card{min-height:64px;padding:10px}.card .v{font-size:19px}.chart-head{align-items:flex-start}.chart-trend .chart-head{flex-direction:column}.workspace-tab{padding:0 12px}.detail-tools{padding:8px}.detail-table-wrap{max-height:500px}#dTable .detail-sticky{min-width:190px}.detail-pages{justify-content:space-between}}
+</style></head><body data-theme="editorial-light">
+<main class="dashboard-shell">
+<header class="command-bar">
+  <div class="command-brand"><span class="brand-mark">CC Team</span><h1 class="command-title">团队用量</h1><span class="command-status"><span class="led on"></span>监控服务运行中</span><span class="meta" id="meta">正在加载数据</span></div>
+  <div class="controls"><select id="profileSel" aria-label="查看方案" onchange="switchProfileView(this.value)"><option value="">全部方案</option></select><a href="/settings">设置</a><button id="autoRefreshBtn" class="ar-on">自动刷新：开</button><button onclick="fetch('/api/logout',{method:'POST',headers:{'x-csrf-token':(document.cookie.match(/tm_csrf=([^;]+)/)||[])[1]||''}}).then(()=>location.reload())">退出</button></div>
+</header>
+<section class="metric-strip" id="cards" aria-label="用量摘要"></section>
+<section class="chart-workspace" aria-label="用量图表">
+  <div class="chart-panel chart-trend"><div class="chart-head"><h2>Token 用量趋势</h2><div class="tabs" id="tabs" aria-label="统计周期">
+    <button class="tab on" data-p="day">按日</button><button class="tab" data-p="week">按周</button><button class="tab" data-p="month">按月</button><button class="tab" data-p="year">按年</button>
+  </div></div><div class="chart-canvas"><canvas id="trend"></canvas></div></div>
+  <div class="chart-panel chart-users"><div class="chart-head"><h2>用户分布</h2></div><div class="chart-canvas"><canvas id="pie"></canvas></div></div>
+  <div class="chart-panel chart-models"><div class="chart-head"><h2>模型分布</h2></div><div class="chart-canvas"><canvas id="modelChart"></canvas></div></div>
+  <div class="chart-panel chart-hourly"><div class="chart-head"><h2>24 小时趋势</h2></div><div class="chart-canvas"><canvas id="hourChart"></canvas></div></div>
+</section>
+<section class="data-workspace" aria-label="数据工作区">
+  <div class="workspace-tabs" role="tablist" aria-label="数据视图">
+    <button id="workspace-tab-users" role="tab" aria-controls="workspace-panel-users" aria-selected="true" tabindex="0" class="workspace-tab">用户用量<span class="workspace-tab-count" id="workspaceCountUsers">0</span></button>
+    <button id="workspace-tab-detail" role="tab" aria-controls="workspace-panel-detail" aria-selected="false" tabindex="-1" class="workspace-tab">明细记录<span class="workspace-tab-count" id="workspaceCountDetail">0</span></button>
+    <button id="workspace-tab-profiles" role="tab" aria-controls="workspace-panel-profiles" aria-selected="false" tabindex="-1" class="workspace-tab">方案中心<span class="workspace-tab-count" id="workspaceCountProfiles">0</span></button>
+    <button id="workspace-tab-errors" role="tab" aria-controls="workspace-panel-errors" aria-selected="false" tabindex="-1" class="workspace-tab">错误记录<span class="workspace-tab-count" id="workspaceCountErrors">0</span></button>
+  </div>
+  <div class="workspace-content">
+    <section id="workspace-panel-users" role="tabpanel" aria-labelledby="workspace-tab-users" class="workspace-panel active"><div class="workspace-panel-scroll"><table id="uTable"><thead>
+      <tr><th>用户</th><th>状态</th><th class="n">请求数</th><th class="n">输入</th><th class="n">输出</th><th class="n">缓存写入</th><th class="n">缓存命中</th><th class="n">合计</th><th class="n">配额</th><th>最后活跃</th></tr>
+    </thead><tbody></tbody></table></div></section>
+    <section id="workspace-panel-detail" role="tabpanel" aria-labelledby="workspace-tab-detail" class="workspace-panel" hidden><div id="detailSec">
+      <div class="workspace-panel-head"><span class="sec-toggle open" id="detailSecIcon"></span><strong>明细记录</strong><span class="sec-hint" id="detailHint"></span></div><div class="sec-body open" id="detailSecBody">
+      <div class="detail-tools">
+        <div class="detail-field detail-search"><label for="detailQuery">用户</label><input type="search" id="detailQuery" placeholder="搜索用户名或虚拟 Key" oninput="updateDetailFilters()"></div>
+        <div class="detail-field"><label for="detailRange">时间范围</label><select id="detailRange" onchange="updateDetailFilters()"><option value="all">全部</option><option value="7">最近 7 天</option><option value="30">最近 30 天</option><option value="90">最近 90 天</option></select></div>
+        <div class="detail-field"><label for="detailSort">周期排序</label><select id="detailSort" onchange="updateDetailFilters()"><option value="time">最新优先</option><option value="tokens">Token 高到低</option><option value="requests">请求数高到低</option></select></div>
+        <button type="button" class="detail-reset" id="detailReset" onclick="resetDetailFilters()">重置</button>
+      </div>
+      <div class="detail-table-wrap"><table id="dTable"><thead><tr><th class="detail-sticky">周期 / 用户</th><th class="n">请求数</th><th class="n">输入</th><th class="n">输出</th><th class="n">缓存写入</th><th class="n">缓存命中</th><th class="n">总 Token</th></tr></thead><tbody></tbody></table></div><div class="detail-pages" id="detailPages"></div>
+      </div></div>
+    </section>
+    <section id="workspace-panel-profiles" role="tabpanel" aria-labelledby="workspace-tab-profiles" class="workspace-panel" hidden><div id="profileSummarySec" class="workspace-panel-inner">
+      <div class="workspace-panel-head"><strong>方案中心</strong><span class="workspace-panel-summary" id="profileContext">当前查看：全部方案</span></div><div class="workspace-panel-scroll"><table><thead><tr><th>方案</th><th>入口</th><th>上游</th><th class="n">今日请求</th><th class="n">今日用量</th><th>状态</th></tr></thead><tbody id="profileSummaryBody"></tbody></table></div>
+    </div></section>
+    <section id="workspace-panel-errors" role="tabpanel" aria-labelledby="workspace-tab-errors" class="workspace-panel" hidden><div id="errorSec">
+      <div class="workspace-panel-head"><span class="sec-toggle" id="errorSecIcon"></span><strong>错误记录</strong><span id="errorCount" style="font-size:10px;color:var(--red)"></span><span class="workspace-panel-summary" id="errorHint">暂无错误</span><button id="clearErrors" class="clear-btn">清除</button></div>
+      <div class="sec-body" id="errorSecBody"><table id="eTable"><thead><tr><th>时间</th><th>用户</th><th class="n">状态码</th><th>模型</th><th>路径</th><th>错误信息</th></tr></thead><tbody></tbody></table><div id="errPages" style="padding:8px 12px;text-align:right"></div></div>
+    </div></section>
+  </div>
+</section>
+</main>
 <script>
-${PIXEL_JS}
-Chart.defaults.color='#9aa0c8';Chart.defaults.font.family="'Pixelify Sans',monospace";Chart.defaults.font.size=11;
+${UI_HELPERS}
+Chart.defaults.color='#686863';Chart.defaults.font.family='-apple-system,BlinkMacSystemFont,"SF Pro Text","PingFang SC","Microsoft YaHei","Segoe UI",sans-serif';Chart.defaults.font.size=11;
 let D=null,P="day",C={t:null,p:null,m:null,h:null},errPage=1,autoRefresh=true,refreshTimer=null,currentProfile="all";
+let activeWorkspaceTab="users";
 const ERR_PAGE_SIZE=20;
-const COL=["#00e5ff","#ff2d95","#00ff88","#ffd23f","#b14eff","#ff3860","#29e7ff","#ff9f1c"];
+const DETAIL_PAGE_SIZE=10;
+let detailPage=1,detailQuery="",detailRange="all",detailSort="time",detailInitialized=false;
+const expandedDetailPeriods=new Set();
+const COL=["#2f6e50","#181816","#8c8c84","#456b5a","#a7a79f","#b42318","#956400","#c7c7c0"];
 const escH=s=>String(s??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 const fmtT=n=>n.toLocaleString("zh-CN");
 const fmtTk=n=>{if(n>=1e6)return(n/1e6).toFixed(1)+"M";if(n>=1e3)return(n/1e3).toFixed(1)+"k";return n.toString()};
@@ -3802,14 +3145,76 @@ function ago(iso){if(!iso)return"-";const d=Date.now()-new Date(iso).getTime();c
 function wk(s){const d=new Date(s),day=d.getDay()||7,mon=new Date(d);mon.setDate(d.getDate()-day+1);return mon.toISOString().slice(0,10)}
 function grp(daily,p){const g={};for(const[day,ud]of Object.entries(daily)){const k=p==="week"?wk(day):p==="month"?day.slice(0,7):p==="year"?day.slice(0,4):day;if(!g[k])g[k]={};for(const[u,s]of Object.entries(ud)){if(!g[k][u])g[k][u]={inputTokens:0,outputTokens:0,requests:0,cacheCreationTokens:0,cacheReadTokens:0};g[k][u].inputTokens+=s.inputTokens;g[k][u].outputTokens+=s.outputTokens;g[k][u].requests+=s.requests;g[k][u].cacheCreationTokens+=(s.cacheCreationTokens||0);g[k][u].cacheReadTokens+=(s.cacheReadTokens||0)}}return g}
 function lbl(p,k){if(p==="day")return k.slice(5);if(p==="week")return k.slice(5)+" 周";if(p==="month")return k;return k+"年"}
-function c(l,v,cl,k){return'<div class="card"><div class="l">'+l+'</div><div class="v" data-cu="'+v+'"'+(k?' data-cu-k':'')+' style="color:'+cl+'">0</div></div>'}
-function switchProfileView(v){currentProfile=v||"all";load()}
+function c(l,v,cl,k){return'<div class="card"><div class="l">'+l+'</div><div class="v" data-cu="'+v+'"'+(k?' data-cu-k':'')+'>0</div></div>'}
+let chartResizeFrame=0;
+function doughnutLegend(){const compact=innerWidth<1280;return{position:innerWidth<=820?"bottom":"right",labels:{color:"#686863",font:{size:compact?10:11},padding:compact?6:12,boxWidth:compact?18:40}}}
+function trendLegend(){const compact=innerWidth<=820;return{labels:{color:"#686863",font:{size:compact?9:11},padding:compact?6:10,boxWidth:compact?16:40}}}
+function scheduleChartResize(){cancelAnimationFrame(chartResizeFrame);chartResizeFrame=requestAnimationFrame(()=>{const legend=doughnutLegend();for(const chart of[C.p,C.m]){if(chart){chart.options.plugins.legend=legend;chart.update("none")}}if(C.t){C.t.options.plugins.legend=trendLegend();C.t.update("none")}Object.values(C).forEach(chart=>chart&&chart.resize())})}
+function setWorkspaceTab(tab,focus){
+  const next=document.getElementById("workspace-tab-"+tab),panel=document.getElementById("workspace-panel-"+tab);
+  if(!next||!panel)return;
+  activeWorkspaceTab=tab;
+  document.querySelectorAll(".workspace-tab").forEach(button=>{const selected=button===next;button.setAttribute("aria-selected",String(selected));button.tabIndex=selected?0:-1});
+  document.querySelectorAll(".workspace-content>[role=tabpanel]").forEach(item=>{const selected=item===panel;item.hidden=!selected;item.classList.toggle("active",selected)});
+  if(focus)next.focus();
+  scheduleChartResize();
+}
+function handleWorkspaceTabKeydown(event){
+  const tabs=[...document.querySelectorAll(".workspace-tab")],index=tabs.indexOf(event.currentTarget);let next=index;
+  if(event.key==="ArrowRight")next=(index+1)%tabs.length;else if(event.key==="ArrowLeft")next=(index-1+tabs.length)%tabs.length;else if(event.key==="Home")next=0;else if(event.key==="End")next=tabs.length-1;else return;
+  event.preventDefault();setWorkspaceTab(tabs[next].id.replace("workspace-tab-",""),true);
+}
+function renderWorkspaceSummaries(){
+  if(!D)return;
+  document.getElementById("workspaceCountUsers").textContent=Object.keys(D.users||{}).length;
+  document.getElementById("workspaceCountProfiles").textContent=Array.isArray(D.profileSummaries)?D.profileSummaries.length:0;
+  document.getElementById("workspaceCountErrors").textContent=Array.isArray(D.errors)?D.errors.length:0;
+}
+function maskDetailKey(key){const value=String(key||"");return value.length<=12?value:value.slice(0,8)+"****"+value.slice(-4)}
+function detailTokens(row){return(row.inputTokens||0)+(row.outputTokens||0)}
+function detailPeriodLabel(key){if(P==="day")return key;if(P==="week")return key+" 周";if(P==="month")return key;return key+" 年"}
+function detailRangeDaily(daily){if(detailRange==="all")return daily;const days=Number(detailRange)||0;const cutoff=new Date(Date.now()+8*3600000-Math.max(0,days-1)*86400000).toISOString().slice(0,10);return Object.fromEntries(Object.entries(daily).filter(([date])=>date>=cutoff))}
+function detailTotals(members){const total={requests:0,inputTokens:0,outputTokens:0,cacheCreationTokens:0,cacheReadTokens:0};for(const member of members){const row=member.data;total.requests+=row.requests||0;total.inputTokens+=row.inputTokens||0;total.outputTokens+=row.outputTokens||0;total.cacheCreationTokens+=row.cacheCreationTokens||0;total.cacheReadTokens+=row.cacheReadTokens||0}return total}
+function resetDetailGrouping(){detailPage=1;expandedDetailPeriods.clear();detailInitialized=false}
+function updateDetailFilters(){const nextQuery=document.getElementById("detailQuery").value.trim().toLowerCase(),nextRange=document.getElementById("detailRange").value,nextSort=document.getElementById("detailSort").value;const groupingChanged=nextQuery!==detailQuery||nextRange!==detailRange;detailQuery=nextQuery;detailRange=nextRange;detailSort=nextSort;detailPage=1;if(groupingChanged){expandedDetailPeriods.clear();detailInitialized=false}renderDetail()}
+function resetDetailFilters(){detailQuery="";detailRange="all";detailSort="time";document.getElementById("detailQuery").value="";document.getElementById("detailRange").value="all";document.getElementById("detailSort").value="time";resetDetailGrouping();renderDetail()}
+function setDetailPage(page){detailPage=page;renderDetail()}
+function setErrorPage(page){errPage=page;render();requestAnimationFrame(()=>{document.getElementById("errorSecBody").scrollTop=0})}
+function toggleDetailPeriod(period){if(expandedDetailPeriods.has(period))expandedDetailPeriods.delete(period);else expandedDetailPeriods.add(period);detailInitialized=true;renderDetail()}
+function renderDetail(){
+  if(!D)return;
+  const grouped=grp(detailRangeDaily(D.daily||{}),P);
+  let periods=Object.entries(grouped).map(([key,userRows])=>{
+    const members=Object.entries(userRows).map(([userKey,data])=>{const info=D.users[userKey]||{};return{key:userKey,name:info.name||userKey.slice(0,8),data}}).filter(member=>!detailQuery||member.name.toLowerCase().includes(detailQuery)||member.key.toLowerCase().includes(detailQuery));
+    if(!members.length)return null;
+    members.sort((a,b)=>detailTokens(b.data)-detailTokens(a.data)||b.data.requests-a.data.requests||a.name.localeCompare(b.name,"zh-CN"));
+    return{key,members,total:detailTotals(members)};
+  }).filter(Boolean);
+  const latestKey=periods.reduce((latest,period)=>!latest||period.key>latest?period.key:latest,"");
+  if(!detailInitialized&&latestKey){expandedDetailPeriods.add(latestKey);detailInitialized=true}
+  periods.sort((a,b)=>detailSort==="tokens"?detailTokens(b.total)-detailTokens(a.total)||b.key.localeCompare(a.key):detailSort==="requests"?b.total.requests-a.total.requests||b.key.localeCompare(a.key):b.key.localeCompare(a.key));
+  const memberCount=periods.reduce((sum,period)=>sum+period.members.length,0);
+  const totalPages=Math.max(1,Math.ceil(periods.length/DETAIL_PAGE_SIZE));
+  detailPage=Math.max(1,Math.min(detailPage,totalPages));
+  const pagePeriods=periods.slice((detailPage-1)*DETAIL_PAGE_SIZE,detailPage*DETAIL_PAGE_SIZE);
+  const rows=[];
+  for(const period of pagePeriods){
+    const open=expandedDetailPeriods.has(period.key),total=period.total;
+    rows.push('<tr class="detail-group" data-period="'+escH(period.key)+'" tabindex="0" aria-expanded="'+open+'" onclick="toggleDetailPeriod(this.dataset.period)" onkeydown="if(event.keyCode===13||event.keyCode===32){event.preventDefault();toggleDetailPeriod(this.dataset.period)}"><td class="detail-sticky"><span class="detail-period"><span class="detail-period-toggle '+(open?'open':'')+'"></span><span>'+escH(detailPeriodLabel(period.key))+'</span><span class="detail-period-meta">'+period.members.length+' 位用户</span></span></td><td class="n">'+fmtT(total.requests)+'</td><td class="n">'+fmtT(total.inputTokens)+'</td><td class="n">'+fmtT(total.outputTokens)+'</td><td class="n">'+fmtT(total.cacheCreationTokens)+'</td><td class="n">'+fmtT(total.cacheReadTokens)+'</td><td class="n hl">'+fmtT(detailTokens(total))+'</td></tr>');
+    if(open){for(const member of period.members){const data=member.data,totalTokens=detailTokens(data),share=detailTokens(total)>0?Math.round(totalTokens/detailTokens(total)*100):0;rows.push('<tr class="detail-member"><td class="detail-sticky"><span class="detail-user"><span class="detail-user-name">'+escH(member.name)+'</span><span class="detail-key">'+escH(maskDetailKey(member.key))+'</span></span></td><td class="n">'+fmtT(data.requests||0)+'</td><td class="n">'+fmtT(data.inputTokens||0)+'</td><td class="n">'+fmtT(data.outputTokens||0)+'</td><td class="n">'+fmtT(data.cacheCreationTokens||0)+'</td><td class="n">'+fmtT(data.cacheReadTokens||0)+'</td><td class="n hl">'+fmtT(totalTokens)+'<span class="detail-share">'+share+'%</span></td></tr>')}}
+  }
+  document.querySelector("#dTable tbody").innerHTML=rows.length?rows.join(""):'<tr><td colspan="7" class="empty">'+(detailQuery?'没有匹配的用户记录':'暂无数据')+'</td></tr>';
+  document.getElementById("detailHint").textContent=periods.length+' 个周期 · '+memberCount+' 条用户记录';
+  document.getElementById("workspaceCountDetail").textContent=periods.length;
+  document.getElementById("detailPages").innerHTML=periods.length?'<span>第 '+detailPage+' / '+totalPages+' 页</span><button type="button" onclick="setDetailPage('+(detailPage-1)+')" '+(detailPage<=1?'disabled':'')+'>上一页</button><button type="button" onclick="setDetailPage('+(detailPage+1)+')" '+(detailPage>=totalPages?'disabled':'')+'>下一页</button>':'';
+}
+function switchProfileView(v){currentProfile=v||"all";resetDetailGrouping();load()}
 function render(){
   if(!D)return;
   // Populate profile dropdown
   const sel=document.getElementById("profileSel");
   if(sel.options.length<=1 && D.profiles){
-    sel.innerHTML='<option value="all">📊 全部方案</option>';
+    sel.innerHTML='<option value="all">全部方案</option>';
     for(const p of D.profiles){
       const sfx="/"+p.suffix+(p.isDefault?" · 默认入口":"");
       sel.innerHTML+='<option value="'+escH(p.suffix)+'">'+escH(p.name)+' '+sfx+'</option>';
@@ -3821,22 +3226,23 @@ function render(){
   const tIn=Object.values(tdd).reduce((s,d)=>s+d.inputTokens,0),tOut=Object.values(tdd).reduce((s,d)=>s+d.outputTokens,0),tR=Object.values(tdd).reduce((s,d)=>s+d.requests,0);
   document.getElementById("cards").innerHTML=c("今日用量",tIn+tOut,"var(--accent)",1)+c("今日请求",tR,"var(--blue)",1)+c("总用量",ti+to,"var(--green)",1)+c("总请求",tr,"var(--orange)",1)+c("今日错误",(Array.isArray(D.errors)?D.errors:[]).filter(e=>e.time&&e.time.startsWith(td)).length,"var(--red)",1);
   runCountUps(document.getElementById("cards"));
-  const ps=document.getElementById("profileSummarySec"),psb=document.getElementById("profileSummaryBody");
-  if(currentProfile==="all"&&Array.isArray(D.profileSummaries)){ps.style.display="block";psb.innerHTML=D.profileSummaries.map(p=>{const st=p.breakerState||"UNKNOWN";const col=st==="CLOSED"?"var(--green)":st==="HALF_OPEN"?"var(--orange)":"var(--red)";const led=st==="CLOSED"?"on":st==="HALF_OPEN"?"warn":"err";const lbl=st==="CLOSED"?"正常":st==="HALF_OPEN"?"探测中":"熔断";return'<tr><td>'+escH(p.name)+(p.isDefault?' <span style="color:var(--green);font-family:var(--font-pixel);font-size:9px;vertical-align:middle">DEF</span>':'')+'</td><td><code>/'+escH(p.suffix)+'</code>'+(p.isDefault?' <span style="color:var(--dim)">/ <code>/v1</code></span>':'')+'</td><td style="font-size:13px;color:var(--dim);max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+escH((p.upstream||'').replace('https://','').replace('http://',''))+'</td><td class="n">'+fmtT(p.todayRequests||0)+'</td><td class="n hl">'+fmtT(p.todayTokens||0)+'</td><td><span class="led '+led+'"></span><span style="color:'+col+';font-size:13px">'+lbl+'</span></td></tr>'}).join('')}else{ps.style.display="none"}
+  const psb=document.getElementById("profileSummaryBody"),profiles=Array.isArray(D.profileSummaries)?D.profileSummaries:[];
+  psb.innerHTML=profiles.length?profiles.map(p=>{const st=p.breakerState||"UNKNOWN";const col=st==="CLOSED"?"var(--green)":st==="HALF_OPEN"?"var(--orange)":"var(--red)";const led=st==="CLOSED"?"on":st==="HALF_OPEN"?"warn":"err";const stateLabel=st==="CLOSED"?"正常":st==="HALF_OPEN"?"探测中":"熔断";const current=currentProfile!=="all"&&p.suffix===currentProfile;return'<tr'+(current?' class="profile-current" aria-current="true"':'')+'><td>'+escH(p.name)+(p.isDefault?' <span style="color:var(--green);font-size:11px;font-weight:600;vertical-align:middle">默认</span>':'')+(current?' <span class="current-mark">当前</span>':'')+'</td><td><code>/'+escH(p.suffix)+'</code>'+(p.isDefault?' <span style="color:var(--dim)"> / <code>/v1</code></span>':'')+'</td><td style="font-size:12px;color:var(--dim);max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+escH((p.upstream||'').replace('https://','').replace('http://',''))+'</td><td class="n">'+fmtT(p.todayRequests||0)+'</td><td class="n hl">'+fmtT(p.todayTokens||0)+'</td><td><span class="led '+led+'"></span><span style="color:'+col+';font-size:12px">'+stateLabel+'</span></td></tr>'}).join(''):'<tr><td colspan="6" class="empty">暂无方案</td></tr>';
   const profileLabel=D.profileView||(currentProfile==="all"?"全部方案":"默认方案");
+  document.getElementById("profileContext").textContent="当前查看："+profileLabel;
   const upstreamInfo=D.upstream?(" | 上游: "+D.upstream.replace("https://","").replace("http://","")):"";
   document.getElementById("meta").innerHTML='<span style="color:var(--accent);font-weight:600">方案: '+profileLabel+'</span>'+upstreamInfo+' &nbsp;|&nbsp; 更新于 '+(function(){const d=new Date();const utc=d.getTime()+d.getTimezoneOffset()*60000;return new Date(utc+8*3600000).toLocaleTimeString("zh-CN")})()+" (北京时间) | 每30秒刷新";
 
   // Charts
   const g=grp(D.daily||{},P),keys=Object.keys(g).sort(),uks=Object.keys(D.users);
   if(C.t)C.t.destroy();if(C.p)C.p.destroy();if(C.m)C.m.destroy();if(C.h)C.h.destroy();
-  C.t=new Chart(document.getElementById("trend"),{type:"bar",data:{labels:keys.map(k=>lbl(P,k)),datasets:uks.map((u,i)=>({label:D.users[u].name,data:keys.map(k=>(g[k][u]||{}).inputTokens+(g[k][u]||{}).outputTokens||0),backgroundColor:COL[i%COL.length]+"cc",borderRadius:3,borderSkipped:false}))},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{labels:{color:"#9aa0c8",font:{size:11}}},tooltip:{callbacks:{label:ctx=>ctx.dataset.label+": "+fmtT(ctx.raw)}}},scales:{x:{stacked:true,ticks:{color:"#6f6f8f",font:{size:10}},grid:{color:"rgba(0,229,255,.08)"}},y:{stacked:true,ticks:{color:"#6f6f8f",callback:v=>fmtTk(v)},grid:{color:"rgba(0,229,255,.08)"}}}}});
+  C.t=new Chart(document.getElementById("trend"),{type:"bar",data:{labels:keys.map(k=>lbl(P,k)),datasets:uks.map((u,i)=>({label:D.users[u].name,data:keys.map(k=>(g[k][u]||{}).inputTokens+(g[k][u]||{}).outputTokens||0),backgroundColor:COL[i%COL.length]+"cc",borderRadius:3,borderSkipped:false}))},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:trendLegend(),tooltip:{callbacks:{label:ctx=>ctx.dataset.label+": "+fmtT(ctx.raw)}}},scales:{x:{stacked:true,ticks:{color:"#686863",font:{size:10}},grid:{color:"rgba(24,24,22,.08)"}},y:{stacked:true,ticks:{color:"#686863",callback:v=>fmtTk(v)},grid:{color:"rgba(24,24,22,.08)"}}}}});
   const tot=uks.map(u=>{let t=0;for(const k of keys)t+=(g[k][u]||{}).inputTokens+(g[k][u]||{}).outputTokens||0;return t});
-  C.p=new Chart(document.getElementById("pie"),{type:"doughnut",data:{labels:uks.map(k=>D.users[k].name),datasets:[{data:tot,backgroundColor:uks.map((_,i)=>COL[i%COL.length]+"cc"),borderWidth:0}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{position:"right",labels:{color:"#9aa0c8",font:{size:11},padding:12}},tooltip:{callbacks:{label:ctx=>ctx.label+": "+fmtT(ctx.raw)+" tokens"}}},cutout:"55%"}});
+  C.p=new Chart(document.getElementById("pie"),{type:"doughnut",data:{labels:uks.map(k=>D.users[k].name),datasets:[{data:tot,backgroundColor:uks.map((_,i)=>COL[i%COL.length]+"cc"),borderWidth:0}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:doughnutLegend(),tooltip:{callbacks:{label:ctx=>ctx.label+": "+fmtT(ctx.raw)+" tokens"}}},cutout:"55%"}});
 
   // 模型分布
   const mods=D.models||{};const mNames=Object.keys(mods);
-  C.m=new Chart(document.getElementById("modelChart"),{type:"doughnut",data:{labels:mNames,datasets:[{data:mNames.map(m=>mods[m].tokens),backgroundColor:mNames.map((_,i)=>COL[i%COL.length]+"cc"),borderWidth:0}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{position:"right",labels:{color:"#9aa0c8",font:{size:11},padding:12}},tooltip:{callbacks:{label:ctx=>ctx.label+": "+fmtT(ctx.raw)+" tokens"}}},cutout:"55%"}});
+  C.m=new Chart(document.getElementById("modelChart"),{type:"doughnut",data:{labels:mNames,datasets:[{data:mNames.map(m=>mods[m].tokens),backgroundColor:mNames.map((_,i)=>COL[i%COL.length]+"cc"),borderWidth:0}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:doughnutLegend(),tooltip:{callbacks:{label:ctx=>ctx.label+": "+fmtT(ctx.raw)+" tokens"}}},cutout:"55%"}});
 
   // 24小时趋势图
   const hrs=[];for(let i=0;i<24;i++)hrs.push(i.toString().padStart(2,"0")+":00");
@@ -3844,16 +3250,14 @@ function render(){
   const hReq=hrs.map((_,i)=>{const h=todayHourly[i.toString().padStart(2,"0")];return typeof h==="object"?(h.requests||0):0});
   const hIn=hrs.map((_,i)=>{const h=todayHourly[i.toString().padStart(2,"0")];return typeof h==="object"?(h.inputTokens||0):0});
   const hOut=hrs.map((_,i)=>{const h=todayHourly[i.toString().padStart(2,"0")];return typeof h==="object"?(h.outputTokens||0):0});
-  C.h=new Chart(document.getElementById("hourChart"),{type:"line",data:{labels:hrs,datasets:[{label:"请求数",data:hReq,borderColor:"#29e7ff",backgroundColor:"rgba(41,231,255,.12)",fill:true,tension:.4,pointRadius:3,pointBackgroundColor:"#29e7ff",pointHoverRadius:6,borderWidth:2.5,yAxisID:"y"},{label:"输入",data:hIn,borderColor:"#b14eff",backgroundColor:"rgba(177,78,255,.12)",fill:true,tension:.4,pointRadius:3,pointBackgroundColor:"#b14eff",pointHoverRadius:6,borderWidth:2.5,yAxisID:"y1"},{label:"输出",data:hOut,borderColor:"#ff3860",backgroundColor:"rgba(255,56,96,.12)",fill:true,tension:.4,pointRadius:3,pointBackgroundColor:"#ff3860",pointHoverRadius:6,borderWidth:2.5,yAxisID:"y1"}]},options:{responsive:true,maintainAspectRatio:false,interaction:{mode:"index",intersect:false},plugins:{legend:{labels:{color:"#9aa0c8",font:{size:11},usePointStyle:true,pointStyle:"circle"}},tooltip:{callbacks:{label:ctx=>ctx.dataset.label+": "+fmtT(ctx.raw)}}},scales:{x:{ticks:{color:"#6f6f8f",font:{size:9},maxRotation:0,autoSkip:true,maxTicksLimit:12},grid:{display:false}},y:{type:"linear",position:"left",ticks:{color:"#29e7ff"},grid:{color:"rgba(0,229,255,.08)"},title:{display:true,text:"请求数",color:"#29e7ff",font:{size:10}}},y1:{type:"linear",position:"right",ticks:{color:"#b14eff",callback:v=>fmtTk(v)},grid:{drawOnChartArea:false},title:{display:true,text:"Tokens",color:"#b14eff",font:{size:10}}}}}});
+  C.h=new Chart(document.getElementById("hourChart"),{type:"line",data:{labels:hrs,datasets:[{label:"请求数",data:hReq,borderColor:"#2f6e50",backgroundColor:"rgba(47,110,80,.12)",fill:true,tension:.28,pointRadius:2,pointBackgroundColor:"#2f6e50",pointHoverRadius:4,borderWidth:2,yAxisID:"y"},{label:"输入",data:hIn,borderColor:"#181816",backgroundColor:"rgba(24,24,22,.08)",fill:true,tension:.28,pointRadius:2,pointBackgroundColor:"#181816",pointHoverRadius:4,borderWidth:2,yAxisID:"y1"},{label:"输出",data:hOut,borderColor:"#8c8c84",backgroundColor:"rgba(140,140,132,.12)",fill:true,tension:.28,pointRadius:2,pointBackgroundColor:"#8c8c84",pointHoverRadius:4,borderWidth:2,yAxisID:"y1"}]},options:{responsive:true,maintainAspectRatio:false,interaction:{mode:"index",intersect:false},plugins:{legend:{labels:{color:"#686863",font:{size:11},usePointStyle:true,pointStyle:"circle"}},tooltip:{callbacks:{label:ctx=>ctx.dataset.label+": "+fmtT(ctx.raw)}}},scales:{x:{ticks:{color:"#686863",font:{size:9},maxRotation:0,autoSkip:true,maxTicksLimit:12},grid:{display:false}},y:{type:"linear",position:"left",ticks:{color:"#2f6e50"},grid:{color:"rgba(24,24,22,.08)"},title:{display:true,text:"请求数",color:"#2f6e50",font:{size:10}}},y1:{type:"linear",position:"right",ticks:{color:"#181816",callback:v=>fmtTk(v)},grid:{drawOnChartArea:false},title:{display:true,text:"Tokens",color:"#181816",font:{size:10}}}}}});
 
   // User table
   const ut=document.querySelector("#uTable tbody");
   const ul=Object.entries(D.users).sort((a,b)=>(b[1].totalInputTokens+b[1].totalOutputTokens)-(a[1].totalInputTokens+a[1].totalOutputTokens));
-  if(!ul.length){ut.innerHTML='<tr><td colspan="10" class="empty">暂无数据</td></tr>'}else{ut.innerHTML=ul.map(([uk,u],idx)=>{const on=u.lastActive&&Date.now()-new Date(u.lastActive).getTime()<36e5;const uq=(D.userQuotas||{})[uk]||D.profileQuota||0;const td2=(D.daily||{})[td]||{};const tdu=td2[uk]||{inputTokens:0,outputTokens:0};const used=tdu.inputTokens+tdu.outputTokens;const qPct=uq>0?Math.min(100,Math.round(used/uq*100)):0;const medal=idx<3?['🥇','🥈','🥉'][idx]+' ':'<span style="display:inline-block;width:1.2em"></span>';const qCell=uq>0?'<span style="color:var(--accent);font-size:12px">'+qPct+'%</span> '+hpBar(qPct,12):'<span style="color:var(--dim)">-</span>';return'<tr><td>'+medal+u.name+'</td><td><span class="led '+(on?'on':'')+'"></span><span style="color:'+(on?'var(--green)':'var(--dim)')+';font-size:12px">'+(on?'在线':'离线')+'</span></td><td class="n">'+fmtT(u.totalRequests)+'</td><td class="n">'+fmtT(u.totalInputTokens)+'</td><td class="n">'+fmtT(u.totalOutputTokens)+'</td><td class="n">'+fmtT(u.cacheCreationTokens || 0)+'</td><td class="n">'+fmtT(u.cacheReadTokens || 0)+'</td><td class="n hl">'+fmtT(u.totalInputTokens+u.totalOutputTokens)+'</td><td class="n" style="white-space:nowrap">'+qCell+'</td><td style="font-size:12px;color:var(--dim)">'+ago(u.lastActive)+'</td></tr>'}).join("")}
+  if(!ul.length){ut.innerHTML='<tr><td colspan="10" class="empty">暂无数据</td></tr>'}else{ut.innerHTML=ul.map(([uk,u],idx)=>{const on=u.lastActive&&Date.now()-new Date(u.lastActive).getTime()<36e5;const uq=(D.userQuotas||{})[uk]||D.profileQuota||0;const td2=(D.daily||{})[td]||{};const tdu=td2[uk]||{inputTokens:0,outputTokens:0};const used=tdu.inputTokens+tdu.outputTokens;const qPct=uq>0?Math.min(100,Math.round(used/uq*100)):0;const rank='<span class="rank">'+(idx+1)+'.</span>';const qCell=uq>0?'<span style="color:var(--accent);font-size:12px">'+qPct+'%</span> '+quotaBar(qPct):'<span style="color:var(--dim)">-</span>';return'<tr><td>'+rank+escH(u.name)+'</td><td><span class="led '+(on?'on':'')+'"></span><span style="color:'+(on?'var(--green)':'var(--dim)')+';font-size:12px">'+(on?'在线':'离线')+'</span></td><td class="n">'+fmtT(u.totalRequests)+'</td><td class="n">'+fmtT(u.totalInputTokens)+'</td><td class="n">'+fmtT(u.totalOutputTokens)+'</td><td class="n">'+fmtT(u.cacheCreationTokens || 0)+'</td><td class="n">'+fmtT(u.cacheReadTokens || 0)+'</td><td class="n hl">'+fmtT(u.totalInputTokens+u.totalOutputTokens)+'</td><td class="n" style="white-space:nowrap">'+qCell+'</td><td style="font-size:12px;color:var(--dim)">'+ago(u.lastActive)+'</td></tr>'}).join("")}
 
-  // Detail table
-  const dt=document.querySelector("#dTable tbody");
-  if(!keys.length){dt.innerHTML='<tr><td colspan="8" class="empty">暂无数据</td></tr>'}else{let rows=[];for(const k of keys.sort().reverse()){const us2=Object.entries(g[k]).sort((a,b)=>(b[1].inputTokens+b[1].outputTokens)-(a[1].inputTokens+a[1].outputTokens));for(const[u,d]of us2){const n=(D.users[u]||{}).name||u.slice(0,8);rows.push('<tr><td>'+lbl(P,k)+'</td><td>'+n+'</td><td class="n">'+fmtT(d.requests)+'</td><td class="n">'+fmtT(d.inputTokens)+'</td><td class="n">'+fmtT(d.outputTokens)+'</td><td class="n">'+fmtT(d.cacheCreationTokens || 0)+'</td><td class="n">'+fmtT(d.cacheReadTokens || 0)+'</td><td class="n hl">'+fmtT(d.inputTokens+d.outputTokens)+'</td></tr>')}}dt.innerHTML=rows.join("");document.getElementById("detailHint").textContent=rows.length+"条记录"}
+  renderDetail();
 
   // Error table with pagination
   const allErrs=Array.isArray(D.errors)?D.errors:[];
@@ -3863,16 +3267,19 @@ function render(){
   const et=document.querySelector("#eTable tbody");
   if(!errs.length){et.innerHTML='<tr><td colspan="6" class="empty">暂无错误记录</td></tr>'}else{et.innerHTML=errs.map(e=>{const sc=e.statusCode||"-";const col=sc>=500?"var(--red)":sc>=400?"var(--orange)":"var(--dim)";return'<tr><td style="font-size:12px;white-space:nowrap">'+(e.time?fmtBJ(e.time):"-")+'</td><td>'+(e.user||"-")+'</td><td class="n" style="color:'+col+';font-weight:600">'+sc+'</td><td style="font-size:12px;color:var(--blue)">'+(e.model||"-")+'</td><td style="font-size:12px;color:var(--dim);max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+(e.path||"-")+'</td><td style="font-size:12px;color:var(--red);max-width:400px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="'+(e.error||"").replace(/"/g,'&quot;')+'">'+(e.error||"-")+'</td></tr>'}).join("")}
   const pg=document.getElementById("errPages");
-  pg.innerHTML='<span style="font-size:12px;color:var(--dim)">第 '+errPage+"/"+totalErrPages+' 页 (共 '+allErrs.length+' 条)</span> '+(errPage>1?'<button onclick="errPage--;render()" style="font-size:11px;background:var(--card);color:var(--text);border:1px solid var(--border);padding:2px 10px;border-radius:4px;cursor:pointer">上一页</button> ':'')+(errPage<totalErrPages?'<button onclick="errPage++;render()" style="font-size:11px;background:var(--card);color:var(--text);border:1px solid var(--border);padding:2px 10px;border-radius:4px;cursor:pointer">下一页</button>':'');
+  pg.innerHTML='<span style="font-size:12px;color:var(--dim)">第 '+errPage+"/"+totalErrPages+' 页 (共 '+allErrs.length+' 条)</span> '+(errPage>1?'<button onclick="setErrorPage('+(errPage-1)+')" style="font-size:11px;background:var(--card);color:var(--text);border:1px solid var(--border);padding:2px 10px;border-radius:4px;cursor:pointer">上一页</button> ':'')+(errPage<totalErrPages?'<button onclick="setErrorPage('+(errPage+1)+')" style="font-size:11px;background:var(--card);color:var(--text);border:1px solid var(--border);padding:2px 10px;border-radius:4px;cursor:pointer">下一页</button>':'');
   document.getElementById("errorCount").textContent=allErrs.length>0?'('+allErrs.length+')':'';
   document.getElementById("errorHint").textContent=allErrs.length>0?(allErrs.length+'条错误'):'暂无错误';
+  renderWorkspaceSummaries();
 }
 async function load(){try{const profile=currentProfile==="all"?"all":currentProfile;const r=await fetch("/api/stats"+(profile?"?profile="+encodeURIComponent(profile):""));D=await r.json();render()}catch(e){document.getElementById("meta").textContent="Error: "+e.message}}
 function toggleSec(id){const body=document.getElementById(id+"Body");const icon=document.getElementById(id+"Icon");const open=body.classList.toggle("open");icon.classList.toggle("open",open)}
-document.querySelectorAll(".tab").forEach(b=>b.addEventListener("click",()=>{document.querySelectorAll(".tab").forEach(x=>x.classList.remove("on"));b.classList.add("on");P=b.dataset.p;render()}));
+document.querySelectorAll(".tab").forEach(b=>b.addEventListener("click",()=>{document.querySelectorAll(".tab").forEach(x=>x.classList.remove("on"));b.classList.add("on");P=b.dataset.p;resetDetailGrouping();render()}));
+document.querySelectorAll(".workspace-tab").forEach(button=>{button.addEventListener("click",()=>setWorkspaceTab(button.id.replace("workspace-tab-","")));button.addEventListener("keydown",handleWorkspaceTabKeydown)});
 document.getElementById("clearErrors").addEventListener("click",async()=>{if(confirm("确定清除所有错误记录？")){const csrf=(document.cookie.match(/tm_csrf=([^;]+)/)||[])[1]||'';await fetch("/api/clear-errors",{method:"POST",headers:{"x-csrf-token":csrf}});errPage=1;load()}});
 function startAutoRefresh(){if(refreshTimer)clearInterval(refreshTimer);refreshTimer=setInterval(()=>{if(autoRefresh)load()},30000)}
 document.getElementById("autoRefreshBtn").addEventListener("click",()=>{autoRefresh=!autoRefresh;const btn=document.getElementById("autoRefreshBtn");btn.textContent="自动刷新: "+(autoRefresh?"开":"关");btn.className=autoRefresh?"ar-on":"ar-off"});
+window.addEventListener("resize",scheduleChartResize);
 load();startAutoRefresh();
 <\/script></body></html>`;
 }
@@ -3881,33 +3288,29 @@ load();startAutoRefresh();
 function loginHtml() {
   return `<!DOCTYPE html>
 <html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
-<title>团队AI Coding监控 - ACCESS</title>
-${PIXEL_FONT}
+<title>登录 - CC Team</title>
 <style>
-${PIXEL_THEME}
-body{display:flex;justify-content:center;align-items:center;height:100vh;padding:20px}
-.wrap{width:100%;max-width:380px}
-.brand{text-align:center;margin-bottom:20px}
-.brand .t{font-family:var(--font-pixel);font-size:15px;color:var(--accent);text-shadow:var(--glow);letter-spacing:1px}
-.brand .s{font-family:'VT323',monospace;font-size:17px;color:var(--dim);margin-top:10px;letter-spacing:3px}
-.term{padding:30px 28px}
-.term .hd{font-family:'VT323',monospace;font-size:16px;color:var(--green);margin-bottom:18px;border-bottom:1px dashed var(--border);padding-bottom:12px;letter-spacing:1px}
-.term label{display:block;font-family:'VT323',monospace;font-size:15px;color:var(--dim);margin-bottom:6px;letter-spacing:2px}
-.term input{width:100%;padding:12px;background:var(--bg);border:2px solid var(--border);color:var(--accent);font-size:18px;font-family:'VT323',monospace;letter-spacing:3px;outline:none;margin-bottom:20px}
-.term input:focus{border-color:var(--accent);box-shadow:var(--glow)}
-.term button{width:100%;padding:13px;background:var(--accent);color:var(--bg);border:none;font-family:var(--font-pixel);font-size:11px;letter-spacing:1px;cursor:pointer;box-shadow:4px 4px 0 0 var(--magenta);transition:transform .08s,box-shadow .08s}
-.term button:hover{transform:translate(-2px,-2px);box-shadow:6px 6px 0 0 var(--magenta)}
-.term button:active{transform:translate(2px,2px);box-shadow:1px 1px 0 0 var(--magenta)}
-.err{color:var(--red);font-family:'VT323',monospace;font-size:15px;margin-bottom:14px;display:none;border-left:3px solid var(--red);padding-left:10px;letter-spacing:1px}
-</style></head><body>
+${UI_THEME}
+body{display:flex;justify-content:center;align-items:center;min-height:100vh;padding:24px}
+.wrap{width:100%;max-width:390px}
+.brand{margin-bottom:22px}.brand .t{font-size:24px;font-weight:650;margin-bottom:7px}.brand .s{font-size:13px;color:var(--dim)}
+.term{background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:26px}
+.term .hd{font-size:13px;font-weight:600;margin-bottom:18px;color:var(--text)}
+.term label{display:block;font-size:12px;font-weight:550;color:var(--dim);margin-bottom:6px}
+.term input{width:100%;padding:11px 12px;background:var(--surface);border:1px solid var(--border-strong);border-radius:5px;color:var(--text);font-size:15px;outline:none;margin-bottom:18px}
+.term input:focus{border-color:var(--accent)}
+.term button{width:100%;padding:11px 12px;background:var(--text);color:#fff;border:none;border-radius:5px;font-size:13px;font-weight:600;cursor:pointer}
+.term button:hover{background:#33332f}
+.err{color:var(--red);background:#fff2f0;border:1px solid #f1c8c2;border-radius:5px;padding:9px 10px;font-size:12px;margin-bottom:14px;display:none}
+</style></head><body data-theme="editorial-light">
 <div class="wrap">
-<div class="brand"><div class="t glitch">CODING MONITOR</div><div class="s">// ACCESS TERMINAL</div></div>
+<div class="brand"><div class="t">CC Team</div><div class="s">团队 AI 编码用量网关</div></div>
 <div class="term">
-<div class="hd">&gt; SYSTEM READY_</div>
-<div class="err" id="err">&gt; ACCESS DENIED · 密码错误</div>
-<label>PASSWORD</label>
+<div class="hd">登录管理后台</div>
+<div class="err" id="err">密码错误，请重试。</div>
+<label>访问密码</label>
 <input type="password" id="pw" placeholder="••••••••" autofocus>
-<button onclick="doLogin()">CONNECT<span class="cursor"></span></button>
+<button onclick="doLogin()">登录</button>
 </div></div>
 <script>
 document.getElementById("pw").addEventListener("keydown",e=>{if(e.key==="Enter")doLogin()});
@@ -3919,32 +3322,22 @@ async function doLogin(){const pw=document.getElementById("pw").value;const r=aw
 function personalUsageLandingHtml() {
   return `<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
 <title>我的用量</title>
-${PIXEL_FONT}
 <style>
-${PIXEL_THEME}
-body{display:flex;justify-content:center;align-items:center;height:100vh;padding:20px;margin:0}
-.wrap{width:100%;max-width:440px}
-.brand{text-align:center;margin-bottom:20px}
-.brand .t{font-family:var(--font-pixel);font-size:14px;color:var(--accent);text-shadow:var(--glow);letter-spacing:1px}
-.brand .s{font-family:'VT323',monospace;font-size:16px;color:var(--dim);margin-top:10px;letter-spacing:3px}
-.term{padding:30px 28px}
-.term .hd{font-family:'VT323',monospace;font-size:15px;color:var(--green);margin-bottom:16px;border-bottom:1px dashed var(--border);padding-bottom:10px;letter-spacing:1px}
-.term label{display:block;font-family:'VT323',monospace;font-size:15px;color:var(--dim);margin-bottom:6px;letter-spacing:2px}
-.term input{width:100%;padding:12px;background:var(--bg);border:2px solid var(--border);color:var(--accent);font-size:15px;font-family:'VT323',monospace;letter-spacing:2px;outline:none;margin-bottom:18px}
-.term input:focus{border-color:var(--accent);box-shadow:var(--glow)}
-.term button{width:100%;padding:12px;background:var(--accent);color:var(--bg);border:none;font-family:var(--font-pixel);font-size:11px;letter-spacing:1px;cursor:pointer;box-shadow:4px 4px 0 0 var(--magenta);transition:transform .08s,box-shadow .08s}
-.term button:hover{transform:translate(-2px,-2px);box-shadow:6px 6px 0 0 var(--magenta)}
-.term button:active{transform:translate(2px,2px);box-shadow:1px 1px 0 0 var(--magenta)}
-.note{font-family:'VT323',monospace;font-size:14px;color:var(--dim);text-align:center;margin-top:16px;letter-spacing:1px}
-.note code{color:var(--accent)}
-</style></head><body>
+${UI_THEME}
+body{display:flex;justify-content:center;align-items:center;min-height:100vh;padding:24px;margin:0}
+.wrap{width:100%;max-width:440px}.brand{margin-bottom:22px}.brand .t{font-size:24px;font-weight:650;margin-bottom:7px}.brand .s{font-size:13px;color:var(--dim)}
+.term{background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:26px}.term .hd{font-size:13px;font-weight:600;margin-bottom:18px;color:var(--text)}
+.term label{display:block;font-size:12px;font-weight:550;color:var(--dim);margin-bottom:6px}.term input{width:100%;padding:11px 12px;background:var(--surface);border:1px solid var(--border-strong);border-radius:5px;color:var(--text);font-size:14px;font-family:var(--font-mono);outline:none;margin-bottom:18px}.term input:focus{border-color:var(--accent)}
+.term button{width:100%;padding:11px 12px;background:var(--text);color:#fff;border:none;border-radius:5px;font-size:13px;font-weight:600;cursor:pointer}.term button:hover{background:#33332f}
+.note{font-size:12px;color:var(--dim);text-align:center;margin-top:14px}.note code{color:var(--accent);font-family:var(--font-mono)}
+</style></head><body data-theme="editorial-light">
 <div class="wrap">
-<div class="brand"><div class="t glitch">MY USAGE</div><div class="s">// QUERY TERMINAL</div></div>
+<div class="brand"><div class="t">我的用量</div><div class="s">输入虚拟 Key 查看个人配额与消耗。</div></div>
 <div class="term">
-<div class="hd">&gt; INSERT VIRTUAL KEY_</div>
-<label>KEY</label>
+<div class="hd">查询个人用量</div>
+<label>虚拟 Key</label>
 <input type="text" id="key" placeholder="jx-xxxxxxxx" autofocus>
-<button onclick="go()">EXECUTE<span class="cursor"></span></button>
+<button onclick="go()">查看用量</button>
 <div class="note">或直接访问 <code>/usage/你的虚拟Key</code></div>
 </div></div>
 <script>
@@ -3956,46 +3349,31 @@ function go(){const k=document.getElementById('key').value.trim();if(k)location.
 function personalUsageHtml(virtualKey) {
   return `<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
 <title>我的用量 - 团队AI Coding监控</title>
-${PIXEL_FONT}
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js"><\/script>
 <style>
-${PIXEL_THEME}
-body{padding:22px 26px}
-.top,.meta,.box{animation:boot-in .45s ease-out both}
-.top{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-bottom:6px}
-.top h1{font-family:var(--font-pixel);font-size:16px;color:var(--accent);text-shadow:0 0 14px rgba(34,233,255,.7),0 0 4px rgba(34,233,255,.9);letter-spacing:1px;line-height:1.6}
-.top h1::after{content:"";display:block;width:110px;height:3px;margin-top:8px;background:linear-gradient(90deg,var(--accent),var(--magenta),transparent);box-shadow:0 0 8px var(--accent)}
-.top .sub{font-family:'Pixelify Sans',monospace;font-weight:500;font-size:15px;color:var(--dim);letter-spacing:1px;margin-top:8px}
-select{font-family:'VT323',monospace;font-size:15px;background:var(--card);color:var(--text);border:2px solid var(--border);padding:5px 10px;letter-spacing:1px;cursor:pointer}
-select:focus{border-color:var(--accent)}
-.meta{font-family:'VT323',monospace;font-size:15px;color:var(--dim);margin-bottom:18px;letter-spacing:1px;border-left:3px solid var(--accent);padding:2px 0 2px 10px}
-.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px;margin-bottom:20px}
-.card{background:linear-gradient(180deg,var(--card2),var(--card));border:2px solid var(--border);padding:16px 16px 14px;position:relative;overflow:hidden;transition:transform .12s,border-color .12s,box-shadow .12s}
-.card::after{content:"";position:absolute;top:0;left:0;right:0;height:2px;background:linear-gradient(90deg,var(--accent),var(--magenta));opacity:.9}
-.card:hover{transform:translate(-3px,-3px);border-color:var(--accent);box-shadow:5px 5px 0 0 var(--accent),-3px -3px 0 0 var(--magenta),var(--glow)}
-.card .l{font-family:'Pixelify Sans',monospace;font-weight:600;font-size:14px;color:var(--dim);margin-bottom:8px;letter-spacing:1px;text-transform:uppercase}
-.card .v{font-size:15px}
-.box{position:relative;background:var(--card);border:2px solid var(--border);padding:16px;margin-bottom:14px}
-.box::before,.box::after{content:"";position:absolute;width:12px;height:12px;border:2px solid var(--accent);pointer-events:none;opacity:.6}
-.box::before{top:-2px;left:-2px;border-right:0;border-bottom:0}.box::after{bottom:-2px;right:-2px;border-left:0;border-top:0}
-.box h3{font-family:'Pixelify Sans',monospace;font-weight:600;font-size:15px;color:var(--accent);margin-bottom:10px;letter-spacing:1px;text-transform:uppercase;text-shadow:0 0 8px rgba(34,233,255,.5)}
-.box h3::before{content:"// ";color:var(--magenta)}
-.box canvas{max-height:220px}
-table{width:100%;border-collapse:collapse}
-th{text-align:left;padding:6px 12px;font-family:'Pixelify Sans',monospace;font-weight:600;font-size:13px;color:#b4bcd9;border-bottom:2px solid var(--accent);letter-spacing:1px;text-transform:uppercase}
-td{padding:6px 12px;font-size:13px;border-bottom:1px solid var(--border)}.n{text-align:right;font-variant-numeric:tabular-nums}
-tbody tr:hover td{background:rgba(0,229,255,.05)}
-.tag{font-family:var(--font-pixel);font-size:9px;background:rgba(0,229,255,.15);color:var(--accent);padding:2px 6px}
-</style></head><body>
-<div class="top"><div><h1 class="glitch">MY USAGE</h1><div class="sub">我的用量统计</div></div><select id="profileSel" onchange="switchProfile(this.value)"><option value="all">全部可用方案</option></select></div>
+${UI_THEME}
+body{padding:28px clamp(18px,3vw,44px) 48px}
+body>div{max-width:1120px;margin-left:auto;margin-right:auto}
+.top{display:flex;align-items:flex-start;justify-content:space-between;gap:24px;flex-wrap:wrap;margin-bottom:14px;padding-bottom:20px;border-bottom:1px solid var(--border)}
+.top h1{font-size:28px;font-weight:650;line-height:1.15;margin-bottom:7px}.top .sub{font-size:12px;color:var(--dim)}
+select{font-size:12px;background:var(--surface);color:var(--text);border:1px solid var(--border);border-radius:5px;padding:7px 10px;cursor:pointer}select:hover{background:var(--surface-subtle)}select:focus{border-color:var(--accent)}
+.meta{font-size:12px;color:var(--dim);margin-bottom:18px}
+.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin-bottom:20px}
+.card{background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:15px 16px;min-height:88px}.card:first-child{border-top:2px solid var(--accent)}
+.card .l{font-size:11px;font-weight:550;color:var(--dim);margin-bottom:12px}.card .v{font-size:22px;line-height:1;font-weight:650;font-variant-numeric:tabular-nums;color:var(--text)!important}
+.box{background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:17px;margin-bottom:14px;overflow-x:auto}.box h3{font-size:13px;font-weight:650;color:var(--text);margin-bottom:12px}.box canvas{max-height:220px}
+table{width:100%;border-collapse:collapse;min-width:560px}th{text-align:left;padding:9px 12px;font-size:11px;font-weight:550;color:var(--dim);border-bottom:1px solid var(--border);white-space:nowrap}td{padding:9px 12px;font-size:12px;border-bottom:1px solid #ecece8;white-space:nowrap}.n{text-align:right;font-variant-numeric:tabular-nums}tbody tr:hover td{background:#fafaf7}.tag{font-size:10px;background:var(--accent-soft);color:var(--accent);padding:2px 6px;border-radius:4px}
+@media(max-width:560px){body{padding:20px 14px 36px}.top h1{font-size:24px}.cards{grid-template-columns:1fr 1fr}.card .v{font-size:20px}.box{padding:14px}}
+</style></head><body data-theme="editorial-light">
+<div class="top"><div><h1>我的用量</h1><div class="sub">查看个人配额、趋势和模型明细</div></div><select id="profileSel" onchange="switchProfile(this.value)"><option value="all">全部可用方案</option></select></div>
 <div class="meta" id="meta">加载中...</div>
 <div class="cards" id="cards"></div>
 <div class="box"><h3>今日24小时趋势</h3><canvas id="hourChart"></canvas></div>
 <div class="box"><h3>近7天趋势</h3><canvas id="trendChart"></canvas></div>
 <div class="box"><h3>今日模型用量</h3><table id="modelTable"><thead><tr><th>模型</th><th class="n">请求数</th><th class="n">输入</th><th class="n">输出</th><th class="n">合计</th></tr></thead><tbody></tbody></table></div>
 <script>
-${PIXEL_JS}
-Chart.defaults.color='#9aa0c8';Chart.defaults.font.family="'Pixelify Sans',monospace";Chart.defaults.font.size=11;
+${UI_HELPERS}
+Chart.defaults.color='#686863';Chart.defaults.font.family='-apple-system,BlinkMacSystemFont,"SF Pro Text","PingFang SC","Microsoft YaHei","Segoe UI",sans-serif';Chart.defaults.font.size=11;
 const VK='${escJs(virtualKey)}';
 let D=null,C={h:null,t:null},currentProfile='all';
 const fmtT=n=>n.toLocaleString("zh-CN");
@@ -4031,10 +3409,10 @@ function render(){
   const hrs=[];for(let i=0;i<24;i++)hrs.push(i.toString().padStart(2,"0")+":00");
   const hData=hrs.map((_,i)=>{const h=D.hourly[i.toString().padStart(2,"0")]||{};return{req:h.requests||0,tokens:(h.inputTokens||0)+(h.outputTokens||0)}});
   if(C.h)C.h.destroy();
-  C.h=new Chart(document.getElementById("hourChart"),{type:"bar",data:{labels:hrs,datasets:[{label:"Token",data:hData.map(d=>d.tokens),backgroundColor:"#00e5ffcc",borderRadius:3},{label:"请求数",data:hData.map(d=>d.req),backgroundColor:"#29e7ffcc",borderRadius:3}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{labels:{color:"#9aa0c8",font:{size:10}}}},scales:{x:{ticks:{color:"#6f6f8f",font:{size:9},maxRotation:0,autoSkip:true,maxTicksLimit:12},grid:{display:false}},y:{ticks:{color:"#6f6f8f",callback:v=>fmtTk(v)},grid:{color:"rgba(0,229,255,.08)"}}}}});
+  C.h=new Chart(document.getElementById("hourChart"),{type:"bar",data:{labels:hrs,datasets:[{label:"Token",data:hData.map(d=>d.tokens),backgroundColor:"#2f6e50cc",borderRadius:3},{label:"请求数",data:hData.map(d=>d.req),backgroundColor:"#181816cc",borderRadius:3}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{labels:{color:"#686863",font:{size:10}}}},scales:{x:{ticks:{color:"#686863",font:{size:9},maxRotation:0,autoSkip:true,maxTicksLimit:12},grid:{display:false}},y:{ticks:{color:"#686863",callback:v=>fmtTk(v)},grid:{color:"rgba(24,24,22,.08)"}}}}});
   // Trend chart
   if(C.t)C.t.destroy();
-  C.t=new Chart(document.getElementById("trendChart"),{type:"line",data:{labels:D.trend.map(d=>d.date.slice(5)),datasets:[{label:"输入",data:D.trend.map(d=>d.input),borderColor:"#00ff88",backgroundColor:"rgba(0,255,136,.12)",fill:true,tension:.4,pointRadius:3,borderWidth:2},{label:"输出",data:D.trend.map(d=>d.output),borderColor:"#ff3860",backgroundColor:"rgba(255,56,96,.12)",fill:true,tension:.4,pointRadius:3,borderWidth:2}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{labels:{color:"#9aa0c8",font:{size:10}}}},scales:{x:{ticks:{color:"#6f6f8f"},grid:{display:false}},y:{ticks:{color:"#6f6f8f",callback:v=>fmtTk(v)},grid:{color:"rgba(0,229,255,.08)"}}}}});
+  C.t=new Chart(document.getElementById("trendChart"),{type:"line",data:{labels:D.trend.map(d=>d.date.slice(5)),datasets:[{label:"输入",data:D.trend.map(d=>d.input),borderColor:"#2f6e50",backgroundColor:"rgba(47,110,80,.12)",fill:true,tension:.28,pointRadius:2,borderWidth:2},{label:"输出",data:D.trend.map(d=>d.output),borderColor:"#181816",backgroundColor:"rgba(24,24,22,.08)",fill:true,tension:.28,pointRadius:2,borderWidth:2}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{labels:{color:"#686863",font:{size:10}}}},scales:{x:{ticks:{color:"#686863"},grid:{display:false}},y:{ticks:{color:"#686863",callback:v=>fmtTk(v)},grid:{color:"rgba(24,24,22,.08)"}}}}});
   // Model table
   const mt=document.querySelector("#modelTable tbody");
   const models=Object.entries(D.models||{}).sort((a,b)=>(b[1].inputTokens+b[1].outputTokens)-(a[1].inputTokens+a[1].outputTokens));
@@ -4066,19 +3444,6 @@ function applySettings(formData) {
   const editingProfileName = formData.profileName || getProfileNameBySuffix(formData.profileSuffix) || getDefaultProfileName();
   const editingProfile = config.profiles[editingProfileName];
   if (!editingProfile) throw new Error(`Profile "${editingProfileName}" not found`);
-
-  if (formData.apiProtocol !== undefined) {
-    editingProfile.apiProtocol = validateApiProtocol(formData.apiProtocol);
-  }
-  if (formData.openaiStreamUsage !== undefined || formData.apiProtocol !== undefined) {
-    editingProfile.openaiStreamUsage = formData.openaiStreamUsage === "on" || formData.openaiStreamUsage === true;
-  }
-  if (formData.responsesAdapter !== undefined || formData.apiProtocol !== undefined) {
-    const protocol = normalizeApiProtocol(editingProfile.apiProtocol);
-    editingProfile.responsesAdapter = protocol === "openai"
-      ? validateResponsesAdapter(formData.responsesAdapter || "none")
-      : "none";
-  }
 
   if (formData.upstream && formData.upstream !== editingProfile.upstream) {
     if (!/^https?:\/\/[^\s]+/.test(formData.upstream)) throw new Error("Invalid upstream URL");
@@ -4143,11 +3508,6 @@ function applySettings(formData) {
     if (editingProfile.allowedModels.length === 0) throw new Error("至少需要设置 1 个允许模型");
   }
 
-  // Update default model mappings (jx-* aliases)
-  if (!editingProfile.defaultModels) editingProfile.defaultModels = {};
-  if (formData.defaultModels_sonnet) editingProfile.defaultModels.sonnet = formData.defaultModels_sonnet.trim();
-  if (formData.defaultModels_opus)   editingProfile.defaultModels.opus   = formData.defaultModels_opus.trim();
-  if (formData.defaultModels_haiku)  editingProfile.defaultModels.haiku  = formData.defaultModels_haiku.trim();
   if (formData.modelAliases !== undefined) {
     const parsedAliases = parseModelAliasesInput(formData.modelAliases);
     editingProfile.modelAliases = parsedAliases;
@@ -4214,6 +3574,66 @@ function applySettings(formData) {
   reloadAllRuntimes();
 
   console.log(`[CONFIG] Settings saved to profile "${editingProfileName}"`);
+}
+
+function getImportPreview(raw) {
+  const normalized = normalizeLegacyImportData(raw);
+  const availableSuffixes = new Set(listProfiles().map((profile) => profile.suffix));
+  const sourceProfiles = Object.keys(normalized.profiles).map((suffix) => ({
+    suffix,
+    matchedTarget: availableSuffixes.has(normalizeProfileSuffix(suffix)) ? normalizeProfileSuffix(suffix) : null,
+  }));
+  const warnings = sourceProfiles
+    .filter((profile) => !profile.matchedTarget)
+    .map((profile) => `来源方案 ${profile.suffix} 未自动匹配，请选择目标方案或跳过`);
+  return { summary: summarizeLegacyImport(normalized), sourceProfiles, warnings, sourceHash: legacyImportHash(raw) };
+}
+
+function resolveImportProfileMap(normalized, requestedMap = {}) {
+  const availableSuffixes = new Set(listProfiles().map((profile) => profile.suffix));
+  const resolved = {};
+  for (const source of Object.keys(normalized.profiles)) {
+    const requested = requestedMap[source];
+    if (requested === "skip" || requested === null) {
+      resolved[source] = "";
+      continue;
+    }
+    const target = normalizeProfileSuffix(requested || (availableSuffixes.has(normalizeProfileSuffix(source)) ? source : ""));
+    if (!target) throw new Error(`来源方案 ${source} 尚未映射`);
+    if (!availableSuffixes.has(target)) throw new Error(`目标方案 ${target} 不存在`);
+    resolved[source] = target;
+  }
+  if (!Object.values(resolved).some(Boolean)) throw new Error("至少需要导入一个来源方案");
+  return resolved;
+}
+
+function clearInMemoryRequestState() {
+  for (const state of [userConcurrent, userRateBucket, ipRateBucket]) {
+    for (const key of Object.keys(state)) delete state[key];
+  }
+}
+
+function resetConfigToUnconfiguredState() {
+  const preserved = {
+    port: config.port,
+    dashboardPassword: config.dashboardPassword,
+    proxy: { ...(config.proxy || {}) },
+  };
+  for (const key of Object.keys(config)) delete config[key];
+  Object.assign(config, preserved, {
+    users: {},
+    profiles: {
+      "默认方案": {
+        suffix: "default",
+        isDefault: true,
+        upstream: "",
+        allowedModels: [],
+        modelAliases: {},
+        dailyTokenLimit: null,
+        users: {},
+      },
+    },
+  });
 }
 
 const server = http.createServer((req, res) => {
@@ -4305,6 +3725,109 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+  if (req.method === "POST" && req.url === "/api/data-import/preview") {
+    if (!checkAuth(req)) { res.writeHead(401); res.end("Unauthorized"); return; }
+    if (!checkCsrf(req)) { res.writeHead(403); res.end("CSRF validation failed"); return; }
+    readBody(req, 50_000_000).then((buf) => {
+      try {
+        const { data } = JSON.parse(buf.toString());
+        const preview = getImportPreview(data);
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify(preview));
+      } catch (err) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: err.message }));
+      }
+    }).catch(() => {
+      res.writeHead(413, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Request too large" }));
+    });
+    return;
+  }
+
+  if (req.method === "POST" && req.url === "/api/data-import/apply") {
+    if (!checkAuth(req)) { res.writeHead(401); res.end("Unauthorized"); return; }
+    if (!checkCsrf(req)) { res.writeHead(403); res.end("CSRF validation failed"); return; }
+    readBody(req, 50_000_000).then((buf) => {
+      try {
+        const payload = JSON.parse(buf.toString());
+        if (!['merge', 'replace'].includes(payload.mode)) throw new Error("导入模式必须是 merge 或 replace");
+        if (payload.mode === "replace" && (!dashboardPassword || !timingSafeEqual(payload.password || "", dashboardPassword))) {
+          res.writeHead(401, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "密码错误" }));
+          return;
+        }
+        const actualHash = legacyImportHash(payload.data);
+        if (!payload.sourceHash || !timingSafeEqual(payload.sourceHash, actualHash)) throw new Error("文件指纹不匹配，请重新预览");
+        if (getMeta(`dataImport:${actualHash}`)) {
+          res.writeHead(409, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "该文件已经导入" }));
+          return;
+        }
+        const normalized = normalizeLegacyImportData(payload.data);
+        const profileMap = resolveImportProfileMap(normalized, payload.profileMap || {});
+        if (payload.mode === "replace") backupDatabaseSync("data-import-replace");
+        const tx = db.transaction(() => {
+          if (payload.mode === "replace") clearRequestData();
+          writeLegacyData(normalized, profileMap);
+          stmts.upsertMeta.run({ k: `dataImport:${actualHash}`, v: new Date().toISOString() });
+        });
+        tx();
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: true, summary: summarizeLegacyImport(normalized) }));
+      } catch (err) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: err.message }));
+      }
+    }).catch(() => {
+      res.writeHead(413, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Request too large" }));
+    });
+    return;
+  }
+
+  if (req.method === "POST" && req.url === "/api/data-clear") {
+    if (!checkAuth(req)) { res.writeHead(401); res.end("Unauthorized"); return; }
+    if (!checkCsrf(req)) { res.writeHead(403); res.end("CSRF validation failed"); return; }
+    readBody(req, 10_000).then((buf) => {
+      try {
+        const { password } = JSON.parse(buf.toString());
+        if (!dashboardPassword || !timingSafeEqual(password || "", dashboardPassword)) {
+          res.writeHead(401, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "密码错误" }));
+          return;
+        }
+        backupFileSync(configPath, "config.json", "data-clear");
+        backupDatabaseSync("data-clear");
+        const previousConfig = JSON.parse(JSON.stringify(config));
+        const tx = db.transaction(() => {
+          clearRequestData();
+          resetConfigToUnconfiguredState();
+          try {
+            saveConfig(config);
+          } catch (err) {
+            for (const key of Object.keys(config)) delete config[key];
+            Object.assign(config, previousConfig);
+            throw err;
+          }
+        });
+        tx();
+        clearInMemoryRequestState();
+        reloadAllRuntimes();
+        console.log("[DATA] All configuration and request data cleared");
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: true }));
+      } catch (err) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: err.message }));
+      }
+    }).catch(() => {
+      res.writeHead(413, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Request too large" }));
+    });
+    return;
+  }
+
   // Settings save (form POST from settings page)
   if (req.method === "POST" && req.url === "/api/settings-save") {
     if (!checkAuth(req)) {
@@ -4387,29 +3910,20 @@ const server = http.createServer((req, res) => {
     if (!checkCsrf(req)) { res.writeHead(403); res.end("CSRF validation failed"); return; }
     readBody(req).then(buf => {
       try {
-        const { profile, upstream, allowedModels, defaultModels, suffix, apiProtocol, modelAliases, openaiStreamUsage, responsesAdapter } = JSON.parse(buf.toString());
+        const { profile, upstream, allowedModels, suffix, modelAliases } = JSON.parse(buf.toString());
         const name = (profile || "").trim();
         if (!name) throw new Error("Profile name required");
         if (config.profiles[name]) throw new Error(`方案 "${name}" 已存在`);
         const sfx = validateProfileSuffix(suffix, name);
-        const protocol = validateApiProtocol(apiProtocol || "anthropic");
-        const nextDefaultModels = defaultModels || { ...rt.defaultModels };
         const aliases = parseModelAliasesInput(modelAliases);
-        const runtimeAliases = protocol === "anthropic"
-          ? { ...legacyDefaultModelAliases(nextDefaultModels), ...aliases }
-          : aliases;
-        const models = allowedModels ? allowedModels.split(",").map(s => s.trim()).filter(Boolean) : [...rt.allowedModels];
-        for (const m of Object.values(runtimeAliases)) {
+        const models = allowedModels ? allowedModels.split(",").map(s => s.trim()).filter(Boolean) : [...(rt?.allowedModels || [])];
+        for (const m of Object.values(aliases)) {
           if (m && !models.includes(m)) models.push(m);
         }
         config.profiles[name] = {
-          upstream: upstream || rt.upstream,
-          apiProtocol: protocol,
+          upstream: upstream || rt?.upstream || "",
           allowedModels: models,
-          defaultModels: nextDefaultModels,
           modelAliases: aliases,
-          openaiStreamUsage: openaiStreamUsage !== false,
-          responsesAdapter: protocol === "openai" ? validateResponsesAdapter(responsesAdapter || "none") : "none",
           users: {},
           suffix: sfx,
           isDefault: false,
@@ -4470,9 +3984,6 @@ const server = http.createServer((req, res) => {
         const formData = {};
         if (updates.profileName) formData.profileName = updates.profileName;
         if (updates.profileSuffix) formData.profileSuffix = updates.profileSuffix;
-        if (updates.apiProtocol) formData.apiProtocol = updates.apiProtocol;
-        if (updates.openaiStreamUsage !== undefined) formData.openaiStreamUsage = updates.openaiStreamUsage;
-        if (updates.responsesAdapter !== undefined) formData.responsesAdapter = updates.responsesAdapter;
         if (updates.upstream) formData.upstream = updates.upstream;
         if (updates.proxy) {
           Object.assign(formData, {
@@ -4489,11 +4000,6 @@ const server = http.createServer((req, res) => {
         }
         if (updates.allowedModels) {
           formData.allowedModels = Array.isArray(updates.allowedModels) ? updates.allowedModels.join(",") : updates.allowedModels;
-        }
-        if (updates.defaultModels) {
-          if (updates.defaultModels.sonnet) formData.defaultModels_sonnet = updates.defaultModels.sonnet;
-          if (updates.defaultModels.opus)   formData.defaultModels_opus   = updates.defaultModels.opus;
-          if (updates.defaultModels.haiku)  formData.defaultModels_haiku  = updates.defaultModels.haiku;
         }
         if (updates.modelAliases !== undefined) {
           formData.modelAliases = updates.modelAliases;
@@ -4618,9 +4124,17 @@ const server = http.createServer((req, res) => {
         for (const pname of Object.keys(config.profiles)) {
           delete config.profiles[pname].users[key];
         }
-        saveConfig(config);
+        const tx = db.transaction(() => {
+          for (const table of ["users", "usage_daily", "usage_daily_model", "usage_daily_hourly", "errors", "quota_adjust_history"]) {
+            db.prepare(`DELETE FROM ${table} WHERE user_key=?`).run(key);
+          }
+          saveConfig(config);
+        });
+        tx();
+        delete userConcurrent[key];
+        delete userRateBucket[key];
         reloadAllRuntimes();
-        console.log(`[USER] Deleted global user: ${key}`);
+        console.log(`[USER] Deleted global user and history: ${key.slice(0, 8)}****`);
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ ok: true }));
       } catch (err) {
@@ -4690,7 +4204,7 @@ const server = http.createServer((req, res) => {
   // Personal usage page
   if (req.method === "GET" && req.url.startsWith("/usage/")) {
     const vk = decodeURIComponent(req.url.slice(7).split("?")[0]);
-    if (!vk || (!rt.users[vk] && !rt.globalUsers[vk])) {
+    if (!rt || !vk || (!rt.users[vk] && !rt.globalUsers[vk])) {
       res.writeHead(404, { "Content-Type": "text/html; charset=utf-8" });
       res.end("<h1>Key不存在</h1><p>请检查你的虚拟Key是否正确。</p>");
       return;
@@ -4702,7 +4216,7 @@ const server = http.createServer((req, res) => {
   if (req.method === "GET" && req.url.startsWith("/my-usage")) {
     const url = new URL(req.url, `http://${req.headers.host}`);
     const vk = url.searchParams.get("key");
-    if (!vk || (!rt.users[vk] && !rt.globalUsers[vk])) {
+    if (!rt || !vk || (!rt.users[vk] && !rt.globalUsers[vk])) {
       res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
       res.end(personalUsageLandingHtml());
       return;
@@ -4748,8 +4262,8 @@ const server = http.createServer((req, res) => {
       status: "ok",
       uptime: Math.floor(process.uptime()),
       activeConnections: activeConns,
-      upstream: rt.upstream,
-      circuitBreaker: rt.breaker.status(),
+      upstream: rt?.upstream || "",
+      circuitBreaker: rt?.breaker?.status() || { state: "UNCONFIGURED" },
     }));
     return;
   }
@@ -4768,7 +4282,7 @@ server.listen(port, "0.0.0.0", () => {
   console.log(`[团队AI Coding监控] http://0.0.0.0:${port}  Dashboard: http://localhost:${port}/dashboard`);
   console.log(`[团队AI Coding监控] Profiles: ${Object.values(runtimes).map(r => `"${r.profileName}"(${JSON.stringify(r.suffix)})→${r.upstream.replace("https://","").replace("http://","").split("/")[0]}`).join(", ")}`);
   console.log(`[团队AI Coding监控] Settings: http://localhost:${port}/settings`);
-  console.log(`[团队AI Coding监控] Users: ${Object.values(rt.globalUsers).map(u => u.username || "").join(", ")}`);
+  console.log(`[团队AI Coding监控] Users: ${Object.values(rt?.globalUsers || {}).map(u => u.username || "").join(", ")}`);
 });
 
 // Server timeouts

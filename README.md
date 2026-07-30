@@ -1,38 +1,27 @@
-# CC-TEAM
+# CC Team
 
-团队 AI 编码用量监控网关。
+面向 Claude Code 团队的 Anthropic Messages 用量网关。CC Team 将请求透明转发到多个兼容上游，通过虚拟 Key 管理成员访问，并提供 Token 统计、每日配额、错误记录和明亮极简的可视化工作台。
 
-透明代理请求到多个上游 AI API，记录每个成员的 token 消耗量，提供可视化监控面板、个人用量页面和热加载配置管理。
+项目只支持 Claude Code 使用的 Anthropic Messages 协议，不提供 OpenAI Chat Completions、Responses 或 Models 兼容接口。
 
-> 单文件 · 零依赖 · Docker 就绪
-
-![CC-TEAM](docs/Introduction.png)
+![CC Team Dashboard](docs/Introduction.png)
 
 ## 功能
 
-- **透明代理**：请求/响应原样透传，零影响 LLM 上下文和输出质量
-- **多方案并发**：GLM、阿里云 Token Plan、DeepSeek 等多上游配置同时在线，通过 URL 后缀区分
-- **虚拟 Key 映射**：多人共享同一上游账号，各自使用 `jx-` 虚拟 Key，用量分人统计
-- **协议方案**：每个方案可选择 Anthropic 或 OpenAI-compatible 协议，Claude Code 和 Codex 可共用同一套用户/配额/监控
-- **模型别名**：支持通用 `alias=实际模型`，并兼容 `jx-sonnet` / `jx-opus` / `jx-haiku`
-- **模型准入**：按方案限制可用模型，拦截未知 Key
-- **Token 配额**：方案级 + 用户级每日 token 限额，超限自动拦截
-- **自动增长额度**：高强度用户自动增长配额
-- **个人用量页**：用户通过虚拟 Key 查看自己的配额、模型明细、趋势图表
-- **Token 统计**：按人、按日、按模型、按小时记录 token 消耗
-- **Dashboard**：Chart.js 可视化图表（趋势、分布、24小时热力），自动刷新
-- **请求分类**：自动识别用户请求、工具调用、子代理请求
-- **错误记录**：上报错误实时记录，分页查看
-- **熔断保护**：连续失败自动熔断，上游恢复后半开探测
-- **限流控制**：每用户最大并发 + 每分钟速率限制
-- **登录鉴权**：Dashboard 和设置页面密码保护
-- **热加载**：Web 页面修改全部设置，即时生效
+- 多个 Anthropic Messages 上游同时在线，通过 URL 后缀区分方案
+- 每位成员使用独立的 `jx-` 虚拟 Key，真实上游 Key 不暴露
+- 按成员、方案、模型、日期和小时统计 Token 用量
+- 方案级与成员级每日配额，北京时间零点重置
+- 统一的 `alias=实际模型` 模型别名配置
+- 模型准入、并发限制、速率限制、重试和熔断保护
+- 桌面单屏 Dashboard、设置页与成员个人用量页
+- Dashboard 内置用户用量、周期明细、方案中心和错误记录工作区
+- 从旧版 `data.json` 预览并导入历史数据
+- 创建本地备份后清空配置与请求数据
 
 ## 快速开始
 
-### 方式一：脚本启动（推荐）
-
-自动检测环境、安装 Node.js、生成配置并引导填写，双击即用。
+### 脚本启动
 
 ```bash
 git clone https://github.com/Linlx0628/cc-team.git
@@ -45,52 +34,38 @@ cd cc-team
 start.bat
 ```
 
-> 首次运行自动检测 Node.js（没有则自动安装）、自动生成 `config.json` 并引导你完成配置。
-
-### 方式二：Docker
+### Docker
 
 ```bash
 docker pull linlx/cc-team:latest
 
-# 首次启动 — 自动生成默认配置
+mkdir -p cc-team-data/backups
+curl -fsSL https://raw.githubusercontent.com/Linlx0628/cc-team/master/config.example.json \
+  -o cc-team-data/config.json
+touch cc-team-data/data.db
+
 docker run -d \
   -p 6789:6789 \
-  -v cc-team-config:/app \
+  -v "$PWD/cc-team-data/config.json:/app/config.json" \
+  -v "$PWD/cc-team-data/data.db:/app/data.db" \
+  -v "$PWD/cc-team-data/backups:/app/backups" \
   --name cc-team \
   linlx/cc-team:latest
-
-# 编辑配置（填入你的上游地址、API Key、用户等）
-docker exec -it cc-team vi /app/config.json
-
-# 重启生效
-docker restart cc-team
 ```
 
-> 首次启动会自动从模板生成 `config.json`，编辑后重启即可。
+不要把卷直接挂载到整个 `/app`，否则会覆盖镜像内的服务程序。升级容器时保留 `cc-team-data/` 即可。
 
-或者用 docker compose（适合 clone 仓库后使用）：
-
-```bash
-git clone https://github.com/Linlx0628/cc-team.git
-cd cc-team
-cp config.example.json config.json
-# 编辑 config.json 填入真实配置
-docker compose up -d
-```
-
-首次运行会自动从模板创建 `config.json`，编辑后重新启动即可。
-
-### 方式三：直接运行
+### 直接运行
 
 ```bash
 cp config.example.json config.json
-# 编辑 config.json
+npm install
 node server.mjs
 ```
 
-## 配置
+打开 `http://localhost:6789/settings` 完成上游、模型和成员配置。
 
-编辑 `config.json`：
+## 配置
 
 ```json
 {
@@ -100,41 +75,30 @@ node server.mjs
     "glm": {
       "suffix": "glm",
       "isDefault": true,
-      "apiProtocol": "anthropic",
       "upstream": "https://open.bigmodel.cn/api/anthropic",
       "dailyTokenLimit": 2000000,
-      "allowedModels": ["glm-5.1", "glm-5-turbo", "glm-4.7"],
-      "defaultModels": {
-        "sonnet": "glm-5-turbo",
-        "opus": "glm-5.1",
-        "haiku": "glm-4.7"
-      },
+      "allowedModels": ["glm-5.1"],
       "modelAliases": {
-        "jx-sonnet": "glm-5-turbo",
+        "jx-sonnet": "glm-5.1",
         "jx-opus": "glm-5.1",
-        "jx-haiku": "glm-4.7"
+        "jx-haiku": "glm-5.1"
       },
-      "openaiStreamUsage": true,
-      "responsesAdapter": "none",
-      "users": {}
-    },
-    "openai-codex": {
-      "suffix": "openai",
-      "isDefault": false,
-      "apiProtocol": "openai",
-      "upstream": "https://api.openai.com/v1",
-      "dailyTokenLimit": 2000000,
-      "allowedModels": ["gpt-5", "gpt-5-mini"],
-      "modelAliases": {
-        "codex-main": "gpt-5",
-        "codex-fast": "gpt-5-mini"
-      },
-      "openaiStreamUsage": true,
-      "responsesAdapter": "none",
-      "users": {}
+      "users": {
+        "jx-example-user": {
+          "key": "real-upstream-key",
+          "disabled": false,
+          "dailyTokenLimit": null
+        }
+      }
     }
   },
-  "users": {},
+  "users": {
+    "jx-example-user": {
+      "username": "示例成员",
+      "expiresAt": null,
+      "disabled": false
+    }
+  },
   "proxy": {
     "timeout": 180000,
     "streamTimeout": 600000,
@@ -149,248 +113,117 @@ node server.mjs
 }
 ```
 
+`modelAliases` 是唯一的模型映射入口。别名目标会自动加入 `allowedModels`；不需要别名时可直接使用真实模型名。
+
+`jx-sonnet`、`jx-opus` 和 `jx-haiku` 没有特殊的独立配置入口，它们与其他别名一样统一写入 `modelAliases`。
+
 ## 接入 Claude Code
 
-### 默认方案（无后缀）
+默认方案使用无后缀地址：
 
 ```bash
 export ANTHROPIC_BASE_URL="http://localhost:6789"
 export ANTHROPIC_API_KEY="jx-your-virtual-key"
 ```
 
-默认入口是当前默认方案的别名。默认方案也保留自己的后缀入口，例如：
+指定方案时在地址中加入方案后缀：
 
 ```bash
 export ANTHROPIC_BASE_URL="http://localhost:6789/glm"
 export ANTHROPIC_API_KEY="jx-your-virtual-key"
 ```
 
-### 指定方案（通过 URL 后缀）
+所有方案同时在线。管理员可在设置页选择默认入口，默认方案的后缀入口仍然可用。
 
-```bash
-# 使用 DeepSeek 方案
-export ANTHROPIC_BASE_URL="http://localhost:6789/deepseek"
-export ANTHROPIC_API_KEY="jx-your-virtual-key"
+## 用户与配额
+
+用户管理分为两层：
+
+1. 全局用户保存虚拟 Key、名称、失效时间和禁用状态。
+2. 每个方案为该虚拟 Key 分配真实上游 Key、方案禁用状态和可选个人配额。
+
+配额优先级为：
+
+```text
+用户配额 > 方案配额 > 不限制
 ```
 
-所有方案同时在线，无需切换。每个方案都必须有唯一后缀；管理员可在设置页把任一方案设为默认入口。
+达到限额时返回 429、`type: "quota_exceeded"` 和距北京时间下一个零点的 `Retry-After`。配额、并发和速率限制产生的 429 都会进入错误记录。
 
-## 接入 Codex / OpenAI-compatible 客户端
+删除用户会同时删除该虚拟 Key 的成员汇总、每日数据、模型与小时明细、错误和配额调整记录。
 
-创建方案时把"接口协议"设为 `OpenAI-compatible / Codex`，上游地址填写 OpenAI 或中转商提供的 OpenAI-compatible base URL：
+## 数据管理
 
-```json
-{
-  "suffix": "openai",
-  "apiProtocol": "openai",
-  "upstream": "https://api.openai.com/v1",
-  "allowedModels": ["gpt-5", "gpt-5-mini"],
-  "modelAliases": {
-    "codex-main": "gpt-5",
-    "codex-fast": "gpt-5-mini"
-  },
-  "openaiStreamUsage": true,
-  "responsesAdapter": "none"
-}
-```
+数据管理是设置页中的独立全局功能，不属于当前选中的单个方案。导入时可以将旧数据来源分别映射到现有方案；清空操作作用于整个系统。
 
-Codex 或 OpenAI SDK 填的是 base URL，不是完整 endpoint。Codex 推荐写到 `/v1`：
+### 导入旧版 data.json
 
-```toml
-model = "gpt-5"
-model_provider = "cc-team-openai"
+设置页的“旧数据导入”支持旧版顶层结构和 `_profiles` 多方案结构：
 
-[model_providers.cc-team-openai]
-name = "CC-Team OpenAI"
-base_url = "http://localhost:6789/openai/v1"
-env_key = "OPENAI_API_KEY"
-wire_api = "responses"
-```
+1. 选择文件并预览日期范围、成员数、请求数和来源方案。
+2. 为每个来源方案选择目标方案或明确跳过。
+3. 选择“合并现有数据”或“替换全部请求数据”。
+4. 替换模式需要再次输入后台密码。
 
-如果 OpenAI 方案被设为默认入口，也可以使用 `base_url = "http://localhost:6789/v1"`。
+合并模式使用文件 SHA-256 指纹防止重复导入。所有写入都在 SQLite 事务中完成；替换模式会先备份数据库。
 
-启动 Codex 前导出虚拟 Key：
+### 清空全部数据
 
-```bash
-export OPENAI_API_KEY="jx-your-virtual-key"
-```
+危险操作区要求输入后台密码。执行前会将 `config.json` 和 SQLite 复制到 Git 忽略的 `backups/`，然后清除全系统的方案、成员、密钥、配额、统计、错误和导入记录。端口、后台密码和代理参数保留，服务进入可继续访问设置页的未配置状态。
 
-Codex 的模型由 Codex 客户端配置或请求体里的 `model` 决定，例如 `gpt-5`、`qwen3-coder-plus`、`glm-5`。平台侧不需要配置 `jx-sonnet`、`jx-opus`、`jx-haiku`；这些只是 Claude/Anthropic 方案的兼容别名。
+## 从旧版本升级
 
-默认模式是 OpenAI 透明代理：客户端请求 `/v1/responses`、`/v1/chat/completions` 时，平台只做虚拟 Key 映射、可选模型别名、限额和 usage 统计，不把 Anthropic `/v1/messages` 转换成 OpenAI 请求。`/v1/models` 始终由平台按 `allowedModels` 本地返回，不会转发到上游，避免 Codex/Cockpit Tools 等客户端探测消耗真实接口。如果你的客户端固定使用 Anthropic 协议，请配置上游的 Anthropic 接口；OpenAI-only 上游需要客户端按 OpenAI 协议访问。
-
-### Aliyun Coding Plan / 只有 Chat Completions 的上游
-
-如果上游像 `https://coding.dashscope.aliyuncs.com/v1` 这样只有 `/v1/chat/completions`，没有 `/v1/responses` 或 `/v1/models`，创建 OpenAI 方案时启用 `responsesAdapter: "chat_completions"`：
-
-```json
-{
-  "suffix": "aliyun-openai",
-  "apiProtocol": "openai",
-  "upstream": "https://coding.dashscope.aliyuncs.com/v1",
-  "allowedModels": ["glm-5", "qwen3.7-plus", "qwen3.6-plus"],
-  "modelAliases": {
-    "codex-min": "qwen3.6-plus",
-    "codex-max": "qwen3.7-plus",
-    "codex-pro": "glm-5"
-  },
-  "openaiStreamUsage": true,
-  "responsesAdapter": "chat_completions"
-}
-```
-
-Codex 仍然使用 Responses wire API，网关负责把 `/v1/responses` 转为上游 `/v1/chat/completions`；流式响应会把 Chat Completions 的文本 delta 和 `tool_calls` 转成 Responses 风格事件，`/v1/models` 继续用 `allowedModels` 本地返回：
-
-```toml
-model = "glm-5"
-model_provider = "cc-team-aliyun"
-
-[model_providers.cc-team-aliyun]
-name = "CC-Team Aliyun Coding"
-base_url = "http://localhost:6789/aliyun-openai/v1"
-env_key = "OPENAI_API_KEY"
-wire_api = "responses"
-```
+- 旧 `defaultModels` 会迁移为普通 `modelAliases`；已经存在的同名 `modelAliases` 优先。
+- `apiProtocol`、`openaiStreamUsage` 和 `responsesAdapter` 等旧协议字段会被移除。
+- OpenAI 协议方案不再受支持。升级时会先在 `backups/` 中备份 `config.json` 和 SQLite，再删除这些方案及其关联统计数据。
+- 如果仍需保留旧 OpenAI 方案，请在升级前备份整个数据目录，并继续使用支持该协议的旧版本。
 
 ## 页面
 
 | 页面 | 地址 | 说明 |
-|------|------|------|
-| 监控面板 | `http://localhost:6789/dashboard` | 管理员查看全队用量，支持按方案筛选，需登录 |
-| 设置页面 | `http://localhost:6789/settings` | 配置方案、用户、配额，需登录 |
-| 个人用量 | `http://localhost:6789/usage/你的虚拟Key` | 用户查看自己的用量，无需登录 |
-| 用量输入 | `http://localhost:6789/my-usage` | 输入虚拟 Key 跳转个人页面 |
-| 健康检查 | `http://localhost:6789/health` | 服务状态，无需登录 |
+| --- | --- | --- |
+| 管理面板 | `http://localhost:6789/dashboard` | 单屏查看指标、图表、用户、周期明细、方案和错误 |
+| 设置 | `http://localhost:6789/settings` | 方案、成员、配额与独立的全局数据管理 |
+| 个人用量 | `http://localhost:6789/usage/虚拟Key` | 指定成员的用量页面 |
+| Key 查询 | `http://localhost:6789/my-usage` | 输入虚拟 Key 查询 |
+| 健康检查 | `http://localhost:6789/health` | 服务与熔断状态 |
 
-## 用户管理
+## 主要接口
 
-所有用户管理在设置页面的"用户管理"弹窗中完成：
-
-1. **添加用户**：点击"添加用户"，自动生成 `jx-` 开头的虚拟 Key
-2. **填写信息**：用户名、失效时间（可选）
-3. **选择方案**：在"方案真实Key分配"区域先选择要配置的方案
-4. **分配真实 Key**：为该方案填入上游真实 API Key；留空表示该用户不能使用此方案
-5. **设置配额**：可选，设每日 token 限额（0 = 跟随方案配额）
-6. 点击"保存全部"
-
-## Token 配额
-
-### 配额层级
-
-```
-用户级配额 > 方案级配额 > 不限制
-```
-
-- **方案配额**：设置页 → "每日Token配额" → 设一个数字（总Token = 输入+输出）
-- **用户配额**：用户管理弹窗 → 方案真实Key分配表格 → "每日配额"列
-- **0 = 不限制**，null = 不限制
-- **北京时间每日0点自动重置**
-
-### 超限行为
-
-用户达到限额时，请求返回 429：
-
-```json
-{
-  "error": "今日Token额度已用完。已用: 500,123, 限额: 500,000。额度将于北京时间次日凌晨重置。查看用量详情: http://host/usage/jx-xxx",
-  "type": "quota_exceeded",
-  "quota": { "used": 500123, "limit": 500000, "remaining": 0, "source": "个人配额" },
-  "usageUrl": "http://host/usage/jx-xxx"
-}
-```
-
-### 个人用量页面
-
-每个用户通过 `http://host/usage/虚拟Key` 查看：
-
-- 配额状态（已用/剩余/限额）
-- 今日24小时趋势图
-- 近7天趋势图
-- 按模型明细表
-- 自动30秒刷新
-
-### 个人用量 API
-
-```bash
-curl -H "Authorization: Bearer jx-your-key" http://localhost:6789/api/my-usage
-```
-
-返回 JSON：用户名、配额、今日用量、模型明细、7日趋势。
-
-## 方案说明
-
-### 多方案并发与默认入口
-
-每个方案独立配置上游地址、模型列表、用户分配和 URL 后缀。设置页左侧用于编辑方案；所有方案始终同时在线。
-
-默认入口是一个无后缀别名：`http://host:6789/v1/*` 会路由到被标记为默认入口的方案。该方案自己的后缀入口仍然可用，例如 `http://host:6789/glm/v1/*`。
-
-### 模型别名
-
-Anthropic 方案中，`jx-sonnet` / `jx-opus` / `jx-haiku` 自动映射到实际模型。OpenAI/Codex 方案中，客户端直接发送真实模型名；`modelAliases` 只用于可选短别名，例如 `codex-main=gpt-5`。
-
-### 模型准入
-
-`allowedModels` 限制可用模型。不在列表的请求返回 403。`null` 或 `["*"]` 不限制。
-
-## API 端点
+Anthropic Messages 代理使用虚拟 Key 鉴权。管理类写入接口除登录外，均要求管理员会话和 CSRF 校验。
 
 | 端点 | 方法 | 说明 |
-|------|------|------|
-| `/v1/*` | * | 默认入口代理转发至上游 |
-| `/:suffix/v1/*` | * | 指定方案代理转发至上游 |
-| `/dashboard` | GET | 监控面板（需登录） |
-| `/settings` | GET | 设置页面（需登录） |
-| `/usage/:key` | GET | 个人用量页面（Key 即认证） |
-| `/my-usage` | GET | 输入 Key 或查询用量 |
-| `/api/my-usage` | GET | 个人用量 JSON（Bearer Key 认证） |
-| `/api/stats` | GET | 全队统计 JSON（需登录） |
-| `/api/settings` | GET | 当前设置 JSON |
-| `/api/settings-save` | POST | 保存设置（表单提交） |
-| `/api/profile/switch` | POST | 兼容旧客户端，重新加载指定方案 |
-| `/api/profile/save` | POST | 创建新方案 |
-| `/api/profile/default` | POST | 设置默认入口方案 |
+| --- | --- | --- |
+| `/v1/messages` | POST | 默认方案的 Anthropic Messages 代理 |
+| `/:suffix/v1/messages` | POST | 指定方案的 Anthropic Messages 代理 |
+| `/api/stats` | GET | 团队统计 |
+| `/api/my-usage` | GET | Bearer Key 对应的个人统计 |
+| `/api/settings` | GET / POST | 读取或更新设置 |
+| `/api/settings-save` | POST | 保存设置页表单 |
+| `/api/profile/save` | POST | 创建方案 |
+| `/api/profile/default` | POST | 设置默认方案 |
 | `/api/profile/delete` | POST | 删除方案 |
-| `/api/global-user/save` | POST | 保存用户管理 |
-| `/api/global-user/delete` | POST | 删除用户 |
-| `/api/clear-errors` | POST | 清除错误记录 |
-| `/api/circuit-breaker-reset` | POST | 重置熔断器 |
-| `/health` | GET | 健康检查 |
+| `/api/global-user/save` | POST | 保存用户与方案分配 |
+| `/api/global-user/delete` | POST | 删除用户及其可识别历史 |
+| `/api/data-import/preview` | POST | 预览旧数据与方案映射 |
+| `/api/data-import/apply` | POST | 合并或替换导入 |
+| `/api/data-clear` | POST | 验证密码并清空全部数据 |
 
-## 日志说明
+`/v1/responses`、`/v1/chat/completions` 和 `/v1/models` 会明确返回不支持，不会转发到上游。
 
-所有日志为中文，每个请求有开始/结束分割线：
+## 数据文件
 
-```
-── 请求开始 ── 张三 [用户请求] 模型=jx-opus→glm-5.1 ──
-[映射] 张三 虚拟key=jx-usbb1IWHX... → 真实key=cf0b2ff0ac0... 请求模型=jx-opus → 实际=glm-5.1
-[SSE] 张三 第1条 类型=message_start
-[Token] 张三 [用户请求] model=glm-5.1 输入=526 输出=1099 缓存写=0 缓存读=59226
-── 请求结束 ── 张三 ──
-```
+- `config.json`：方案、成员、Key、配额和代理配置
+- `data.db`：SQLite 统计、错误、配额历史和导入指纹
+- `backups/`：破坏性迁移、替换导入和数据清空前的本地备份
 
-**请求分类**：`[用户请求]` 手动输入、`[工具调用]` Claude 自动执行、`[子代理]` 子任务
-
-## 数据存储
-
-- `config.json` — 方案、用户、配额、设置（通过 Web 页面修改，自动迁移）
-- `data.json` — token 用量统计数据，30 秒自动落盘，关机时写入
-
-## 代理透明度
-
-默认情况下代理对请求/响应内容保持透明：
-
-- 请求 body（messages/input、system prompt、参数）原样透传；OpenAI Chat Completions 流式请求会在启用 `openaiStreamUsage` 时合并 `stream_options.include_usage=true`
-- 响应 body（JSON / SSE 流）逐字节转发
-- 只替换 `Authorization` header 实现 Key 映射
-- 本地处理延迟 < 1ms
-
-例外：所有 OpenAI 方案都会本地返回 `/v1/models` 并拦截不支持的 OpenAI/Codex 代理端点；启用 `responsesAdapter: "chat_completions"` 后，网关还会把客户端 `/v1/responses` 请求转换为上游 `/v1/chat/completions`，并把流式文本与 function/tool call 事件转换回 Responses 风格。客户端断开连接时，网关会同步取消正在进行的上游请求。
+运行中的旧版 `data.json` 可通过设置页导入。首次启动且 SQLite 为空时，服务也会自动迁移同目录下的旧文件并将其重命名为 `data.json.migrated`。
 
 ## 技术栈
 
-- Node.js 内置模块（http、https、fs、crypto），零外部依赖
-- Chart.js 4.4（CDN 引入，Dashboard 和个人页面使用）
+- Node.js HTTP/HTTPS 服务
+- better-sqlite3
+- Chart.js 4.4
 
 ## License
 

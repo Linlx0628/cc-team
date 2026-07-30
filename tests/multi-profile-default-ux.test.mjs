@@ -560,6 +560,19 @@ describe("management and usage pages", () => {
     assertInlineScriptsCompile(res.text);
   });
 
+  it("renders operable light-theme expiry pickers for existing and new users", async () => {
+    const res = await request("GET", "/settings", { key: null });
+
+    assert.equal(res.status, 200);
+    assert.doesNotMatch(res.text, /color-scheme\s*:\s*dark/i);
+    assert.match(res.text, /function openDateTimePicker\(input\)/);
+    const expiryInputs = res.text.match(/type="datetime-local"/g) || [];
+    const pickerTriggers = res.text.match(/onclick="openDateTimePicker\(this\)"/g) || [];
+    assert.ok(expiryInputs.length >= 2);
+    assert.equal(pickerTriggers.length, expiryInputs.length);
+    assertInlineScriptsCompile(res.text);
+  });
+
   it("returns only generic model aliases in settings API", async () => {
     const res = await request("GET", "/api/settings", { key: null });
 

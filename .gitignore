@@ -14,4 +14,9 @@ backups/
 # Worktree temporary directories
 .claude/*
 .spec-workflow/*
+.superpowers/*
+
+docs/superpowers/*
+
+tests/*.mjs
 

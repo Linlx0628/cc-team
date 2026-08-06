@@ -39,6 +39,7 @@ button:active,.btn:active{transform:translateY(1px)}
 
 const UI_HELPERS = `
 function formatCompact(n){if(n>=1e6)return(n/1e6).toFixed(1)+'M';if(n>=1e3)return(n/1e3).toFixed(1)+'k';return Number(n).toLocaleString('zh-CN')}
+function totalTokens(row){row=row||{};return(row.inputTokens??row.totalInputTokens??row.input??0)+(row.outputTokens??row.totalOutputTokens??row.output??0)+(row.cacheCreationTokens??row.cacheWrite??0)+(row.cacheReadTokens??row.cacheRead??0)}
 function quotaBar(pct){var value=Math.max(0,Math.min(100,Number(pct)||0));var cls=value>90?'crit':value>70?'warn':'';return '<span class="quota-progress '+cls+'" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="'+value+'"><i style="width:'+value+'%"></i></span>'}
 function runCountUps(root){(root||document).querySelectorAll('[data-cu]').forEach(function(el){var raw=Number(el.dataset.cu)||0;el.textContent=el.hasAttribute('data-cu-k')?formatCompact(raw):raw.toLocaleString('zh-CN');el.dataset.cur=String(raw)})}
 function hpBar(pct){return quotaBar(pct)}
@@ -63,6 +64,13 @@ const dbPath = path.join(__dirname, "data.db");
 const backupDir = path.join(__dirname, "backups");
 const RESERVED_SUFFIXES = new Set(["dashboard", "settings", "api", "health", "usage", "my-usage", "v1", "login", "logout", "favicon", "robots", "js", "css"]);
 const PROFILE_SUFFIX_RE = /^[a-z0-9_-]{2,20}$/;
+
+function totalUsageTokens(usage = {}) {
+  return (usage.inputTokens ?? usage.input_tokens ?? usage.input ?? 0) +
+    (usage.outputTokens ?? usage.output_tokens ?? usage.output ?? 0) +
+    (usage.cacheCreationTokens ?? usage.cache_creation ?? usage.cacheWrite ?? 0) +
+    (usage.cacheReadTokens ?? usage.cache_read ?? usage.cacheRead ?? 0);
+}
 
 function backupTimestamp() {
   return new Date().toISOString().replace(/[:.]/g, "-");
@@ -854,15 +862,15 @@ function initDb() {
   stmts.upsertMeta = db.prepare(`INSERT INTO kv_meta (key,value) VALUES (@k,@v) ON CONFLICT(key) DO UPDATE SET value=excluded.value`);
 
   // ── Read statements ──
-  stmts.todayUsageForQuota = db.prepare(`SELECT COALESCE(SUM(input_tokens+output_tokens),0) AS used FROM usage_daily WHERE profile=? AND date=? AND user_key=?`);
+  stmts.todayUsageForQuota = db.prepare(`SELECT COALESCE(SUM(input_tokens+output_tokens+cache_creation+cache_read),0) AS used FROM usage_daily WHERE profile=? AND date=? AND user_key=?`);
   stmts.profileDailyRow = db.prepare(`SELECT * FROM usage_daily WHERE profile=? AND date=? AND user_key=?`);
   stmts.profileDailyModelRows = db.prepare(`SELECT model,input_tokens,output_tokens,requests FROM usage_daily_model WHERE profile=? AND date=? AND user_key=?`);
   stmts.profileDailyHourlyRows = db.prepare(`SELECT hour,requests,input_tokens,output_tokens,cache_creation,cache_read FROM usage_daily_hourly WHERE profile=? AND date=? AND user_key=?`);
   stmts.profileDailyTrend = db.prepare(`SELECT date,input_tokens,output_tokens,requests,cache_creation,cache_read FROM usage_daily WHERE profile=? AND user_key=? AND date>=? ORDER BY date`);
-  stmts.profileSummaryToday = db.prepare(`SELECT COALESCE(SUM(input_tokens+output_tokens),0) AS tokens, COALESCE(SUM(requests),0) AS requests FROM usage_daily WHERE profile=? AND date=?`);
+  stmts.profileSummaryToday = db.prepare(`SELECT COALESCE(SUM(input_tokens+output_tokens+cache_creation+cache_read),0) AS tokens, COALESCE(SUM(requests),0) AS requests FROM usage_daily WHERE profile=? AND date=?`);
   stmts.lastQuotaAdjust = db.prepare(`SELECT * FROM quota_adjust_history WHERE user_key=? ORDER BY id DESC LIMIT 1`);
   stmts.quotaAdjustRecent = db.prepare(`SELECT * FROM quota_adjust_history ORDER BY id DESC LIMIT 20`);
-  stmts.defaultDailyForUser = db.prepare(`SELECT date,input_tokens,output_tokens FROM usage_daily WHERE profile=? AND user_key=? AND date>=?`);
+  stmts.defaultDailyForUser = db.prepare(`SELECT date,input_tokens,output_tokens,cache_creation,cache_read FROM usage_daily WHERE profile=? AND user_key=? AND date>=?`);
 }
 
 // ── Pruning (called once a day via a lazy check) ──
@@ -1430,7 +1438,10 @@ function mergeUsageCounters(target, source) {
 }
 
 function usageHasTokens(usage = {}) {
-  return !!((usage.input_tokens || 0) > 0 || (usage.output_tokens || 0) > 0 || (usage.prompt_tokens || 0) > 0 || (usage.completion_tokens || 0) > 0 || (usage.total_tokens || 0) > 0);
+  return !!((usage.input_tokens || 0) > 0 || (usage.output_tokens || 0) > 0 ||
+    (usage.prompt_tokens || 0) > 0 || (usage.completion_tokens || 0) > 0 ||
+    (usage.cache_creation_input_tokens || 0) > 0 || (usage.cache_read_input_tokens || 0) > 0 ||
+    (usage.total_tokens || 0) > 0);
 }
 
 // ─── Timezone Helpers (UTC+8 北京时间) ────────────────────────────────────────
@@ -1565,7 +1576,7 @@ function evaluateAutoQuotaAdjustments() {
     let totalUsage = 0;
     let usageDays = 0;
     for (const r of dayRows) {
-      const dayUsage = (r.input_tokens || 0) + (r.output_tokens || 0);
+      const dayUsage = totalUsageTokens(r);
       if (dayUsage > 0) {
         usageDays++;
         totalUsage += dayUsage;
@@ -1660,14 +1671,16 @@ function getProfilePersonalUsage(apiKey, suffix, runtime) {
   const trendStartDate = trendStart.toISOString().slice(0, 10);
   const trendMap = {};
   for (const r of stmts.profileDailyTrend.all(suffix, key, trendStartDate)) {
-    trendMap[r.date] = { date: r.date, input: r.input_tokens||0, output: r.output_tokens||0, requests: r.requests||0, total: (r.input_tokens||0)+(r.output_tokens||0) };
+    const row = { date: r.date, input: r.input_tokens||0, output: r.output_tokens||0, cacheWrite: r.cache_creation||0, cacheRead: r.cache_read||0, requests: r.requests||0 };
+    row.total = totalUsageTokens(row);
+    trendMap[r.date] = row;
   }
   const trend = [];
   for (let i = 6; i >= 0; i--) {
     const d = new Date(Date.now() + 8 * 3600 * 1000);
     d.setDate(d.getDate() - i);
     const dateStr = d.toISOString().slice(0, 10);
-    trend.push(trendMap[dateStr] || { date: dateStr, input: 0, output: 0, requests: 0, total: 0 });
+    trend.push(trendMap[dateStr] || { date: dateStr, input: 0, output: 0, cacheWrite: 0, cacheRead: 0, requests: 0, total: 0 });
   }
 
   // Check if quota was auto-adjusted
@@ -1678,7 +1691,7 @@ function getProfilePersonalUsage(apiKey, suffix, runtime) {
     profile: runtime.profileName,
     profileSuffix: suffix,
     quota: { type: quota.source, limit: quota.limit, used: quota.used, remaining: quota.remaining, autoAdjusted: quotaAutoAdjusted },
-    today: { input: todayUsage.inputTokens||0, output: todayUsage.outputTokens||0, requests: todayUsage.requests||0, cacheWrite: todayUsage.cacheCreationTokens||0, cacheRead: todayUsage.cacheReadTokens||0, total: (todayUsage.inputTokens||0)+(todayUsage.outputTokens||0) },
+    today: { input: todayUsage.inputTokens||0, output: todayUsage.outputTokens||0, requests: todayUsage.requests||0, cacheWrite: todayUsage.cacheCreationTokens||0, cacheRead: todayUsage.cacheReadTokens||0, total: totalUsageTokens(todayUsage) },
     models: todayModels,
     hourly: todayHourly,
     trend,
@@ -1702,7 +1715,7 @@ function getAggregatedPersonalUsage(apiKey, availableProfiles) {
     const d = new Date(Date.now() + 8 * 3600 * 1000);
     d.setDate(d.getDate() - i);
     const dateStr = d.toISOString().slice(0, 10);
-    trendByDate[dateStr] = { date: dateStr, input: 0, output: 0, requests: 0, total: 0 };
+    trendByDate[dateStr] = { date: dateStr, input: 0, output: 0, cacheWrite: 0, cacheRead: 0, requests: 0, total: 0 };
   }
 
   for (const profile of availableProfiles) {
@@ -1737,8 +1750,10 @@ function getAggregatedPersonalUsage(apiKey, availableProfiles) {
       if (trendByDate[r.date]) {
         trendByDate[r.date].input += r.input_tokens || 0;
         trendByDate[r.date].output += r.output_tokens || 0;
+        trendByDate[r.date].cacheWrite += r.cache_creation || 0;
+        trendByDate[r.date].cacheRead += r.cache_read || 0;
         trendByDate[r.date].requests += r.requests || 0;
-        trendByDate[r.date].total += (r.input_tokens||0) + (r.output_tokens||0);
+        trendByDate[r.date].total += totalUsageTokens(r);
       }
     }
 
@@ -1759,7 +1774,7 @@ function getAggregatedPersonalUsage(apiKey, availableProfiles) {
       remaining: limit > 0 ? Math.max(0, limit - totalQuotaUsed) : Infinity,
       autoAdjusted: false,
     },
-    today: { input: todayUsage.inputTokens, output: todayUsage.outputTokens, requests: todayUsage.requests, cacheWrite: todayUsage.cacheCreationTokens || 0, cacheRead: todayUsage.cacheReadTokens || 0, total: todayUsage.inputTokens + todayUsage.outputTokens },
+    today: { input: todayUsage.inputTokens, output: todayUsage.outputTokens, requests: todayUsage.requests, cacheWrite: todayUsage.cacheCreationTokens || 0, cacheRead: todayUsage.cacheReadTokens || 0, total: totalUsageTokens(todayUsage) },
     models: todayModels,
     hourly: todayHourly,
     trend: Object.values(trendByDate).sort((a, b) => a.date.localeCompare(b.date)),
@@ -2361,7 +2376,7 @@ async function handleStreamingProxy(req, res, body, reqHeaders, apiKey, reqModel
             }
           } catch {}
         }
-        if (usage.input_tokens > 0 || usage.output_tokens > 0) {
+        if (usageHasTokens(usage)) {
           recordUsage(apiKey, usage, model, suffix, runtime);
           console.log(`[Token] ${getUserName(apiKey, runtime)} [${reqSource}] model=${model} 输入=${usage.input_tokens} 输出=${usage.output_tokens} 缓存写=${usage.cache_creation_input_tokens || 0} 缓存读=${usage.cache_read_input_tokens || 0}`);
         } else {
@@ -2667,7 +2682,7 @@ ${errDiv}
 </div>
 </div>
 
-<h2>每日Token配额 <span style="font-size:11px;color:var(--dim);font-weight:400">总Token=输入+输出，0=不限制，北京时间每日0点重置</span></h2>
+<h2>每日Token配额 <span style="font-size:11px;color:var(--dim);font-weight:400">总Token=输入+输出+缓存写入+缓存命中，0=不限制，北京时间每日0点重置</span></h2>
 <div class="section">
 <label>方案每日总Token上限 (0=不限制)</label>
 <input type="number" name="profileQuota" value="${s.profileQuota || 0}" min="0" step="100000" placeholder="0 = 不限制">
@@ -3092,7 +3107,7 @@ td{padding:8px 12px;font-size:11px;border-bottom:1px solid #ecece8;white-space:n
     <button class="tab on" data-p="day">按日</button><button class="tab" data-p="week">按周</button><button class="tab" data-p="month">按月</button><button class="tab" data-p="year">按年</button>
   </div></div><div class="chart-canvas"><canvas id="trend"></canvas></div></div>
   <div class="chart-panel chart-users"><div class="chart-head"><h2>用户分布</h2></div><div class="chart-canvas"><canvas id="pie"></canvas></div></div>
-  <div class="chart-panel chart-models"><div class="chart-head"><h2>模型分布</h2></div><div class="chart-canvas"><canvas id="modelChart"></canvas></div></div>
+  <div class="chart-panel chart-models"><div class="chart-head"><h2>模型请求分布</h2></div><div class="chart-canvas"><canvas id="modelChart"></canvas></div></div>
   <div class="chart-panel chart-hourly"><div class="chart-head"><h2>24 小时趋势</h2></div><div class="chart-canvas"><canvas id="hourChart"></canvas></div></div>
 </section>
 <section class="data-workspace" aria-label="数据工作区">
@@ -3171,7 +3186,7 @@ function renderWorkspaceSummaries(){
   document.getElementById("workspaceCountErrors").textContent=Array.isArray(D.errors)?D.errors.length:0;
 }
 function maskDetailKey(key){const value=String(key||"");return value.length<=12?value:value.slice(0,8)+"****"+value.slice(-4)}
-function detailTokens(row){return(row.inputTokens||0)+(row.outputTokens||0)}
+function detailTokens(row){return totalTokens(row)}
 function detailPeriodLabel(key){if(P==="day")return key;if(P==="week")return key+" 周";if(P==="month")return key;return key+" 年"}
 function detailRangeDaily(daily){if(detailRange==="all")return daily;const days=Number(detailRange)||0;const cutoff=new Date(Date.now()+8*3600000-Math.max(0,days-1)*86400000).toISOString().slice(0,10);return Object.fromEntries(Object.entries(daily).filter(([date])=>date>=cutoff))}
 function detailTotals(members){const total={requests:0,inputTokens:0,outputTokens:0,cacheCreationTokens:0,cacheReadTokens:0};for(const member of members){const row=member.data;total.requests+=row.requests||0;total.inputTokens+=row.inputTokens||0;total.outputTokens+=row.outputTokens||0;total.cacheCreationTokens+=row.cacheCreationTokens||0;total.cacheReadTokens+=row.cacheReadTokens||0}return total}
@@ -3221,10 +3236,10 @@ function render(){
     }
     sel.value=currentProfile==="all"?"all":currentProfile;
   }
-  const us=Object.values(D.users),ti=us.reduce((s,u)=>s+u.totalInputTokens,0),to=us.reduce((s,u)=>s+u.totalOutputTokens,0),tr=us.reduce((s,u)=>s+u.totalRequests,0);
+  const us=Object.values(D.users),allTokens=us.reduce((s,u)=>s+totalTokens(u),0),tr=us.reduce((s,u)=>s+u.totalRequests,0);
   const td=new Date(Date.now()+8*36e5).toISOString().slice(0,10),tdd=(D.daily||{})[td]||{};
-  const tIn=Object.values(tdd).reduce((s,d)=>s+d.inputTokens,0),tOut=Object.values(tdd).reduce((s,d)=>s+d.outputTokens,0),tR=Object.values(tdd).reduce((s,d)=>s+d.requests,0);
-  document.getElementById("cards").innerHTML=c("今日用量",tIn+tOut,"var(--accent)",1)+c("今日请求",tR,"var(--blue)",1)+c("总用量",ti+to,"var(--green)",1)+c("总请求",tr,"var(--orange)",1)+c("今日错误",(Array.isArray(D.errors)?D.errors:[]).filter(e=>e.time&&e.time.startsWith(td)).length,"var(--red)",1);
+  const todayTokens=Object.values(tdd).reduce((s,d)=>s+totalTokens(d),0),tR=Object.values(tdd).reduce((s,d)=>s+d.requests,0);
+  document.getElementById("cards").innerHTML=c("今日用量",todayTokens,"var(--accent)",1)+c("今日请求",tR,"var(--blue)",1)+c("总用量",allTokens,"var(--green)",1)+c("总请求",tr,"var(--orange)",1)+c("今日错误",(Array.isArray(D.errors)?D.errors:[]).filter(e=>e.time&&e.time.startsWith(td)).length,"var(--red)",1);
   runCountUps(document.getElementById("cards"));
   const psb=document.getElementById("profileSummaryBody"),profiles=Array.isArray(D.profileSummaries)?D.profileSummaries:[];
   psb.innerHTML=profiles.length?profiles.map(p=>{const st=p.breakerState||"UNKNOWN";const col=st==="CLOSED"?"var(--green)":st==="HALF_OPEN"?"var(--orange)":"var(--red)";const led=st==="CLOSED"?"on":st==="HALF_OPEN"?"warn":"err";const stateLabel=st==="CLOSED"?"正常":st==="HALF_OPEN"?"探测中":"熔断";const current=currentProfile!=="all"&&p.suffix===currentProfile;return'<tr'+(current?' class="profile-current" aria-current="true"':'')+'><td>'+escH(p.name)+(p.isDefault?' <span style="color:var(--green);font-size:11px;font-weight:600;vertical-align:middle">默认</span>':'')+(current?' <span class="current-mark">当前</span>':'')+'</td><td><code>/'+escH(p.suffix)+'</code>'+(p.isDefault?' <span style="color:var(--dim)"> / <code>/v1</code></span>':'')+'</td><td style="font-size:12px;color:var(--dim);max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+escH((p.upstream||'').replace('https://','').replace('http://',''))+'</td><td class="n">'+fmtT(p.todayRequests||0)+'</td><td class="n hl">'+fmtT(p.todayTokens||0)+'</td><td><span class="led '+led+'"></span><span style="color:'+col+';font-size:12px">'+stateLabel+'</span></td></tr>'}).join(''):'<tr><td colspan="6" class="empty">暂无方案</td></tr>';
@@ -3236,26 +3251,25 @@ function render(){
   // Charts
   const g=grp(D.daily||{},P),keys=Object.keys(g).sort(),uks=Object.keys(D.users);
   if(C.t)C.t.destroy();if(C.p)C.p.destroy();if(C.m)C.m.destroy();if(C.h)C.h.destroy();
-  C.t=new Chart(document.getElementById("trend"),{type:"bar",data:{labels:keys.map(k=>lbl(P,k)),datasets:uks.map((u,i)=>({label:D.users[u].name,data:keys.map(k=>(g[k][u]||{}).inputTokens+(g[k][u]||{}).outputTokens||0),backgroundColor:COL[i%COL.length]+"cc",borderRadius:3,borderSkipped:false}))},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:trendLegend(),tooltip:{callbacks:{label:ctx=>ctx.dataset.label+": "+fmtT(ctx.raw)}}},scales:{x:{stacked:true,ticks:{color:"#686863",font:{size:10}},grid:{color:"rgba(24,24,22,.08)"}},y:{stacked:true,ticks:{color:"#686863",callback:v=>fmtTk(v)},grid:{color:"rgba(24,24,22,.08)"}}}}});
-  const tot=uks.map(u=>{let t=0;for(const k of keys)t+=(g[k][u]||{}).inputTokens+(g[k][u]||{}).outputTokens||0;return t});
+  C.t=new Chart(document.getElementById("trend"),{type:"bar",data:{labels:keys.map(k=>lbl(P,k)),datasets:uks.map((u,i)=>({label:D.users[u].name,data:keys.map(k=>totalTokens(g[k][u])),backgroundColor:COL[i%COL.length]+"cc",borderRadius:3,borderSkipped:false}))},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:trendLegend(),tooltip:{callbacks:{label:ctx=>ctx.dataset.label+": "+fmtT(ctx.raw)}}},scales:{x:{stacked:true,ticks:{color:"#686863",font:{size:10}},grid:{color:"rgba(24,24,22,.08)"}},y:{stacked:true,ticks:{color:"#686863",callback:v=>fmtTk(v)},grid:{color:"rgba(24,24,22,.08)"}}}}});
+  const tot=uks.map(u=>{let t=0;for(const k of keys)t+=totalTokens(g[k][u]);return t});
   C.p=new Chart(document.getElementById("pie"),{type:"doughnut",data:{labels:uks.map(k=>D.users[k].name),datasets:[{data:tot,backgroundColor:uks.map((_,i)=>COL[i%COL.length]+"cc"),borderWidth:0}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:doughnutLegend(),tooltip:{callbacks:{label:ctx=>ctx.label+": "+fmtT(ctx.raw)+" tokens"}}},cutout:"55%"}});
 
-  // 模型分布
+  // 历史缓存没有模型维度，模型分布使用准确的请求数。
   const mods=D.models||{};const mNames=Object.keys(mods);
-  C.m=new Chart(document.getElementById("modelChart"),{type:"doughnut",data:{labels:mNames,datasets:[{data:mNames.map(m=>mods[m].tokens),backgroundColor:mNames.map((_,i)=>COL[i%COL.length]+"cc"),borderWidth:0}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:doughnutLegend(),tooltip:{callbacks:{label:ctx=>ctx.label+": "+fmtT(ctx.raw)+" tokens"}}},cutout:"55%"}});
+  C.m=new Chart(document.getElementById("modelChart"),{type:"doughnut",data:{labels:mNames,datasets:[{data:mNames.map(m=>mods[m].requests),backgroundColor:mNames.map((_,i)=>COL[i%COL.length]+"cc"),borderWidth:0}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:doughnutLegend(),tooltip:{callbacks:{label:ctx=>ctx.label+": "+fmtT(ctx.raw)+" 次请求"}}},cutout:"55%"}});
 
   // 24小时趋势图
   const hrs=[];for(let i=0;i<24;i++)hrs.push(i.toString().padStart(2,"0")+":00");
   const todayHourly=(D.hourly||{})[td]||{};
   const hReq=hrs.map((_,i)=>{const h=todayHourly[i.toString().padStart(2,"0")];return typeof h==="object"?(h.requests||0):0});
-  const hIn=hrs.map((_,i)=>{const h=todayHourly[i.toString().padStart(2,"0")];return typeof h==="object"?(h.inputTokens||0):0});
-  const hOut=hrs.map((_,i)=>{const h=todayHourly[i.toString().padStart(2,"0")];return typeof h==="object"?(h.outputTokens||0):0});
-  C.h=new Chart(document.getElementById("hourChart"),{type:"line",data:{labels:hrs,datasets:[{label:"请求数",data:hReq,borderColor:"#2f6e50",backgroundColor:"rgba(47,110,80,.12)",fill:true,tension:.28,pointRadius:2,pointBackgroundColor:"#2f6e50",pointHoverRadius:4,borderWidth:2,yAxisID:"y"},{label:"输入",data:hIn,borderColor:"#181816",backgroundColor:"rgba(24,24,22,.08)",fill:true,tension:.28,pointRadius:2,pointBackgroundColor:"#181816",pointHoverRadius:4,borderWidth:2,yAxisID:"y1"},{label:"输出",data:hOut,borderColor:"#8c8c84",backgroundColor:"rgba(140,140,132,.12)",fill:true,tension:.28,pointRadius:2,pointBackgroundColor:"#8c8c84",pointHoverRadius:4,borderWidth:2,yAxisID:"y1"}]},options:{responsive:true,maintainAspectRatio:false,interaction:{mode:"index",intersect:false},plugins:{legend:{labels:{color:"#686863",font:{size:11},usePointStyle:true,pointStyle:"circle"}},tooltip:{callbacks:{label:ctx=>ctx.dataset.label+": "+fmtT(ctx.raw)}}},scales:{x:{ticks:{color:"#686863",font:{size:9},maxRotation:0,autoSkip:true,maxTicksLimit:12},grid:{display:false}},y:{type:"linear",position:"left",ticks:{color:"#2f6e50"},grid:{color:"rgba(24,24,22,.08)"},title:{display:true,text:"请求数",color:"#2f6e50",font:{size:10}}},y1:{type:"linear",position:"right",ticks:{color:"#181816",callback:v=>fmtTk(v)},grid:{drawOnChartArea:false},title:{display:true,text:"Tokens",color:"#181816",font:{size:10}}}}}});
+  const hTokens=hrs.map((_,i)=>{const h=todayHourly[i.toString().padStart(2,"0")];return typeof h==="object"?totalTokens(h):0});
+  C.h=new Chart(document.getElementById("hourChart"),{type:"line",data:{labels:hrs,datasets:[{label:"请求数",data:hReq,borderColor:"#2f6e50",backgroundColor:"rgba(47,110,80,.12)",fill:true,tension:.28,pointRadius:2,pointBackgroundColor:"#2f6e50",pointHoverRadius:4,borderWidth:2,yAxisID:"y"},{label:"总 Token",data:hTokens,borderColor:"#181816",backgroundColor:"rgba(24,24,22,.08)",fill:true,tension:.28,pointRadius:2,pointBackgroundColor:"#181816",pointHoverRadius:4,borderWidth:2,yAxisID:"y1"}]},options:{responsive:true,maintainAspectRatio:false,interaction:{mode:"index",intersect:false},plugins:{legend:{labels:{color:"#686863",font:{size:11},usePointStyle:true,pointStyle:"circle"}},tooltip:{callbacks:{label:ctx=>ctx.dataset.label+": "+fmtT(ctx.raw)}}},scales:{x:{ticks:{color:"#686863",font:{size:9},maxRotation:0,autoSkip:true,maxTicksLimit:12},grid:{display:false}},y:{type:"linear",position:"left",ticks:{color:"#2f6e50"},grid:{color:"rgba(24,24,22,.08)"},title:{display:true,text:"请求数",color:"#2f6e50",font:{size:10}}},y1:{type:"linear",position:"right",ticks:{color:"#181816",callback:v=>fmtTk(v)},grid:{drawOnChartArea:false},title:{display:true,text:"Tokens",color:"#181816",font:{size:10}}}}}});
 
   // User table
   const ut=document.querySelector("#uTable tbody");
-  const ul=Object.entries(D.users).sort((a,b)=>(b[1].totalInputTokens+b[1].totalOutputTokens)-(a[1].totalInputTokens+a[1].totalOutputTokens));
-  if(!ul.length){ut.innerHTML='<tr><td colspan="10" class="empty">暂无数据</td></tr>'}else{ut.innerHTML=ul.map(([uk,u],idx)=>{const on=u.lastActive&&Date.now()-new Date(u.lastActive).getTime()<36e5;const uq=(D.userQuotas||{})[uk]||D.profileQuota||0;const td2=(D.daily||{})[td]||{};const tdu=td2[uk]||{inputTokens:0,outputTokens:0};const used=tdu.inputTokens+tdu.outputTokens;const qPct=uq>0?Math.min(100,Math.round(used/uq*100)):0;const rank='<span class="rank">'+(idx+1)+'.</span>';const qCell=uq>0?'<span style="color:var(--accent);font-size:12px">'+qPct+'%</span> '+quotaBar(qPct):'<span style="color:var(--dim)">-</span>';return'<tr><td>'+rank+escH(u.name)+'</td><td><span class="led '+(on?'on':'')+'"></span><span style="color:'+(on?'var(--green)':'var(--dim)')+';font-size:12px">'+(on?'在线':'离线')+'</span></td><td class="n">'+fmtT(u.totalRequests)+'</td><td class="n">'+fmtT(u.totalInputTokens)+'</td><td class="n">'+fmtT(u.totalOutputTokens)+'</td><td class="n">'+fmtT(u.cacheCreationTokens || 0)+'</td><td class="n">'+fmtT(u.cacheReadTokens || 0)+'</td><td class="n hl">'+fmtT(u.totalInputTokens+u.totalOutputTokens)+'</td><td class="n" style="white-space:nowrap">'+qCell+'</td><td style="font-size:12px;color:var(--dim)">'+ago(u.lastActive)+'</td></tr>'}).join("")}
+  const ul=Object.entries(D.users).sort((a,b)=>totalTokens(b[1])-totalTokens(a[1]));
+  if(!ul.length){ut.innerHTML='<tr><td colspan="10" class="empty">暂无数据</td></tr>'}else{ut.innerHTML=ul.map(([uk,u],idx)=>{const on=u.lastActive&&Date.now()-new Date(u.lastActive).getTime()<36e5;const uq=(D.userQuotas||{})[uk]||D.profileQuota||0;const td2=(D.daily||{})[td]||{};const tdu=td2[uk]||{};const used=totalTokens(tdu);const qPct=uq>0?Math.min(100,Math.round(used/uq*100)):0;const rank='<span class="rank">'+(idx+1)+'.</span>';const qCell=uq>0?'<span style="color:var(--accent);font-size:12px">'+qPct+'%</span> '+quotaBar(qPct):'<span style="color:var(--dim)">-</span>';return'<tr><td>'+rank+escH(u.name)+'</td><td><span class="led '+(on?'on':'')+'"></span><span style="color:'+(on?'var(--green)':'var(--dim)')+';font-size:12px">'+(on?'在线':'离线')+'</span></td><td class="n">'+fmtT(u.totalRequests)+'</td><td class="n">'+fmtT(u.totalInputTokens)+'</td><td class="n">'+fmtT(u.totalOutputTokens)+'</td><td class="n">'+fmtT(u.cacheCreationTokens || 0)+'</td><td class="n">'+fmtT(u.cacheReadTokens || 0)+'</td><td class="n hl">'+fmtT(totalTokens(u))+'</td><td class="n" style="white-space:nowrap">'+qCell+'</td><td style="font-size:12px;color:var(--dim)">'+ago(u.lastActive)+'</td></tr>'}).join("")}
 
   renderDetail();
 
@@ -3370,7 +3384,7 @@ table{width:100%;border-collapse:collapse;min-width:560px}th{text-align:left;pad
 <div class="cards" id="cards"></div>
 <div class="box"><h3>今日24小时趋势</h3><canvas id="hourChart"></canvas></div>
 <div class="box"><h3>近7天趋势</h3><canvas id="trendChart"></canvas></div>
-<div class="box"><h3>今日模型用量</h3><table id="modelTable"><thead><tr><th>模型</th><th class="n">请求数</th><th class="n">输入</th><th class="n">输出</th><th class="n">合计</th></tr></thead><tbody></tbody></table></div>
+<div class="box"><h3>今日模型请求</h3><table id="modelTable"><thead><tr><th>模型</th><th class="n">请求数</th></tr></thead><tbody></tbody></table></div>
 <script>
 ${UI_HELPERS}
 Chart.defaults.color='#686863';Chart.defaults.font.family='-apple-system,BlinkMacSystemFont,"SF Pro Text","PingFang SC","Microsoft YaHei","Segoe UI",sans-serif';Chart.defaults.font.size=11;
@@ -3402,22 +3416,24 @@ function render(){
     '<div class="card"><div class="l">今日请求</div><div class="v" data-cu="'+t.requests+'" data-cu-k style="color:var(--blue)">0</div></div>'+
     '<div class="card"><div class="l">今日输入</div><div class="v" data-cu="'+t.input+'" data-cu-k style="color:var(--green)">0</div></div>'+
     '<div class="card"><div class="l">今日输出</div><div class="v" data-cu="'+t.output+'" data-cu-k style="color:var(--orange)">0</div></div>'+
+    '<div class="card"><div class="l">今日缓存写入</div><div class="v" data-cu="'+t.cacheWrite+'" data-cu-k>0</div></div>'+
+    '<div class="card"><div class="l">今日缓存命中</div><div class="v" data-cu="'+t.cacheRead+'" data-cu-k>0</div></div>'+
     (q.limit>0?'<div class="card"><div class="l">剩余额度</div><div class="v" data-cu="'+q.remaining+'" data-cu-k style="color:'+color+'">0</div><div style="margin-top:8px">'+hpBar(pct,16)+'</div></div>'+
     '<div class="card"><div class="l">每日限额</div><div class="v" data-cu="'+q.limit+'" data-cu-k style="color:var(--dim)">0</div></div>':'');
   runCountUps(document.getElementById('cards'));
   // Hourly chart
   const hrs=[];for(let i=0;i<24;i++)hrs.push(i.toString().padStart(2,"0")+":00");
-  const hData=hrs.map((_,i)=>{const h=D.hourly[i.toString().padStart(2,"0")]||{};return{req:h.requests||0,tokens:(h.inputTokens||0)+(h.outputTokens||0)}});
+  const hData=hrs.map((_,i)=>{const h=D.hourly[i.toString().padStart(2,"0")]||{};return{req:h.requests||0,tokens:totalTokens(h)}});
   if(C.h)C.h.destroy();
   C.h=new Chart(document.getElementById("hourChart"),{type:"bar",data:{labels:hrs,datasets:[{label:"Token",data:hData.map(d=>d.tokens),backgroundColor:"#2f6e50cc",borderRadius:3},{label:"请求数",data:hData.map(d=>d.req),backgroundColor:"#181816cc",borderRadius:3}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{labels:{color:"#686863",font:{size:10}}}},scales:{x:{ticks:{color:"#686863",font:{size:9},maxRotation:0,autoSkip:true,maxTicksLimit:12},grid:{display:false}},y:{ticks:{color:"#686863",callback:v=>fmtTk(v)},grid:{color:"rgba(24,24,22,.08)"}}}}});
   // Trend chart
   if(C.t)C.t.destroy();
-  C.t=new Chart(document.getElementById("trendChart"),{type:"line",data:{labels:D.trend.map(d=>d.date.slice(5)),datasets:[{label:"输入",data:D.trend.map(d=>d.input),borderColor:"#2f6e50",backgroundColor:"rgba(47,110,80,.12)",fill:true,tension:.28,pointRadius:2,borderWidth:2},{label:"输出",data:D.trend.map(d=>d.output),borderColor:"#181816",backgroundColor:"rgba(24,24,22,.08)",fill:true,tension:.28,pointRadius:2,borderWidth:2}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{labels:{color:"#686863",font:{size:10}}}},scales:{x:{ticks:{color:"#686863"},grid:{display:false}},y:{ticks:{color:"#686863",callback:v=>fmtTk(v)},grid:{color:"rgba(24,24,22,.08)"}}}}});
+  C.t=new Chart(document.getElementById("trendChart"),{type:"line",data:{labels:D.trend.map(d=>d.date.slice(5)),datasets:[{label:"总 Token",data:D.trend.map(d=>d.total),borderColor:"#2f6e50",backgroundColor:"rgba(47,110,80,.12)",fill:true,tension:.28,pointRadius:2,borderWidth:2}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{labels:{color:"#686863",font:{size:10}}}},scales:{x:{ticks:{color:"#686863"},grid:{display:false}},y:{ticks:{color:"#686863",callback:v=>fmtTk(v)},grid:{color:"rgba(24,24,22,.08)"}}}}});
   // Model table
   const mt=document.querySelector("#modelTable tbody");
-  const models=Object.entries(D.models||{}).sort((a,b)=>(b[1].inputTokens+b[1].outputTokens)-(a[1].inputTokens+a[1].outputTokens));
-  if(!models.length){mt.innerHTML='<tr><td colspan="5" style="text-align:center;color:var(--dim)">暂无数据</td></tr>'}else{
-    mt.innerHTML=models.map(([m,d])=>'<tr><td style="color:var(--blue)">'+m+'</td><td class="n">'+fmtT(d.requests)+'</td><td class="n">'+fmtT(d.inputTokens)+'</td><td class="n">'+fmtT(d.outputTokens)+'</td><td class="n" style="color:var(--accent);font-weight:600">'+fmtT(d.inputTokens+d.outputTokens)+'</td></tr>').join("");
+  const models=Object.entries(D.models||{}).sort((a,b)=>b[1].requests-a[1].requests);
+  if(!models.length){mt.innerHTML='<tr><td colspan="2" style="text-align:center;color:var(--dim)">暂无数据</td></tr>'}else{
+    mt.innerHTML=models.map(([m,d])=>'<tr><td style="color:var(--blue)">'+m+'</td><td class="n">'+fmtT(d.requests)+'</td></tr>').join("");
   }
 }
 load();setInterval(load,30000);

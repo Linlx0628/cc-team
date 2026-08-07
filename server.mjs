@@ -316,19 +316,22 @@ const removedOpenAIUserKeys = new Set();
   }
 })();
 
-// Auto-migrate: ensure every profile has a stable suffix and exactly one default entry
+// Auto-migrate: ensure every profile has a stable suffix, a billing type, and a
+// well-formed ordered default profile group (used for /v1 failover). isDefault is
+// now derived from defaultProfileGroup[0] rather than stored authoritatively.
 (function migrateProfileSuffix() {
   let migrated = false;
   const names = Object.keys(config.profiles);
-  const explicitDefaults = names.filter(name => config.profiles[name].isDefault);
-  // Determine the default profile. We trust the explicit isDefault flag over the
-  // legacy activeProfile hint — activeProfile is a leftover from the old single-profile
-  // switch model and can point at a non-default profile, silently misrouting /v1/* traffic.
-  const defaultName = explicitDefaults[0] || names[0];
+  const VALID_BILLING = ["coding_plan", "token_plan", "on_demand"];
   const used = new Set();
 
+  // 1) billingType default + suffix normalization
   names.forEach((pname, index) => {
     const profile = config.profiles[pname];
+    if (!VALID_BILLING.includes(profile.billingType)) {
+      profile.billingType = "on_demand";
+      migrated = true;
+    }
     const normalized = normalizeProfileSuffix(profile.suffix);
     if (!normalized || used.has(normalized) || RESERVED_SUFFIXES.has(normalized) || !PROFILE_SUFFIX_RE.test(normalized)) {
       profile.suffix = makeProfileSuffix(pname, used, index + 1);
@@ -340,21 +343,54 @@ const removedOpenAIUserKeys = new Set();
       }
       used.add(normalized);
     }
+  });
 
-    const shouldBeDefault = pname === defaultName;
-    if (!!profile.isDefault !== shouldBeDefault) {
-      profile.isDefault = shouldBeDefault;
+  // 2) Derive / repair the ordered default profile group.
+  if (!Array.isArray(config.defaultProfileGroup)) {
+    // First run: build from the legacy explicit isDefault flag (trusted over the old
+    // activeProfile hint, which could point at a non-default profile and misroute /v1).
+    const explicitDefaults = names.filter(name => config.profiles[name].isDefault);
+    const defaultName = explicitDefaults[0] || names[0];
+    config.defaultProfileGroup = defaultName ? [defaultName] : [];
+    migrated = true;
+  } else {
+    // Keep only existing, de-duped names; preserve declared order.
+    const valid = [];
+    for (const name of config.defaultProfileGroup) {
+      if (config.profiles[name] && !valid.includes(name)) valid.push(name);
+    }
+    config.defaultProfileGroup = valid;
+  }
+  // Guarantee a non-empty group when configured profiles exist.
+  if (config.defaultProfileGroup.length === 0 && names.length) {
+    const fallback = names.find(n => config.profiles[n].upstream) || names[0];
+    if (fallback) {
+      config.defaultProfileGroup = [fallback];
+      migrated = true;
+    }
+  }
+
+  // 3) isDefault is now derived from the group head.
+  const groupHead = config.defaultProfileGroup[0];
+  names.forEach((pname) => {
+    const shouldBeDefault = pname === groupHead;
+    if (!!config.profiles[pname].isDefault !== shouldBeDefault) {
+      config.profiles[pname].isDefault = shouldBeDefault;
       migrated = true;
     }
   });
 
   if (migrated) {
     saveConfig(config);
-    console.log("[MIGRATE] Normalized profile suffix/default:", Object.entries(config.profiles).map(([n, p]) => `${n}(${JSON.stringify(p.suffix)}${p.isDefault ? ",default" : ""})`).join(", "));
+    console.log("[MIGRATE] Normalized profiles:", Object.entries(config.profiles).map(([n, p]) => `${n}(${JSON.stringify(p.suffix)},${p.billingType}${p.isDefault ? ",default" : ""})`).join(", "), "group:", JSON.stringify(config.defaultProfileGroup));
   }
 })();
 
 function getDefaultProfileName() {
+  const group = Array.isArray(config.defaultProfileGroup) ? config.defaultProfileGroup : [];
+  for (const name of group) {
+    if (config.profiles[name]) return name;
+  }
   for (const [name, p] of Object.entries(config.profiles)) {
     if (p.isDefault) return name;
   }
@@ -375,16 +411,20 @@ function getProfileNameBySuffix(suffix) {
 }
 
 function listProfiles() {
+  const group = Array.isArray(config.defaultProfileGroup) ? config.defaultProfileGroup : [];
   return Object.keys(config.profiles).map(name => ({
     name,
     suffix: normalizeProfileSuffix(config.profiles[name].suffix),
     isDefault: !!config.profiles[name].isDefault,
+    billingType: config.profiles[name].billingType || "on_demand",
     upstream: config.profiles[name].upstream,
     userCount: Object.keys(config.profiles[name].users || {}).length,
     allowedModels: config.profiles[name].allowedModels || [],
     modelAliases: getConfigurableModelAliases(config.profiles[name]),
     dailyTokenLimit: config.profiles[name].dailyTokenLimit || 0,
     configured: !!config.profiles[name].upstream,
+    inDefaultGroup: group.includes(name),
+    groupOrder: group.indexOf(name),
   }));
 }
 
@@ -484,6 +524,7 @@ function createProfileRuntime(profileName, profile) {
     profileName,
     suffix: normalizeProfileSuffix(profile.suffix),
     isDefault: !!profile.isDefault,
+    billingType: profile.billingType || "on_demand",
     upstream: profile.upstream,
     upstreamUrl,
     users: { ...(profile.users || {}) },
@@ -538,6 +579,7 @@ gProxy.retryDelay = gProxy.retryDelay || 1000;
 gProxy.retryableStatusCodes = gProxy.retryableStatusCodes || [429, 502, 503, 504];
 gProxy.maxConcurrentPerUser = gProxy.maxConcurrentPerUser || 5;
 gProxy.rateLimitPerMinute = gProxy.rateLimitPerMinute || 60;
+gProxy.rateLimitFallbackSeconds = gProxy.rateLimitFallbackSeconds || 120;
 
 // Backward-compat: rt → default profile runtime (used by non-request-path code)
 let rt;
@@ -559,7 +601,7 @@ function resolveProfile(url) {
   const pathname = new URL(url, "http://localhost").pathname;
   const defaultRuntime = getDefaultRuntime();
   if (pathname === "/v1" || pathname.startsWith("/v1/")) {
-    return { suffix: defaultRuntime?.suffix || "", runtime: defaultRuntime, strippedUrl: url };
+    return { suffix: defaultRuntime?.suffix || "", runtime: defaultRuntime, strippedUrl: url, isDefaultEntry: true };
   }
 
   // Try to match /<suffix>/... pattern.
@@ -569,14 +611,14 @@ function resolveProfile(url) {
     if (!RESERVED_SUFFIXES.has(candidate) && runtimes[candidate]) {
       const strippedPath = seg[2] || "/";
       const query = url.includes("?") ? url.slice(url.indexOf("?")) : "";
-      return { suffix: candidate, runtime: runtimes[candidate], strippedUrl: strippedPath + query };
+      return { suffix: candidate, runtime: runtimes[candidate], strippedUrl: strippedPath + query, isDefaultEntry: false };
     }
     if (!RESERVED_SUFFIXES.has(candidate)) {
       return { error: `Unknown profile suffix "${candidate}"` };
     }
   }
 
-  return { suffix: defaultRuntime?.suffix || "", runtime: defaultRuntime, strippedUrl: url };
+  return { suffix: defaultRuntime?.suffix || "", runtime: defaultRuntime, strippedUrl: url, isDefaultEntry: false };
 }
 
 // ─── Concurrency & Rate Limit ────────────────────────────────────────────────
@@ -1150,6 +1192,125 @@ function getMeta(key, fallback = null) {
 }
 function setMeta(key, value) { stmts.upsertMeta.run({ k: key, v: String(value) }); }
 
+// ── Rate-limit (429 plan-exhaustion) state for default-group failover ──
+// Independent from CircuitBreaker: a 429 plan limit has a *known* resume time
+// (parsed from the upstream error), whereas the breaker recovers by probing.
+// Entries lazily self-clear once resumeAt has passed, so no timer is needed.
+const rateLimitState = {};   // { [profileName]: { resumeAt: <ms>, source: <string>, updatedAt: <ms> } }
+const RATE_LIMIT_META_KEY = "rateLimitState";
+
+class RateLimitedError extends Error {
+  constructor(resumeAt, source, message) {
+    super(message || `rate limited until ${new Date(resumeAt).toISOString()}`);
+    this.name = "RateLimitedError";
+    this.isRateLimited = true;
+    this.resumeAt = resumeAt;
+    this.source = source || "unknown";
+  }
+}
+
+function persistRateLimitState() {
+  try { setMeta(RATE_LIMIT_META_KEY, JSON.stringify(rateLimitState)); }
+  catch (err) { console.warn("[RateLimit] persist failed:", err.message); }
+}
+
+function markRateLimited(profileName, resumeAtMs, source) {
+  if (!profileName || !Number.isFinite(resumeAtMs)) return;
+  rateLimitState[profileName] = { resumeAt: resumeAtMs, source: source || "unknown", updatedAt: Date.now() };
+  persistRateLimitState();
+  console.log(`[RateLimit] "${profileName}" marked limited until ${new Date(resumeAtMs).toISOString()} (source: ${source || "unknown"})`);
+}
+
+function clearRateLimited(profileName) {
+  if (profileName && rateLimitState[profileName]) {
+    delete rateLimitState[profileName];
+    persistRateLimitState();
+  }
+}
+
+// Lazily self-heals: once resumeAt has passed, clear and report "not limited".
+function isRateLimited(profileName) {
+  const st = rateLimitState[profileName];
+  if (!st) return false;
+  if (Date.now() >= st.resumeAt) { clearRateLimited(profileName); return false; }
+  return true;
+}
+
+function getRateLimitInfo(profileName) {
+  const st = rateLimitState[profileName];
+  if (!st) return null;
+  if (Date.now() >= st.resumeAt) { clearRateLimited(profileName); return null; }
+  return { resumeAt: st.resumeAt, source: st.source };
+}
+
+// Parse a reset time out of an upstream 429 body. GLM shape:
+//   "...您的限额将在 2026-08-06 10:41:33 重置。..."
+// The timestamp is Beijing time (+08:00); the server may run in another zone, so we
+// pin the offset instead of treating it as local time.
+const RATE_LIMIT_RESET_RE = /限额将在\s*(\d{4}-\d{2}-\d{2})[ T]+(\d{2}:\d{2}(?::\d{2})?)\s*重置/;
+function parseRateLimitReset(text) {
+  if (!text) return null;
+  const m = String(text).match(RATE_LIMIT_RESET_RE);
+  if (!m) return null;
+  let hhmmss = m[2];
+  if (/^\d{2}:\d{2}$/.test(hhmmss)) hhmmss += ":00";   // HH:mm → HH:mm:ss
+  const ms = Date.parse(`${m[1]}T${hhmmss}+08:00`);
+  return Number.isFinite(ms) ? ms : null;
+}
+
+function fallbackResumeAtMs() {
+  const secs = Number(gProxy.rateLimitFallbackSeconds) || 120;
+  return Date.now() + secs * 1000;
+}
+
+// Classify an upstream response as a plan limit we should fail over from.
+// Returns { resumeAt, source } when it is, or null for a plain burst 429
+// (which should follow the normal same-upstream retry path).
+function classifyRateLimit(statusCode, text) {
+  if (statusCode !== 429) return null;
+  const body = String(text || "");
+  const parsed = parseRateLimitReset(body);
+  if (parsed) return { resumeAt: parsed, source: "reset-time" };
+  const looksLikePlanLimit = /rate_limit_error|"code"\s*:\s*1310|使用上限|usage limit|plan limit/i.test(body);
+  return looksLikePlanLimit ? { resumeAt: fallbackResumeAtMs(), source: "fallback" } : null;
+}
+
+// Ordered list of currently-usable default-group profiles for a given user key.
+// Skips: rate-limited, breaker OPEN, user not authorized, or profiles with no runtime.
+function getAvailableDefaultProfiles(apiKey) {
+  const group = Array.isArray(config.defaultProfileGroup) ? config.defaultProfileGroup : [];
+  const out = [];
+  for (const name of group) {
+    const profile = config.profiles[name];
+    if (!profile) continue;
+    const suffix = normalizeProfileSuffix(profile.suffix);
+    const runtime = runtimes[suffix];
+    if (!runtime) continue;
+    if (isRateLimited(name)) continue;
+    if (runtime.breaker.status().state === "OPEN") continue;
+    if (!canUseProfile(apiKey, runtime)) continue;
+    out.push({ name, suffix, runtime });
+  }
+  return out;
+}
+
+// Load persisted rate-limit state once the DB is ready.
+function loadRateLimitState() {
+  try {
+    const raw = getMeta(RATE_LIMIT_META_KEY);
+    if (!raw) return;
+    const parsed = JSON.parse(raw);
+    if (parsed && typeof parsed === "object") {
+      const now = Date.now();
+      for (const [name, st] of Object.entries(parsed)) {
+        if (st && Number.isFinite(st.resumeAt) && st.resumeAt > now) {
+          rateLimitState[name] = { resumeAt: st.resumeAt, source: st.source || "unknown", updatedAt: st.updatedAt || now };
+        }
+      }
+    }
+  } catch (err) { console.warn("[RateLimit] load failed:", err.message); }
+}
+
 // ── Profile snapshot: assemble nested object for sanitizeStore (single profile) ──
 function loadProfileSnapshot(suffix) {
   const users = {};
@@ -1188,6 +1349,7 @@ function loadProfileSnapshot(suffix) {
 
 initDb();
 migrateFromJsonIfNeeded();
+loadRateLimitState();
 
 function removeLegacyOpenAIData() {
   const suffixes = removedOpenAIProfileSuffixes.filter(Boolean);
@@ -1260,11 +1422,15 @@ function getProfileSummaries() {
       name: profile.name,
       suffix: profile.suffix,
       isDefault: profile.isDefault,
+      billingType: profile.billingType,
       upstream: profile.upstream,
       userCount: profile.userCount,
       todayTokens: row.tokens || 0,
       todayRequests: row.requests || 0,
       breakerState: runtime?.breaker?.status().state || "UNKNOWN",
+      rateLimit: getRateLimitInfo(profile.name),
+      inDefaultGroup: profile.inDefaultGroup,
+      groupOrder: profile.groupOrder,
     };
   });
 }
@@ -1976,6 +2142,26 @@ function proxyRequest(req, res) {
     return;
   }
   const apiKey = getApiKey(req);
+
+  // Group members (default-profile-group with ≥2 entries) are reachable only via /v1,
+  // which fails over across the group. Reject direct /<suffix>/... access so users can't
+  // bypass failover to pin an expensive on-demand profile.
+  const dpg = Array.isArray(config.defaultProfileGroup) ? config.defaultProfileGroup : [];
+  if (config.restrictGroupSuffix !== false && !resolvedProfile.isDefaultEntry && dpg.length >= 2 && dpg.includes(runtime.profileName)) {
+    res.writeHead(403, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({
+      type: "error",
+      error: {
+        type: "group_member_restricted",
+        message: `方案 "${runtime.profileName}" 是默认方案组成员，请通过 /v1 入口使用（系统按 failover 顺序自动调度）。`
+      },
+      hint: "Use /v1/messages instead."
+    }));
+    recordError(apiKey, 403, `group_member_restricted: /${suffix} 直连被拒，引导走 /v1`, req.url, "unknown", suffix, runtime);
+    console.log(`[拦截] ${getUserName(apiKey, runtime)} 直连组内方案 /${suffix} 被拒 → 引导 /v1`);
+    return;
+  }
+
   const proxyStartTime = Date.now();
   let proxyPhase = "init";
   const clientState = createClientAbortState();
@@ -2054,47 +2240,24 @@ function proxyRequest(req, res) {
           reqSource = "子代理";
         }
       }
-      const resolved = resolveModel(reqModel, runtime);
-      if (resolved !== reqModel) {
-        parsed.model = resolved;
-        body = Buffer.from(JSON.stringify(parsed));
-        reqModel = resolved;
-      }
     } catch {}
 
-    // Model access restriction
-    if (!checkModelAllowed(reqModel, runtime)) {
-      res.writeHead(403, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: modelNotAllowedMessage(reqModel, runtime) }));
-      console.log(`[拦截] ${getUserName(apiKey, runtime)} model=${reqModel} 被拒绝`);
-      return;
+    // Save the pre-resolve body so each failover candidate can re-resolve the model
+    // against its own modelAliases.
+    const originalBody = body;
+
+    // Build the ordered candidate list. Default-group (/v1) entries fail over across
+    // the whole group; explicit /<suffix>/... requests stay pinned to one profile.
+    const candidateList = resolvedProfile.isDefaultEntry
+      ? getAvailableDefaultProfiles(apiKey)
+      : [{ name: runtime.profileName, suffix, runtime }];
+    // If every default-group member is currently unavailable (all rate-limited / breaker
+    // open / unauthorized), fall back to the resolved default so the normal error path runs.
+    if (candidateList.length === 0) {
+      candidateList.push({ name: runtime.profileName, suffix, runtime });
     }
 
-    // Circuit breaker check
-    if (!runtime.breaker.allowRequest()) {
-      const remaining = Math.ceil(runtime.breaker.status().cooldownRemaining / 1000);
-      res.writeHead(503, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: `Upstream temporarily unavailable. Circuit open, retry in ${remaining}s.` }));
-      recordError(apiKey, 503, "Circuit breaker open", req.url, reqModel, suffix, runtime);
-      return;
-    }
-
-    // Quota and rate checks happen before a concurrency slot is occupied.
-    const quota = checkTokenQuota(apiKey, suffix, runtime);
-    if (!quota.allowed) {
-      const reqHost = req.headers.host || `localhost:${port}`;
-      const usageUrl = `http://${reqHost}/usage/${apiKey}`;
-      const retryAfter = secondsUntilNextCnMidnight();
-      res.writeHead(429, { "Content-Type": "application/json", "Retry-After": String(retryAfter) });
-      res.end(JSON.stringify({
-        error: `今日Token额度已用完。已用: ${quota.used.toLocaleString()}, 限额: ${quota.limit.toLocaleString()}。额度将于北京时间次日凌晨重置。查看用量详情: ${usageUrl}`,
-        type: "quota_exceeded",
-        quota: { used: quota.used, limit: quota.limit, remaining: quota.remaining, source: quota.source },
-        usageUrl,
-      }));
-      recordError(apiKey, 429, `quota_exceeded: ${quota.used}/${quota.limit}, retry in ${retryAfter}s`, req.url, reqModel, suffix, runtime);
-      return;
-    }
+    // Rate + concurrency are per-user, independent of which profile serves the request.
     if (!checkAndRecordRate(userKey)) {
       res.writeHead(429, { "Content-Type": "application/json", "Retry-After": "60" });
       res.end(JSON.stringify({ error: "Rate limit exceeded. Please slow down.", type: "rate_limit_exceeded" }));
@@ -2108,42 +2271,129 @@ function proxyRequest(req, res) {
       return;
     }
 
+    let lastFailure = null;   // { kind, status?, message?, runtime, suffix, quota?, err? }
+    let served = false;
     try {
-      proxyPhase = "upstream-connect";
-      const realKey = getRealKey(apiKey, runtime);
-      const reqHeaders = { ...req.headers, host: runtime.upstreamUrl.host, "content-length": body.length };
-      console.log(`── 请求开始 ── ${getUserName(apiKey, runtime)} [${reqSource}] 模型=${originalModel}${originalModel !== reqModel ? "→" + reqModel : ""}${suffix ? ` [${suffix}]` : ""} ──`);
-      // Replace virtual key with real upstream key
-      if (realKey !== apiKey) {
-        reqHeaders["authorization"] = `Bearer ${realKey}`;
-        console.log(`[映射] ${getUserName(apiKey, runtime)} 虚拟key=${apiKey.slice(0,8)}**** 请求模型=${originalModel}${originalModel !== reqModel ? " → 实际=" + reqModel : ""}`);
-      }
-      delete reqHeaders["connection"];
-      delete reqHeaders["transfer-encoding"];
-      delete reqHeaders["accept-encoding"];
+      for (let ci = 0; ci < candidateList.length; ci++) {
+        const cand = candidateList[ci];
+        const cruntime = cand.runtime;
+        const csuffix = cand.suffix;
+        const isLastCandidate = ci === candidateList.length - 1;
 
-      const isStreamRequest = (req.headers["accept"] || "").includes("text/event-stream") ||
-        (function() { try { return JSON.parse(body.toString()).stream; } catch { return false; } })();
+        // Per-candidate model resolution (each profile may map aliases differently).
+        let cbody = originalBody;
+        let creqModel = reqModel;
+        try {
+          const resolved = resolveModel(reqModel, cruntime);
+          if (resolved !== reqModel) {
+            const parsed = JSON.parse(originalBody.toString());
+            parsed.model = resolved;
+            cbody = Buffer.from(JSON.stringify(parsed));
+            creqModel = resolved;
+          }
+        } catch {}
 
-      proxyPhase = isStreamRequest ? "streaming-proxy" : "json-proxy";
-      const timeout = isStreamRequest ? gProxy.streamTimeout : gProxy.timeout;
+        if (!checkModelAllowed(creqModel, cruntime)) {
+          lastFailure = { kind: "model", status: 403, message: modelNotAllowedMessage(creqModel, cruntime), runtime: cruntime, suffix: csuffix };
+          if (!isLastCandidate) continue;
+          break;
+        }
 
-      if (isStreamRequest) {
-        await handleStreamingProxy(req, res, body, reqHeaders, apiKey, reqModel, timeout, reqSource, runtime, suffix, strippedUrl, clientState);
-      } else {
-        await handleJsonProxy(req, res, body, reqHeaders, apiKey, reqModel, timeout, reqSource, runtime, suffix, strippedUrl, clientState);
+        // Circuit breaker: skip an open upstream and try the next candidate (default
+        // group entries are pre-filtered, so this mainly guards explicit /suffix/ use).
+        if (!cruntime.breaker.allowRequest()) {
+          lastFailure = { kind: "breaker", status: 503, runtime: cruntime, suffix: csuffix };
+          if (!isLastCandidate) continue;
+          break;
+        }
+
+        const quota = checkTokenQuota(apiKey, csuffix, cruntime);
+        if (!quota.allowed) {
+          lastFailure = { kind: "quota", status: 429, quota, runtime: cruntime, suffix: csuffix };
+          if (!isLastCandidate) continue;
+          break;
+        }
+
+        try {
+          proxyPhase = "upstream-connect";
+          const realKey = getRealKey(apiKey, cruntime);
+          const reqHeaders = { ...req.headers, host: cruntime.upstreamUrl.host, "content-length": cbody.length };
+          console.log(`── 请求开始 ── ${getUserName(apiKey, cruntime)} [${reqSource}] 模型=${originalModel}${originalModel !== creqModel ? "→" + creqModel : ""}${csuffix ? ` [${csuffix}]` : ""} ──`);
+          if (realKey !== apiKey) {
+            reqHeaders["authorization"] = `Bearer ${realKey}`;
+            console.log(`[映射] ${getUserName(apiKey, cruntime)} 虚拟key=${apiKey.slice(0,8)}**** 请求模型=${originalModel}${originalModel !== creqModel ? " → 实际=" + creqModel : ""}`);
+          }
+          delete reqHeaders["connection"];
+          delete reqHeaders["transfer-encoding"];
+          delete reqHeaders["accept-encoding"];
+
+          const isStreamRequest = (req.headers["accept"] || "").includes("text/event-stream") ||
+            (function() { try { return JSON.parse(cbody.toString()).stream; } catch { return false; } })();
+
+          proxyPhase = isStreamRequest ? "streaming-proxy" : "json-proxy";
+          const timeout = isStreamRequest ? gProxy.streamTimeout : gProxy.timeout;
+
+          if (isStreamRequest) {
+            await handleStreamingProxy(req, res, cbody, reqHeaders, apiKey, creqModel, timeout, reqSource, cruntime, csuffix, strippedUrl, clientState);
+          } else {
+            await handleJsonProxy(req, res, cbody, reqHeaders, apiKey, creqModel, timeout, reqSource, cruntime, csuffix, strippedUrl, clientState);
+          }
+          served = true;
+          break;
+        } catch (err) {
+          if (err?.isRateLimited) {
+            markRateLimited(cand.name, err.resumeAt, err.source);
+            lastFailure = { kind: "rate-limit", status: 429, err, runtime: cruntime, suffix: csuffix };
+            if (!isLastCandidate) continue;
+            break;
+          }
+          if (isClientAbortError(err)) {
+            console.log(`[取消] ${getUserName(apiKey, cruntime)} 客户端已断开，停止代理 model=${creqModel} phase=${proxyPhase}`);
+            served = true;   // client disconnect is not a failure to surface
+            break;
+          }
+          lastFailure = { kind: "proxy", status: err.isTimeout ? 504 : 502, err, runtime: cruntime, suffix: csuffix };
+          if (!isLastCandidate) continue;
+          break;
+        }
       }
-    } catch (err) {
-      if (isClientAbortError(err)) {
-        console.log(`[取消] ${getUserName(apiKey, runtime)} 客户端已断开，停止代理 model=${reqModel} phase=${proxyPhase}`);
-        return;
-      }
-      const status = err.isTimeout ? 504 : 502;
-      const label = err.isTimeout ? "Gateway Timeout" : "Bad Gateway";
-      recordError(apiKey, status, `${label}: ${err.message}`, req.url, reqModel, suffix, runtime);
-      if (!res.headersSent) {
-        res.writeHead(status, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: `Proxy ${label}. Please try again later.` }));
+
+      // Every candidate failed: surface the last failure to the client.
+      if (!served && lastFailure && !res.headersSent) {
+        if (lastFailure.kind === "model") {
+          res.writeHead(403, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: lastFailure.message }));
+          console.log(`[拦截] ${apiKey.slice(0, 8)}**** profile=${lastFailure.runtime.profileName} model 拒绝`);
+        } else if (lastFailure.kind === "breaker") {
+          const remaining = Math.ceil(lastFailure.runtime.breaker.status().cooldownRemaining / 1000);
+          res.writeHead(503, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: `Upstream temporarily unavailable. Circuit open, retry in ${remaining}s.` }));
+          recordError(apiKey, 503, "Circuit breaker open", req.url, reqModel, lastFailure.suffix, lastFailure.runtime);
+        } else if (lastFailure.kind === "quota") {
+          const q = lastFailure.quota;
+          const reqHost = req.headers.host || `localhost:${port}`;
+          const usageUrl = `http://${reqHost}/usage/${apiKey}`;
+          const retryAfter = secondsUntilNextCnMidnight();
+          res.writeHead(429, { "Content-Type": "application/json", "Retry-After": String(retryAfter) });
+          res.end(JSON.stringify({
+            error: `今日Token额度已用完。已用: ${q.used.toLocaleString()}, 限额: ${q.limit.toLocaleString()}。额度将于北京时间次日凌晨重置。查看用量详情: ${usageUrl}`,
+            type: "quota_exceeded",
+            quota: { used: q.used, limit: q.limit, remaining: q.remaining, source: q.source },
+            usageUrl,
+          }));
+          recordError(apiKey, 429, `quota_exceeded: ${q.used}/${q.limit}, retry in ${retryAfter}s`, req.url, reqModel, lastFailure.suffix, lastFailure.runtime);
+        } else if (lastFailure.kind === "rate-limit") {
+          const retryAfter = Math.max(1, Math.ceil((lastFailure.err.resumeAt - Date.now()) / 1000));
+          res.writeHead(429, { "Content-Type": "application/json", "Retry-After": String(retryAfter) });
+          res.end(JSON.stringify({ type: "error", error: { type: "rate_limit_error", message: `所有可用方案均已限额，最早 ${new Date(lastFailure.err.resumeAt).toISOString()} 恢复。` } }));
+          recordError(apiKey, 429, `all profiles rate-limited until ${new Date(lastFailure.err.resumeAt).toISOString()}`, req.url, reqModel, lastFailure.suffix, lastFailure.runtime);
+        } else {
+          const status = lastFailure.status;
+          const label = status === 504 ? "Gateway Timeout" : "Bad Gateway";
+          res.writeHead(status, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: `Proxy ${label}. Please try again later.` }));
+          recordError(apiKey, status, `${label}: ${lastFailure.err.message}`, req.url, reqModel, lastFailure.suffix, lastFailure.runtime);
+        }
       }
     } finally {
       releaseConcurrency(userKey);
@@ -2180,6 +2430,10 @@ async function handleJsonProxy(req, res, body, reqHeaders, apiKey, reqModel, tim
           console.log(`[套餐] 上游套餐已耗尽或需要付款 状态码: ${upRes.statusCode}`);
         }
       }
+
+      // Plan-exhaustion 429: hand off to the failover layer (do not retry same upstream).
+      const rateLimitHit = classifyRateLimit(upRes.statusCode, text);
+      if (rateLimitHit) throw new RateLimitedError(rateLimitHit.resumeAt, rateLimitHit.source);
 
       // Retryable status codes
       if (gProxy.retryableStatusCodes.includes(upRes.statusCode) && attempt < gProxy.maxRetries) {
@@ -2225,6 +2479,7 @@ async function handleJsonProxy(req, res, body, reqHeaders, apiKey, reqModel, tim
       res.end(text);
       return;
     } catch (err) {
+      if (err?.isRateLimited) throw err;   // propagate to outer failover loop — no breaker/retry
       if (isClientAbortError(err)) {
         console.log(`[取消] ${getUserName(apiKey, runtime)} JSON 客户端断开 model=${reqModel}`);
         return;
@@ -2277,6 +2532,14 @@ async function handleStreamingProxy(req, res, body, reqHeaders, apiKey, reqModel
         resolve();
       }
     }
+    function safeReject(err) {
+      if (!resolved) {
+        resolved = true;
+        cleanupClientAbort();
+        cleanupUpstream();
+        reject(err);
+      }
+    }
     const upReq = transport.request(opts, (upRes) => {
       const h = { ...upRes.headers };
       delete h["transfer-encoding"];
@@ -2285,8 +2548,6 @@ async function handleStreamingProxy(req, res, body, reqHeaders, apiKey, reqModel
       h["content-type"] = "text/event-stream";
       h["cache-control"] = "no-cache";
       h["connection"] = "keep-alive";
-      res.writeHead(upRes.statusCode, h);
-
       res.on("error", () => {
         clientGone = true;
         upReq.destroy(makeClientAbortError("response-error"));
@@ -2297,7 +2558,33 @@ async function handleStreamingProxy(req, res, body, reqHeaders, apiKey, reqModel
       let sseDataLines = 0;
       let rawSample = "";
 
+      // Plan-exhaustion 429: buffer the full body, then hand off to the failover
+      // layer WITHOUT writing anything to the client — so the next profile can own
+      // the response. A burst 429 (no plan-limit signal) is passed through instead.
+      if (upRes.statusCode === 429) {
+        let errBuf = "";
+        upRes.on("data", (c) => { if (!clientGone) errBuf += c.toString(); });
+        upRes.on("end", () => {
+          const rl = classifyRateLimit(upRes.statusCode, errBuf);
+          if (rl) {
+            recordError(apiKey, upRes.statusCode, errBuf.slice(0, 200), req.url, reqModel, suffix, runtime);
+            safeReject(new RateLimitedError(rl.resumeAt, rl.source));
+            return;
+          }
+          recordError(apiKey, upRes.statusCode, errBuf.slice(0, 200), req.url, reqModel, suffix, runtime);
+          runtime.breaker.recordSuccess();
+          if (!clientGone) {
+            res.writeHead(upRes.statusCode, h);
+            if (errBuf) res.write(errBuf);
+            res.end();
+          }
+          safeResolve();
+        });
+        return;
+      }
+
       if (upRes.statusCode >= 400) {
+        res.writeHead(upRes.statusCode, h);
         let errBuf = "";
         upRes.on("data", (c) => { if (clientGone) return; errBuf += c.toString(); res.write(c); });
         upRes.on("end", () => {
@@ -2310,6 +2597,7 @@ async function handleStreamingProxy(req, res, body, reqHeaders, apiKey, reqModel
         return;
       }
 
+      res.writeHead(upRes.statusCode, h);
       runtime.breaker.recordSuccess();
 
       upRes.on("data", (chunk) => {
@@ -2480,6 +2768,15 @@ function settingsHtml(errorMsg) {
   const initialSuffix = s.selectedProfileSuffix || getDefaultProfileSuffix();
   const initialAssignments = s.profileAssignments[initialSuffix] || {};
   const initialProfile = s.profiles.find(p => p.suffix === initialSuffix) || s.profiles[0] || {};
+
+  // Default profile group (failover chain for /v1) rendering
+  const dpg = (Array.isArray(config.defaultProfileGroup) ? config.defaultProfileGroup : []).filter(n => config.profiles[n]);
+  const groupItemsHtml = dpg.map((name, i) => {
+    const p = config.profiles[name];
+    const bt = p.billingType === "coding_plan" ? "Coding Plan" : p.billingType === "token_plan" ? "Token Plan" : "按量计费";
+    return `<div class="group-item" data-name="${escHtml(name)}" style="display:flex;align-items:center;gap:8px;padding:6px 8px;border:1px solid var(--border);border-radius:6px;margin-bottom:6px"><span style="color:var(--blue);font-weight:600;min-width:20px">${i + 1}</span><span style="flex:1">${escHtml(name)} <span style="color:var(--dim);font-size:11px">${bt}</span></span><button type="button" class="btn btn-outline btn-sm" onclick="event.stopPropagation();moveDefaultGroup('${escJs(name)}',-1)" ${i === 0 ? "disabled" : ""}>↑</button><button type="button" class="btn btn-outline btn-sm" onclick="event.stopPropagation();moveDefaultGroup('${escJs(name)}',1)" ${i === dpg.length - 1 ? "disabled" : ""}>↓</button><button type="button" class="btn btn-outline btn-sm" onclick="event.stopPropagation();removeFromDefaultGroup('${escJs(name)}')">移出</button></div>`;
+  }).join("");
+  const nonMembersHtml = Object.keys(config.profiles).filter(n => !dpg.includes(n) && config.profiles[n].upstream).map(name => `<button type="button" class="preset" onclick="event.stopPropagation();addToDefaultGroup('${escJs(name)}')">+ ${escHtml(name)}</button>`).join("");
 
   const globalUserRows = Object.entries(s.globalUsers).map(([k, v]) => {
     const isObj = typeof v === "object" && v !== null;
@@ -2680,6 +2977,24 @@ ${errDiv}
 <div><label>每用户最大并发数</label><input type="number" name="maxConcurrentPerUser" value="${s.proxy.maxConcurrentPerUser}" min="1" max="100"></div>
 <div><label>每用户每分钟最大请求数</label><input type="number" name="rateLimitPerMinute" value="${s.proxy.rateLimitPerMinute}" min="1" max="600"></div>
 </div>
+</div>
+
+<h2>计费类型</h2>
+<div class="section">
+<label>该方案的计费模式（仅用于展示；默认方案组里通常把 Coding Plan 排在按量计费之前）</label>
+<select name="billingType">
+  <option value="coding_plan" ${initialProfile.billingType === "coding_plan" ? "selected" : ""}>Coding Plan（套餐限额，触发 429 自动切换）</option>
+  <option value="token_plan" ${initialProfile.billingType === "token_plan" ? "selected" : ""}>Token Plan（包年/包月）</option>
+  <option value="on_demand" ${(!initialProfile.billingType || initialProfile.billingType === "on_demand") ? "selected" : ""}>按量计费（无限额，通常作 failover 兜底）</option>
+</select>
+</div>
+
+<h2>默认方案组 <span style="font-size:11px;color:var(--dim);font-weight:400">/v1 入口按此顺序 failover：首位限额或故障自动切下一个，恢复后切回</span></h2>
+<div class="section">
+<div class="note" style="margin-bottom:10px">排在前面的优先级更高。典型：第 1 位 Coding Plan（套餐限额），第 2 位 按量计费（兜底）。同一虚拟 key 需在组内各方案都配置真实 key。组内成员（≥2 个时）的独立 suffix 入口将禁用，所有流量统一走 /v1，避免用户绕过 failover 直连按量计费。</div>
+<label style="display:flex;align-items:center;gap:6px;margin:0 0 12px;cursor:pointer"><input type="checkbox" name="restrictGroupSuffix" ${config.restrictGroupSuffix !== false ? "checked" : ""} style="width:auto;accent-color:var(--accent)"> 限制组内方案仅走 /v1（禁止 /&lt;suffix&gt; 直连；取消勾选则允许直接调用组内方案）</label>
+<div id="defaultGroupList">${groupItemsHtml || '<div class="note">组为空</div>'}</div>
+${nonMembersHtml ? `<div style="margin-top:10px"><span style="font-size:11px;color:var(--dim)">加入组：</span>${nonMembersHtml}</div>` : ""}
 </div>
 
 <h2>每日Token配额 <span style="font-size:11px;color:var(--dim);font-weight:400">总Token=输入+输出+缓存写入+缓存命中，0=不限制，北京时间每日0点重置</span></h2>
@@ -2949,6 +3264,14 @@ async function deleteProfile(n){
   const r=await fetch('/api/profile/delete',{method:'POST',headers:csrfHeaders({'Content-Type':'application/json'}),body:JSON.stringify({profile:n})});
   if(r.ok)location.reload();else{const e=await r.json();alert('删除失败: '+e.error)}
 }
+async function saveDefaultGroup(group){
+  const r=await fetch('/api/profile/default-group',{method:'POST',headers:csrfHeaders({'Content-Type':'application/json'}),body:JSON.stringify({group:group})});
+  if(r.ok)location.reload();else{const e=await r.json().catch(()=>({}));alert('保存失败: '+(e.error||''))}
+}
+function currentDefaultGroupFromDom(){return Array.prototype.map.call(document.querySelectorAll('#defaultGroupList .group-item'),function(el){return el.dataset.name})}
+async function addToDefaultGroup(n){const g=currentDefaultGroupFromDom();if(!g.includes(n))g.push(n);saveDefaultGroup(g)}
+async function removeFromDefaultGroup(n){saveDefaultGroup(currentDefaultGroupFromDom().filter(function(x){return x!==n}))}
+async function moveDefaultGroup(n,d){const g=currentDefaultGroupFromDom();const i=g.indexOf(n);if(i<0)return;const j=i+d;if(j<0||j>=g.length)return;g.splice(i,1);g.splice(j,0,n);saveDefaultGroup(g)}
 async function deleteGlobalUser(k){
   if(!confirm('确定删除用户？该用户将从所有方案中移除。'))return;
   const r=await fetch('/api/global-user/delete',{method:'POST',headers:csrfHeaders({'Content-Type':'application/json'}),body:JSON.stringify({key:k})});
@@ -3242,7 +3565,7 @@ function render(){
   document.getElementById("cards").innerHTML=c("今日用量",todayTokens,"var(--accent)",1)+c("今日请求",tR,"var(--blue)",1)+c("总用量",allTokens,"var(--green)",1)+c("总请求",tr,"var(--orange)",1)+c("今日错误",(Array.isArray(D.errors)?D.errors:[]).filter(e=>e.time&&e.time.startsWith(td)).length,"var(--red)",1);
   runCountUps(document.getElementById("cards"));
   const psb=document.getElementById("profileSummaryBody"),profiles=Array.isArray(D.profileSummaries)?D.profileSummaries:[];
-  psb.innerHTML=profiles.length?profiles.map(p=>{const st=p.breakerState||"UNKNOWN";const col=st==="CLOSED"?"var(--green)":st==="HALF_OPEN"?"var(--orange)":"var(--red)";const led=st==="CLOSED"?"on":st==="HALF_OPEN"?"warn":"err";const stateLabel=st==="CLOSED"?"正常":st==="HALF_OPEN"?"探测中":"熔断";const current=currentProfile!=="all"&&p.suffix===currentProfile;return'<tr'+(current?' class="profile-current" aria-current="true"':'')+'><td>'+escH(p.name)+(p.isDefault?' <span style="color:var(--green);font-size:11px;font-weight:600;vertical-align:middle">默认</span>':'')+(current?' <span class="current-mark">当前</span>':'')+'</td><td><code>/'+escH(p.suffix)+'</code>'+(p.isDefault?' <span style="color:var(--dim)"> / <code>/v1</code></span>':'')+'</td><td style="font-size:12px;color:var(--dim);max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+escH((p.upstream||'').replace('https://','').replace('http://',''))+'</td><td class="n">'+fmtT(p.todayRequests||0)+'</td><td class="n hl">'+fmtT(p.todayTokens||0)+'</td><td><span class="led '+led+'"></span><span style="color:'+col+';font-size:12px">'+stateLabel+'</span></td></tr>'}).join(''):'<tr><td colspan="6" class="empty">暂无方案</td></tr>';
+  psb.innerHTML=profiles.length?profiles.map(p=>{const st=p.breakerState||"UNKNOWN";const rl=p.rateLimit;let col,led,stateLabel;if(rl){col='var(--red)';led='err';const rm=new Date(rl.resumeAt);stateLabel='限额中 '+String(rm.getHours()).padStart(2,'0')+':'+String(rm.getMinutes()).padStart(2,'0')+'恢复';}else{col=st==="CLOSED"?"var(--green)":st==="HALF_OPEN"?"var(--orange)":"var(--red)";led=st==="CLOSED"?"on":st==="HALF_OPEN"?"warn":"err";stateLabel=st==="CLOSED"?"正常":st==="HALF_OPEN"?"探测中":"熔断";}const current=currentProfile!=="all"&&p.suffix===currentProfile;const gBadge=p.inDefaultGroup?' <span style="color:var(--blue);font-size:10px;font-weight:600">默认组·'+(p.groupOrder+1)+'</span>':'';const bLabel=p.billingType==='coding_plan'?' <span style="color:var(--dim);font-size:10px">CP</span>':p.billingType==='token_plan'?' <span style="color:var(--dim);font-size:10px">TP</span>':'';const restricted=p.inDefaultGroup&&profiles.filter(x=>x.inDefaultGroup).length>=2;return'<tr'+(current?' class="profile-current" aria-current="true"':'')+'><td>'+escH(p.name)+(p.isDefault?' <span style="color:var(--green);font-size:11px;font-weight:600;vertical-align:middle">默认</span>':'')+gBadge+bLabel+(current?' <span class="current-mark">当前</span>':'')+'</td><td>'+(restricted?'<code>/v1</code> <span style="color:var(--dim);font-size:10px">仅 /v1</span>':'<code>/'+escH(p.suffix)+'</code>'+(p.isDefault?' <span style="color:var(--dim)"> / <code>/v1</code></span>':''))+'</td><td style="font-size:12px;color:var(--dim);max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+escH((p.upstream||'').replace('https://','').replace('http://',''))+'</td><td class="n">'+fmtT(p.todayRequests||0)+'</td><td class="n hl">'+fmtT(p.todayTokens||0)+'</td><td><span class="led '+led+'"></span><span style="color:'+col+';font-size:12px">'+stateLabel+'</span></td></tr>'}).join(''):'<tr><td colspan="6" class="empty">暂无方案</td></tr>';
   const profileLabel=D.profileView||(currentProfile==="all"?"全部方案":"默认方案");
   document.getElementById("profileContext").textContent="当前查看："+profileLabel;
   const upstreamInfo=D.upstream?(" | 上游: "+D.upstream.replace("https://","").replace("http://","")):"";
@@ -3495,6 +3818,11 @@ function applySettings(formData) {
     editingProfile.dailyTokenLimit = q > 0 ? q : null;
   }
 
+  // Update billing type (display label, drives no logic)
+  if (formData.billingType && ["coding_plan", "token_plan", "on_demand"].includes(formData.billingType)) {
+    editingProfile.billingType = formData.billingType;
+  }
+
   // Update auto quota adjustment settings
   if (!config.autoQuotaAdjust) config.autoQuotaAdjust = {};
   config.autoQuotaAdjust.enabled = formData.autoQuotaEnabled === "on";
@@ -3507,6 +3835,10 @@ function applySettings(formData) {
   if (formData.aqMaxQuota) config.autoQuotaAdjust.maxAutoQuota = parseInt(formData.aqMaxQuota, 10) || 10000000;
   if (formData.aqCooldown) config.autoQuotaAdjust.cooldownDays = Math.max(1, parseInt(formData.aqCooldown, 10) || 3);
   setMeta("lastQuotaEval", ""); // Reset eval date so new config takes effect immediately
+
+  // Restrict default-group members to /v1 only (block direct /<suffix>/... access).
+  // Default ON (undefined → enabled) to prevent bypassing failover to on-demand profiles.
+  config.restrictGroupSuffix = formData.restrictGroupSuffix === "on";
 
   // Update retryable status codes
   if (formData.retryableStatusCodes) {
@@ -3894,7 +4226,8 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  // Profile: set default entry alias
+  // Profile: set default entry alias — make this profile the head of the default
+  // group (other members kept after it). /v1 traffic fails over across the group.
   if (req.method === "POST" && req.url === "/api/profile/default") {
     if (!checkAuth(req)) { res.writeHead(401); res.end("Unauthorized"); return; }
     if (!checkCsrf(req)) { res.writeHead(403); res.end("CSRF validation failed"); return; }
@@ -3903,13 +4236,47 @@ const server = http.createServer((req, res) => {
         const { profile, suffix } = JSON.parse(buf.toString());
         const name = profile || getProfileNameBySuffix(suffix);
         if (!name || !config.profiles[name]) throw new Error(`Profile "${profile || suffix}" not found`);
+        if (!Array.isArray(config.defaultProfileGroup)) config.defaultProfileGroup = [];
+        config.defaultProfileGroup = [name, ...config.defaultProfileGroup.filter(n => n !== name)];
         for (const [pname, p] of Object.entries(config.profiles)) {
-          p.isDefault = pname === name;
+          p.isDefault = pname === config.defaultProfileGroup[0];
         }
         saveConfig(config);
         reloadAllRuntimes();
         res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ ok: true, defaultProfile: name, profiles: listProfiles() }));
+        res.end(JSON.stringify({ ok: true, defaultProfile: name, defaultProfileGroup: config.defaultProfileGroup, profiles: listProfiles() }));
+      } catch (err) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: err.message }));
+      }
+    }).catch(() => {
+      res.writeHead(413); res.end("Request too large");
+    });
+    return;
+  }
+
+  // Profile: set the ordered default group (failover chain for /v1).
+  if (req.method === "POST" && req.url === "/api/profile/default-group") {
+    if (!checkAuth(req)) { res.writeHead(401); res.end("Unauthorized"); return; }
+    if (!checkCsrf(req)) { res.writeHead(403); res.end("CSRF validation failed"); return; }
+    readBody(req).then(buf => {
+      try {
+        const { group } = JSON.parse(buf.toString());
+        if (!Array.isArray(group)) throw new Error("group must be an array of profile names");
+        const valid = [];
+        for (const name of group) {
+          if (config.profiles[name] && !valid.includes(name)) valid.push(name);
+        }
+        if (valid.length === 0) throw new Error("默认方案组至少需要 1 个方案");
+        config.defaultProfileGroup = valid;
+        for (const [pname, p] of Object.entries(config.profiles)) {
+          p.isDefault = pname === valid[0];
+        }
+        saveConfig(config);
+        reloadAllRuntimes();
+        console.log(`[PROFILE] Default group set: ${JSON.stringify(valid)}`);
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: true, defaultProfileGroup: valid, profiles: listProfiles() }));
       } catch (err) {
         res.writeHead(400, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ error: err.message }));
@@ -3926,7 +4293,7 @@ const server = http.createServer((req, res) => {
     if (!checkCsrf(req)) { res.writeHead(403); res.end("CSRF validation failed"); return; }
     readBody(req).then(buf => {
       try {
-        const { profile, upstream, allowedModels, suffix, modelAliases } = JSON.parse(buf.toString());
+        const { profile, upstream, allowedModels, suffix, modelAliases, billingType } = JSON.parse(buf.toString());
         const name = (profile || "").trim();
         if (!name) throw new Error("Profile name required");
         if (config.profiles[name]) throw new Error(`方案 "${name}" 已存在`);
@@ -3936,6 +4303,7 @@ const server = http.createServer((req, res) => {
         for (const m of Object.values(aliases)) {
           if (m && !models.includes(m)) models.push(m);
         }
+        const validBilling = ["coding_plan", "token_plan", "on_demand"].includes(billingType) ? billingType : "on_demand";
         config.profiles[name] = {
           upstream: upstream || rt?.upstream || "",
           allowedModels: models,
@@ -3943,6 +4311,7 @@ const server = http.createServer((req, res) => {
           users: {},
           suffix: sfx,
           isDefault: false,
+          billingType: validBilling,
         };
         saveConfig(config);
         reloadAllRuntimes();
@@ -4060,6 +4429,24 @@ const server = http.createServer((req, res) => {
     } else {
       // Reset all
       for (const r of Object.values(runtimes)) r.breaker.reset();
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ ok: true }));
+    }
+    return;
+  }
+
+  // Reset rate-limit (quota-exhaustion) state for a profile or all
+  if (req.method === "POST" && req.url.startsWith("/api/rate-limit-reset")) {
+    if (!checkAuth(req)) { res.writeHead(401); res.end("Unauthorized"); return; }
+    if (!checkCsrf(req)) { res.writeHead(403); res.end("CSRF validation failed"); return; }
+    const url = new URL(req.url, `http://localhost`);
+    const profileName = url.searchParams.get("profile") || "";
+    if (profileName) {
+      clearRateLimited(profileName);
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ ok: true, profile: profileName }));
+    } else {
+      for (const name of Object.keys(rateLimitState)) clearRateLimited(name);
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ ok: true }));
     }

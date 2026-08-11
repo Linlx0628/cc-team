@@ -2862,6 +2862,8 @@ input[type=datetime-local]{color-scheme:light;cursor:pointer}
 .btn-danger{background:#fff2f0;color:var(--red);border-color:#f1c8c2}.btn-danger:hover{background:#ffe8e5}
 .btn-outline{background:var(--surface);border-color:var(--border);color:var(--text)}.btn-outline:hover{background:var(--surface-subtle);border-color:var(--border-strong)}
 .btn-sm{padding:5px 10px;font-size:11px}
+.cleanup-tab.on{background:var(--text);color:#fff;border-color:var(--text)}.cleanup-tab.on span{color:#cfcfcf}
+.n{text-align:right;font-variant-numeric:tabular-nums}
 .actions{position:fixed;left:260px;right:0;bottom:0;margin:0;padding:12px clamp(24px,4vw,56px) calc(12px + env(safe-area-inset-bottom));display:flex;gap:8px;justify-content:flex-end;background:rgba(255,255,255,.96);border-top:1px solid var(--border);backdrop-filter:blur(8px);z-index:40}
 table{width:100%;border-collapse:collapse;margin-top:8px}
 th{text-align:left;padding:8px;font-size:11px;font-weight:600;color:var(--dim);border-bottom:1px solid var(--border);white-space:nowrap}
@@ -2904,12 +2906,21 @@ td{padding:8px;border-bottom:1px solid #ecece8;font-size:12px}
 </div></div>`;
   }).join("")}</div>
 <div class="sidebar-global"><button type="button" class="pl-item sidebar-tool" id="dataManagementNav" onclick="openDataManagementView()"><span class="pl-name">全局数据管理</span><span class="pl-users">导入、备份与清空</span></button></div>
+<div class="sidebar-global" style="padding:10px 12px">
+  <div style="font-size:11px;font-weight:650;margin-bottom:8px;display:flex;align-items:center;justify-content:space-between">
+    <span>默认方案组 <span style="color:var(--dim);font-weight:400;font-size:10px">/v1 failover</span></span>
+    <label style="display:flex;align-items:center;gap:4px;cursor:pointer;font-size:10px;font-weight:400;white-space:nowrap"><input type="checkbox" id="restrictGroupSuffixCb" ${config.restrictGroupSuffix !== false ? "checked" : ""} onchange="document.getElementById('restrictGroupSuffixHidden').value=this.checked?'on':'off'" style="width:auto;accent-color:var(--accent)"> 限制直连</label>
+  </div>
+  <div id="defaultGroupList" style="margin-bottom:6px">${groupItemsHtml || '<span style="font-size:11px;color:var(--dim)">组为空 — 至少加入 2 个方案以启用 failover</span>'}</div>
+  ${nonMembersHtml ? `<div style="margin-top:6px;display:flex;align-items:center;gap:6px;flex-wrap:wrap"><span style="color:var(--dim);font-size:10px">加入：</span>${nonMembersHtml}</div>` : ''}
+</div>
 <div class="sidebar-ft" style="display:flex;gap:6px"><button class="btn btn-outline btn-sm" onclick="openUserModal()" style="flex:1">用户管理</button><button class="btn btn-outline btn-sm" onclick="openProfileModal()" style="flex:1">新增方案</button></div>
 </div>
 <div class="main">
 ${errDiv}
 <form method="post" action="/api/settings-save" id="settingsForm">
 <input type="hidden" name="_csrf" id="csrfToken">
+<input type="hidden" name="restrictGroupSuffix" id="restrictGroupSuffixHidden" value="${config.restrictGroupSuffix !== false ? "on" : "off"}">
 <input type="hidden" name="profileName" id="profileNameInput" value="${escHtml(initialProfile.name || "")}">
 <input type="hidden" name="profileSuffix" id="profileSuffixInput" value="${escHtml(initialSuffix)}">
 
@@ -2989,14 +3000,6 @@ ${errDiv}
 </select>
 </div>
 
-<h2>默认方案组 <span style="font-size:11px;color:var(--dim);font-weight:400">/v1 入口按此顺序 failover：首位限额或故障自动切下一个，恢复后切回</span></h2>
-<div class="section">
-<div class="note" style="margin-bottom:10px">排在前面的优先级更高。典型：第 1 位 Coding Plan（套餐限额），第 2 位 按量计费（兜底）。同一虚拟 key 需在组内各方案都配置真实 key。组内成员（≥2 个时）的独立 suffix 入口将禁用，所有流量统一走 /v1，避免用户绕过 failover 直连按量计费。</div>
-<label style="display:flex;align-items:center;gap:6px;margin:0 0 12px;cursor:pointer"><input type="checkbox" name="restrictGroupSuffix" ${config.restrictGroupSuffix !== false ? "checked" : ""} style="width:auto;accent-color:var(--accent)"> 限制组内方案仅走 /v1（禁止 /&lt;suffix&gt; 直连；取消勾选则允许直接调用组内方案）</label>
-<div id="defaultGroupList">${groupItemsHtml || '<div class="note">组为空</div>'}</div>
-${nonMembersHtml ? `<div style="margin-top:10px"><span style="font-size:11px;color:var(--dim)">加入组：</span>${nonMembersHtml}</div>` : ""}
-</div>
-
 <h2>每日Token配额 <span style="font-size:11px;color:var(--dim);font-weight:400">总Token=输入+输出+缓存写入+缓存命中，0=不限制，北京时间每日0点重置</span></h2>
 <div class="section">
 <label>方案每日总Token上限 (0=不限制)</label>
@@ -3052,6 +3055,31 @@ ${((() => { const qa = stmts.quotaAdjustRecent.all(); return qa.length > 0 ? `<h
   <div style="display:flex;justify-content:flex-end;margin-top:12px"><button type="button" class="btn btn-primary" onclick="applyDataImport()">执行导入</button></div>
   <div class="inline-status" id="dataImportStatus" role="status"></div>
 </div>
+</div>
+
+<h2>统计数据清理</h2>
+<div class="section">
+  <div class="note" style="margin-top:0;margin-bottom:12px">清理数据库中已删除用户或模型的残留统计数据，不影响 config.json 配置。孤儿数据（已不在配置中的 Key 或模型）以淡红色高亮，可优先清理。每次删除前自动创建本地备份。</div>
+  <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:12px;flex-wrap:wrap">
+    <div style="display:flex;gap:6px;flex-wrap:wrap">
+      <button type="button" class="btn btn-outline btn-sm cleanup-tab on" data-t="users" onclick="switchCleanupTab('users')">用户统计残留 <span id="cleanupUserCount" style="color:var(--dim);font-weight:400">0</span></button>
+      <button type="button" class="btn btn-outline btn-sm cleanup-tab" data-t="models" onclick="switchCleanupTab('models')">模型统计残留 <span id="cleanupModelCount" style="color:var(--dim);font-weight:400">0</span></button>
+    </div>
+    <button type="button" class="btn btn-outline btn-sm" onclick="loadCleanupList()">刷新列表</button>
+  </div>
+  <div id="cleanupUsersView">
+    <table>
+      <thead><tr><th>虚拟 Key（脱敏）</th><th>名称</th><th class="n">请求数</th><th>最后活跃</th><th style="width:80px">配置</th><th style="width:70px">操作</th></tr></thead>
+      <tbody id="cleanupUsersBody"><tr><td colspan="6" style="color:var(--dim);text-align:center;padding:18px">点击「刷新列表」加载数据</td></tr></tbody>
+    </table>
+  </div>
+  <div id="cleanupModelsView" hidden>
+    <table>
+      <thead><tr><th>模型</th><th class="n">请求数</th><th class="n">Token 数</th><th style="width:70px">操作</th></tr></thead>
+      <tbody id="cleanupModelsBody"><tr><td colspan="4" style="color:var(--dim);text-align:center;padding:18px">点击「刷新列表」加载数据</td></tr></tbody>
+    </table>
+  </div>
+  <div class="inline-status" id="cleanupStatus" role="status"></div>
 </div>
 
 <h2 style="color:var(--red)">危险操作</h2>
@@ -3221,6 +3249,69 @@ function showProfileSettings(){
   view.setAttribute('aria-hidden','true');
   document.getElementById('dataManagementNav').classList.remove('active');
 }
+// ─── Stats cleanup (residual user/model stats) ───
+let cleanupData={users:[],models:[]},cleanupTab='users',cleanupLoaded=false;
+function fmtCleanupNum(n){return Number(n||0).toLocaleString('zh-CN')}
+function fmtCleanupTk(n){n=Number(n||0);if(n>=1e6)return(n/1e6).toFixed(1)+'M';if(n>=1e3)return(n/1e3).toFixed(1)+'k';return String(n)}
+function cleanupAgo(iso){if(!iso)return'-';const d=Date.now()-new Date(iso).getTime();const m=Math.floor(d/6e4);if(m<1)return'刚刚';if(m<60)return m+'分钟前';const hr=Math.floor(m/60);if(hr<24)return hr+'小时前';return Math.floor(hr/24)+'天前'}
+function maskCleanupKey(k){const v=String(k||'');return v.length<=12?v:v.slice(0,8)+'****'+v.slice(-4)}
+async function loadCleanupList(){
+  const status=document.getElementById('cleanupStatus');
+  status.textContent='正在加载...';status.className='inline-status';
+  try{
+    const r=await fetch('/api/stats-cleanup/list');if(!r.ok)throw new Error('加载失败');
+    cleanupData=await r.json();cleanupLoaded=true;renderCleanup();
+    status.textContent='';status.className='inline-status';
+  }catch(e){status.textContent=e.message||'加载失败';status.className='inline-status error'}
+}
+function switchCleanupTab(t){
+  cleanupTab=t;
+  document.querySelectorAll('.cleanup-tab').forEach(b=>b.classList.toggle('on',b.dataset.t===t));
+  document.getElementById('cleanupUsersView').hidden=(t!=='users');
+  document.getElementById('cleanupModelsView').hidden=(t!=='models');
+  if(!cleanupLoaded)loadCleanupList();else renderCleanup();
+}
+function renderCleanup(){
+  document.getElementById('cleanupUserCount').textContent=cleanupData.users.length;
+  document.getElementById('cleanupModelCount').textContent=cleanupData.models.length;
+  const ub=document.getElementById('cleanupUsersBody');
+  if(!cleanupData.users.length){ub.innerHTML='<tr><td colspan="6" style="color:var(--dim);text-align:center;padding:18px">暂无用户统计数据</td></tr>'}
+  else{ub.innerHTML=cleanupData.users.map(u=>{
+    const orphan=!u.existsInConfig;const bg='style="background:'+(orphan?'#fff5f3':'transparent')+'"';
+    const nameCell=orphan?'<span style="color:var(--red)">'+h(u.name)+'</span> <span style="color:var(--red);font-size:10px">(未配置)</span>':h(u.name);
+    const cfgCell=orphan?'<span style="color:var(--red);font-size:11px">无</span>':'<span style="color:var(--green);font-size:11px">有</span>';
+    return '<tr '+bg+'><td><code style="font-size:11px">'+h(maskCleanupKey(u.key))+'</code></td><td>'+nameCell+'</td><td class="n">'+fmtCleanupNum(u.requests)+'</td><td style="font-size:11px;color:var(--dim)">'+cleanupAgo(u.lastActive)+'</td><td>'+cfgCell+'</td><td><button type="button" class="btn btn-outline btn-sm cleanup-del-user" data-key="'+h(u.key)+'">删除</button></td></tr>';
+  }).join('')}
+  const mb=document.getElementById('cleanupModelsBody');
+  if(!cleanupData.models.length){mb.innerHTML='<tr><td colspan="4" style="color:var(--dim);text-align:center;padding:18px">暂无模型统计数据</td></tr>'}
+  else{mb.innerHTML=cleanupData.models.map(m=>{
+    return '<tr><td><code style="font-size:11px">'+h(m.model)+'</code></td><td class="n">'+fmtCleanupNum(m.requests)+'</td><td class="n">'+fmtCleanupTk(m.tokens)+'</td><td><button type="button" class="btn btn-outline btn-sm cleanup-del-model" data-model="'+h(m.model)+'">删除</button></td></tr>';
+  }).join('')}
+  ub.querySelectorAll('.cleanup-del-user').forEach(b=>b.addEventListener('click',()=>deleteCleanupUser(b.dataset.key)));
+  mb.querySelectorAll('.cleanup-del-model').forEach(b=>b.addEventListener('click',()=>deleteCleanupModel(b.dataset.model)));
+}
+async function deleteCleanupUser(key){
+  if(!confirm('确定删除该用户的所有统计数据？\\nKey: '+maskCleanupKey(key)+'\\n此操作只清理统计数据，不影响 config.json 配置，执行前自动备份。'))return;
+  const status=document.getElementById('cleanupStatus');
+  status.textContent='正在删除并备份...';status.className='inline-status';
+  try{
+    const r=await fetch('/api/stats-user/delete',{method:'POST',headers:csrfHeaders({'Content-Type':'application/json'}),body:JSON.stringify({key:key})});
+    const result=await r.json();if(!r.ok)throw new Error(result.error||'删除失败');
+    status.textContent='已删除用户残留统计';status.className='inline-status ok';
+    cleanupData.users=cleanupData.users.filter(u=>u.key!==key);renderCleanup();
+  }catch(e){status.textContent=e.message||'删除失败';status.className='inline-status error'}
+}
+async function deleteCleanupModel(model){
+  if(!confirm('确定删除该模型的所有统计数据？\\n模型: '+model+'\\n此操作只清理统计数据，不影响 config.json 配置，执行前自动备份。'))return;
+  const status=document.getElementById('cleanupStatus');
+  status.textContent='正在删除并备份...';status.className='inline-status';
+  try{
+    const r=await fetch('/api/stats-model/delete',{method:'POST',headers:csrfHeaders({'Content-Type':'application/json'}),body:JSON.stringify({model:model})});
+    const result=await r.json();if(!r.ok)throw new Error(result.error||'删除失败');
+    status.textContent='已删除模型残留统计';status.className='inline-status ok';
+    cleanupData.models=cleanupData.models.filter(m=>m.model!==model);renderCleanup();
+  }catch(e){status.textContent=e.message||'删除失败';status.className='inline-status error'}
+}
 async function editProfile(n){
   const p=SETTINGS.profiles.find(x=>x.name===n);
   if(!p)return;
@@ -3362,13 +3453,15 @@ function dashboardHtml() {
 ${UI_THEME}
 body{padding:16px clamp(14px,2vw,28px) 28px}
 .dashboard-shell{width:100%;max-width:1560px;margin:0 auto;display:grid;gap:10px;min-width:0}
-.command-bar{min-height:46px;display:flex;align-items:center;justify-content:space-between;gap:18px;padding-bottom:9px;border-bottom:1px solid var(--border);min-width:0}
+.command-bar{min-height:46px;display:flex;align-items:center;justify-content:space-between;gap:18px;padding-bottom:9px;border-bottom:1px solid var(--border);min-width:0;position:sticky;top:0;z-index:20;background:var(--canvas);padding-top:4px}
 .command-brand{display:flex;align-items:center;gap:14px;min-width:0;white-space:nowrap}
 .brand-mark{font-size:13px;font-weight:700;color:var(--accent)}
 .command-title{font-size:16px;font-weight:650;line-height:1.2;padding-right:14px;border-right:1px solid var(--border)}
 .command-status{font-size:11px;color:var(--dim);display:flex;align-items:center;flex-shrink:0}
 .meta{font-size:11px;color:var(--dim);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0}.meta b{color:var(--text);font-weight:550}
-.controls{display:flex;gap:7px;align-items:center;flex-wrap:wrap}
+.controls{display:flex;gap:7px;align-items:center;flex-wrap:nowrap;min-width:0;flex-shrink:0}
+.controls select{max-width:180px;min-width:0;overflow:hidden;text-overflow:ellipsis}
+.controls a,.controls button{flex-shrink:0;white-space:nowrap}
 .controls select,.controls a,.controls button{font-size:12px;background:var(--surface);color:var(--text);border:1px solid var(--border);border-radius:5px;padding:7px 10px;cursor:pointer;text-decoration:none;line-height:1.3}
 .controls select:hover,.controls a:hover,.controls button:hover{border-color:var(--border-strong);background:var(--surface-subtle)}
 .controls .ar-on{border-color:#bdd0c3;color:var(--green);background:var(--accent-soft)}.controls .ar-off{color:var(--dim)}
@@ -3377,9 +3470,9 @@ body{padding:16px clamp(14px,2vw,28px) 28px}
 .card:first-child{border-top:2px solid var(--accent)}
 .card .l{font-size:10px;font-weight:600;color:var(--dim);margin-bottom:5px}
 .card .v{font-size:21px;line-height:1;font-weight:650;font-variant-numeric:tabular-nums;color:var(--text)!important}
-.chart-workspace{display:grid;grid-template-columns:minmax(0,1.55fr) minmax(0,.725fr) minmax(0,.725fr);grid-template-rows:repeat(2,minmax(0,1fr));gap:8px;min-height:280px;max-height:300px}
+.chart-workspace{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));grid-template-rows:repeat(2,minmax(0,1fr));gap:8px;min-height:480px}
 .chart-panel{background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:10px 12px;min-width:0;min-height:0;display:flex;flex-direction:column;overflow:hidden}
-.chart-trend{grid-row:1/3}.chart-users{grid-column:2}.chart-models{grid-column:3}.chart-hourly{grid-column:2/4;grid-row:2}
+.chart-trend{grid-column:1;grid-row:1}.chart-users{grid-column:2;grid-row:1}.chart-models{grid-column:1;grid-row:2}.chart-hourly{grid-column:2;grid-row:2}
 .chart-head{min-height:24px;display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:4px}.chart-head h2{font-size:12px;font-weight:650;color:var(--text);white-space:nowrap}
 .chart-canvas{position:relative;flex:1;min-height:0}.chart-canvas canvas{position:absolute!important;inset:0;width:100%!important;height:100%!important}
 .tabs{display:flex;gap:1px;background:var(--surface-subtle);border:1px solid var(--border);border-radius:5px;padding:2px;width:fit-content;flex-shrink:0}
@@ -3414,9 +3507,9 @@ th{text-align:left;padding:8px 12px;font-weight:550;font-size:10px;color:var(--d
 td{padding:8px 12px;font-size:11px;border-bottom:1px solid #ecece8;white-space:nowrap}tr:last-child td{border-bottom:0}tbody tr:hover td{background:#fafaf7}
 .n{font-variant-numeric:tabular-nums;text-align:right}.hl{color:var(--accent);font-weight:600}
 .rank{display:inline-block;width:20px;color:var(--dim);font-variant-numeric:tabular-nums}code{font-family:var(--font-mono);color:var(--accent);font-size:11px}.empty{color:var(--dim);padding:24px;text-align:center;font-size:12px}
-@media(min-width:1280px) and (min-height:800px){html,body{height:100%;overflow:hidden}body{padding:0}.dashboard-shell{height:100dvh;padding:12px 18px;grid-template-rows:46px 68px minmax(280px,300px) minmax(0,1fr);gap:8px}.command-bar{height:46px}.controls{flex-wrap:nowrap}.data-workspace{min-height:0}}
-@media(max-width:1279px), (max-height:799px){.dashboard-shell{height:auto}.chart-workspace{grid-template-columns:repeat(2,minmax(0,1fr));grid-template-rows:260px 220px 240px;max-height:none}.chart-trend{grid-column:1/3;grid-row:1}.chart-users{grid-column:1;grid-row:2}.chart-models{grid-column:2;grid-row:2}.chart-hourly{grid-column:1/3;grid-row:3}.data-workspace{height:auto;min-height:440px}.workspace-panel{min-height:400px}.workspace-panel.active{display:flex}}
-@media(max-width:820px){.command-bar{align-items:flex-start;flex-direction:column}.command-brand{width:100%;flex-wrap:wrap}.meta{order:3;width:100%;white-space:normal}.controls{width:100%}.chart-workspace{grid-template-columns:1fr;grid-template-rows:repeat(4,240px)}.chart-trend,.chart-users,.chart-models,.chart-hourly{grid-column:1;grid-row:auto}.detail-tools{grid-template-columns:1fr 1fr}.detail-search{grid-column:1/-1}.detail-reset{width:100%}.metric-strip{grid-template-columns:repeat(3,1fr)}}
+@media(min-width:1280px) and (min-height:800px){.dashboard-shell{padding:12px 18px;grid-template-rows:46px 68px auto minmax(440px,1fr);gap:8px}.command-bar{height:46px}.controls{flex-wrap:nowrap}.data-workspace{min-height:0}}
+@media(max-width:1279px), (max-height:799px){.dashboard-shell{height:auto}.chart-workspace{grid-template-rows:repeat(2,280px);max-height:none}.data-workspace{height:auto;min-height:440px}.workspace-panel{min-height:400px}.workspace-panel.active{display:flex}}
+@media(max-width:820px){.command-bar{align-items:flex-start;flex-direction:column;position:static;background:transparent;padding-top:0}.command-brand{width:100%;flex-wrap:wrap}.meta{order:3;width:100%;white-space:normal}.controls{width:100%}.metric-strip{grid-template-columns:repeat(3,1fr)}.chart-workspace{grid-template-columns:1fr;grid-template-rows:repeat(4,240px)}.chart-trend,.chart-users,.chart-models,.chart-hourly{grid-column:1;grid-row:auto}.detail-tools{grid-template-columns:1fr 1fr}.detail-search{grid-column:1/-1}.detail-reset{width:100%}}
 @media(max-width:560px){body{padding:12px 10px 24px}.command-title{border-right:0;padding-right:0}.command-status{width:100%}.controls select{flex:1;min-width:150px}.metric-strip{grid-template-columns:1fr 1fr}.card{min-height:64px;padding:10px}.card .v{font-size:19px}.chart-head{align-items:flex-start}.chart-trend .chart-head{flex-direction:column}.workspace-tab{padding:0 12px}.detail-tools{padding:8px}.detail-table-wrap{max-height:500px}#dTable .detail-sticky{min-width:190px}.detail-pages{justify-content:space-between}}
 </style></head><body data-theme="editorial-light">
 <main class="dashboard-shell">
@@ -3485,9 +3578,9 @@ function grp(daily,p){const g={};for(const[day,ud]of Object.entries(daily)){cons
 function lbl(p,k){if(p==="day")return k.slice(5);if(p==="week")return k.slice(5)+" 周";if(p==="month")return k;return k+"年"}
 function c(l,v,cl,k){return'<div class="card"><div class="l">'+l+'</div><div class="v" data-cu="'+v+'"'+(k?' data-cu-k':'')+'>0</div></div>'}
 let chartResizeFrame=0;
-function doughnutLegend(){const compact=innerWidth<1280;return{position:innerWidth<=820?"bottom":"right",labels:{color:"#686863",font:{size:compact?10:11},padding:compact?6:12,boxWidth:compact?18:40}}}
+function doughnutLegend(){const compact=innerWidth<1280;return{position:"bottom",labels:{color:"#686863",font:{size:compact?10:11},padding:compact?6:10,boxWidth:compact?16:24}}}
 function trendLegend(){const compact=innerWidth<=820;return{labels:{color:"#686863",font:{size:compact?9:11},padding:compact?6:10,boxWidth:compact?16:40}}}
-function scheduleChartResize(){cancelAnimationFrame(chartResizeFrame);chartResizeFrame=requestAnimationFrame(()=>{const legend=doughnutLegend();for(const chart of[C.p,C.m]){if(chart){chart.options.plugins.legend=legend;chart.update("none")}}if(C.t){C.t.options.plugins.legend=trendLegend();C.t.update("none")}Object.values(C).forEach(chart=>chart&&chart.resize())})}
+function scheduleChartResize(){cancelAnimationFrame(chartResizeFrame);chartResizeFrame=requestAnimationFrame(()=>{for(const chart of[C.p,C.m]){if(chart){chart.options.plugins.legend={display:false};chart.update("none")}}if(C.t){C.t.options.plugins.legend=trendLegend();C.t.update("none")}Object.values(C).forEach(chart=>chart&&chart.resize())})}
 function setWorkspaceTab(tab,focus){
   const next=document.getElementById("workspace-tab-"+tab),panel=document.getElementById("workspace-panel-"+tab);
   if(!next||!panel)return;
@@ -3576,11 +3669,15 @@ function render(){
   if(C.t)C.t.destroy();if(C.p)C.p.destroy();if(C.m)C.m.destroy();if(C.h)C.h.destroy();
   C.t=new Chart(document.getElementById("trend"),{type:"bar",data:{labels:keys.map(k=>lbl(P,k)),datasets:uks.map((u,i)=>({label:D.users[u].name,data:keys.map(k=>totalTokens(g[k][u])),backgroundColor:COL[i%COL.length]+"cc",borderRadius:3,borderSkipped:false}))},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:trendLegend(),tooltip:{callbacks:{label:ctx=>ctx.dataset.label+": "+fmtT(ctx.raw)}}},scales:{x:{stacked:true,ticks:{color:"#686863",font:{size:10}},grid:{color:"rgba(24,24,22,.08)"}},y:{stacked:true,ticks:{color:"#686863",callback:v=>fmtTk(v)},grid:{color:"rgba(24,24,22,.08)"}}}}});
   const tot=uks.map(u=>{let t=0;for(const k of keys)t+=totalTokens(g[k][u]);return t});
-  C.p=new Chart(document.getElementById("pie"),{type:"doughnut",data:{labels:uks.map(k=>D.users[k].name),datasets:[{data:tot,backgroundColor:uks.map((_,i)=>COL[i%COL.length]+"cc"),borderWidth:0}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:doughnutLegend(),tooltip:{callbacks:{label:ctx=>ctx.label+": "+fmtT(ctx.raw)+" tokens"}}},cutout:"55%"}});
+  // 用户分布：横向柱状图，Y 轴显示用户名完整可读。
+  const uIdx=tot.map((_,i)=>i).sort((a,b)=>tot[b]-tot[a]);
+  C.p=new Chart(document.getElementById("pie"),{type:"bar",data:{labels:uIdx.map(i=>D.users[uks[i]].name),datasets:[{label:"总 Token",data:uIdx.map(i=>tot[i]),backgroundColor:uIdx.map((_,i)=>COL[i%COL.length]+"cc"),borderWidth:0,borderRadius:3,borderSkipped:false}]},options:{indexAxis:"y",responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false},tooltip:{callbacks:{label:ctx=>fmtT(ctx.raw)+" tokens"}}},scales:{x:{ticks:{color:"#686863",callback:v=>fmtTk(v)},grid:{color:"rgba(24,24,22,.08)"}},y:{ticks:{color:"#686863",font:{size:11},autoSkip:false},grid:{display:false}}}}});
 
-  // 历史缓存没有模型维度，模型分布使用准确的请求数。
+  // 历史缓存没有模型维度，模型分布使用准确的请求数。横向柱状图便于读取模型名。
   const mods=D.models||{};const mNames=Object.keys(mods);
-  C.m=new Chart(document.getElementById("modelChart"),{type:"doughnut",data:{labels:mNames,datasets:[{data:mNames.map(m=>mods[m].requests),backgroundColor:mNames.map((_,i)=>COL[i%COL.length]+"cc"),borderWidth:0}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:doughnutLegend(),tooltip:{callbacks:{label:ctx=>ctx.label+": "+fmtT(ctx.raw)+" 次请求"}}},cutout:"55%"}});
+  const mReq=mNames.map(m=>mods[m].requests||0);
+  const mIdx=mReq.map((_,i)=>i).sort((a,b)=>mReq[b]-mReq[a]);
+  C.m=new Chart(document.getElementById("modelChart"),{type:"bar",data:{labels:mIdx.map(i=>mNames[i]),datasets:[{label:"请求数",data:mIdx.map(i=>mReq[i]),backgroundColor:mIdx.map((_,i)=>COL[i%COL.length]+"cc"),borderWidth:0,borderRadius:3,borderSkipped:false}]},options:{indexAxis:"y",responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false},tooltip:{callbacks:{label:ctx=>fmtT(ctx.raw)+" 次请求"}}},scales:{x:{ticks:{color:"#686863",callback:v=>fmtTk(v)},grid:{color:"rgba(24,24,22,.08)"}},y:{ticks:{color:"#686863",font:{size:11},autoSkip:false},grid:{display:false}}}}});
 
   // 24小时趋势图
   const hrs=[];for(let i=0;i<24;i++)hrs.push(i.toString().padStart(2,"0")+":00");
@@ -4466,7 +4563,7 @@ const server = http.createServer((req, res) => {
   }
 
   // Protected API: stats (supports ?profile=<suffix> and ?profile=all)
-  if (req.method === "GET" && req.url.startsWith("/api/stats")) {
+  if (req.method === "GET" && (req.url === "/api/stats" || req.url.startsWith("/api/stats?"))) {
     if (!checkAuth(req)) { res.writeHead(401); res.end("Unauthorized"); return; }
     const url = new URL(req.url, `http://localhost`);
     const profileSuffix = url.searchParams.get("profile") || "all";
@@ -4550,7 +4647,86 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  // Save all global users
+  // ─── Stats cleanup (remove residual user/model stats only, keep config) ────
+  // List all user/model stats rows present in DB, marking orphans (not in config).
+  if (req.method === "GET" && req.url.startsWith("/api/stats-cleanup/list")) {
+    if (!checkAuth(req)) { res.writeHead(401); res.end("Unauthorized"); return; }
+    const globalKeys = new Set(Object.keys(config.users || {}));
+    for (const pname of Object.keys(config.profiles || {})) {
+      for (const k of Object.keys((config.profiles[pname] || {}).users || {})) globalKeys.add(k);
+    }
+    const users = db.prepare(
+      `SELECT user_key, MAX(name) AS name, SUM(total_requests) AS requests, MAX(last_active) AS last_active
+       FROM users GROUP BY user_key ORDER BY requests DESC`
+    ).all().map(r => ({
+      key: r.user_key, name: r.name || r.user_key.slice(0, 8),
+      requests: r.requests || 0, lastActive: r.last_active || null,
+      existsInConfig: globalKeys.has(r.user_key),
+    }));
+    const models = db.prepare(
+      `SELECT model, SUM(tokens) AS tokens, SUM(requests) AS requests
+       FROM usage_model GROUP BY model ORDER BY requests DESC`
+    ).all().map(r => ({ model: r.model, tokens: r.tokens || 0, requests: r.requests || 0 }));
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ users, models }));
+    return;
+  }
+
+  // Delete residual stats for a single user_key (keeps config.json untouched).
+  if (req.method === "POST" && req.url === "/api/stats-user/delete") {
+    if (!checkAuth(req)) { res.writeHead(401); res.end("Unauthorized"); return; }
+    if (!checkCsrf(req)) { res.writeHead(403); res.end("CSRF validation failed"); return; }
+    readBody(req).then(buf => {
+      try {
+        const { key } = JSON.parse(buf.toString());
+        if (!key) throw new Error("Key required");
+        backupDatabaseSync("stats-user-delete");
+        const tx = db.transaction(() => {
+          for (const table of ["users", "usage_daily", "usage_daily_model", "usage_daily_hourly", "errors", "quota_adjust_history"]) {
+            db.prepare(`DELETE FROM ${table} WHERE user_key=?`).run(key);
+          }
+        });
+        tx();
+        console.log(`[STATS] Deleted residual stats for user: ${key.slice(0, 8)}****`);
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: true }));
+      } catch (err) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: err.message }));
+      }
+    }).catch(() => {
+      res.writeHead(413); res.end("Request too large");
+    });
+    return;
+  }
+
+  // Delete residual stats for a single model (keeps config.json untouched).
+  if (req.method === "POST" && req.url === "/api/stats-model/delete") {
+    if (!checkAuth(req)) { res.writeHead(401); res.end("Unauthorized"); return; }
+    if (!checkCsrf(req)) { res.writeHead(403); res.end("CSRF validation failed"); return; }
+    readBody(req).then(buf => {
+      try {
+        const { model } = JSON.parse(buf.toString());
+        if (!model) throw new Error("Model required");
+        backupDatabaseSync("stats-model-delete");
+        const tx = db.transaction(() => {
+          db.prepare("DELETE FROM usage_model WHERE model=?").run(model);
+          db.prepare("DELETE FROM usage_daily_model WHERE model=?").run(model);
+        });
+        tx();
+        console.log(`[STATS] Deleted residual stats for model: ${model}`);
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: true }));
+      } catch (err) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: err.message }));
+      }
+    }).catch(() => {
+      res.writeHead(413); res.end("Request too large");
+    });
+    return;
+  }
+
   if (req.method === "POST" && req.url === "/api/global-user/save") {
     if (!checkAuth(req)) { res.writeHead(401); res.end("Unauthorized"); return; }
     if (!checkCsrf(req)) { res.writeHead(403); res.end("CSRF validation failed"); return; }

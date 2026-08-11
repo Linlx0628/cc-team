@@ -15,6 +15,7 @@ backups/
 .claude/*
 .spec-workflow/*
 .superpowers/*
+.zcode/
 
 docs/superpowers/*
 

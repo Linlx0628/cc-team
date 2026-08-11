@@ -2143,6 +2143,15 @@ function proxyRequest(req, res) {
   }
   const apiKey = getApiKey(req);
 
+  // Reject non-API requests (browser favicon, Chrome DevTools, etc.) before any group check.
+  // These requests carry no auth header (apiKey === "unknown") and would otherwise be mis-logged
+  // as "直连被拒" when the path falls through to a default-runtime group member.
+  if (apiKey === "unknown") {
+    res.writeHead(404, { "Content-Type": "text/plain" });
+    res.end("Not found");
+    return;
+  }
+
   // Group members (default-profile-group with ≥2 entries) are reachable only via /v1,
   // which fails over across the group. Reject direct /<suffix>/... access so users can't
   // bypass failover to pin an expensive on-demand profile.
@@ -2195,12 +2204,6 @@ function proxyRequest(req, res) {
     }
   });
 
-  // Reject non-API requests (browser favicon, Chrome DevTools, etc.)
-  if (apiKey === "unknown") {
-    res.writeHead(404, { "Content-Type": "text/plain" });
-    res.end("Not found");
-    return;
-  }
 
   const userKey = resolveUserKey(apiKey, runtime);
   const targetUrl = strippedUrl || req.url;

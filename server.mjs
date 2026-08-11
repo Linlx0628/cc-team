@@ -40,6 +40,7 @@ button:active,.btn:active{transform:translateY(1px)}
 const UI_HELPERS = `
 function formatCompact(n){if(n>=1e6)return(n/1e6).toFixed(1)+'M';if(n>=1e3)return(n/1e3).toFixed(1)+'k';return Number(n).toLocaleString('zh-CN')}
 function totalTokens(row){row=row||{};return(row.inputTokens??row.totalInputTokens??row.input??0)+(row.outputTokens??row.totalOutputTokens??row.output??0)+(row.cacheCreationTokens??row.cacheWrite??0)+(row.cacheReadTokens??row.cacheRead??0)}
+function ioTokens(row){row=row||{};return(row.inputTokens??row.totalInputTokens??row.input??0)+(row.outputTokens??row.totalOutputTokens??row.output??0)}
 function quotaBar(pct){var value=Math.max(0,Math.min(100,Number(pct)||0));var cls=value>90?'crit':value>70?'warn':'';return '<span class="quota-progress '+cls+'" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="'+value+'"><i style="width:'+value+'%"></i></span>'}
 function runCountUps(root){(root||document).querySelectorAll('[data-cu]').forEach(function(el){var raw=Number(el.dataset.cu)||0;el.textContent=el.hasAttribute('data-cu-k')?formatCompact(raw):raw.toLocaleString('zh-CN');el.dataset.cur=String(raw)})}
 function hpBar(pct){return quotaBar(pct)}
@@ -904,7 +905,7 @@ function initDb() {
   stmts.upsertMeta = db.prepare(`INSERT INTO kv_meta (key,value) VALUES (@k,@v) ON CONFLICT(key) DO UPDATE SET value=excluded.value`);
 
   // ── Read statements ──
-  stmts.todayUsageForQuota = db.prepare(`SELECT COALESCE(SUM(input_tokens+output_tokens+cache_creation+cache_read),0) AS used FROM usage_daily WHERE profile=? AND date=? AND user_key=?`);
+  stmts.todayUsageForQuota = db.prepare(`SELECT COALESCE(SUM(input_tokens+output_tokens),0) AS used FROM usage_daily WHERE profile=? AND date=? AND user_key=?`);
   stmts.profileDailyRow = db.prepare(`SELECT * FROM usage_daily WHERE profile=? AND date=? AND user_key=?`);
   stmts.profileDailyModelRows = db.prepare(`SELECT model,input_tokens,output_tokens,requests FROM usage_daily_model WHERE profile=? AND date=? AND user_key=?`);
   stmts.profileDailyHourlyRows = db.prepare(`SELECT hour,requests,input_tokens,output_tokens,cache_creation,cache_read FROM usage_daily_hourly WHERE profile=? AND date=? AND user_key=?`);
@@ -1742,7 +1743,7 @@ function evaluateAutoQuotaAdjustments() {
     let totalUsage = 0;
     let usageDays = 0;
     for (const r of dayRows) {
-      const dayUsage = totalUsageTokens(r);
+      const dayUsage = (r.input_tokens||0)+(r.output_tokens||0);
       if (dayUsage > 0) {
         usageDays++;
         totalUsage += dayUsage;
@@ -3003,7 +3004,7 @@ ${errDiv}
 </select>
 </div>
 
-<h2>每日Token配额 <span style="font-size:11px;color:var(--dim);font-weight:400">总Token=输入+输出+缓存写入+缓存命中，0=不限制，北京时间每日0点重置</span></h2>
+<h2>每日Token配额 <span style="font-size:11px;color:var(--dim);font-weight:400">配额只计输入+输出（不含缓存），0=不限制，北京时间每日0点重置</span></h2>
 <div class="section">
 <label>方案每日总Token上限 (0=不限制)</label>
 <input type="number" name="profileQuota" value="${s.profileQuota || 0}" min="0" step="100000" placeholder="0 = 不限制">
@@ -3538,7 +3539,7 @@ td{padding:8px 12px;font-size:11px;border-bottom:1px solid #ecece8;white-space:n
   </div>
   <div class="workspace-content">
     <section id="workspace-panel-users" role="tabpanel" aria-labelledby="workspace-tab-users" class="workspace-panel active"><div class="workspace-panel-scroll"><table id="uTable"><thead>
-      <tr><th>用户</th><th>状态</th><th class="n">请求数</th><th class="n">输入</th><th class="n">输出</th><th class="n">缓存写入</th><th class="n">缓存命中</th><th class="n">合计</th><th class="n">配额</th><th>最后活跃</th></tr>
+      <tr><th>用户</th><th>状态</th><th class="n">请求数</th><th class="n">输入</th><th class="n">输出</th><th class="n">缓存写入</th><th class="n">缓存命中</th><th class="n">合计</th><th class="n">今日</th><th class="n">配额</th><th>最后活跃</th></tr>
     </thead><tbody></tbody></table></div></section>
     <section id="workspace-panel-detail" role="tabpanel" aria-labelledby="workspace-tab-detail" class="workspace-panel" hidden><div id="detailSec">
       <div class="workspace-panel-head"><span class="sec-toggle open" id="detailSecIcon"></span><strong>明细记录</strong><span class="sec-hint" id="detailHint"></span></div><div class="sec-body open" id="detailSecBody">
@@ -3548,7 +3549,7 @@ td{padding:8px 12px;font-size:11px;border-bottom:1px solid #ecece8;white-space:n
         <div class="detail-field"><label for="detailSort">周期排序</label><select id="detailSort" onchange="updateDetailFilters()"><option value="time">最新优先</option><option value="tokens">Token 高到低</option><option value="requests">请求数高到低</option></select></div>
         <button type="button" class="detail-reset" id="detailReset" onclick="resetDetailFilters()">重置</button>
       </div>
-      <div class="detail-table-wrap"><table id="dTable"><thead><tr><th class="detail-sticky">周期 / 用户</th><th class="n">请求数</th><th class="n">输入</th><th class="n">输出</th><th class="n">缓存写入</th><th class="n">缓存命中</th><th class="n">总 Token</th></tr></thead><tbody></tbody></table></div><div class="detail-pages" id="detailPages"></div>
+      <div class="detail-table-wrap"><table id="dTable"><thead><tr><th class="detail-sticky">周期 / 用户</th><th class="n">请求数</th><th class="n">输入</th><th class="n">输出</th><th class="n">缓存写入</th><th class="n">缓存命中</th><th class="n">合计</th></tr></thead><tbody></tbody></table></div><div class="detail-pages" id="detailPages"></div>
       </div></div>
     </section>
     <section id="workspace-panel-profiles" role="tabpanel" aria-labelledby="workspace-tab-profiles" class="workspace-panel" hidden><div id="profileSummarySec" class="workspace-panel-inner">
@@ -3605,7 +3606,7 @@ function renderWorkspaceSummaries(){
   document.getElementById("workspaceCountErrors").textContent=Array.isArray(D.errors)?D.errors.length:0;
 }
 function maskDetailKey(key){const value=String(key||"");return value.length<=12?value:value.slice(0,8)+"****"+value.slice(-4)}
-function detailTokens(row){return totalTokens(row)}
+function detailTokens(row){return ioTokens(row)}
 function detailPeriodLabel(key){if(P==="day")return key;if(P==="week")return key+" 周";if(P==="month")return key;return key+" 年"}
 function detailRangeDaily(daily){if(detailRange==="all")return daily;const days=Number(detailRange)||0;const cutoff=new Date(Date.now()+8*3600000-Math.max(0,days-1)*86400000).toISOString().slice(0,10);return Object.fromEntries(Object.entries(daily).filter(([date])=>date>=cutoff))}
 function detailTotals(members){const total={requests:0,inputTokens:0,outputTokens:0,cacheCreationTokens:0,cacheReadTokens:0};for(const member of members){const row=member.data;total.requests+=row.requests||0;total.inputTokens+=row.inputTokens||0;total.outputTokens+=row.outputTokens||0;total.cacheCreationTokens+=row.cacheCreationTokens||0;total.cacheReadTokens+=row.cacheReadTokens||0}return total}
@@ -3692,7 +3693,7 @@ function render(){
   // User table
   const ut=document.querySelector("#uTable tbody");
   const ul=Object.entries(D.users).sort((a,b)=>totalTokens(b[1])-totalTokens(a[1]));
-  if(!ul.length){ut.innerHTML='<tr><td colspan="10" class="empty">暂无数据</td></tr>'}else{ut.innerHTML=ul.map(([uk,u],idx)=>{const on=u.lastActive&&Date.now()-new Date(u.lastActive).getTime()<36e5;const uq=(D.userQuotas||{})[uk]||D.profileQuota||0;const td2=(D.daily||{})[td]||{};const tdu=td2[uk]||{};const used=totalTokens(tdu);const qPct=uq>0?Math.min(100,Math.round(used/uq*100)):0;const rank='<span class="rank">'+(idx+1)+'.</span>';const qCell=uq>0?'<span style="color:var(--accent);font-size:12px">'+qPct+'%</span> '+quotaBar(qPct):'<span style="color:var(--dim)">-</span>';return'<tr><td>'+rank+escH(u.name)+'</td><td><span class="led '+(on?'on':'')+'"></span><span style="color:'+(on?'var(--green)':'var(--dim)')+';font-size:12px">'+(on?'在线':'离线')+'</span></td><td class="n">'+fmtT(u.totalRequests)+'</td><td class="n">'+fmtT(u.totalInputTokens)+'</td><td class="n">'+fmtT(u.totalOutputTokens)+'</td><td class="n">'+fmtT(u.cacheCreationTokens || 0)+'</td><td class="n">'+fmtT(u.cacheReadTokens || 0)+'</td><td class="n hl">'+fmtT(totalTokens(u))+'</td><td class="n" style="white-space:nowrap">'+qCell+'</td><td style="font-size:12px;color:var(--dim)">'+ago(u.lastActive)+'</td></tr>'}).join("")}
+  if(!ul.length){ut.innerHTML='<tr><td colspan="11" class="empty">暂无数据</td></tr>'}else{ut.innerHTML=ul.map(([uk,u],idx)=>{const on=u.lastActive&&Date.now()-new Date(u.lastActive).getTime()<36e5;const uq=(D.userQuotas||{})[uk]||D.profileQuota||0;const td2=(D.daily||{})[td]||{};const tdu=td2[uk]||{};const used=ioTokens(tdu);const qPct=uq>0?Math.min(100,Math.round(used/uq*100)):0;const rank='<span class="rank">'+(idx+1)+'.</span>';const qCell=uq>0?'<span style="color:var(--accent);font-size:12px">'+qPct+'%</span> '+quotaBar(qPct):'<span style="color:var(--dim)">-</span>';return'<tr><td>'+rank+escH(u.name)+'</td><td><span class="led '+(on?'on':'')+'"></span><span style="color:'+(on?'var(--green)':'var(--dim)')+';font-size:12px">'+(on?'在线':'离线')+'</span></td><td class="n">'+fmtT(u.totalRequests)+'</td><td class="n">'+fmtT(u.totalInputTokens)+'</td><td class="n">'+fmtT(u.totalOutputTokens)+'</td><td class="n">'+fmtT(u.cacheCreationTokens || 0)+'</td><td class="n">'+fmtT(u.cacheReadTokens || 0)+'</td><td class="n hl">'+fmtT(ioTokens(u))+'</td><td class="n">'+fmtT(ioTokens(tdu))+'</td><td class="n" style="white-space:nowrap">'+qCell+'</td><td style="font-size:12px;color:var(--dim)">'+ago(u.lastActive)+'</td></tr>'}).join("")}
 
   renderDetail();
 

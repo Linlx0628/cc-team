@@ -3822,6 +3822,7 @@ const VK='${escJs(virtualKey)}';
 let D=null,C={h:null,t:null},currentProfile='all';
 const fmtT=n=>n.toLocaleString("zh-CN");
 const fmtTk=n=>{if(n>=1e6)return(n/1e6).toFixed(1)+"M";if(n>=1e3)return(n/1e3).toFixed(1)+"k";return n.toString()};
+const COL=["#2f6e50","#4a6fa5","#c2604f","#c4a23a","#7a6bb0","#d4824a","#4a9ba8","#c47a99","#6ba368","#5a6bc4","#8a6db5","#5a9b8e"];
 async function load(){
   try{
     const r=await fetch('/api/my-usage?profile='+encodeURIComponent(currentProfile),{headers:{'Authorization':'Bearer '+VK}});
@@ -3842,23 +3843,23 @@ function render(){
   const color=pct>90?'var(--red)':pct>70?'var(--orange)':'var(--green)';
   document.getElementById('meta').innerHTML=D.username+' · 方案: '+D.profile+(q.limit>0?' · <span style="color:'+color+'">'+pct+'% 已用</span> '+hpBar(pct,16)+(q.autoAdjusted?' <span class="tag">AUTO</span>':''):' · 无配额限制');
   document.getElementById('cards').innerHTML=
-    '<div class="card"><div class="l">今日用量</div><div class="v" data-cu="'+t.total+'" data-cu-k style="color:var(--accent)">0</div></div>'+
+    '<div class="card"><div class="l">今日用量 <span style="font-size:9px;color:var(--dim);font-weight:400">输入+输出</span></div><div class="v" data-cu="'+ioTokens(t)+'" data-cu-k style="color:var(--accent)">0</div></div>'+
     '<div class="card"><div class="l">今日请求</div><div class="v" data-cu="'+t.requests+'" data-cu-k style="color:var(--blue)">0</div></div>'+
+    (q.limit>0?'<div class="card"><div class="l">剩余额度</div><div class="v" data-cu="'+q.remaining+'" data-cu-k style="color:'+color+'">0</div><div style="margin-top:8px">'+hpBar(pct,16)+'</div></div>'+
+    '<div class="card"><div class="l">每日限额</div><div class="v" data-cu="'+q.limit+'" data-cu-k style="color:var(--dim)">0</div></div>':'')+
     '<div class="card"><div class="l">今日输入</div><div class="v" data-cu="'+t.input+'" data-cu-k style="color:var(--green)">0</div></div>'+
     '<div class="card"><div class="l">今日输出</div><div class="v" data-cu="'+t.output+'" data-cu-k style="color:var(--orange)">0</div></div>'+
     '<div class="card"><div class="l">今日缓存写入</div><div class="v" data-cu="'+t.cacheWrite+'" data-cu-k>0</div></div>'+
-    '<div class="card"><div class="l">今日缓存命中</div><div class="v" data-cu="'+t.cacheRead+'" data-cu-k>0</div></div>'+
-    (q.limit>0?'<div class="card"><div class="l">剩余额度</div><div class="v" data-cu="'+q.remaining+'" data-cu-k style="color:'+color+'">0</div><div style="margin-top:8px">'+hpBar(pct,16)+'</div></div>'+
-    '<div class="card"><div class="l">每日限额</div><div class="v" data-cu="'+q.limit+'" data-cu-k style="color:var(--dim)">0</div></div>':'');
+    '<div class="card"><div class="l">今日缓存命中</div><div class="v" data-cu="'+t.cacheRead+'" data-cu-k>0</div></div>';
   runCountUps(document.getElementById('cards'));
   // Hourly chart
   const hrs=[];for(let i=0;i<24;i++)hrs.push(i.toString().padStart(2,"0")+":00");
-  const hData=hrs.map((_,i)=>{const h=D.hourly[i.toString().padStart(2,"0")]||{};return{req:h.requests||0,tokens:totalTokens(h)}});
+  const hData=hrs.map((_,i)=>{const h=D.hourly[i.toString().padStart(2,"0")]||{};return{req:h.requests||0,tokens:ioTokens(h)}});
   if(C.h)C.h.destroy();
-  C.h=new Chart(document.getElementById("hourChart"),{type:"bar",data:{labels:hrs,datasets:[{label:"Token",data:hData.map(d=>d.tokens),backgroundColor:"#2f6e50cc",borderRadius:3},{label:"请求数",data:hData.map(d=>d.req),backgroundColor:"#181816cc",borderRadius:3}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{labels:{color:"#686863",font:{size:10}}}},scales:{x:{ticks:{color:"#686863",font:{size:9},maxRotation:0,autoSkip:true,maxTicksLimit:12},grid:{display:false}},y:{ticks:{color:"#686863",callback:v=>fmtTk(v)},grid:{color:"rgba(24,24,22,.08)"}}}}});
+  C.h=new Chart(document.getElementById("hourChart"),{type:"bar",data:{labels:hrs,datasets:[{label:"Token(输入+输出)",data:hData.map(d=>d.tokens),backgroundColor:COL[0]+"cc",borderRadius:3},{label:"请求数",data:hData.map(d=>d.req),backgroundColor:COL[1]+"cc",borderRadius:3}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{labels:{color:"#686863",font:{size:10}}}},scales:{x:{ticks:{color:"#686863",font:{size:9},maxRotation:0,autoSkip:true,maxTicksLimit:12},grid:{display:false}},y:{ticks:{color:"#686863",callback:v=>fmtTk(v)},grid:{color:"rgba(24,24,22,.08)"}}}}});
   // Trend chart
   if(C.t)C.t.destroy();
-  C.t=new Chart(document.getElementById("trendChart"),{type:"line",data:{labels:D.trend.map(d=>d.date.slice(5)),datasets:[{label:"总 Token",data:D.trend.map(d=>d.total),borderColor:"#2f6e50",backgroundColor:"rgba(47,110,80,.12)",fill:true,tension:.28,pointRadius:2,borderWidth:2}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{labels:{color:"#686863",font:{size:10}}}},scales:{x:{ticks:{color:"#686863"},grid:{display:false}},y:{ticks:{color:"#686863",callback:v=>fmtTk(v)},grid:{color:"rgba(24,24,22,.08)"}}}}});
+  C.t=new Chart(document.getElementById("trendChart"),{type:"line",data:{labels:D.trend.map(d=>d.date.slice(5)),datasets:[{label:"总Token(含缓存)",data:D.trend.map(d=>d.total),borderColor:COL[0],backgroundColor:"rgba(47,110,80,.12)",fill:true,tension:.28,pointRadius:2,borderWidth:2}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{labels:{color:"#686863",font:{size:10}}}},scales:{x:{ticks:{color:"#686863"},grid:{display:false}},y:{ticks:{color:"#686863",callback:v=>fmtTk(v)},grid:{color:"rgba(24,24,22,.08)"}}}}});
   // Model table
   const mt=document.querySelector("#modelTable tbody");
   const models=Object.entries(D.models||{}).sort((a,b)=>b[1].requests-a[1].requests);

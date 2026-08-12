@@ -2966,6 +2966,28 @@ ${errDiv}
 <div class="note" id="allowedModelsNote">不在列表中的模型请求将被拦截返回403。所有别名目标模型会自动添加到此列表。</div>
 </div>
 
+<h2>计费类型</h2>
+<div class="section">
+<label>该方案的计费模式（仅用于展示；默认方案组里通常把 Coding Plan 排在按量计费之前）</label>
+<select name="billingType">
+  <option value="coding_plan" ${initialProfile.billingType === "coding_plan" ? "selected" : ""}>Coding Plan（套餐限额，触发 429 自动切换）</option>
+  <option value="token_plan" ${initialProfile.billingType === "token_plan" ? "selected" : ""}>Token Plan（包年/包月）</option>
+  <option value="on_demand" ${(!initialProfile.billingType || initialProfile.billingType === "on_demand") ? "selected" : ""}>按量计费（无限额，通常作 failover 兜底）</option>
+</select>
+</div>
+
+<h2>每日Token配额 <span style="font-size:11px;color:var(--dim);font-weight:400">配额只计输入+输出（不含缓存），0=不限制，北京时间每日0点重置</span></h2>
+<div class="section">
+<label>方案每日总Token上限 (0=不限制)</label>
+<input type="number" name="profileQuota" value="${s.profileQuota || 0}" min="0" step="100000" placeholder="0 = 不限制">
+<div class="note">方案配额适用于该方案下所有用户。每个用户可以在用户管理弹窗中单独设置。</div>
+</div>
+
+<h2 style="border-top:2px solid var(--border);padding-top:18px;margin-top:30px">全局配置 <span style="color:var(--dim);font-size:12px;font-weight:400">所有方案共享，不随方案切换</span></h2>
+<div class="section" style="background:var(--surface-subtle);border-color:var(--border-strong)">
+<div class="note" style="margin:0">以下设置作用于整个系统（所有方案共用同一份代理参数与自动配额策略），切换左侧方案不会改变这里的值。</div>
+</div>
+
 <h2>超时 & 重试</h2>
 <div class="section">
 <div class="row">
@@ -2992,23 +3014,6 @@ ${errDiv}
 <div><label>每用户最大并发数</label><input type="number" name="maxConcurrentPerUser" value="${s.proxy.maxConcurrentPerUser}" min="1" max="100"></div>
 <div><label>每用户每分钟最大请求数</label><input type="number" name="rateLimitPerMinute" value="${s.proxy.rateLimitPerMinute}" min="1" max="600"></div>
 </div>
-</div>
-
-<h2>计费类型</h2>
-<div class="section">
-<label>该方案的计费模式（仅用于展示；默认方案组里通常把 Coding Plan 排在按量计费之前）</label>
-<select name="billingType">
-  <option value="coding_plan" ${initialProfile.billingType === "coding_plan" ? "selected" : ""}>Coding Plan（套餐限额，触发 429 自动切换）</option>
-  <option value="token_plan" ${initialProfile.billingType === "token_plan" ? "selected" : ""}>Token Plan（包年/包月）</option>
-  <option value="on_demand" ${(!initialProfile.billingType || initialProfile.billingType === "on_demand") ? "selected" : ""}>按量计费（无限额，通常作 failover 兜底）</option>
-</select>
-</div>
-
-<h2>每日Token配额 <span style="font-size:11px;color:var(--dim);font-weight:400">配额只计输入+输出（不含缓存），0=不限制，北京时间每日0点重置</span></h2>
-<div class="section">
-<label>方案每日总Token上限 (0=不限制)</label>
-<input type="number" name="profileQuota" value="${s.profileQuota || 0}" min="0" step="100000" placeholder="0 = 不限制">
-<div class="note">方案配额适用于该方案下所有用户。每个用户可以在用户管理弹窗中单独设置。</div>
 </div>
 
 <h2>自动配额调整 <span style="font-size:11px;color:var(--dim);font-weight:400">用户持续用满配额时自动上调限额</span></h2>
@@ -3328,6 +3333,7 @@ async function editProfile(n){
   if(p.allowedModels)fm.allowedModels.value=p.allowedModels.join(', ');
   if(fm.modelAliases)fm.modelAliases.value=aliasText(p.modelAliases||{});
   if(fm.profileQuota)fm.profileQuota.value=p.dailyTokenLimit||0;
+  const bt=fm.querySelector('select[name="billingType"]');if(bt)bt.value=p.billingType||'on_demand';
   document.querySelectorAll('.pl-item').forEach(el=>el.classList.remove('active'));
   const el=document.getElementById('pl-'+n);
   if(el)el.classList.add('active');
@@ -3571,7 +3577,7 @@ const ERR_PAGE_SIZE=20;
 const DETAIL_PAGE_SIZE=10;
 let detailPage=1,detailQuery="",detailRange="all",detailSort="time",detailInitialized=false;
 const expandedDetailPeriods=new Set();
-const COL=["#2f6e50","#181816","#8c8c84","#456b5a","#a7a79f","#b42318","#956400","#c7c7c0"];
+const COL=["#2f6e50","#4a6fa5","#c2604f","#c4a23a","#7a6bb0","#d4824a","#4a9ba8","#c47a99","#6ba368","#5a6bc4","#8a6db5","#5a9b8e"];
 const escH=s=>String(s??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 const fmtT=n=>n.toLocaleString("zh-CN");
 const fmtTk=n=>{if(n>=1e6)return(n/1e6).toFixed(1)+"M";if(n>=1e3)return(n/1e3).toFixed(1)+"k";return n.toString()};

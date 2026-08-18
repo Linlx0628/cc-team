@@ -292,6 +292,7 @@ const removedOpenAIUserKeys = new Set();
   for (const pname of Object.keys(config.profiles)) {
     const p = config.profiles[pname];
     if (p.dailyTokenLimit === undefined) { p.dailyTokenLimit = null; migrated = true; }
+    if (p.peakHours === undefined) { p.peakHours = []; migrated = true; }
     if (p.users) {
       for (const [vk, u] of Object.entries(p.users)) {
         if (typeof u === "object" && u.dailyTokenLimit === undefined) { u.dailyTokenLimit = null; migrated = true; }
@@ -300,6 +301,53 @@ const removedOpenAIUserKeys = new Set();
   }
   if (migrated) { saveConfig(config); console.log("[MIGRATE] Added dailyTokenLimit fields"); }
 })();
+
+// Peak hours: per-profile recurring daily time ranges, display-only (does not
+// affect proxying/quota). Format: [{start:"HH:mm", end:"HH:mm"}]; end < start
+// means the range crosses midnight (e.g. 22:00-02:00).
+const PEAK_TIME_RE = /^([01]\d|2[0-3]):([0-5]\d)$/;
+
+function parsePeakTimeMinutes(t) {
+  if (typeof t !== "string") return null;
+  const m = PEAK_TIME_RE.exec(t.trim());
+  if (!m) return null;
+  return parseInt(m[1], 10) * 60 + parseInt(m[2], 10);
+}
+
+function normalizePeakHours(raw) {
+  if (!Array.isArray(raw)) return [];
+  const out = [];
+  for (const item of raw) {
+    if (!item || typeof item !== "object") continue;
+    const start = parsePeakTimeMinutes(item.start);
+    const end = parsePeakTimeMinutes(item.end);
+    if (start === null || end === null || start === end) continue;
+    const norm = { start: item.start.trim(), end: item.end.trim() };
+    if (!out.some(r => r.start === norm.start && r.end === norm.end)) out.push(norm);
+  }
+  return out;
+}
+
+function isInPeakHours(ranges, date = new Date()) {
+  if (!Array.isArray(ranges) || ranges.length === 0) return false;
+  const minutes = date.getHours() * 60 + date.getMinutes();
+  for (const r of ranges) {
+    const start = parsePeakTimeMinutes(r.start);
+    const end = parsePeakTimeMinutes(r.end);
+    if (start === null || end === null || start === end) continue;
+    if (start < end) {
+      if (minutes >= start && minutes < end) return true;
+    } else if (minutes >= start || minutes < end) { // crosses midnight
+      return true;
+    }
+  }
+  return false;
+}
+
+function formatPeakHoursSummary(ranges) {
+  if (!Array.isArray(ranges) || ranges.length === 0) return "";
+  return ranges.map(r => `${r.start}-${r.end}`).join(", ");
+}
 
 // Auto-migrate: ensure autoQuotaAdjust config exists
 (function migrateAutoQuotaConfig() {
@@ -423,6 +471,7 @@ function listProfiles() {
     allowedModels: config.profiles[name].allowedModels || [],
     modelAliases: getConfigurableModelAliases(config.profiles[name]),
     dailyTokenLimit: config.profiles[name].dailyTokenLimit || 0,
+    peakHours: normalizePeakHours(config.profiles[name].peakHours),
     configured: !!config.profiles[name].upstream,
     inDefaultGroup: group.includes(name),
     groupOrder: group.indexOf(name),
@@ -1424,6 +1473,7 @@ function getProfileSummaries() {
       suffix: profile.suffix,
       isDefault: profile.isDefault,
       billingType: profile.billingType,
+      peakHours: normalizePeakHours(profile.peakHours),
       upstream: profile.upstream,
       userCount: profile.userCount,
       todayTokens: row.tokens || 0,
@@ -2900,10 +2950,15 @@ td{padding:8px;border-bottom:1px solid #ecece8;font-size:12px}
 <div class="sidebar-list">${s.profiles.map(p => {
     const host = p.upstream.replace(/^https?:\/\//, "").replace(/\/.*/, "");
     const suffixLabel = '<span style="color:var(--accent);font-size:10px">/'+ escHtml(p.suffix)+'</span>' + (p.isDefault ? ' <span style="color:var(--green);font-size:10px">默认入口</span>' : '');
+    const peakList = normalizePeakHours(p.peakHours);
+    const peakLabel = peakList.length > 0
+      ? `<div class="pl-users" style="${isInPeakHours(peakList) ? "color:var(--orange);font-weight:600" : ""}">⏰ ${escHtml(formatPeakHoursSummary(peakList))}${isInPeakHours(peakList) ? " · 高峰中" : ""}</div>`
+      : "";
     return `<div class="pl-item${p.suffix === initialSuffix ? " active" : ""}" id="pl-${escHtml(p.name)}" onclick="editProfile('${escJs(p.name)}')">
 <div class="pl-name">${escHtml(p.name)} ${suffixLabel}</div>
 <div class="pl-host">${escHtml(host)}</div>
 <div class="pl-users">${p.userCount}位用户</div>
+${peakLabel}
 <div class="pl-actions">
   ${!p.isDefault ? '<button class="pl-activate" onclick="event.stopPropagation();setDefaultProfile(\'' + escJs(p.name) + '\')">设为默认</button>' : ''}
   ${!p.isDefault ? '<button class="pl-delete" onclick="event.stopPropagation();deleteProfile(\'' + escJs(p.name) + '\')">删除</button>' : ''}
@@ -2981,6 +3036,17 @@ ${errDiv}
 <label>方案每日总Token上限 (0=不限制)</label>
 <input type="number" name="profileQuota" value="${s.profileQuota || 0}" min="0" step="100000" placeholder="0 = 不限制">
 <div class="note">方案配额适用于该方案下所有用户。每个用户可以在用户管理弹窗中单独设置。</div>
+</div>
+
+<h2>高峰时段 <span style="font-size:11px;color:var(--dim);font-weight:400">每日重复的时间段，仅用于展示记录，不影响请求转发</span></h2>
+<div class="section">
+<input type="hidden" name="peakStart" value="">
+<div id="peakHoursList">${(normalizePeakHours(initialProfile.peakHours) || []).map(r => `<div style="display:flex;align-items:center;gap:8px;margin-bottom:6px"><input type="time" name="peakStart" value="${escHtml(r.start)}" style="width:110px"> <span style="color:var(--dim)">至</span> <input type="time" name="peakEnd" value="${escHtml(r.end)}" style="width:110px"> <button type="button" class="btn btn-outline btn-sm" onclick="this.parentElement.remove();updatePeakHoursStatus()">删除</button></div>`).join("")}</div>
+<div style="display:flex;align-items:center;gap:10px;margin-top:8px">
+<button type="button" class="btn btn-outline btn-sm" onclick="addPeakHoursRow()">添加时段</button>
+<span class="note" id="peakHoursStatus"></span>
+</div>
+<div class="note" style="margin-top:6px">结束时间早于开始时间表示跨天时段（如 22:00-02:00）。可添加多个时段。</div>
 </div>
 
 <h2 style="border-top:2px solid var(--border);padding-top:18px;margin-top:30px">全局配置 <span style="color:var(--dim);font-size:12px;font-weight:400">所有方案共享，不随方案切换</span></h2>
@@ -3241,6 +3307,47 @@ function updateAccessUrl(){
   document.getElementById('accessUrlPreview').innerHTML='接入地址: http://&lt;host&gt;:6789/'+h(sfx)+'/v1/messages'+defaultNote;
 }
 updateAccessUrl();
+// ─── Peak hours editor (display-only recurring daily ranges) ───
+function addPeakHoursRow(start,end){
+  const list=document.getElementById('peakHoursList');
+  const row=document.createElement('div');
+  row.style.cssText='display:flex;align-items:center;gap:8px;margin-bottom:6px';
+  row.innerHTML='<input type="time" name="peakStart" value="'+(start||'')+'" style="width:110px"> <span style="color:var(--dim)">至</span> <input type="time" name="peakEnd" value="'+(end||'')+'" style="width:110px"> <button type="button" class="btn btn-outline btn-sm" onclick="this.parentElement.remove();updatePeakHoursStatus()">删除</button>';
+  list.appendChild(row);
+  updatePeakHoursStatus();
+}
+function renderPeakHoursRows(ranges){
+  const list=document.getElementById('peakHoursList');
+  if(!list)return;
+  list.innerHTML='';
+  (ranges||[]).forEach(r=>addPeakHoursRow(r.start,r.end));
+  updatePeakHoursStatus();
+}
+function collectPeakHours(){
+  const rows=document.querySelectorAll('#peakHoursList > div');
+  return Array.prototype.map.call(rows,function(row){
+    const s=row.querySelector('input[name="peakStart"]'),e=row.querySelector('input[name="peakEnd"]');
+    return {start:s?s.value:'',end:e?e.value:''};
+  }).filter(r=>r.start&&r.end);
+}
+function nowInPeakHours(ranges){
+  const now=new Date(),cur=now.getHours()*60+now.getMinutes();
+  const toMin=function(t){if(!t||!/^\d{2}:\d{2}$/.test(t))return null;const p=t.split(':');return parseInt(p[0],10)*60+parseInt(p[1],10)};
+  return (ranges||[]).some(function(r){
+    const s=toMin(r.start),e=toMin(r.end);
+    if(s===null||e===null||s===e)return false;
+    return s<e?(cur>=s&&cur<e):(cur>=s||cur<e));
+  });
+}
+function updatePeakHoursStatus(){
+  const el=document.getElementById('peakHoursStatus');
+  if(!el)return;
+  const ranges=collectPeakHours();
+  if(!ranges.length){el.textContent='未设置时段';el.style.color='var(--dim)';return}
+  if(nowInPeakHours(ranges)){el.textContent='⏰ 当前处于高峰';el.style.color='var(--orange)'}
+  else{el.textContent='当前不在高峰';el.style.color='var(--green)'}
+}
+setInterval(updatePeakHoursStatus,30000);
 function openDataManagementView(){
   const form=document.getElementById('settingsForm');
   const view=document.getElementById('dataManagementView');
@@ -3334,6 +3441,7 @@ async function editProfile(n){
   if(fm.modelAliases)fm.modelAliases.value=aliasText(p.modelAliases||{});
   if(fm.profileQuota)fm.profileQuota.value=p.dailyTokenLimit||0;
   const bt=fm.querySelector('select[name="billingType"]');if(bt)bt.value=p.billingType||'on_demand';
+  renderPeakHoursRows(p.peakHours||[]);
   document.querySelectorAll('.pl-item').forEach(el=>el.classList.remove('active'));
   const el=document.getElementById('pl-'+n);
   if(el)el.classList.add('active');
@@ -3668,7 +3776,7 @@ function render(){
   document.getElementById("cards").innerHTML=c("今日用量",todayTokens,"var(--accent)",1)+c("今日请求",tR,"var(--blue)",1)+c("总用量",allTokens,"var(--green)",1)+c("总请求",tr,"var(--orange)",1)+c("今日错误",(Array.isArray(D.errors)?D.errors:[]).filter(e=>e.time&&e.time.startsWith(td)).length,"var(--red)",1);
   runCountUps(document.getElementById("cards"));
   const psb=document.getElementById("profileSummaryBody"),profiles=Array.isArray(D.profileSummaries)?D.profileSummaries:[];
-  psb.innerHTML=profiles.length?profiles.map(p=>{const st=p.breakerState||"UNKNOWN";const rl=p.rateLimit;let col,led,stateLabel;if(rl){col='var(--red)';led='err';const rm=new Date(rl.resumeAt);stateLabel='限额中 '+String(rm.getHours()).padStart(2,'0')+':'+String(rm.getMinutes()).padStart(2,'0')+'恢复';}else{col=st==="CLOSED"?"var(--green)":st==="HALF_OPEN"?"var(--orange)":"var(--red)";led=st==="CLOSED"?"on":st==="HALF_OPEN"?"warn":"err";stateLabel=st==="CLOSED"?"正常":st==="HALF_OPEN"?"探测中":"熔断";}const current=currentProfile!=="all"&&p.suffix===currentProfile;const gBadge=p.inDefaultGroup?' <span style="color:var(--blue);font-size:10px;font-weight:600">默认组·'+(p.groupOrder+1)+'</span>':'';const bLabel=p.billingType==='coding_plan'?' <span style="color:var(--dim);font-size:10px">CP</span>':p.billingType==='token_plan'?' <span style="color:var(--dim);font-size:10px">TP</span>':'';const restricted=p.inDefaultGroup&&profiles.filter(x=>x.inDefaultGroup).length>=2;return'<tr'+(current?' class="profile-current" aria-current="true"':'')+'><td>'+escH(p.name)+(p.isDefault?' <span style="color:var(--green);font-size:11px;font-weight:600;vertical-align:middle">默认</span>':'')+gBadge+bLabel+(current?' <span class="current-mark">当前</span>':'')+'</td><td>'+(restricted?'<code>/v1</code> <span style="color:var(--dim);font-size:10px">仅 /v1</span>':'<code>/'+escH(p.suffix)+'</code>'+(p.isDefault?' <span style="color:var(--dim)"> / <code>/v1</code></span>':''))+'</td><td style="font-size:12px;color:var(--dim);max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+escH((p.upstream||'').replace('https://','').replace('http://',''))+'</td><td class="n">'+fmtT(p.todayRequests||0)+'</td><td class="n hl">'+fmtT(p.todayTokens||0)+'</td><td><span class="led '+led+'"></span><span style="color:'+col+';font-size:12px">'+stateLabel+'</span></td></tr>'}).join(''):'<tr><td colspan="6" class="empty">暂无方案</td></tr>';
+  psb.innerHTML=profiles.length?profiles.map(p=>{const st=p.breakerState||"UNKNOWN";const rl=p.rateLimit;let col,led,stateLabel;if(rl){col='var(--red)';led='err';const rm=new Date(rl.resumeAt);stateLabel='限额中 '+String(rm.getHours()).padStart(2,'0')+':'+String(rm.getMinutes()).padStart(2,'0')+'恢复';}else{col=st==="CLOSED"?"var(--green)":st==="HALF_OPEN"?"var(--orange)":"var(--red)";led=st==="CLOSED"?"on":st==="HALF_OPEN"?"warn":"err";stateLabel=st==="CLOSED"?"正常":st==="HALF_OPEN"?"探测中":"熔断";}const current=currentProfile!=="all"&&p.suffix===currentProfile;const gBadge=p.inDefaultGroup?' <span style="color:var(--blue);font-size:10px;font-weight:600">默认组·'+(p.groupOrder+1)+'</span>':'';const bLabel=p.billingType==='coding_plan'?' <span style="color:var(--dim);font-size:10px">CP</span>':p.billingType==='token_plan'?' <span style="color:var(--dim);font-size:10px">TP</span>':'';const pk=(p.peakHours&&p.peakHours.length)?(function(rs){const now=new Date(),cur=now.getHours()*60+now.getMinutes();const tm=function(t){if(!t)return null;const a=t.split(':');return (+a[0])*60+(+a[1])};const inPk=rs.some(function(r){const s=tm(r.start),e=tm(r.end);return s!==null&&e!==null&&s!==e&&(s<e?(cur>=s&&cur<e):(cur>=s||cur<e))});return ' <span style="color:'+(inPk?'var(--orange)':'var(--dim)')+';font-size:10px" title="高峰时段 '+rs.map(function(r){return r.start+'-'+r.end}).join(', ')+'">⏰'+(inPk?'高峰中':rs.map(function(r){return r.start+'-'+r.end}).join(','))+'</span>'})(p.peakHours):'';const restricted=p.inDefaultGroup&&profiles.filter(x=>x.inDefaultGroup).length>=2;return'<tr'+(current?' class="profile-current" aria-current="true"':'')+'><td>'+escH(p.name)+(p.isDefault?' <span style="color:var(--green);font-size:11px;font-weight:600;vertical-align:middle">默认</span>':'')+gBadge+bLabel+pk+(current?' <span class="current-mark">当前</span>':'')+'</td><td>'+(restricted?'<code>/v1</code> <span style="color:var(--dim);font-size:10px">仅 /v1</span>':'<code>/'+escH(p.suffix)+'</code>'+(p.isDefault?' <span style="color:var(--dim)"> / <code>/v1</code></span>':''))+'</td><td style="font-size:12px;color:var(--dim);max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+escH((p.upstream||'').replace('https://','').replace('http://',''))+'</td><td class="n">'+fmtT(p.todayRequests||0)+'</td><td class="n hl">'+fmtT(p.todayTokens||0)+'</td><td><span class="led '+led+'"></span><span style="color:'+col+';font-size:12px">'+stateLabel+'</span></td></tr>'}).join(''):'<tr><td colspan="6" class="empty">暂无方案</td></tr>';
   const profileLabel=D.profileView||(currentProfile==="all"?"全部方案":"默认方案");
   document.getElementById("profileContext").textContent="当前查看："+profileLabel;
   const upstreamInfo=D.upstream?(" | 上游: "+D.upstream.replace("https://","").replace("http://","")):"";
@@ -3929,6 +4037,13 @@ function applySettings(formData) {
   // Update billing type (display label, drives no logic)
   if (formData.billingType && ["coding_plan", "token_plan", "on_demand"].includes(formData.billingType)) {
     editingProfile.billingType = formData.billingType;
+  }
+
+  // Update peak hours (display-only recurring daily time ranges)
+  if (formData.peakStart !== undefined) {
+    const starts = [].concat(formData.peakStart);
+    const ends = [].concat(formData.peakEnd);
+    editingProfile.peakHours = normalizePeakHours(starts.map((s, i) => ({ start: s, end: ends[i] })));
   }
 
   // Update auto quota adjustment settings
@@ -4420,6 +4535,7 @@ const server = http.createServer((req, res) => {
           suffix: sfx,
           isDefault: false,
           billingType: validBilling,
+          peakHours: [],
         };
         saveConfig(config);
         reloadAllRuntimes();

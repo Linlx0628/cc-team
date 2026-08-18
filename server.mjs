@@ -1321,7 +1321,12 @@ function classifyRateLimit(statusCode, text) {
   const body = String(text || "");
   const parsed = parseRateLimitReset(body);
   if (parsed) return { resumeAt: parsed, source: "reset-time" };
-  const looksLikePlanLimit = /rate_limit_error|"code"\s*:\s*1310|使用上限|usage limit|plan limit/i.test(body);
+  // Frequency throttling (e.g. GLM 1302 速率限制) is per-request/user pacing, not plan
+  // exhaustion — the account still has quota. Never fail over for these; return null so
+  // the normal same-upstream retry path runs and the error stays with the requesting user.
+  const isFrequencyLimit = /"code"\s*:\s*1302|速率限制|请求频率|too many requests|requests per/i.test(body);
+  if (isFrequencyLimit) return null;
+  const looksLikePlanLimit = /"code"\s*:\s*1310|使用上限|usage limit|plan limit|额度已耗尽|quota exceeded/i.test(body);
   return looksLikePlanLimit ? { resumeAt: fallbackResumeAtMs(), source: "fallback" } : null;
 }
 

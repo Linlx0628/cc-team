@@ -1321,12 +1321,15 @@ function classifyRateLimit(statusCode, text) {
   const body = String(text || "");
   const parsed = parseRateLimitReset(body);
   if (parsed) return { resumeAt: parsed, source: "reset-time" };
-  // Frequency throttling (e.g. GLM 1302 速率限制) is per-request/user pacing, not plan
+  // Frequency throttling (e.g. GLM 1302 速率限制, GLM 1305 平台过载, Aliyun
+  // Throttling.RateQuota) is per-request/user pacing or transient load, not plan
   // exhaustion — the account still has quota. Never fail over for these; return null so
   // the normal same-upstream retry path runs and the error stays with the requesting user.
-  const isFrequencyLimit = /"code"\s*:\s*1302|速率限制|请求频率|too many requests|requests per/i.test(body);
+  const isFrequencyLimit = /"code"\s*:\s*13(02|05)|速率限制|请求频率|too many requests|requests per|Requests rate limit exceeded|Throttling\.RateQuota/i.test(body);
   if (isFrequencyLimit) return null;
-  const looksLikePlanLimit = /"code"\s*:\s*1310|使用上限|usage limit|plan limit|额度已耗尽|quota exceeded/i.test(body);
+  // Plan exhaustion: GLM 1310 用量上限 / 1113 欠费 / 1311 套餐未开放模型权限,
+  // Aliyun Throttling.AllocationQuota (free allocated quota exceeded), DeepSeek 429 quota.
+  const looksLikePlanLimit = /"code"\s*:\s*1(310|311|113)|使用上限|usage limit|plan limit|额度已耗尽|quota exceeded|AllocationQuota|free allocated quota/i.test(body);
   return looksLikePlanLimit ? { resumeAt: fallbackResumeAtMs(), source: "fallback" } : null;
 }
 

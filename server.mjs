@@ -46,6 +46,35 @@ function runCountUps(root){(root||document).querySelectorAll('[data-cu]').forEac
 function hpBar(pct){return quotaBar(pct)}
 `;
 
+// ─── Toast (auto-dismissing success notifications) ─────────────────────────
+const TOAST_CSS = `
+#toastWrap{position:fixed;top:18px;left:50%;transform:translateX(-50%);z-index:99999;display:flex;flex-direction:column;align-items:center;gap:8px;pointer-events:none}
+.toast{background:var(--green);color:#fff;padding:9px 18px;border-radius:6px;font-size:13px;font-weight:550;box-shadow:0 6px 18px rgba(0,0,0,.16);opacity:0;transform:translateY(-8px);transition:opacity .25s ease,transform .25s ease;max-width:80vw}
+.toast.show{opacity:1;transform:translateY(0)}
+@media (prefers-reduced-motion:reduce){.toast{transition:none}}
+`;
+
+const TOAST_JS = `
+function toast(msg){
+  let wrap=document.getElementById('toastWrap');
+  if(!wrap){wrap=document.createElement('div');wrap.id='toastWrap';document.body.appendChild(wrap)}
+  const t=document.createElement('div');t.className='toast';t.textContent=msg;wrap.appendChild(t);
+  requestAnimationFrame(function(){requestAnimationFrame(function(){t.classList.add('show')})});
+  setTimeout(function(){t.classList.remove('show');setTimeout(function(){t.remove()},300)},2200);
+}
+function toastThen(msg,fn){try{sessionStorage.setItem('tm_toast',msg)}catch(e){}if(fn)fn()}
+(function(){
+  try{
+    const pending=sessionStorage.getItem('tm_toast');
+    if(pending){sessionStorage.removeItem('tm_toast');toast(pending)}
+  }catch(e){}
+  if(/[?&]saved=1/.test(location.search)){
+    toast('设置已保存');
+    try{history.replaceState(null,'',location.pathname)}catch(e){}
+  }
+})();
+`;
+
 // ─── Config ──────────────────────────────────────────────────────────────────
 const configPath = path.join(__dirname, "config.json");
 function loadConfig() {
@@ -2911,6 +2940,7 @@ function settingsHtml(errorMsg) {
 <title>设置 - CC Team</title>
 <style>
 ${UI_THEME}
+${TOAST_CSS}
 body{padding:0;overflow:hidden;height:100vh}
 .layout{display:flex;height:100vh}
 .sidebar{width:260px;min-width:260px;background:var(--surface);border-right:1px solid var(--border);display:flex;flex-direction:column;overflow:hidden}
@@ -3271,6 +3301,7 @@ ${s.profiles.map(p => `<option value="${escHtml(p.suffix)}" ${p.suffix === initi
 </div>
 </div>
 <script>
+${TOAST_JS}
 const SETTINGS=${settingsJson};
 const PAGE_CSRF="${CSRF_TOKEN}";
 function getCsrf(){return PAGE_CSRF||(document.cookie.match(/tm_csrf=([^;]+)/)||[])[1]||''}
@@ -3316,6 +3347,7 @@ async function applyDataImport(){
     const result=await r.json();
     if(!r.ok)throw new Error(result.error||'导入失败');
     setImportStatus('导入完成','ok');
+    toast('数据导入完成');
   }catch(error){setImportStatus(error.message||'导入失败','error')}
 }
 function openDataClearModal(){const modal=document.getElementById('dataClearModal');modal.classList.add('open');document.getElementById('dataClearPassword').value='';document.getElementById('dataClearStatus').textContent='';document.getElementById('dataClearPassword').focus()}
@@ -3330,7 +3362,7 @@ async function clearAllData(){
     const r=await fetch('/api/data-clear',{method:'POST',headers:csrfHeaders({'Content-Type':'application/json'}),body:JSON.stringify({password:password})});
     const result=await r.json();
     if(!r.ok)throw new Error(result.error||'清空失败');
-    location.reload();
+    toastThen('数据已清空，已自动备份',()=>location.reload());
   }catch(error){status.textContent=error.message||'清空失败';status.className='inline-status error'}
 }
 function openUserModal(){const sfx=document.getElementById('profileSuffixInput').value||SETTINGS.selectedProfileSuffix;document.getElementById('userProfileSel').value=sfx;renderProfileUsers(sfx);document.getElementById('userModal').classList.add('open')}
@@ -3489,6 +3521,7 @@ async function deleteCleanupUser(key){
     const r=await fetch('/api/stats-user/delete',{method:'POST',headers:csrfHeaders({'Content-Type':'application/json'}),body:JSON.stringify({key:key})});
     const result=await r.json();if(!r.ok)throw new Error(result.error||'删除失败');
     status.textContent='已删除用户残留统计';status.className='inline-status ok';
+    toast('已删除用户残留统计');
     cleanupData.users=cleanupData.users.filter(u=>u.key!==key);renderCleanup();
   }catch(e){status.textContent=e.message||'删除失败';status.className='inline-status error'}
 }
@@ -3500,6 +3533,7 @@ async function deleteCleanupModel(model){
     const r=await fetch('/api/stats-model/delete',{method:'POST',headers:csrfHeaders({'Content-Type':'application/json'}),body:JSON.stringify({model:model})});
     const result=await r.json();if(!r.ok)throw new Error(result.error||'删除失败');
     status.textContent='已删除模型残留统计';status.className='inline-status ok';
+    toast('已删除模型残留统计');
     cleanupData.models=cleanupData.models.filter(m=>m.model!==model);renderCleanup();
   }catch(e){status.textContent=e.message||'删除失败';status.className='inline-status error'}
 }
@@ -3538,20 +3572,20 @@ async function createProfile(){
     profile:name,suffix:suffix,upstream:upstream,allowedModels:models||fm.allowedModels.value,
     modelAliases:modelAliases
   })});
-  if(r.ok)location.reload();else{const e=await r.json();alert('创建失败: '+e.error)}
+  if(r.ok)toastThen('方案已创建',()=>location.reload());else{const e=await r.json();alert('创建失败: '+e.error)}
 }
 async function setDefaultProfile(n){
   const r=await fetch('/api/profile/default',{method:'POST',headers:csrfHeaders({'Content-Type':'application/json'}),body:JSON.stringify({profile:n})});
-  if(r.ok)location.reload();else{const e=await r.json();alert('设置失败: '+e.error)}
+  if(r.ok)toastThen('已设为默认方案',()=>location.reload());else{const e=await r.json();alert('设置失败: '+e.error)}
 }
 async function deleteProfile(n){
   if(!confirm('确定删除方案 "'+n+'"？'))return;
   const r=await fetch('/api/profile/delete',{method:'POST',headers:csrfHeaders({'Content-Type':'application/json'}),body:JSON.stringify({profile:n})});
-  if(r.ok)location.reload();else{const e=await r.json();alert('删除失败: '+e.error)}
+  if(r.ok)toastThen('方案已删除',()=>location.reload());else{const e=await r.json();alert('删除失败: '+e.error)}
 }
 async function saveDefaultGroup(group){
   const r=await fetch('/api/profile/default-group',{method:'POST',headers:csrfHeaders({'Content-Type':'application/json'}),body:JSON.stringify({group:group})});
-  if(r.ok)location.reload();else{const e=await r.json().catch(()=>({}));alert('保存失败: '+(e.error||''))}
+  if(r.ok)toastThen('默认方案组已保存',()=>location.reload());else{const e=await r.json().catch(()=>({}));alert('保存失败: '+(e.error||''))}
 }
 function currentDefaultGroupFromDom(){return Array.prototype.map.call(document.querySelectorAll('#defaultGroupList .group-item'),function(el){return el.dataset.name})}
 async function addToDefaultGroup(n){const g=currentDefaultGroupFromDom();if(!g.includes(n))g.push(n);saveDefaultGroup(g)}
@@ -3560,7 +3594,7 @@ async function moveDefaultGroup(n,d){const g=currentDefaultGroupFromDom();const 
 async function deleteGlobalUser(k){
   if(!confirm('确定删除用户？该用户将从所有方案中移除。'))return;
   const r=await fetch('/api/global-user/delete',{method:'POST',headers:csrfHeaders({'Content-Type':'application/json'}),body:JSON.stringify({key:k})});
-  if(r.ok)location.reload();else{const e=await r.json();alert('删除失败: '+e.error)}
+  if(r.ok)toastThen('用户已删除',()=>location.reload());else{const e=await r.json();alert('删除失败: '+e.error)}
 }
 function renderProfileUsers(suffix){
   const assignments=SETTINGS.profileAssignments[suffix]||{};
@@ -3609,7 +3643,7 @@ async function saveUsers(){
   });
   const profileSuffix=document.getElementById('userProfileSel').value;
   const r=await fetch('/api/global-user/save',{method:'POST',headers:csrfHeaders({'Content-Type':'application/json'}),body:JSON.stringify({users,profileUsers,profileSuffix})});
-  if(r.ok){alert('保存成功');location.reload()}else{const e=await r.json();alert('保存失败: '+e.error)}
+  if(r.ok){toastThen('用户配置已保存',()=>location.reload())}else{const e=await r.json();alert('保存失败: '+e.error)}
 }
 function genVK(){const c="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";const a=new Uint8Array(24);crypto.getRandomValues(a);let k="jx-";for(let i=0;i<24;i++)k+=c[a[i]%c.length];return k}
 function addGlobalUser(){
@@ -3645,6 +3679,7 @@ function dashboardHtml() {
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js"><\/script>
 <style>
 ${UI_THEME}
+${TOAST_CSS}
 body{padding:16px clamp(14px,2vw,28px) 28px}
 .dashboard-shell{width:100%;max-width:1560px;margin:0 auto;display:grid;gap:10px;min-width:0}
 .command-bar{min-height:46px;display:flex;align-items:center;justify-content:space-between;gap:18px;padding-bottom:9px;border-bottom:1px solid var(--border);min-width:0;position:sticky;top:0;z-index:20;background:var(--canvas);padding-top:4px}
@@ -3709,7 +3744,7 @@ td{padding:8px 12px;font-size:11px;border-bottom:1px solid #ecece8;white-space:n
 <main class="dashboard-shell">
 <header class="command-bar">
   <div class="command-brand"><span class="brand-mark">CC Team</span><h1 class="command-title">团队用量</h1><span class="command-status"><span class="led on"></span>监控服务运行中</span><span class="meta" id="meta">正在加载数据</span></div>
-  <div class="controls"><select id="profileSel" aria-label="查看方案" onchange="switchProfileView(this.value)"><option value="">全部方案</option></select><a href="/settings">设置</a><button id="autoRefreshBtn" class="ar-on">自动刷新：开</button><button onclick="fetch('/api/logout',{method:'POST',headers:{'x-csrf-token':(document.cookie.match(/tm_csrf=([^;]+)/)||[])[1]||''}}).then(()=>location.reload())">退出</button></div>
+  <div class="controls"><select id="profileSel" aria-label="查看方案" onchange="switchProfileView(this.value)"><option value="">全部方案</option></select><a href="/settings">设置</a><button id="autoRefreshBtn" class="ar-on">自动刷新：开</button><button onclick="fetch('/api/logout',{method:'POST',headers:{'x-csrf-token':(document.cookie.match(/tm_csrf=([^;]+)/)||[])[1]||''}}).then(()=>toastThen('已退出登录',()=>location.reload()))">退出</button></div>
 </header>
 <section class="metric-strip" id="cards" aria-label="用量摘要"></section>
 <section class="chart-workspace" aria-label="用量图表">
@@ -3754,6 +3789,7 @@ td{padding:8px 12px;font-size:11px;border-bottom:1px solid #ecece8;white-space:n
 </main>
 <script>
 ${UI_HELPERS}
+${TOAST_JS}
 Chart.defaults.color='#686863';Chart.defaults.font.family='-apple-system,BlinkMacSystemFont,"SF Pro Text","PingFang SC","Microsoft YaHei","Segoe UI",sans-serif';Chart.defaults.font.size=11;
 let D=null,P="day",C={t:null,p:null,m:null,h:null},errPage=1,autoRefresh=true,refreshTimer=null,currentProfile="all";
 let activeWorkspaceTab="users";
@@ -3904,7 +3940,7 @@ async function load(){try{const profile=currentProfile==="all"?"all":currentProf
 function toggleSec(id){const body=document.getElementById(id+"Body");const icon=document.getElementById(id+"Icon");const open=body.classList.toggle("open");icon.classList.toggle("open",open)}
 document.querySelectorAll(".tab").forEach(b=>b.addEventListener("click",()=>{document.querySelectorAll(".tab").forEach(x=>x.classList.remove("on"));b.classList.add("on");P=b.dataset.p;resetDetailGrouping();render()}));
 document.querySelectorAll(".workspace-tab").forEach(button=>{button.addEventListener("click",()=>setWorkspaceTab(button.id.replace("workspace-tab-","")));button.addEventListener("keydown",handleWorkspaceTabKeydown)});
-document.getElementById("clearErrors").addEventListener("click",async()=>{if(confirm("确定清除所有错误记录？")){const csrf=(document.cookie.match(/tm_csrf=([^;]+)/)||[])[1]||'';await fetch("/api/clear-errors",{method:"POST",headers:{"x-csrf-token":csrf}});errPage=1;load()}});
+document.getElementById("clearErrors").addEventListener("click",async()=>{if(confirm("确定清除所有错误记录？")){const csrf=(document.cookie.match(/tm_csrf=([^;]+)/)||[])[1]||'';await fetch("/api/clear-errors",{method:"POST",headers:{"x-csrf-token":csrf}});toast('错误记录已清除');errPage=1;load()}});
 function startAutoRefresh(){if(refreshTimer)clearInterval(refreshTimer);refreshTimer=setInterval(()=>{if(autoRefresh)load()},30000)}
 document.getElementById("autoRefreshBtn").addEventListener("click",()=>{autoRefresh=!autoRefresh;const btn=document.getElementById("autoRefreshBtn");btn.textContent="自动刷新: "+(autoRefresh?"开":"关");btn.className=autoRefresh?"ar-on":"ar-off"});
 window.addEventListener("resize",scheduleChartResize);
@@ -3919,6 +3955,7 @@ function loginHtml() {
 <title>登录 - CC Team</title>
 <style>
 ${UI_THEME}
+${TOAST_CSS}
 body{display:flex;justify-content:center;align-items:center;min-height:100vh;padding:24px}
 .wrap{width:100%;max-width:390px}
 .brand{margin-bottom:22px}.brand .t{font-size:24px;font-weight:650;margin-bottom:7px}.brand .s{font-size:13px;color:var(--dim)}
@@ -3941,6 +3978,7 @@ body{display:flex;justify-content:center;align-items:center;min-height:100vh;pad
 <button onclick="doLogin()">登录</button>
 </div></div>
 <script>
+${TOAST_JS}
 document.getElementById("pw").addEventListener("keydown",e=>{if(e.key==="Enter")doLogin()});
 async function doLogin(){const pw=document.getElementById("pw").value;const r=await fetch("/api/login",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({password:pw})});if(r.ok){window.location.reload()}else{document.getElementById("err").style.display="block"}}
 <\/script></body></html>`;
@@ -3952,6 +3990,7 @@ function personalUsageLandingHtml() {
 <title>我的用量</title>
 <style>
 ${UI_THEME}
+${TOAST_CSS}
 body{display:flex;justify-content:center;align-items:center;min-height:100vh;padding:24px;margin:0}
 .wrap{width:100%;max-width:440px}.brand{margin-bottom:22px}.brand .t{font-size:24px;font-weight:650;margin-bottom:7px}.brand .s{font-size:13px;color:var(--dim)}
 .term{background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:26px}.term .hd{font-size:13px;font-weight:600;margin-bottom:18px;color:var(--text)}
@@ -3980,6 +4019,7 @@ function personalUsageHtml(virtualKey) {
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js"><\/script>
 <style>
 ${UI_THEME}
+${TOAST_CSS}
 body{padding:28px clamp(18px,3vw,44px) 48px}
 body>div{max-width:1120px;margin-left:auto;margin-right:auto}
 .top{display:flex;align-items:flex-start;justify-content:space-between;gap:24px;flex-wrap:wrap;margin-bottom:14px;padding-bottom:20px;border-bottom:1px solid var(--border)}
@@ -4001,6 +4041,7 @@ table{width:100%;border-collapse:collapse;min-width:560px}th{text-align:left;pad
 <div class="box"><h3>今日模型请求</h3><table id="modelTable"><thead><tr><th>模型</th><th class="n">请求数</th></tr></thead><tbody></tbody></table></div>
 <script>
 ${UI_HELPERS}
+${TOAST_JS}
 Chart.defaults.color='#686863';Chart.defaults.font.family='-apple-system,BlinkMacSystemFont,"SF Pro Text","PingFang SC","Microsoft YaHei","Segoe UI",sans-serif';Chart.defaults.font.size=11;
 const VK='${escJs(virtualKey)}';
 let D=null,C={h:null,t:null},currentProfile='all';
@@ -4360,7 +4401,7 @@ const server = http.createServer((req, res) => {
   }
 
   // Settings page (auth required)
-  if (req.method === "GET" && req.url === "/settings") {
+  if (req.method === "GET" && req.url.split("?")[0] === "/settings") {
     if (!checkAuth(req)) {
       res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
       res.end(loginHtml());
@@ -4503,7 +4544,7 @@ const server = http.createServer((req, res) => {
         }
         const formData = parseFormBody(body);
         applySettings(formData);
-        res.writeHead(302, { "Location": "/settings" });
+        res.writeHead(302, { "Location": "/settings?saved=1" });
         res.end();
       } catch (err) {
         res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });

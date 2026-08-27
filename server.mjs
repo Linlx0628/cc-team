@@ -219,6 +219,7 @@ const removedOpenAIUserKeys = new Set();
       upstream: "",
       allowedModels: [],
       modelAliases: {},
+      peakModelAliases: {},
       dailyTokenLimit: null,
       users: {},
     };
@@ -230,8 +231,10 @@ const removedOpenAIUserKeys = new Set();
     const aliases = { ...legacyDefaultModelAliases(profile.defaultModels || {}), ...explicitAliases };
     if (JSON.stringify(profile.modelAliases || {}) !== JSON.stringify(aliases)) migrated = true;
     profile.modelAliases = aliases;
+    if (profile.peakModelAliases === undefined) { profile.peakModelAliases = {}; migrated = true; }
+    profile.peakModelAliases = normalizeModelAliases(profile.peakModelAliases || {});
     if (!Array.isArray(profile.allowedModels)) profile.allowedModels = [];
-    for (const target of Object.values(aliases)) {
+    for (const target of Object.values({ ...aliases, ...profile.peakModelAliases })) {
       if (target && !profile.allowedModels.includes(target)) profile.allowedModels.push(target);
     }
     for (const field of ["defaultModels", "apiProtocol", "openaiStreamUsage", "responsesAdapter"]) {
@@ -470,6 +473,7 @@ function listProfiles() {
     userCount: Object.keys(config.profiles[name].users || {}).length,
     allowedModels: config.profiles[name].allowedModels || [],
     modelAliases: getConfigurableModelAliases(config.profiles[name]),
+    peakModelAliases: normalizeModelAliases(config.profiles[name].peakModelAliases || {}),
     dailyTokenLimit: config.profiles[name].dailyTokenLimit || 0,
     peakHours: normalizePeakHours(config.profiles[name].peakHours),
     configured: !!config.profiles[name].upstream,
@@ -580,6 +584,8 @@ function createProfileRuntime(profileName, profile) {
     users: { ...(profile.users || {}) },
     allowedModels: profile.allowedModels || [],
     modelAliases: getProfileModelAliases(profile),
+    peakHours: normalizePeakHours(profile.peakHours),
+    peakModelAliases: normalizeModelAliases(profile.peakModelAliases || {}),
     globalUsers: { ...(config.users || {}) },
     breaker: new CircuitBreaker({
       failureThreshold: (config.proxy || {}).circuitBreakerFailures || 5,
@@ -742,18 +748,31 @@ function checkAuth(req) {
 
 function checkCsrf(req, body) {
   if (!dashboardPassword) return true;
-  const cookies = (req.headers.cookie || "").split(";").map(s => s.trim());
-  const csrfCookie = cookies.find(c => c.startsWith(`${CSRF_COOKIE}=`));
-  if (!csrfCookie) return false;
-  const cookieVal = csrfCookie.slice(CSRF_COOKIE.length + 1);
-  // Check header first (for fetch requests), then form field (for form submissions)
+  // Submitted token: x-csrf-token header (fetch requests) or _csrf form field.
   const headerVal = req.headers["x-csrf-token"] || "";
-  if (headerVal && timingSafeEqual(cookieVal, headerVal)) return true;
+  let fieldVal = "";
   if (body && typeof body === "string" && body.includes("_csrf=")) {
     const match = body.match(/(?:^|&)_csrf=([^&]+)/);
-    if (match && timingSafeEqual(cookieVal, decodeURIComponent(match[1]))) return true;
+    if (match) {
+      try { fieldVal = decodeURIComponent(match[1]); } catch { fieldVal = match[1]; }
+    }
   }
-  return false;
+  const submitted = headerVal || fieldVal;
+  if (!submitted) {
+    console.log(`[安全] CSRF 校验失败 ${req.method} ${req.url}: 未携带令牌`);
+    return false;
+  }
+  // Accept the server-known token (rendered into the auth-gated settings page,
+  // so saving works even when the tm_csrf cookie is lost or page JS is dead),
+  // or the legacy double-submit match against the request's tm_csrf cookie.
+  const cookies = (req.headers.cookie || "").split(";").map(s => s.trim());
+  const csrfCookie = cookies.find(c => c.startsWith(`${CSRF_COOKIE}=`));
+  const ok = timingSafeEqual(submitted, CSRF_TOKEN)
+    || (!!csrfCookie && timingSafeEqual(csrfCookie.slice(CSRF_COOKIE.length + 1), submitted));
+  if (!ok) {
+    console.log(`[安全] CSRF 校验失败 ${req.method} ${req.url}: tm_csrf cookie=${csrfCookie ? "有" : "无"}，提交令牌与服务器令牌及 cookie 均不匹配`);
+  }
+  return ok;
 }
 
 function isSecureRequest(req) {
@@ -1622,10 +1641,21 @@ function hasGlobalUser(apiKey) {
   return Object.values(runtimes).some(runtime => !!getGlobalUser(apiKey, runtime));
 }
 
+// During peak hours, peak aliases override the defaults per key; keys absent from
+// the peak set keep their default mapping. Evaluated per request, so crossing a
+// peak boundary needs no config reload.
+function effectiveModelAliases(runtime) {
+  const defaults = runtime.modelAliases || {};
+  const peak = runtime.peakModelAliases || {};
+  if (Object.keys(peak).length === 0) return defaults;
+  if (!isInPeakHours(runtime.peakHours)) return defaults;
+  return { ...defaults, ...peak };
+}
+
 function resolveModel(model, _rt) {
   if (!model) return model;
   const runtime = _rt || rt;
-  const aliases = runtime.modelAliases || {};
+  const aliases = effectiveModelAliases(runtime);
   if (aliases[model]) return aliases[model];
   const alias = model.toLowerCase();
   for (const [name, target] of Object.entries(aliases)) {
@@ -2807,6 +2837,7 @@ function getPublicSettings() {
     proxy: { ...gProxy },
     allowedModels: defaultProfile?.allowedModels || [],
     modelAliases: getConfigurableModelAliases(defaultProfile || {}),
+    peakModelAliases: normalizeModelAliases(defaultProfile?.peakModelAliases || {}),
     profileUsers: profileAssignments[defaultSuffix] || {},
     profileAssignments,
     globalUsers,
@@ -2872,6 +2903,7 @@ function settingsHtml(errorMsg) {
   }).join("");
 
   const aliasesText = formatModelAliasesInput(s.modelAliases || {});
+  const peakAliasesText = formatModelAliasesInput(s.peakModelAliases || {});
   const settingsJson = JSON.stringify(s).replace(/</g, "\\x3c");
 
   return `<!DOCTYPE html>
@@ -2960,7 +2992,7 @@ td{padding:8px;border-bottom:1px solid #ecece8;font-size:12px}
     const suffixLabel = '<span style="color:var(--accent);font-size:10px">/'+ escHtml(p.suffix)+'</span>' + (p.isDefault ? ' <span style="color:var(--green);font-size:10px">默认入口</span>' : '');
     const peakList = normalizePeakHours(p.peakHours);
     const peakLabel = peakList.length > 0
-      ? `<div class="pl-users" style="${isInPeakHours(peakList) ? "color:var(--orange);font-weight:600" : ""}">⏰ ${escHtml(formatPeakHoursSummary(peakList))}${isInPeakHours(peakList) ? " · 高峰中" : ""}</div>`
+      ? `<div class="pl-users" style="${isInPeakHours(peakList) ? "color:var(--orange);font-weight:600" : ""}">${escHtml(formatPeakHoursSummary(peakList))}${isInPeakHours(peakList) ? " · 高峰中" : ""}</div>`
       : "";
     return `<div class="pl-item${p.suffix === initialSuffix ? " active" : ""}" id="pl-${escHtml(p.name)}" onclick="editProfile('${escJs(p.name)}')">
 <div class="pl-name">${escHtml(p.name)} ${suffixLabel}</div>
@@ -2986,7 +3018,7 @@ ${peakLabel}
 <div class="main">
 ${errDiv}
 <form method="post" action="/api/settings-save" id="settingsForm">
-<input type="hidden" name="_csrf" id="csrfToken">
+<input type="hidden" name="_csrf" id="csrfToken" value="${CSRF_TOKEN}">
 <input type="hidden" name="restrictGroupSuffix" id="restrictGroupSuffixHidden" value="${config.restrictGroupSuffix !== false ? "on" : "off"}">
 <input type="hidden" name="profileName" id="profileNameInput" value="${escHtml(initialProfile.name || "")}">
 <input type="hidden" name="profileSuffix" id="profileSuffixInput" value="${escHtml(initialSuffix)}">
@@ -3020,6 +3052,9 @@ ${errDiv}
   <button type="button" class="preset" onclick="fillAliases('glm-5.1','glm-5.1','glm-5.1')">智谱 GLM</button>
   <button type="button" class="preset" onclick="fillAliases('qwen-max','qwen-max','qwen-plus')">通义千问</button>
 </div>
+<label style="margin-top:14px">高峰期模型别名 (每行 alias=实际模型，可选)</label>
+<textarea name="peakModelAliases" id="peakModelAliasesInput" rows="3" placeholder="jx-opus=glm-5.3-flash">${escHtml(peakAliasesText)}</textarea>
+<div class="note">仅在下方「高峰时段」命中时生效：这里配置的别名会覆盖上面的默认映射，未填写的别名沿用默认映射。可用来在高峰期把昂贵模型换成便宜的（如 jx-opus=glm-5.3-flash）。</div>
 </div>
 
 <h2>允许模型<span class="req">*必填</span></h2>
@@ -3046,10 +3081,11 @@ ${errDiv}
 <div class="note">方案配额适用于该方案下所有用户。每个用户可以在用户管理弹窗中单独设置。</div>
 </div>
 
-<h2>高峰时段 <span style="font-size:11px;color:var(--dim);font-weight:400">每日重复的时间段，仅用于展示记录，不影响请求转发</span></h2>
+<h2>高峰时段 <span style="font-size:11px;color:var(--dim);font-weight:400">每日重复的时间段，命中时启用上方的「高峰期模型别名」</span></h2>
 <div class="section">
 <input type="hidden" name="peakStart" value="">
-<div id="peakHoursList">${(normalizePeakHours(initialProfile.peakHours) || []).map(r => `<div style="display:flex;align-items:center;gap:8px;margin-bottom:6px"><input type="time" name="peakStart" value="${escHtml(r.start)}" style="width:110px"> <span style="color:var(--dim)">至</span> <input type="time" name="peakEnd" value="${escHtml(r.end)}" style="width:110px"> <button type="button" class="btn btn-outline btn-sm" onclick="this.parentElement.remove();updatePeakHoursStatus()">删除</button></div>`).join("")}</div>
+<input type="hidden" name="peakEnd" value="">
+<div id="peakHoursList"></div>
 <div style="display:flex;align-items:center;gap:10px;margin-top:8px">
 <button type="button" class="btn btn-outline btn-sm" onclick="addPeakHoursRow()">添加时段</button>
 <span class="note" id="peakHoursStatus"></span>
@@ -3236,8 +3272,8 @@ ${s.profiles.map(p => `<option value="${escHtml(p.suffix)}" ${p.suffix === initi
 </div>
 <script>
 const SETTINGS=${settingsJson};
-function getCsrf(){const m=document.cookie.match(/tm_csrf=([^;]+)/);return m?m[1]:''}
-document.getElementById('csrfToken').value=getCsrf();
+const PAGE_CSRF="${CSRF_TOKEN}";
+function getCsrf(){return PAGE_CSRF||(document.cookie.match(/tm_csrf=([^;]+)/)||[])[1]||''}
 function csrfHeaders(h){h=h||{};h['x-csrf-token']=getCsrf();return h}
 function h(v){return String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
 function aliasText(aliases){return Object.entries(aliases||{}).map(([a,m])=>a+'='+m).join('\\n')}
@@ -3315,13 +3351,37 @@ function updateAccessUrl(){
   document.getElementById('accessUrlPreview').innerHTML='接入地址: http://&lt;host&gt;:6789/'+h(sfx)+'/v1/messages'+defaultNote;
 }
 updateAccessUrl();
-// ─── Peak hours editor (display-only recurring daily ranges) ───
+// ─── Peak hours editor (recurring daily ranges driving peak model aliases) ───
+// Uses native <select> dropdowns (hours 00-23, minutes 00-59): fixed lists, no
+// wheel-wrap like <input type="time">. Hidden peakStart/peakEnd inputs stay the
+// form contract consumed by applySettings.
 function addPeakHoursRow(start,end){
   const list=document.getElementById('peakHoursList');
   const row=document.createElement('div');
-  row.style.cssText='display:flex;align-items:center;gap:8px;margin-bottom:6px';
-  row.innerHTML='<input type="time" name="peakStart" value="'+(start||'')+'" style="width:110px"> <span style="color:var(--dim)">至</span> <input type="time" name="peakEnd" value="'+(end||'')+'" style="width:110px"> <button type="button" class="btn btn-outline btn-sm" onclick="this.parentElement.remove();updatePeakHoursStatus()">删除</button>';
+  row.style.cssText='display:flex;align-items:center;gap:6px;margin-bottom:6px';
+  const sVal=/^\\d{2}:\\d{2}$/.test(start||'')?start:'09:00';
+  const eVal=/^\\d{2}:\\d{2}$/.test(end||'')?end:'12:00';
+  const selStyle='width:auto;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:3px 6px;border-radius:4px;font-size:12px';
+  const opts=function(n,sel){var out='';for(var i=0;i<n;i++){var v=String(i).padStart(2,'0');out+='<option value="'+v+'"'+(v===sel?' selected':'')+'>'+v+'</option>'}return out};
+  const [sh,sm]=sVal.split(':'),[eh,em]=eVal.split(':');
+  row.innerHTML='<input type="hidden" name="peakStart" value="'+sVal+'"><input type="hidden" name="peakEnd" value="'+eVal+'">'
+    +'<select data-peak="sh" style="'+selStyle+'">'+opts(24,sh)+'</select>:<select data-peak="sm" style="'+selStyle+'">'+opts(60,sm)+'</select>'
+    +' <span style="color:var(--dim)">至</span> '
+    +'<select data-peak="eh" style="'+selStyle+'">'+opts(24,eh)+'</select>:<select data-peak="em" style="'+selStyle+'">'+opts(60,em)+'</select>'
+    +' <button type="button" class="btn btn-outline btn-sm" onclick="this.parentElement.remove();updatePeakHoursStatus()">删除</button>';
+  row.querySelectorAll('select[data-peak]').forEach(function(sel){
+    sel.addEventListener('change',syncPeakRow);
+  });
   list.appendChild(row);
+  updatePeakHoursStatus();
+}
+function syncPeakRow(e){
+  const row=e.target.closest('div');
+  if(!row)return;
+  const q=k=>{const s=row.querySelector('select[data-peak="'+k+'"]');return s?s.value:'00'};
+  const sh=row.querySelector('input[name="peakStart"]'),eh2=row.querySelector('input[name="peakEnd"]');
+  if(sh)sh.value=q('sh')+':'+q('sm');
+  if(eh2)eh2.value=q('eh')+':'+q('em');
   updatePeakHoursStatus();
 }
 function renderPeakHoursRows(ranges){
@@ -3340,11 +3400,11 @@ function collectPeakHours(){
 }
 function nowInPeakHours(ranges){
   const now=new Date(),cur=now.getHours()*60+now.getMinutes();
-  const toMin=function(t){if(!t||!/^\d{2}:\d{2}$/.test(t))return null;const p=t.split(':');return parseInt(p[0],10)*60+parseInt(p[1],10)};
+  const toMin=function(t){if(!t||!/^\\d{2}:\\d{2}$/.test(t))return null;const p=t.split(':');return parseInt(p[0],10)*60+parseInt(p[1],10)};
   return (ranges||[]).some(function(r){
     const s=toMin(r.start),e=toMin(r.end);
     if(s===null||e===null||s===e)return false;
-    return s<e?(cur>=s&&cur<e):(cur>=s||cur<e));
+    return s<e?(cur>=s&&cur<e):(cur>=s||cur<e);
   });
 }
 function updatePeakHoursStatus(){
@@ -3352,10 +3412,17 @@ function updatePeakHoursStatus(){
   if(!el)return;
   const ranges=collectPeakHours();
   if(!ranges.length){el.textContent='未设置时段';el.style.color='var(--dim)';return}
-  if(nowInPeakHours(ranges)){el.textContent='⏰ 当前处于高峰';el.style.color='var(--orange)'}
+  if(nowInPeakHours(ranges)){el.textContent='当前处于高峰';el.style.color='var(--orange)'}
   else{el.textContent='当前不在高峰';el.style.color='var(--green)'}
 }
 setInterval(updatePeakHoursStatus,30000);
+// Initial render: fill rows for the profile the page was opened with.
+(function(){
+  var sfx=document.getElementById('profileSuffixInput')?document.getElementById('profileSuffixInput').value:'';
+  var ps=SETTINGS.profiles||[];
+  var p=ps.find(function(x){return x.suffix===sfx})||ps[0];
+  renderPeakHoursRows((p&&p.peakHours)||[]);
+})();
 function openDataManagementView(){
   const form=document.getElementById('settingsForm');
   const view=document.getElementById('dataManagementView');
@@ -3447,6 +3514,7 @@ async function editProfile(n){
   document.getElementById('profileNameInput').value=p.name||'';
   if(p.allowedModels)fm.allowedModels.value=p.allowedModels.join(', ');
   if(fm.modelAliases)fm.modelAliases.value=aliasText(p.modelAliases||{});
+  if(fm.peakModelAliases)fm.peakModelAliases.value=aliasText(p.peakModelAliases||{});
   if(fm.profileQuota)fm.profileQuota.value=p.dailyTokenLimit||0;
   const bt=fm.querySelector('select[name="billingType"]');if(bt)bt.value=p.billingType||'on_demand';
   renderPeakHoursRows(p.peakHours||[]);
@@ -3784,7 +3852,7 @@ function render(){
   document.getElementById("cards").innerHTML=c("今日用量",todayTokens,"var(--accent)",1)+c("今日请求",tR,"var(--blue)",1)+c("总用量",allTokens,"var(--green)",1)+c("总请求",tr,"var(--orange)",1)+c("今日错误",(Array.isArray(D.errors)?D.errors:[]).filter(e=>e.time&&e.time.startsWith(td)).length,"var(--red)",1);
   runCountUps(document.getElementById("cards"));
   const psb=document.getElementById("profileSummaryBody"),profiles=Array.isArray(D.profileSummaries)?D.profileSummaries:[];
-  psb.innerHTML=profiles.length?profiles.map(p=>{const st=p.breakerState||"UNKNOWN";const rl=p.rateLimit;let col,led,stateLabel;if(rl){col='var(--red)';led='err';const rm=new Date(rl.resumeAt);stateLabel='限额中 '+String(rm.getHours()).padStart(2,'0')+':'+String(rm.getMinutes()).padStart(2,'0')+'恢复';}else{col=st==="CLOSED"?"var(--green)":st==="HALF_OPEN"?"var(--orange)":"var(--red)";led=st==="CLOSED"?"on":st==="HALF_OPEN"?"warn":"err";stateLabel=st==="CLOSED"?"正常":st==="HALF_OPEN"?"探测中":"熔断";}const current=currentProfile!=="all"&&p.suffix===currentProfile;const gBadge=p.inDefaultGroup?' <span style="color:var(--blue);font-size:10px;font-weight:600">默认组·'+(p.groupOrder+1)+'</span>':'';const bLabel=p.billingType==='coding_plan'?' <span style="color:var(--dim);font-size:10px">CP</span>':p.billingType==='token_plan'?' <span style="color:var(--dim);font-size:10px">TP</span>':'';const pk=(p.peakHours&&p.peakHours.length)?(function(rs){const now=new Date(),cur=now.getHours()*60+now.getMinutes();const tm=function(t){if(!t)return null;const a=t.split(':');return (+a[0])*60+(+a[1])};const inPk=rs.some(function(r){const s=tm(r.start),e=tm(r.end);return s!==null&&e!==null&&s!==e&&(s<e?(cur>=s&&cur<e):(cur>=s||cur<e))});return ' <span style="color:'+(inPk?'var(--orange)':'var(--dim)')+';font-size:10px" title="高峰时段 '+rs.map(function(r){return r.start+'-'+r.end}).join(', ')+'">⏰'+(inPk?'高峰中':rs.map(function(r){return r.start+'-'+r.end}).join(','))+'</span>'})(p.peakHours):'';const restricted=p.inDefaultGroup&&profiles.filter(x=>x.inDefaultGroup).length>=2;return'<tr'+(current?' class="profile-current" aria-current="true"':'')+'><td>'+escH(p.name)+(p.isDefault?' <span style="color:var(--green);font-size:11px;font-weight:600;vertical-align:middle">默认</span>':'')+gBadge+bLabel+pk+(current?' <span class="current-mark">当前</span>':'')+'</td><td>'+(restricted?'<code>/v1</code> <span style="color:var(--dim);font-size:10px">仅 /v1</span>':'<code>/'+escH(p.suffix)+'</code>'+(p.isDefault?' <span style="color:var(--dim)"> / <code>/v1</code></span>':''))+'</td><td style="font-size:12px;color:var(--dim);max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+escH((p.upstream||'').replace('https://','').replace('http://',''))+'</td><td class="n">'+fmtT(p.todayRequests||0)+'</td><td class="n hl">'+fmtT(p.todayTokens||0)+'</td><td><span class="led '+led+'"></span><span style="color:'+col+';font-size:12px">'+stateLabel+'</span></td></tr>'}).join(''):'<tr><td colspan="6" class="empty">暂无方案</td></tr>';
+  psb.innerHTML=profiles.length?profiles.map(p=>{const st=p.breakerState||"UNKNOWN";const rl=p.rateLimit;let col,led,stateLabel;if(rl){col='var(--red)';led='err';const rm=new Date(rl.resumeAt);stateLabel='限额中 '+String(rm.getHours()).padStart(2,'0')+':'+String(rm.getMinutes()).padStart(2,'0')+'恢复';}else{col=st==="CLOSED"?"var(--green)":st==="HALF_OPEN"?"var(--orange)":"var(--red)";led=st==="CLOSED"?"on":st==="HALF_OPEN"?"warn":"err";stateLabel=st==="CLOSED"?"正常":st==="HALF_OPEN"?"探测中":"熔断";}const current=currentProfile!=="all"&&p.suffix===currentProfile;const gBadge=p.inDefaultGroup?' <span style="color:var(--blue);font-size:10px;font-weight:600">默认组·'+(p.groupOrder+1)+'</span>':'';const bLabel=p.billingType==='coding_plan'?' <span style="color:var(--dim);font-size:10px">CP</span>':p.billingType==='token_plan'?' <span style="color:var(--dim);font-size:10px">TP</span>':'';const pk=(p.peakHours&&p.peakHours.length)?(function(rs){const now=new Date(),cur=now.getHours()*60+now.getMinutes();const tm=function(t){if(!t)return null;const a=t.split(':');return (+a[0])*60+(+a[1])};const inPk=rs.some(function(r){const s=tm(r.start),e=tm(r.end);return s!==null&&e!==null&&s!==e&&(s<e?(cur>=s&&cur<e):(cur>=s||cur<e))});return ' <span style="color:'+(inPk?'var(--orange)':'var(--dim)')+';font-size:10px" title="高峰时段 '+rs.map(function(r){return r.start+'-'+r.end}).join(', ')+'">'+(inPk?'高峰中':rs.map(function(r){return r.start+'-'+r.end}).join(','))+'</span>'})(p.peakHours):'';const restricted=p.inDefaultGroup&&profiles.filter(x=>x.inDefaultGroup).length>=2;return'<tr'+(current?' class="profile-current" aria-current="true"':'')+'><td>'+escH(p.name)+(p.isDefault?' <span style="color:var(--green);font-size:11px;font-weight:600;vertical-align:middle">默认</span>':'')+gBadge+bLabel+pk+(current?' <span class="current-mark">当前</span>':'')+'</td><td>'+(restricted?'<code>/v1</code> <span style="color:var(--dim);font-size:10px">仅 /v1</span>':'<code>/'+escH(p.suffix)+'</code>'+(p.isDefault?' <span style="color:var(--dim)"> / <code>/v1</code></span>':''))+'</td><td style="font-size:12px;color:var(--dim);max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+escH((p.upstream||'').replace('https://','').replace('http://',''))+'</td><td class="n">'+fmtT(p.todayRequests||0)+'</td><td class="n hl">'+fmtT(p.todayTokens||0)+'</td><td><span class="led '+led+'"></span><span style="color:'+col+';font-size:12px">'+stateLabel+'</span></td></tr>'}).join(''):'<tr><td colspan="6" class="empty">暂无方案</td></tr>';
   const profileLabel=D.profileView||(currentProfile==="all"?"全部方案":"默认方案");
   document.getElementById("profileContext").textContent="当前查看："+profileLabel;
   const upstreamInfo=D.upstream?(" | 上游: "+D.upstream.replace("https://","").replace("http://","")):"";
@@ -4094,9 +4162,15 @@ function applySettings(formData) {
     editingProfile.modelAliases = getConfigurableModelAliases(editingProfile);
   }
 
+  if (formData.peakModelAliases !== undefined) {
+    editingProfile.peakModelAliases = formData.peakModelAliases.trim()
+      ? parseModelAliasesInput(formData.peakModelAliases)
+      : {};
+  }
+
   // Ensure alias targets are always in allowedModels
   if (!Array.isArray(editingProfile.allowedModels)) editingProfile.allowedModels = [];
-  for (const m of Object.values(getProfileModelAliases(editingProfile))) {
+  for (const m of Object.values({ ...getProfileModelAliases(editingProfile), ...normalizeModelAliases(editingProfile.peakModelAliases || {}) })) {
     if (m && !editingProfile.allowedModels.includes(m)) {
       editingProfile.allowedModels.push(m);
     }
@@ -4208,6 +4282,7 @@ function resetConfigToUnconfiguredState() {
         upstream: "",
         allowedModels: [],
         modelAliases: {},
+        peakModelAliases: {},
         dailyTokenLimit: null,
         users: {},
       },
@@ -4410,14 +4485,20 @@ const server = http.createServer((req, res) => {
   // Settings save (form POST from settings page)
   if (req.method === "POST" && req.url === "/api/settings-save") {
     if (!checkAuth(req)) {
-      res.writeHead(401); res.end("Unauthorized");
+      // Browser form navigation: land on /settings, which renders the login
+      // page when unauthenticated, instead of a dead-end raw text response.
+      res.writeHead(302, { "Location": "/settings" });
+      res.end();
       return;
     }
     readBody(req).then(buf => {
       try {
         const body = buf.toString();
         if (!checkCsrf(req, body)) {
-          res.writeHead(403); res.end("CSRF validation failed");
+          // Token missing or mismatched. Re-render settings with a banner
+          // rather than raw text so the browser doesn't strand the user here.
+          res.writeHead(403, { "Content-Type": "text/html; charset=utf-8" });
+          res.end(settingsHtml("保存失败: 安全校验未通过，本次修改未保存，请刷新页面后重新填写并保存"));
           return;
         }
         const formData = parseFormBody(body);
@@ -4539,6 +4620,7 @@ const server = http.createServer((req, res) => {
           upstream: upstream || rt?.upstream || "",
           allowedModels: models,
           modelAliases: aliases,
+          peakModelAliases: {},
           users: {},
           suffix: sfx,
           isDefault: false,
@@ -4620,6 +4702,12 @@ const server = http.createServer((req, res) => {
         }
         if (updates.modelAliases !== undefined) {
           formData.modelAliases = updates.modelAliases;
+        }
+        if (updates.peakModelAliases !== undefined) {
+          // Accept an object or the same "alias=target\n" text format as the form.
+          formData.peakModelAliases = typeof updates.peakModelAliases === "object"
+            ? formatModelAliasesInput(normalizeModelAliases(updates.peakModelAliases))
+            : updates.peakModelAliases;
         }
         if (updates.users) {
           for (const [k, v] of Object.entries(updates.users)) {

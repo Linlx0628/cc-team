@@ -360,9 +360,12 @@ function normalizePeakHours(raw) {
   return out;
 }
 
+// Peak ranges are interpreted in Beijing time (UTC+8) regardless of host/container
+// timezone, matching the daily-quota reset convention (cnNow). `date` is an instant;
+// `new Date()` also works — the +8h shift below does the conversion.
 function isInPeakHours(ranges, date = new Date()) {
   if (!Array.isArray(ranges) || ranges.length === 0) return false;
-  const minutes = date.getHours() * 60 + date.getMinutes();
+  const minutes = ((date.getTime() + 8 * 3600000) % 86400000) / 60000;
   for (const r of ranges) {
     const start = parsePeakTimeMinutes(r.start);
     const end = parsePeakTimeMinutes(r.end);
@@ -3084,7 +3087,7 @@ ${errDiv}
 </div>
 <label style="margin-top:14px">高峰期模型别名 (每行 alias=实际模型，可选)</label>
 <textarea name="peakModelAliases" id="peakModelAliasesInput" rows="3" placeholder="jx-opus=glm-5.3-flash">${escHtml(peakAliasesText)}</textarea>
-<div class="note">仅在下方「高峰时段」命中时生效：这里配置的别名会覆盖上面的默认映射，未填写的别名沿用默认映射。可用来在高峰期把昂贵模型换成便宜的（如 jx-opus=glm-5.3-flash）。</div>
+<div class="note">仅在下方「高峰时段」命中时生效（按北京时间判断）：这里配置的别名会覆盖上面的默认映射，未填写的别名沿用默认映射。可用来在高峰期把昂贵模型换成便宜的（如 jx-opus=glm-5.3-flash）。</div>
 </div>
 
 <h2>允许模型<span class="req">*必填</span></h2>
@@ -3111,7 +3114,7 @@ ${errDiv}
 <div class="note">方案配额适用于该方案下所有用户。每个用户可以在用户管理弹窗中单独设置。</div>
 </div>
 
-<h2>高峰时段 <span style="font-size:11px;color:var(--dim);font-weight:400">每日重复的时间段，命中时启用上方的「高峰期模型别名」</span></h2>
+<h2>高峰时段 <span style="font-size:11px;color:var(--dim);font-weight:400">每日重复的时间段（按北京时间判断，与部署服务器时区无关），命中时启用上方的「高峰期模型别名」</span></h2>
 <div class="section">
 <input type="hidden" name="peakStart" value="">
 <input type="hidden" name="peakEnd" value="">
@@ -3120,7 +3123,7 @@ ${errDiv}
 <button type="button" class="btn btn-outline btn-sm" onclick="addPeakHoursRow()">添加时段</button>
 <span class="note" id="peakHoursStatus"></span>
 </div>
-<div class="note" style="margin-top:6px">结束时间早于开始时间表示跨天时段（如 22:00-02:00）。可添加多个时段。</div>
+<div class="note" style="margin-top:6px">结束时间早于开始时间表示跨天时段（如 22:00-02:00）。可添加多个时段，均按北京时间计算。</div>
 </div>
 
 <h2 style="border-top:2px solid var(--border);padding-top:18px;margin-top:30px">全局配置 <span style="color:var(--dim);font-size:12px;font-weight:400">所有方案共享，不随方案切换</span></h2>
@@ -3431,7 +3434,9 @@ function collectPeakHours(){
   }).filter(r=>r.start&&r.end);
 }
 function nowInPeakHours(ranges){
-  const now=new Date(),cur=now.getHours()*60+now.getMinutes();
+  // Beijing time (UTC+8), so the hint matches the server-side peak judgment
+  // regardless of the viewer's local timezone.
+  const now=new Date(),cur=((now.getTime()+8*3600000)%86400000)/60000;
   const toMin=function(t){if(!t||!/^\\d{2}:\\d{2}$/.test(t))return null;const p=t.split(':');return parseInt(p[0],10)*60+parseInt(p[1],10)};
   return (ranges||[]).some(function(r){
     const s=toMin(r.start),e=toMin(r.end);
@@ -3888,7 +3893,7 @@ function render(){
   document.getElementById("cards").innerHTML=c("今日用量",todayTokens,"var(--accent)",1)+c("今日请求",tR,"var(--blue)",1)+c("总用量",allTokens,"var(--green)",1)+c("总请求",tr,"var(--orange)",1)+c("今日错误",(Array.isArray(D.errors)?D.errors:[]).filter(e=>e.time&&e.time.startsWith(td)).length,"var(--red)",1);
   runCountUps(document.getElementById("cards"));
   const psb=document.getElementById("profileSummaryBody"),profiles=Array.isArray(D.profileSummaries)?D.profileSummaries:[];
-  psb.innerHTML=profiles.length?profiles.map(p=>{const st=p.breakerState||"UNKNOWN";const rl=p.rateLimit;let col,led,stateLabel;if(rl){col='var(--red)';led='err';const rm=new Date(rl.resumeAt);stateLabel='限额中 '+String(rm.getHours()).padStart(2,'0')+':'+String(rm.getMinutes()).padStart(2,'0')+'恢复';}else{col=st==="CLOSED"?"var(--green)":st==="HALF_OPEN"?"var(--orange)":"var(--red)";led=st==="CLOSED"?"on":st==="HALF_OPEN"?"warn":"err";stateLabel=st==="CLOSED"?"正常":st==="HALF_OPEN"?"探测中":"熔断";}const current=currentProfile!=="all"&&p.suffix===currentProfile;const gBadge=p.inDefaultGroup?' <span style="color:var(--blue);font-size:10px;font-weight:600">默认组·'+(p.groupOrder+1)+'</span>':'';const bLabel=p.billingType==='coding_plan'?' <span style="color:var(--dim);font-size:10px">CP</span>':p.billingType==='token_plan'?' <span style="color:var(--dim);font-size:10px">TP</span>':'';const pk=(p.peakHours&&p.peakHours.length)?(function(rs){const now=new Date(),cur=now.getHours()*60+now.getMinutes();const tm=function(t){if(!t)return null;const a=t.split(':');return (+a[0])*60+(+a[1])};const inPk=rs.some(function(r){const s=tm(r.start),e=tm(r.end);return s!==null&&e!==null&&s!==e&&(s<e?(cur>=s&&cur<e):(cur>=s||cur<e))});return ' <span style="color:'+(inPk?'var(--orange)':'var(--dim)')+';font-size:10px" title="高峰时段 '+rs.map(function(r){return r.start+'-'+r.end}).join(', ')+'">'+(inPk?'高峰中':rs.map(function(r){return r.start+'-'+r.end}).join(','))+'</span>'})(p.peakHours):'';const restricted=p.inDefaultGroup&&profiles.filter(x=>x.inDefaultGroup).length>=2;return'<tr'+(current?' class="profile-current" aria-current="true"':'')+'><td>'+escH(p.name)+(p.isDefault?' <span style="color:var(--green);font-size:11px;font-weight:600;vertical-align:middle">默认</span>':'')+gBadge+bLabel+pk+(current?' <span class="current-mark">当前</span>':'')+'</td><td>'+(restricted?'<code>/v1</code> <span style="color:var(--dim);font-size:10px">仅 /v1</span>':'<code>/'+escH(p.suffix)+'</code>'+(p.isDefault?' <span style="color:var(--dim)"> / <code>/v1</code></span>':''))+'</td><td style="font-size:12px;color:var(--dim);max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+escH((p.upstream||'').replace('https://','').replace('http://',''))+'</td><td class="n">'+fmtT(p.todayRequests||0)+'</td><td class="n hl">'+fmtT(p.todayTokens||0)+'</td><td><span class="led '+led+'"></span><span style="color:'+col+';font-size:12px">'+stateLabel+'</span></td></tr>'}).join(''):'<tr><td colspan="6" class="empty">暂无方案</td></tr>';
+  psb.innerHTML=profiles.length?profiles.map(p=>{const st=p.breakerState||"UNKNOWN";const rl=p.rateLimit;let col,led,stateLabel;if(rl){col='var(--red)';led='err';const rm=new Date(rl.resumeAt);stateLabel='限额中 '+String(rm.getHours()).padStart(2,'0')+':'+String(rm.getMinutes()).padStart(2,'0')+'恢复';}else{col=st==="CLOSED"?"var(--green)":st==="HALF_OPEN"?"var(--orange)":"var(--red)";led=st==="CLOSED"?"on":st==="HALF_OPEN"?"warn":"err";stateLabel=st==="CLOSED"?"正常":st==="HALF_OPEN"?"探测中":"熔断";}const current=currentProfile!=="all"&&p.suffix===currentProfile;const gBadge=p.inDefaultGroup?' <span style="color:var(--blue);font-size:10px;font-weight:600">默认组·'+(p.groupOrder+1)+'</span>':'';const bLabel=p.billingType==='coding_plan'?' <span style="color:var(--dim);font-size:10px">CP</span>':p.billingType==='token_plan'?' <span style="color:var(--dim);font-size:10px">TP</span>':'';const pk=(p.peakHours&&p.peakHours.length)?(function(rs){const now=new Date(),cur=((now.getTime()+8*3600000)%86400000)/60000;const tm=function(t){if(!t)return null;const a=t.split(':');return (+a[0])*60+(+a[1])};const inPk=rs.some(function(r){const s=tm(r.start),e=tm(r.end);return s!==null&&e!==null&&s!==e&&(s<e?(cur>=s&&cur<e):(cur>=s||cur<e))});return ' <span style="color:'+(inPk?'var(--orange)':'var(--dim)')+';font-size:10px" title="高峰时段(北京时间) '+rs.map(function(r){return r.start+'-'+r.end}).join(', ')+'">'+(inPk?'高峰中':rs.map(function(r){return r.start+'-'+r.end}).join(','))+'</span>'})(p.peakHours):'';const restricted=p.inDefaultGroup&&profiles.filter(x=>x.inDefaultGroup).length>=2;return'<tr'+(current?' class="profile-current" aria-current="true"':'')+'><td>'+escH(p.name)+(p.isDefault?' <span style="color:var(--green);font-size:11px;font-weight:600;vertical-align:middle">默认</span>':'')+gBadge+bLabel+pk+(current?' <span class="current-mark">当前</span>':'')+'</td><td>'+(restricted?'<code>/v1</code> <span style="color:var(--dim);font-size:10px">仅 /v1</span>':'<code>/'+escH(p.suffix)+'</code>'+(p.isDefault?' <span style="color:var(--dim)"> / <code>/v1</code></span>':''))+'</td><td style="font-size:12px;color:var(--dim);max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+escH((p.upstream||'').replace('https://','').replace('http://',''))+'</td><td class="n">'+fmtT(p.todayRequests||0)+'</td><td class="n hl">'+fmtT(p.todayTokens||0)+'</td><td><span class="led '+led+'"></span><span style="color:'+col+';font-size:12px">'+stateLabel+'</span></td></tr>'}).join(''):'<tr><td colspan="6" class="empty">暂无方案</td></tr>';
   const profileLabel=D.profileView||(currentProfile==="all"?"全部方案":"默认方案");
   document.getElementById("profileContext").textContent="当前查看："+profileLabel;
   const upstreamInfo=D.upstream?(" | 上游: "+D.upstream.replace("https://","").replace("http://","")):"";

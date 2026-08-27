@@ -20,4 +20,6 @@ backups/
 docs/superpowers/*
 
 tests/*.mjs
+.agents/*
+.code-review-graph/*
 

@@ -1,6 +1,7 @@
 import http from "node:http";
 import https from "node:https";
 import crypto from "node:crypto";
+import zlib from "node:zlib";
 import { URL } from "node:url";
 import fs from "node:fs";
 import path from "node:path";
@@ -8,6 +9,21 @@ import { fileURLToPath } from "node:url";
 import Database from "better-sqlite3";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
+
+// Send a JSON response with gzip when the client accepts it (the stats payload
+// is nested-dict heavy and compresses ~10x, which matters for 30s polling).
+function sendJson(res, obj, req) {
+  const body = Buffer.from(JSON.stringify(obj));
+  const accept = (req && req.headers && req.headers["accept-encoding"]) || "";
+  if (accept.includes("gzip") && body.length >= 1024) {
+    const gz = zlib.gzipSync(body);
+    res.writeHead(200, { "Content-Type": "application/json", "Content-Encoding": "gzip", "Vary": "Accept-Encoding" });
+    res.end(gz);
+  } else {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(body);
+  }
+}
 
 // Shared editorial light theme for all server-rendered pages.
 const UI_THEME = `
@@ -896,6 +912,21 @@ function sanitizeStore(raw) {
     }
     s.daily = safe;
   }
+  // Mask user keys in dailyModels / dailyHourly the same way as s.daily so the
+  // dashboard's user filter (keyed on masked keys) applies to model/hour dimensions too.
+  const maskByUser = (obj) => {
+    if (!obj) return obj;
+    const safe = {};
+    for (const [day, ud] of Object.entries(obj)) {
+      safe[day] = {};
+      for (const [k, v] of Object.entries(ud)) {
+        safe[day][k.slice(0, 8) + "****"] = v;
+      }
+    }
+    return safe;
+  };
+  s.dailyModels = maskByUser(s.dailyModels);
+  s.dailyHourly = maskByUser(s.dailyHourly);
   if (Array.isArray(s.errors)) {
     s.errors = s.errors.map(e => { const { userKey, ...rest } = e; return rest; });
   }
@@ -949,6 +980,12 @@ function initDb() {
       cache_creation INTEGER DEFAULT 0, cache_read INTEGER DEFAULT 0,
       PRIMARY KEY (profile, date, hour)
     );
+    CREATE TABLE IF NOT EXISTS usage_hourly_model (
+      profile TEXT NOT NULL, date TEXT NOT NULL, user_key TEXT NOT NULL,
+      hour TEXT NOT NULL, model TEXT NOT NULL,
+      requests INTEGER DEFAULT 0, input_tokens INTEGER DEFAULT 0, output_tokens INTEGER DEFAULT 0,
+      PRIMARY KEY (profile, date, user_key, hour, model)
+    );
     CREATE TABLE IF NOT EXISTS errors (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       profile TEXT NOT NULL, time TEXT NOT NULL,
@@ -993,12 +1030,17 @@ function initDb() {
     ON CONFLICT(profile,date,user_key,hour) DO UPDATE SET
       requests=requests+1, input_tokens=input_tokens+@inp, output_tokens=output_tokens+@out,
       cache_creation=cache_creation+@cacheC, cache_read=cache_read+@cacheR`);
+  stmts.upsertHourlyModel = db.prepare(`INSERT INTO usage_hourly_model (profile,date,user_key,hour,model,requests,input_tokens,output_tokens)
+    VALUES (@profile,@today,@key,@hour,@m,1,@inp,@out)
+    ON CONFLICT(profile,date,user_key,hour,model) DO UPDATE SET
+    requests=requests+1, input_tokens=input_tokens+@inp, output_tokens=output_tokens+@out`);
   stmts.insertError = db.prepare(`INSERT INTO errors (profile,time,user_name,user_key,status_code,error,path,model)
     VALUES (@profile,@time,@userName,@key,@statusCode,@error,@path,@model)`);
   stmts.pruneErrors = db.prepare(`DELETE FROM errors WHERE time < ?`);
   stmts.trimErrors = db.prepare(`DELETE FROM errors WHERE id NOT IN (SELECT id FROM errors ORDER BY id DESC LIMIT 200)`);
   stmts.pruneDailyModel = db.prepare(`DELETE FROM usage_daily_model WHERE date < ?`);
   stmts.pruneDailyHourly = db.prepare(`DELETE FROM usage_daily_hourly WHERE date < ?`);
+  stmts.pruneHourlyModel = db.prepare(`DELETE FROM usage_hourly_model WHERE date < ?`);
   stmts.insertQuotaAdjust = db.prepare(`INSERT INTO quota_adjust_history (user_key,user_name,date,old_quota,new_quota,hit_rate,avg_daily_usage,auto,time)
     VALUES (@user,@username,@date,@oldQuota,@newQuota,@hitRate,@avgDailyUsage,1,@time)`);
   stmts.trimQuotaAdjust = db.prepare(`DELETE FROM quota_adjust_history WHERE id NOT IN (SELECT id FROM quota_adjust_history ORDER BY id DESC LIMIT 100)`);
@@ -1024,8 +1066,14 @@ function pruneOldDataIfNewDay() {
   lastPruneDate = today;
   const cutoff = new Date(Date.now() - 7 * 24 * 3600 * 1000 + 8 * 3600 * 1000).toISOString().slice(0, 10);
   const cutoff7d = new Date(Date.now() - 7 * 24 * 3600 * 1000).toISOString();
+  // usage_daily_model feeds the period-switchable model distribution chart
+  // (today/week/month/year in Beijing time); keep ~400 days so a full calendar
+  // year plus cross-year weeks stays queryable. usage_hourly_model feeds the
+  // 24h model trend chart with the same period windows, so it shares the cutoff.
+  const cutoffDailyModel = new Date(Date.now() - 400 * 24 * 3600 * 1000 + 8 * 3600 * 1000).toISOString().slice(0, 10);
   const tx = db.transaction(() => {
-    stmts.pruneDailyModel.run(cutoff);
+    stmts.pruneDailyModel.run(cutoffDailyModel);
+    stmts.pruneHourlyModel.run(cutoffDailyModel);
     stmts.pruneDailyHourly.run(cutoff);
     stmts.pruneErrors.run(cutoff7d);
   });
@@ -1458,6 +1506,7 @@ function loadProfileSnapshot(suffix) {
 
 initDb();
 migrateFromJsonIfNeeded();
+pruneOldDataIfNewDay(); // also run at startup so rows pruned under an old policy converge immediately
 loadRateLimitState();
 
 function removeLegacyOpenAIData() {
@@ -1468,7 +1517,7 @@ function removeLegacyOpenAIData() {
   const placeholders = suffixes.map(() => "?").join(",");
   const removedKeys = db.prepare(`SELECT DISTINCT user_key FROM users WHERE profile IN (${placeholders})`).all(...suffixes).map((row) => row.user_key);
   const tx = db.transaction(() => {
-    for (const table of ["users", "usage_daily", "usage_daily_model", "usage_daily_hourly", "usage_model", "usage_hourly", "errors"]) {
+    for (const table of ["users", "usage_daily", "usage_daily_model", "usage_daily_hourly", "usage_hourly_model", "usage_model", "usage_hourly", "errors"]) {
       db.prepare(`DELETE FROM ${table} WHERE profile IN (${placeholders})`).run(...suffixes);
     }
     for (const key of removedKeys) {
@@ -1520,6 +1569,47 @@ function getAggregatedStore() {
   // errors: merge all profiles (most recent 200)
   agg.errors = db.prepare("SELECT time, user_name AS user, user_key AS userKey, status_code AS statusCode, error, path, model FROM errors ORDER BY id DESC LIMIT 200").all();
   return agg;
+}
+
+// Load hourly-per-model usage for the 24h model trend chart. `suffix` null =
+// all profiles. Shape: { date: { hour: { model: { requests, inputTokens, outputTokens } } } }
+// (already aggregated across users; no cache columns — same scope as usage_daily_model).
+function loadHourlyModels(suffix) {
+  const out = {};
+  const sql = `SELECT date, hour, model, SUM(requests) AS r, SUM(input_tokens) AS ti, SUM(output_tokens) AS tout
+    FROM usage_hourly_model ${suffix ? "WHERE profile=?" : ""} GROUP BY date, hour, model`;
+  const rows = suffix ? db.prepare(sql).all(suffix) : db.prepare(sql).all();
+  for (const row of rows) {
+    if (!out[row.date]) out[row.date] = {};
+    if (!out[row.date][row.hour]) out[row.date][row.hour] = {};
+    out[row.date][row.hour][row.model] = { requests: row.r || 0, inputTokens: row.ti || 0, outputTokens: row.tout || 0 };
+  }
+  return out;
+}
+
+// Load per-profile daily usage (with cache) for the profile request chart.
+// Always covers ALL profiles — the chart is a cross-profile dimension.
+// Shape: { [suffix]: { [date]: { requests, inputTokens, outputTokens, cacheCreationTokens, cacheReadTokens } } }
+function loadProfileDaily() {
+  const out = {};
+  for (const r of db.prepare(`SELECT profile, date, SUM(requests) AS r, SUM(input_tokens) AS ti, SUM(output_tokens) AS tout, SUM(cache_creation) AS cc, SUM(cache_read) AS cr FROM usage_daily GROUP BY profile, date`).all()) {
+    if (!out[r.profile]) out[r.profile] = {};
+    out[r.profile][r.date] = { requests: r.r || 0, inputTokens: r.ti || 0, outputTokens: r.tout || 0, cacheCreationTokens: r.cc || 0, cacheReadTokens: r.cr || 0 };
+  }
+  return out;
+}
+
+// Load per-profile daily per-model usage (no cache) — used by the profile
+// request chart when a model filter is active.
+// Shape: { [suffix]: { [date]: { [model]: { requests, inputTokens, outputTokens } } } }
+function loadProfileDailyModels() {
+  const out = {};
+  for (const r of db.prepare(`SELECT profile, date, model, SUM(requests) AS r, SUM(input_tokens) AS ti, SUM(output_tokens) AS tout FROM usage_daily_model GROUP BY profile, date, model`).all()) {
+    if (!out[r.profile]) out[r.profile] = {};
+    if (!out[r.profile][r.date]) out[r.profile][r.date] = {};
+    out[r.profile][r.date][r.model] = { requests: r.r || 0, inputTokens: r.ti || 0, outputTokens: r.tout || 0 };
+  }
+  return out;
 }
 
 function getProfileSummaries() {
@@ -1769,6 +1859,7 @@ function recordUsage(apiKey, usage, model, suffix, _rt) {
     stmts.upsertHourly.run(p);
     stmts.upsertDailyModel.run(p);
     stmts.upsertDailyHourly.run(p);
+    stmts.upsertHourlyModel.run(p);
   });
   tx();
 }
@@ -3704,9 +3795,16 @@ body{padding:16px clamp(14px,2vw,28px) 28px}
 .card:first-child{border-top:2px solid var(--accent)}
 .card .l{font-size:10px;font-weight:600;color:var(--dim);margin-bottom:5px}
 .card .v{font-size:21px;line-height:1;font-weight:650;font-variant-numeric:tabular-nums;color:var(--text)!important}
-.chart-workspace{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));grid-template-rows:repeat(2,minmax(0,1fr));gap:8px;min-height:480px}
+.chart-filters{display:flex;flex-wrap:wrap;gap:9px;align-items:end;min-height:34px}
+.chart-filters .detail-field{width:150px}
+.chart-filters .chart-date{width:140px}
+.chart-filter-hint{font-size:10px;color:var(--dim);font-weight:400;align-self:center}
+.chart-note{font-size:10px;color:var(--dim);font-weight:400;white-space:nowrap}
+.chart-workspace{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));grid-template-rows:repeat(3,minmax(0,1fr));gap:8px;min-height:660px}
 .chart-panel{background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:10px 12px;min-width:0;min-height:0;display:flex;flex-direction:column;overflow:hidden}
-.chart-trend{grid-column:1;grid-row:1}.chart-users{grid-column:2;grid-row:1}.chart-models{grid-column:1;grid-row:2}.chart-hourly{grid-column:2;grid-row:2}
+.chart-trend{grid-column:1;grid-row:1}.chart-profile{grid-column:2;grid-row:1}
+.chart-models{grid-column:1;grid-row:2}.chart-users{grid-column:2;grid-row:2}
+.chart-hmodel{grid-column:1;grid-row:3}.chart-hourly{grid-column:2;grid-row:3}
 .chart-head{min-height:24px;display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:4px}.chart-head h2{font-size:12px;font-weight:650;color:var(--text);white-space:nowrap}
 .chart-canvas{position:relative;flex:1;min-height:0}.chart-canvas canvas{position:absolute!important;inset:0;width:100%!important;height:100%!important}
 .tabs{display:flex;gap:1px;background:var(--surface-subtle);border:1px solid var(--border);border-radius:5px;padding:2px;width:fit-content;flex-shrink:0}
@@ -3742,8 +3840,8 @@ td{padding:8px 12px;font-size:11px;border-bottom:1px solid #ecece8;white-space:n
 .n{font-variant-numeric:tabular-nums;text-align:right}.hl{color:var(--accent);font-weight:600}
 .rank{display:inline-block;width:20px;color:var(--dim);font-variant-numeric:tabular-nums}code{font-family:var(--font-mono);color:var(--accent);font-size:11px}.empty{color:var(--dim);padding:24px;text-align:center;font-size:12px}
 @media(min-width:1280px) and (min-height:800px){.dashboard-shell{padding:12px 18px;grid-template-rows:46px 68px auto minmax(440px,1fr);gap:8px}.command-bar{height:46px}.controls{flex-wrap:nowrap}.data-workspace{min-height:0}}
-@media(max-width:1279px), (max-height:799px){.dashboard-shell{height:auto}.chart-workspace{grid-template-rows:repeat(2,280px);max-height:none}.data-workspace{height:auto;min-height:440px}.workspace-panel{min-height:400px}.workspace-panel.active{display:flex}}
-@media(max-width:820px){.command-bar{align-items:flex-start;flex-direction:column;position:static;background:transparent;padding-top:0}.command-brand{width:100%;flex-wrap:wrap}.meta{order:3;width:100%;white-space:normal}.controls{width:100%}.metric-strip{grid-template-columns:repeat(3,1fr)}.chart-workspace{grid-template-columns:1fr;grid-template-rows:repeat(4,240px)}.chart-trend,.chart-users,.chart-models,.chart-hourly{grid-column:1;grid-row:auto}.detail-tools{grid-template-columns:1fr 1fr}.detail-search{grid-column:1/-1}.detail-reset{width:100%}}
+@media(max-width:1279px), (max-height:799px){.dashboard-shell{height:auto}.chart-workspace{grid-template-rows:repeat(3,280px);max-height:none}.data-workspace{height:auto;min-height:440px}.workspace-panel{min-height:400px}.workspace-panel.active{display:flex}}
+@media(max-width:820px){.command-bar{align-items:flex-start;flex-direction:column;position:static;background:transparent;padding-top:0}.command-brand{width:100%;flex-wrap:wrap}.meta{order:3;width:100%;white-space:normal}.controls{width:100%}.metric-strip{grid-template-columns:repeat(3,1fr)}.chart-workspace{grid-template-columns:1fr;grid-template-rows:repeat(6,240px)}.chart-trend,.chart-users,.chart-models,.chart-hourly,.chart-hmodel,.chart-profile{grid-column:1;grid-row:auto}.detail-tools{grid-template-columns:1fr 1fr}.detail-search{grid-column:1/-1}.detail-reset{width:100%}}
 @media(max-width:560px){body{padding:12px 10px 24px}.command-title{border-right:0;padding-right:0}.command-status{width:100%}.controls select{flex:1;min-width:150px}.metric-strip{grid-template-columns:1fr 1fr}.card{min-height:64px;padding:10px}.card .v{font-size:19px}.chart-head{align-items:flex-start}.chart-trend .chart-head{flex-direction:column}.workspace-tab{padding:0 12px}.detail-tools{padding:8px}.detail-table-wrap{max-height:500px}#dTable .detail-sticky{min-width:190px}.detail-pages{justify-content:space-between}}
 </style></head><body data-theme="editorial-light">
 <main class="dashboard-shell">
@@ -3752,13 +3850,25 @@ td{padding:8px 12px;font-size:11px;border-bottom:1px solid #ecece8;white-space:n
   <div class="controls"><select id="profileSel" aria-label="查看方案" onchange="switchProfileView(this.value)"><option value="">全部方案</option></select><a href="/settings">设置</a><button id="autoRefreshBtn" class="ar-on">自动刷新：开</button><button onclick="fetch('/api/logout',{method:'POST',headers:{'x-csrf-token':(document.cookie.match(/tm_csrf=([^;]+)/)||[])[1]||''}}).then(()=>toastThen('已退出登录',()=>location.reload()))">退出</button></div>
 </header>
 <section class="metric-strip" id="cards" aria-label="用量摘要"></section>
-<section class="chart-workspace" aria-label="用量图表">
-  <div class="chart-panel chart-trend"><div class="chart-head"><h2>Token 用量趋势</h2><div class="tabs" id="tabs" aria-label="统计周期">
+<section class="chart-filters" aria-label="图表筛选">
+  <div class="tabs" id="globalTabs" aria-label="统计周期">
     <button class="tab on" data-p="day">按日</button><button class="tab" data-p="week">按周</button><button class="tab" data-p="month">按月</button><button class="tab" data-p="year">按年</button>
-  </div></div><div class="chart-canvas"><canvas id="trend"></canvas></div></div>
+  </div>
+  <div class="detail-field"><label for="metricSel">指标</label><select id="metricSel"><option value="tokens">Token</option><option value="requests">请求数</option></select></div>
+  <div class="detail-field"><label for="modelSel">模型</label><select id="modelSel"><option value="all">全部模型</option></select></div>
+  <div class="detail-field"><label for="userSel">用户</label><select id="userSel"><option value="all">全部用户</option></select></div>
+  <div class="detail-field chart-date"><label for="dateStart">开始日期</label><input type="date" id="dateStart" onchange="onDateRangeChange()"></div>
+  <div class="detail-field chart-date"><label for="dateEnd">结束日期</label><input type="date" id="dateEnd" onchange="onDateRangeChange()"></div>
+  <button type="button" class="detail-reset" onclick="resetChartFilters()">重置</button>
+  <span class="chart-filter-hint" id="chartFilterHint">日期范围对 24 小时图不生效；模型/用户筛选对部分图表不适用；按模型筛选时不含缓存 Token</span>
+</section>
+<section class="chart-workspace" aria-label="用量图表">
+  <div class="chart-panel chart-trend"><div class="chart-head"><h2>Token 用量趋势</h2><span class="chart-note" id="trendNote"></span></div><div class="chart-canvas"><canvas id="trend"></canvas></div></div>
   <div class="chart-panel chart-users"><div class="chart-head"><h2>用户分布</h2></div><div class="chart-canvas"><canvas id="pie"></canvas></div></div>
   <div class="chart-panel chart-models"><div class="chart-head"><h2>模型请求分布</h2></div><div class="chart-canvas"><canvas id="modelChart"></canvas></div></div>
   <div class="chart-panel chart-hourly"><div class="chart-head"><h2>24 小时趋势</h2></div><div class="chart-canvas"><canvas id="hourChart"></canvas></div></div>
+  <div class="chart-panel chart-hmodel"><div class="chart-head"><h2>24 小时模型使用趋势</h2></div><div class="chart-canvas"><canvas id="hourModelChart"></canvas></div></div>
+  <div class="chart-panel chart-profile"><div class="chart-head"><h2>方案请求情况</h2><span class="chart-note" id="profileNote"></span></div><div class="chart-canvas"><canvas id="profileChart"></canvas></div></div>
 </section>
 <section class="data-workspace" aria-label="数据工作区">
   <div class="workspace-tabs" role="tablist" aria-label="数据视图">
@@ -3796,7 +3906,9 @@ td{padding:8px 12px;font-size:11px;border-bottom:1px solid #ecece8;white-space:n
 ${UI_HELPERS}
 ${TOAST_JS}
 Chart.defaults.color='#686863';Chart.defaults.font.family='-apple-system,BlinkMacSystemFont,"SF Pro Text","PingFang SC","Microsoft YaHei","Segoe UI",sans-serif';Chart.defaults.font.size=11;
-let D=null,P="day",C={t:null,p:null,m:null,h:null},errPage=1,autoRefresh=true,refreshTimer=null,currentProfile="all";
+let D=null,P="day",C={t:null,p:null,m:null,h:null,hm:null,pr:null},errPage=1,autoRefresh=true,refreshTimer=null,currentProfile="all";
+let MDL="all",USR="all",MT="tokens";
+let DS="",DE="";
 let activeWorkspaceTab="users";
 const ERR_PAGE_SIZE=20;
 const DETAIL_PAGE_SIZE=10;
@@ -3811,11 +3923,43 @@ function ago(iso){if(!iso)return"-";const d=Date.now()-new Date(iso).getTime();c
 function wk(s){const d=new Date(s),day=d.getDay()||7,mon=new Date(d);mon.setDate(d.getDate()-day+1);return mon.toISOString().slice(0,10)}
 function grp(daily,p){const g={};for(const[day,ud]of Object.entries(daily)){const k=p==="week"?wk(day):p==="month"?day.slice(0,7):p==="year"?day.slice(0,4):day;if(!g[k])g[k]={};for(const[u,s]of Object.entries(ud)){if(!g[k][u])g[k][u]={inputTokens:0,outputTokens:0,requests:0,cacheCreationTokens:0,cacheReadTokens:0};g[k][u].inputTokens+=s.inputTokens;g[k][u].outputTokens+=s.outputTokens;g[k][u].requests+=s.requests;g[k][u].cacheCreationTokens+=(s.cacheCreationTokens||0);g[k][u].cacheReadTokens+=(s.cacheReadTokens||0)}}return g}
 function lbl(p,k){if(p==="day")return k.slice(5);if(p==="week")return k.slice(5)+" 周";if(p==="month")return k;return k+"年"}
+// 当前周期窗口（北京时间）：日=今天、周=本周一、月=本月 1 日、年=本年 1 月 1 日。
+function winBounds(){const t=new Date(Date.now()+8*36e5).toISOString().slice(0,10);return{wStart:P==="day"?t:P==="week"?wk(t):P==="month"?t.slice(0,7)+"-01":t.slice(0,4)+"-01-01",td:t}}
+// 四张非 24h 图的有效窗口:日期范围(开始/结束)生效时用它,否则退回周期窗口。
+// 日期范围只做窗口过滤,分桶粒度仍由周期 tabs 控制(两者正交)。
+function effBounds(){
+  if(DS||DE){const t=winBounds().td;return{start:DS||"0000-01-01",end:DE||t,ranged:true}}
+  const{wStart,td}=winBounds();return{start:wStart,end:td,ranged:false};
+}
+function onDateRangeChange(){
+  DS=document.getElementById("dateStart").value||"";
+  DE=document.getElementById("dateEnd").value||"";
+  if(DS&&DE&&DS>DE){[DS,DE]=[DE,DS];document.getElementById("dateStart").value=DS;document.getElementById("dateEnd").value=DE}
+  render();
+}
+// 图表数据源：模型筛选生效时由 dailyModels（已按掩码 key 对齐）重建不含缓存的日粒度数据；
+// 仅用户筛选时过滤 daily；无筛选直接用 daily。与 grp()/totalTokens() 的字段约定兼容。
+function filteredDaily(){
+  if(MDL!=="all"){
+    const out={};
+    for(const[date,users]of Object.entries(D.dailyModels||{})){
+      for(const[u,models]of Object.entries(users)){
+        const v=models[MDL];if(!v)continue;
+        if(!out[date])out[date]={};
+        out[date][u]={inputTokens:v.inputTokens||0,outputTokens:v.outputTokens||0,requests:v.requests||0,cacheCreationTokens:0,cacheReadTokens:0};
+      }
+    }
+    if(USR==="all")return out;
+    const f={};for(const[date,ud]of Object.entries(out)){if(ud[USR])f[date]={[USR]:ud[USR]}}return f;
+  }
+  if(USR==="all")return D.daily||{};
+  const f={};for(const[date,ud]of Object.entries(D.daily||{})){if(ud[USR])f[date]={[USR]:ud[USR]}}return f;
+}
 function c(l,v,cl,k){return'<div class="card"><div class="l">'+l+'</div><div class="v" data-cu="'+v+'"'+(k?' data-cu-k':'')+'>0</div></div>'}
 let chartResizeFrame=0;
 function doughnutLegend(){const compact=innerWidth<1280;return{position:"bottom",labels:{color:"#686863",font:{size:compact?10:11},padding:compact?6:10,boxWidth:compact?16:24}}}
 function trendLegend(){const compact=innerWidth<=820;return{labels:{color:"#686863",font:{size:compact?9:11},padding:compact?6:10,boxWidth:compact?16:40}}}
-function scheduleChartResize(){cancelAnimationFrame(chartResizeFrame);chartResizeFrame=requestAnimationFrame(()=>{for(const chart of[C.p,C.m]){if(chart){chart.options.plugins.legend={display:false};chart.update("none")}}if(C.t){C.t.options.plugins.legend=trendLegend();C.t.update("none")}Object.values(C).forEach(chart=>chart&&chart.resize())})}
+function scheduleChartResize(){cancelAnimationFrame(chartResizeFrame);chartResizeFrame=requestAnimationFrame(()=>{for(const chart of[C.p,C.m]){if(chart){chart.options.plugins.legend={display:false};chart.update("none")}}for(const chart of[C.t,C.hm,C.pr]){if(chart){chart.options.plugins.legend=trendLegend();chart.update("none")}}Object.values(C).forEach(chart=>chart&&chart.resize())})}
 function setWorkspaceTab(tab,focus){
   const next=document.getElementById("workspace-tab-"+tab),panel=document.getElementById("workspace-panel-"+tab);
   if(!next||!panel)return;
@@ -3887,6 +4031,21 @@ function render(){
     }
     sel.value=currentProfile==="all"?"all":currentProfile;
   }
+  // Rebuild chart filter dropdowns on every render (30s refresh), keeping the
+  // current selection; fall back to "all" if the value disappeared from the data.
+  const rebuildFilterSel=(id,entries,allLabel)=>{
+    const el=document.getElementById(id);
+    const keep=el.value||"all";
+    const avail=new Set(entries.map(e=>e[0]));
+    const next=avail.has(keep)?keep:"all";
+    el.innerHTML='<option value="all">'+allLabel+'</option>'+entries.map(e=>'<option value="'+escH(e[0])+'">'+escH(e[1])+'</option>').join("");
+    el.value=next;
+    return next;
+  };
+  const modelEntries=Object.entries(D.models||{}).map(([m,v])=>[m,m+" ("+fmtTk(v.requests||0)+"次)"]).sort((a,b)=>(D.models[b[0]].requests||0)-(D.models[a[0]].requests||0));
+  for(const dh of Object.values(D.hourlyModels||{}))for(const hm of Object.values(dh))for(const m of Object.keys(hm))if(!D.models||!D.models[m])modelEntries.push([m,m]);
+  MDL=rebuildFilterSel("modelSel",modelEntries,"全部模型");
+  USR=rebuildFilterSel("userSel",Object.keys(D.users||{}).map(k=>[k,D.users[k].name]),"全部用户");
   const us=Object.values(D.users),allTokens=us.reduce((s,u)=>s+totalTokens(u),0),tr=us.reduce((s,u)=>s+u.totalRequests,0);
   const td=new Date(Date.now()+8*36e5).toISOString().slice(0,10),tdd=(D.daily||{})[td]||{};
   const todayTokens=Object.values(tdd).reduce((s,d)=>s+totalTokens(d),0),tR=Object.values(tdd).reduce((s,d)=>s+d.requests,0);
@@ -3899,27 +4058,101 @@ function render(){
   const upstreamInfo=D.upstream?(" | 上游: "+D.upstream.replace("https://","").replace("http://","")):"";
   document.getElementById("meta").innerHTML='<span style="color:var(--accent);font-weight:600">方案: '+profileLabel+'</span>'+upstreamInfo+' &nbsp;|&nbsp; 更新于 '+(function(){const d=new Date();const utc=d.getTime()+d.getTimezoneOffset()*60000;return new Date(utc+8*3600000).toLocaleTimeString("zh-CN")})()+" (北京时间) | 每30秒刷新";
 
-  // Charts
-  const g=grp(D.daily||{},P),keys=Object.keys(g).sort(),uks=Object.keys(D.users);
-  if(C.t)C.t.destroy();if(C.p)C.p.destroy();if(C.m)C.m.destroy();if(C.h)C.h.destroy();
-  C.t=new Chart(document.getElementById("trend"),{type:"bar",data:{labels:keys.map(k=>lbl(P,k)),datasets:uks.map((u,i)=>({label:D.users[u].name,data:keys.map(k=>totalTokens(g[k][u])),backgroundColor:COL[i%COL.length]+"cc",borderRadius:3,borderSkipped:false}))},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:trendLegend(),tooltip:{callbacks:{label:ctx=>ctx.dataset.label+": "+fmtT(ctx.raw)}}},scales:{x:{stacked:true,ticks:{color:"#686863",font:{size:10}},grid:{color:"rgba(24,24,22,.08)"}},y:{stacked:true,ticks:{color:"#686863",callback:v=>fmtTk(v)},grid:{color:"rgba(24,24,22,.08)"}}}}});
-  const tot=uks.map(u=>{let t=0;for(const k of keys)t+=totalTokens(g[k][u]);return t});
+  // Charts —— 六图共用全局筛选：P 周期 / MT 指标 / MDL 模型 / USR 用户 / DS+DE 日期范围。
+  // 四张非 24h 图的窗口用 effBounds()(日期范围生效时优先,否则周期窗口);两张 24h 图恒用 winBounds()。
+  const wb=winBounds();
+  const fd0=filteredDaily();
+  const eb=effBounds();
+  let fd=fd0;
+  if(eb.ranged){const rf={};for(const[date,ud]of Object.entries(fd0)){if(date<eb.start||date>eb.end)continue;rf[date]=ud}fd=rf}
+  const g=grp(fd,P),keys=Object.keys(g).sort(),uks=Object.keys(D.users);
+  const val=s=>MT==="requests"?(s.requests||0):totalTokens(s);
+  document.getElementById("trendNote").textContent=MDL!=="all"?"模型筛选：不含缓存 Token":"";
+  if(C.t)C.t.destroy();if(C.p)C.p.destroy();if(C.m)C.m.destroy();if(C.h)C.h.destroy();if(C.hm)C.hm.destroy();if(C.pr)C.pr.destroy();
+  C.t=new Chart(document.getElementById("trend"),{type:"bar",data:{labels:keys.map(k=>lbl(P,k)),datasets:uks.map((u,i)=>({label:D.users[u].name,data:keys.map(k=>val(g[k][u]||{})),backgroundColor:COL[i%COL.length]+"cc",borderRadius:3,borderSkipped:false}))},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:trendLegend(),tooltip:{callbacks:{label:ctx=>ctx.dataset.label+": "+fmtT(ctx.raw)}}},scales:{x:{stacked:true,ticks:{color:"#686863",font:{size:10}},grid:{color:"rgba(24,24,22,.08)"}},y:{stacked:true,ticks:{color:"#686863",callback:v=>fmtTk(v)},grid:{color:"rgba(24,24,22,.08)"}}}}});
+  // 用户分布：按有效窗口累加(默认按日=今天;日期范围生效时按范围),横向柱状图,Y 轴显示用户名完整可读。
+  const tot=uks.map(u=>{let t=0;for(const[date,ud]of Object.entries(fd)){const s=ud[u];if(s)t+=val(s)}return t});
   // 用户分布：横向柱状图，Y 轴显示用户名完整可读。
   const uIdx=tot.map((_,i)=>i).sort((a,b)=>tot[b]-tot[a]);
-  C.p=new Chart(document.getElementById("pie"),{type:"bar",data:{labels:uIdx.map(i=>D.users[uks[i]].name),datasets:[{label:"总 Token",data:uIdx.map(i=>tot[i]),backgroundColor:uIdx.map((_,i)=>COL[i%COL.length]+"cc"),borderWidth:0,borderRadius:3,borderSkipped:false}]},options:{indexAxis:"y",responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false},tooltip:{callbacks:{label:ctx=>fmtT(ctx.raw)+" tokens"}}},scales:{x:{ticks:{color:"#686863",callback:v=>fmtTk(v)},grid:{color:"rgba(24,24,22,.08)"}},y:{ticks:{color:"#686863",font:{size:11},autoSkip:false},grid:{display:false}}}}});
+  C.p=new Chart(document.getElementById("pie"),{type:"bar",data:{labels:uIdx.map(i=>D.users[uks[i]].name),datasets:[{label:MT==="requests"?"请求数":"总 Token",data:uIdx.map(i=>tot[i]),backgroundColor:uIdx.map((_,i)=>COL[i%COL.length]+"cc"),borderWidth:0,borderRadius:3,borderSkipped:false}]},options:{indexAxis:"y",responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false},tooltip:{callbacks:{label:ctx=>MT==="requests"?fmtT(ctx.raw)+" 次请求":fmtT(ctx.raw)+" tokens"}}},scales:{x:{ticks:{color:"#686863",callback:v=>fmtTk(v)},grid:{color:"rgba(24,24,22,.08)"}},y:{ticks:{color:"#686863",font:{size:11},autoSkip:false},grid:{display:false}}}}});
 
-  // 历史缓存没有模型维度，模型分布使用准确的请求数。横向柱状图便于读取模型名。
-  const mods=D.models||{};const mNames=Object.keys(mods);
-  const mReq=mNames.map(m=>mods[m].requests||0);
-  const mIdx=mReq.map((_,i)=>i).sort((a,b)=>mReq[b]-mReq[a]);
-  C.m=new Chart(document.getElementById("modelChart"),{type:"bar",data:{labels:mIdx.map(i=>mNames[i]),datasets:[{label:"请求数",data:mIdx.map(i=>mReq[i]),backgroundColor:mIdx.map((_,i)=>COL[i%COL.length]+"cc"),borderWidth:0,borderRadius:3,borderSkipped:false}]},options:{indexAxis:"y",responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false},tooltip:{callbacks:{label:ctx=>fmtT(ctx.raw)+" 次请求"}}},scales:{x:{ticks:{color:"#686863",callback:v=>fmtTk(v)},grid:{color:"rgba(24,24,22,.08)"}},y:{ticks:{color:"#686863",font:{size:11},autoSkip:false},grid:{display:false}}}}});
+  // 模型请求分布：按有效窗口(日期范围优先,否则周期窗口,北京时间)基于 usage_daily_model
+  // 保留约 400 天的按日模型数据求和，可按用户与指标筛选。横向柱状图便于读取模型名。
+  const dm=D.dailyModels||{};
+  const mAgg={};
+  for(const [date,users] of Object.entries(dm)){
+    if(date<eb.start||date>eb.end)continue;
+    for(const [u,models] of Object.entries(users)){
+      if(USR!=="all"&&u!==USR)continue;
+      for(const [m,v] of Object.entries(models)){
+        if(!mAgg[m])mAgg[m]={requests:0,tokens:0};
+        mAgg[m].requests+=(v.requests||0);mAgg[m].tokens+=((v.inputTokens||0)+(v.outputTokens||0));
+      }
+    }
+  }
+  const mNames=Object.keys(mAgg);
+  const mVal=mNames.map(m=>MT==="requests"?mAgg[m].requests:mAgg[m].tokens);
+  const mIdx=mVal.map((_,i)=>i).sort((a,b)=>mVal[b]-mVal[a]);
+  C.m=new Chart(document.getElementById("modelChart"),{type:"bar",data:{labels:mIdx.map(i=>mNames[i]),datasets:[{label:MT==="requests"?"请求数":"Token",data:mIdx.map(i=>mVal[i]),backgroundColor:mIdx.map((_,i)=>COL[i%COL.length]+"cc"),borderWidth:0,borderRadius:3,borderSkipped:false}]},options:{indexAxis:"y",responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false},tooltip:{callbacks:{label:ctx=>MT==="requests"?fmtT(ctx.raw)+" 次请求":fmtT(ctx.raw)+" tokens"}}},scales:{x:{ticks:{color:"#686863",callback:v=>fmtTk(v)},grid:{color:"rgba(24,24,22,.08)"}},y:{ticks:{color:"#686863",font:{size:11},autoSkip:false},grid:{display:false}}}}});
 
-  // 24小时趋势图
+  // 24小时趋势图：周期窗口内逐日同小时累加（按日=当天真实曲线；周/月/年=各小时累计分布）。
+  // 不受日期范围筛选影响（date input 只作用于其余四图）。
   const hrs=[];for(let i=0;i<24;i++)hrs.push(i.toString().padStart(2,"0")+":00");
-  const todayHourly=(D.hourly||{})[td]||{};
-  const hReq=hrs.map((_,i)=>{const h=todayHourly[i.toString().padStart(2,"0")];return typeof h==="object"?(h.requests||0):0});
-  const hTokens=hrs.map((_,i)=>{const h=todayHourly[i.toString().padStart(2,"0")];return typeof h==="object"?totalTokens(h):0});
+  const hAgg=Array.from({length:24},()=>({requests:0,tokens:0}));
+  for(const [date,hours] of Object.entries(D.hourly||{})){
+    if(date<wb.wStart||date>wb.td)continue;
+    for(const [h,v] of Object.entries(hours)){
+      const i=Number(h);if(!(i>=0&&i<24)||typeof v!=="object")continue;
+      hAgg[i].requests+=(v.requests||0);hAgg[i].tokens+=totalTokens(v);
+    }
+  }
+  const hReq=hAgg.map(a=>a.requests),hTokens=hAgg.map(a=>a.tokens);
   C.h=new Chart(document.getElementById("hourChart"),{type:"line",data:{labels:hrs,datasets:[{label:"请求数",data:hReq,borderColor:"#2f6e50",backgroundColor:"rgba(47,110,80,.12)",fill:true,tension:.28,pointRadius:2,pointBackgroundColor:"#2f6e50",pointHoverRadius:4,borderWidth:2,yAxisID:"y"},{label:"总 Token",data:hTokens,borderColor:"#181816",backgroundColor:"rgba(24,24,22,.08)",fill:true,tension:.28,pointRadius:2,pointBackgroundColor:"#181816",pointHoverRadius:4,borderWidth:2,yAxisID:"y1"}]},options:{responsive:true,maintainAspectRatio:false,interaction:{mode:"index",intersect:false},plugins:{legend:{labels:{color:"#686863",font:{size:11},usePointStyle:true,pointStyle:"circle"}},tooltip:{callbacks:{label:ctx=>ctx.dataset.label+": "+fmtT(ctx.raw)}}},scales:{x:{ticks:{color:"#686863",font:{size:9},maxRotation:0,autoSkip:true,maxTicksLimit:12},grid:{display:false}},y:{type:"linear",position:"left",ticks:{color:"#2f6e50"},grid:{color:"rgba(24,24,22,.08)"},title:{display:true,text:"请求数",color:"#2f6e50",font:{size:10}}},y1:{type:"linear",position:"right",ticks:{color:"#181816",callback:v=>fmtTk(v)},grid:{drawOnChartArea:false},title:{display:true,text:"Tokens",color:"#181816",font:{size:10}}}}}});
+
+  // 24小时模型使用趋势：窗口内同小时累加，按模型分 series 的折线，Y 轴跟随指标筛选。
+  // 模型取窗口总量 Top6，其余合并为「其他」，避免 legend 过长。数据自 usage_hourly_model 表启用日起累积。
+  const hmAgg=Array.from({length:24},()=>({}));
+  for(const [date,hours] of Object.entries(D.hourlyModels||{})){
+    if(date<wb.wStart||date>wb.td)continue;
+    for(const [h,models] of Object.entries(hours)){
+      const i=Number(h);if(!(i>=0&&i<24)||typeof models!=="object")continue;
+      for(const [m,v] of Object.entries(models)){
+        if(!hmAgg[i][m])hmAgg[i][m]={requests:0,tokens:0};
+        hmAgg[i][m].requests+=(v.requests||0);hmAgg[i][m].tokens+=((v.inputTokens||0)+(v.outputTokens||0));
+      }
+    }
+  }
+  const hmTot={};for(const hourAgg of hmAgg)for(const [m,v] of Object.entries(hourAgg))hmTot[m]=(hmTot[m]||0)+(MT==="requests"?v.requests:v.tokens);
+  const topModels=Object.keys(hmTot).sort((a,b)=>hmTot[b]-hmTot[a]).slice(0,6);
+  const hasOther=Object.keys(hmTot).length>topModels.length;
+  const hmSeries=topModels.map(m=>({label:m,data:hmAgg.map(a=>MT==="requests"?((a[m]||{}).requests||0):((a[m]||{}).tokens||0))}));
+  if(hasOther)hmSeries.push({label:"其他",data:hmAgg.map(a=>{let t=0;for(const [m,v] of Object.entries(a))if(!topModels.includes(m))t+=MT==="requests"?v.requests:v.tokens;return t})});
+  C.hm=new Chart(document.getElementById("hourModelChart"),{type:"line",data:{labels:hrs,datasets:hmSeries.map((s,i)=>({label:s.label,data:s.data,borderColor:COL[i%COL.length],backgroundColor:COL[i%COL.length]+"22",fill:i===0,tension:.28,pointRadius:2,pointBackgroundColor:COL[i%COL.length],pointHoverRadius:4,borderWidth:2}))},options:{responsive:true,maintainAspectRatio:false,interaction:{mode:"index",intersect:false},plugins:{legend:trendLegend(),tooltip:{callbacks:{label:ctx=>ctx.dataset.label+": "+fmtT(ctx.raw)+(MT==="requests"?" 次请求":" tokens")}}},scales:{x:{ticks:{color:"#686863",font:{size:9},maxRotation:0,autoSkip:true,maxTicksLimit:12},grid:{display:false}},y:{ticks:{color:"#686863",callback:v=>fmtTk(v)},grid:{color:"rgba(24,24,22,.08)"}}}}});
+
+  // 方案请求情况：跨方案维度（恒为全部方案，不随方案下拉收窄），按周期分桶的堆叠柱。
+  // 统计逻辑与 Token 用量趋势一致:默认全史按周期分桶,日期范围生效时才收窄窗口。
+  // 模型筛选生效时切换到 profileDailyModels 数据源（不含缓存 Token）。
+  document.getElementById("profileNote").textContent=MDL!=="all"?"模型筛选：不含缓存 Token":"";
+  const pdBase=MDL==="all"?(D.profileDaily||{}):(D.profileDailyModels||{});
+  const suffixName={};for(const p of (Array.isArray(D.profiles)?D.profiles:[]))suffixName[p.suffix]=p.name;
+  const pBuckets={};
+  for(const [sfx,days] of Object.entries(pdBase)){
+    for(const [date,entry] of Object.entries(days)){
+      if(eb.ranged&&(date<eb.start||date>eb.end))continue;
+      const k=P==="week"?wk(date):P==="month"?date.slice(0,7):P==="year"?date.slice(0,4):date;
+      if(!pBuckets[k])pBuckets[k]={};
+      if(!pBuckets[k][sfx])pBuckets[k][sfx]={requests:0,tokens:0};
+      if(MDL==="all"){
+        pBuckets[k][sfx].requests+=(entry.requests||0);pBuckets[k][sfx].tokens+=totalTokens(entry);
+      }else{
+        const v=entry[MDL]||{};
+        pBuckets[k][sfx].requests+=(v.requests||0);pBuckets[k][sfx].tokens+=((v.inputTokens||0)+(v.outputTokens||0));
+      }
+    }
+  }
+  const pSorted=Object.keys(pBuckets).sort();
+  const pSfx=Object.keys(pdBase).sort();
+  C.pr=new Chart(document.getElementById("profileChart"),{type:"bar",data:{labels:pSorted.map(k=>lbl(P,k)),datasets:pSfx.map((sfx,i)=>({label:suffixName[sfx]||sfx,data:pSorted.map(k=>{const s=(pBuckets[k]||{})[sfx];return s?(MT==="requests"?s.requests:s.tokens):0}),backgroundColor:COL[i%COL.length]+"cc",borderRadius:3,borderSkipped:false}))},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:trendLegend(),tooltip:{callbacks:{label:ctx=>ctx.dataset.label+": "+fmtT(ctx.raw)+(MT==="requests"?" 次请求":" tokens")}}},scales:{x:{stacked:true,ticks:{color:"#686863",font:{size:10}},grid:{color:"rgba(24,24,22,.08)"}},y:{stacked:true,ticks:{color:"#686863",callback:v=>fmtTk(v)},grid:{color:"rgba(24,24,22,.08)"}}}}});
 
   // User table
   const ut=document.querySelector("#uTable tbody");
@@ -3944,6 +4177,10 @@ function render(){
 async function load(){try{const profile=currentProfile==="all"?"all":currentProfile;const r=await fetch("/api/stats"+(profile?"?profile="+encodeURIComponent(profile):""));D=await r.json();render()}catch(e){document.getElementById("meta").textContent="Error: "+e.message}}
 function toggleSec(id){const body=document.getElementById(id+"Body");const icon=document.getElementById(id+"Icon");const open=body.classList.toggle("open");icon.classList.toggle("open",open)}
 document.querySelectorAll(".tab").forEach(b=>b.addEventListener("click",()=>{document.querySelectorAll(".tab").forEach(x=>x.classList.remove("on"));b.classList.add("on");P=b.dataset.p;resetDetailGrouping();render()}));
+document.getElementById("metricSel").addEventListener("change",e=>{MT=e.target.value;render()});
+document.getElementById("modelSel").addEventListener("change",e=>{MDL=e.target.value;resetDetailGrouping();render()});
+document.getElementById("userSel").addEventListener("change",e=>{USR=e.target.value;render()});
+function resetChartFilters(){P="day";MT="tokens";MDL="all";USR="all";DS="";DE="";document.querySelectorAll("#globalTabs .tab").forEach(x=>x.classList.toggle("on",x.dataset.p==="day"));document.getElementById("metricSel").value="tokens";document.getElementById("modelSel").value="all";document.getElementById("userSel").value="all";document.getElementById("dateStart").value="";document.getElementById("dateEnd").value="";resetDetailGrouping();render()}
 document.querySelectorAll(".workspace-tab").forEach(button=>{button.addEventListener("click",()=>setWorkspaceTab(button.id.replace("workspace-tab-","")));button.addEventListener("keydown",handleWorkspaceTabKeydown)});
 document.getElementById("clearErrors").addEventListener("click",async()=>{if(confirm("确定清除所有错误记录？")){const csrf=(document.cookie.match(/tm_csrf=([^;]+)/)||[])[1]||'';await fetch("/api/clear-errors",{method:"POST",headers:{"x-csrf-token":csrf}});toast('错误记录已清除');errPage=1;load()}});
 function startAutoRefresh(){if(refreshTimer)clearInterval(refreshTimer);refreshTimer=setInterval(()=>{if(autoRefresh)load()},30000)}
@@ -4043,7 +4280,7 @@ table{width:100%;border-collapse:collapse;min-width:560px}th{text-align:left;pad
 <div class="cards" id="cards"></div>
 <div class="box"><h3>今日24小时趋势</h3><canvas id="hourChart"></canvas></div>
 <div class="box"><h3>近7天趋势</h3><canvas id="trendChart"></canvas></div>
-<div class="box"><h3>今日模型请求</h3><table id="modelTable"><thead><tr><th>模型</th><th class="n">请求数</th></tr></thead><tbody></tbody></table></div>
+<div class="box"><h3>今日模型请求</h3><table id="modelTable"><thead><tr><th>模型</th><th class="n">请求数</th><th class="n">Token</th></tr></thead><tbody></tbody></table></div>
 <script>
 ${UI_HELPERS}
 ${TOAST_JS}
@@ -4093,8 +4330,8 @@ function render(){
   // Model table
   const mt=document.querySelector("#modelTable tbody");
   const models=Object.entries(D.models||{}).sort((a,b)=>b[1].requests-a[1].requests);
-  if(!models.length){mt.innerHTML='<tr><td colspan="2" style="text-align:center;color:var(--dim)">暂无数据</td></tr>'}else{
-    mt.innerHTML=models.map(([m,d])=>'<tr><td style="color:var(--blue)">'+m+'</td><td class="n">'+fmtT(d.requests)+'</td></tr>').join("");
+  if(!models.length){mt.innerHTML='<tr><td colspan="3" style="text-align:center;color:var(--dim)">暂无数据</td></tr>'}else{
+    mt.innerHTML=models.map(([m,d])=>'<tr><td style="color:var(--blue)">'+m+'</td><td class="n">'+fmtT(d.requests)+'</td><td class="n" title="输入 '+fmtT(d.inputTokens||0)+' / 输出 '+fmtT(d.outputTokens||0)+'">'+fmtTk(d.total||0)+'</td></tr>').join("");
   }
 }
 load();setInterval(load,30000);
@@ -4134,7 +4371,7 @@ function applySettings(formData) {
     if (nextSuffix !== oldSuffix) {
       editingProfile.suffix = nextSuffix;
       // Rename the profile column across all usage tables.
-      for (const table of ["users", "usage_daily", "usage_daily_model", "usage_daily_hourly", "usage_model", "usage_hourly", "errors"]) {
+      for (const table of ["users", "usage_daily", "usage_daily_model", "usage_daily_hourly", "usage_hourly_model", "usage_model", "usage_hourly", "errors"]) {
         db.prepare(`UPDATE ${table} SET profile = ? WHERE profile = ?`).run(nextSuffix, oldSuffix);
       }
     }
@@ -4866,8 +5103,14 @@ const server = http.createServer((req, res) => {
     // Add profile list for dropdown
     data.profiles = listProfiles();
     data.profileSummaries = getProfileSummaries();
-    res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify(data));
+    // Chart feeds: hourly×model trend (scoped to current profile view) and
+    // cross-profile daily aggregates (always all profiles — the profile chart
+    // is a cross-profile dimension and must not shrink with the profile filter).
+    const scopedSuffix = profileSuffix === "all" ? null : normalizeProfileSuffix(profileSuffix);
+    data.hourlyModels = loadHourlyModels(scopedSuffix);
+    data.profileDaily = loadProfileDaily();
+    data.profileDailyModels = loadProfileDailyModels();
+    sendJson(res, data, req);
     return;
   }
 
@@ -4894,7 +5137,7 @@ const server = http.createServer((req, res) => {
           delete config.profiles[pname].users[key];
         }
         const tx = db.transaction(() => {
-          for (const table of ["users", "usage_daily", "usage_daily_model", "usage_daily_hourly", "errors", "quota_adjust_history"]) {
+          for (const table of ["users", "usage_daily", "usage_daily_model", "usage_daily_hourly", "usage_hourly_model", "errors", "quota_adjust_history"]) {
             db.prepare(`DELETE FROM ${table} WHERE user_key=?`).run(key);
           }
           saveConfig(config);
@@ -4951,7 +5194,7 @@ const server = http.createServer((req, res) => {
         if (!key) throw new Error("Key required");
         backupDatabaseSync("stats-user-delete");
         const tx = db.transaction(() => {
-          for (const table of ["users", "usage_daily", "usage_daily_model", "usage_daily_hourly", "errors", "quota_adjust_history"]) {
+          for (const table of ["users", "usage_daily", "usage_daily_model", "usage_daily_hourly", "usage_hourly_model", "errors", "quota_adjust_history"]) {
             db.prepare(`DELETE FROM ${table} WHERE user_key=?`).run(key);
           }
         });
@@ -4981,6 +5224,7 @@ const server = http.createServer((req, res) => {
         const tx = db.transaction(() => {
           db.prepare("DELETE FROM usage_model WHERE model=?").run(model);
           db.prepare("DELETE FROM usage_daily_model WHERE model=?").run(model);
+          db.prepare("DELETE FROM usage_hourly_model WHERE model=?").run(model);
         });
         tx();
         console.log(`[STATS] Deleted residual stats for model: ${model}`);

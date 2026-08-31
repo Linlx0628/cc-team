@@ -1,18 +1,20 @@
 # CC Team
 
-面向 Claude Code 团队的 Anthropic Messages 用量网关。CC Team 将请求透明转发到多个兼容上游，通过虚拟 Key 管理成员访问，并提供 Token 统计、每日配额、错误记录和明亮极简的可视化工作台。
+面向 Claude Code 与 Codex 团队的 AI 编码网关。CC Team 将请求透明转发到多个兼容上游，通过虚拟 Key 管理成员访问，并提供 Token 统计、每日配额、错误记录和明亮极简的可视化工作台。
 
-项目只支持 Claude Code 使用的 Anthropic Messages 协议，不提供 OpenAI Chat Completions、Responses 或 Models 兼容接口。
+Claude Code 走 Anthropic Messages 协议（`/v1/messages`），Codex 走 OpenAI Responses 协议（`/v1/responses`）。两种协议的方案完全隔离：各自路由、各自默认组 failover，互不接管。不提供 OpenAI Chat Completions 兼容接口。
 
 ![CC Team Dashboard](docs/Introduction.png)
 
 ## 功能
 
 - 多个 Anthropic Messages 上游同时在线，通过 URL 后缀区分方案
+- Codex 透传接入：OpenAI Responses 协议（`/v1/responses`），上游需为原生 Responses 端点（如智谱 `https://open.bigmodel.cn/api/v1`）
+- Responses 方案组独立 failover，与 Anthropic 方案严格隔离
 - 每位成员使用独立的 `jx-` 虚拟 Key，真实上游 Key 不暴露
-- 按成员、方案、模型、日期和小时统计 Token 用量
+- 按成员、方案、模型、日期和小时统计 Token 用量（含缓存 token）
 - 方案级与成员级每日配额，北京时间零点重置
-- 统一的 `alias=实际模型` 模型别名配置
+- 统一的 `alias=实际模型` 模型别名配置，对 Claude Code 与 Codex 同样生效
 - 模型准入、并发限制、速率限制、重试和熔断保护
 - 桌面单屏 Dashboard、设置页与成员个人用量页
 - Dashboard 内置用户用量、周期明细、方案中心和错误记录工作区
@@ -74,6 +76,7 @@ node server.mjs
   "profiles": {
     "glm": {
       "suffix": "glm",
+      "protocol": "anthropic",
       "isDefault": true,
       "upstream": "https://open.bigmodel.cn/api/anthropic",
       "dailyTokenLimit": 2000000,
@@ -90,6 +93,20 @@ node server.mjs
           "dailyTokenLimit": null
         }
       }
+    },
+    "glm-codex": {
+      "suffix": "glmcodex",
+      "protocol": "responses",
+      "upstream": "https://open.bigmodel.cn/api/v1",
+      "allowedModels": ["glm-5.3"],
+      "modelAliases": { "gpt-5.3": "glm-5.3" },
+      "users": {
+        "jx-example-user": {
+          "key": "real-upstream-key",
+          "disabled": false,
+          "dailyTokenLimit": null
+        }
+      }
     }
   },
   "users": {
@@ -99,6 +116,7 @@ node server.mjs
       "disabled": false
     }
   },
+  "responsesProfileGroup": ["glm-codex"],
   "proxy": {
     "timeout": 180000,
     "streamTimeout": 600000,
@@ -134,6 +152,34 @@ export ANTHROPIC_API_KEY="jx-your-virtual-key"
 ```
 
 所有方案同时在线。管理员可在设置页选择默认入口，默认方案的后缀入口仍然可用。
+
+## 接入 Codex
+
+Codex 使用 OpenAI Responses 协议。先在设置页创建一个接口协议为 **OpenAI Responses** 的方案，上游填原生 Responses 端点（例如智谱 GLM Coding Plan 的 `https://open.bigmodel.cn/api/v1`），并把该方案加入「Responses 方案组」。
+
+默认入口（Responses 方案组按序 failover）：
+
+```toml
+# ~/.codex/config.toml
+model_provider = "cc_team"
+model = "glm-5.3"
+
+[model_providers.cc_team]
+name = "CC Team"
+base_url = "http://localhost:6789/v1"
+experimental_bearer_token = "jx-your-virtual-key"
+wire_api = "responses"
+```
+
+指定方案时把 base_url 改为带后缀地址（`http://localhost:6789/<suffix>/v1`，如 `http://localhost:6789/glmcodex/v1`）。
+
+说明：
+
+- Codex 的 `Authorization: Bearer jx-...` 与 Claude Code 共用同一套虚拟 Key 与成员体系
+- `/v1/models` 由网关本地合成（来自方案的允许模型与别名），不会打到上游
+- 模型别名（如 `gpt-5.3=glm-5.3`）与高峰时段切换对 Codex 同样生效
+- Responses 方案与 Anthropic 方案完全隔离：`/v1/messages` 永远不会落到 Responses 方案，反之亦然；交叉访问会返回明确的错误提示
+- 网关对 Responses 流量做字节级透传，只在旁路解析用量（含 `cached_tokens` 缓存统计），协议正确性由上游保证
 
 ## 用户与配额
 
@@ -175,7 +221,8 @@ export ANTHROPIC_API_KEY="jx-your-virtual-key"
 
 - 旧 `defaultModels` 会迁移为普通 `modelAliases`；已经存在的同名 `modelAliases` 优先。
 - `apiProtocol`、`openaiStreamUsage` 和 `responsesAdapter` 等旧协议字段会被移除。
-- OpenAI 协议方案不再受支持。升级时会先在 `backups/` 中备份 `config.json` 和 SQLite，再删除这些方案及其关联统计数据。
+- 旧 OpenAI 协议方案（`apiProtocol: "openai"`，Chat Completions 时代）不再受支持，升级时会先在 `backups/` 中备份 `config.json` 和 SQLite，再删除这些方案及其关联统计数据。新的 Responses 支持使用独立的 `protocol` 字段，与旧字段无关。
+- 所有既有方案会自动补上 `protocol: "anthropic"` 字段；`responsesProfileGroup` 初始化为空。
 - 如果仍需保留旧 OpenAI 方案，请在升级前备份整个数据目录，并继续使用支持该协议的旧版本。
 
 ## 页面
@@ -196,12 +243,15 @@ Anthropic Messages 代理使用虚拟 Key 鉴权。管理类写入接口除登�
 | --- | --- | --- |
 | `/v1/messages` | POST | 默认方案的 Anthropic Messages 代理 |
 | `/:suffix/v1/messages` | POST | 指定方案的 Anthropic Messages 代理 |
+| `/v1/responses` | POST | Responses 方案组的 OpenAI Responses 代理（Codex 入口，组内 failover） |
+| `/:suffix/v1/responses` | POST | 指定 Responses 方案的代理 |
+| `/v1/models`、`/:suffix/v1/models` | GET | 本地合成的模型列表（Responses 池，需虚拟 Key） |
 | `/api/stats` | GET | 团队统计 |
 | `/api/my-usage` | GET | Bearer Key 对应的个人统计 |
 | `/api/settings` | GET / POST | 读取或更新设置 |
 | `/api/settings-save` | POST | 保存设置页表单 |
 | `/api/profile/save` | POST | 创建方案 |
-| `/api/profile/default` | POST | 设置默认方案 |
+| `/api/profile/default` | POST | 设置方案组默认入口 |
 | `/api/profile/delete` | POST | 删除方案 |
 | `/api/global-user/save` | POST | 保存用户与方案分配 |
 | `/api/global-user/delete` | POST | 删除用户及其可识别历史 |
@@ -209,7 +259,7 @@ Anthropic Messages 代理使用虚拟 Key 鉴权。管理类写入接口除登�
 | `/api/data-import/apply` | POST | 合并或替换导入 |
 | `/api/data-clear` | POST | 验证密码并清空全部数据 |
 
-`/v1/responses`、`/v1/chat/completions` 和 `/v1/models` 会明确返回不支持，不会转发到上游。
+`/v1/chat/completions` 和 `GET /v1/responses/{id}` 会明确返回不支持，不会转发到上游。
 
 ## 数据文件
 

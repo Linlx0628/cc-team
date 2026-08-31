@@ -108,8 +108,14 @@ const dashboardPassword = config.dashboardPassword || "";
 const dataPath = path.join(__dirname, "data.json");
 const dbPath = path.join(__dirname, "data.db");
 const backupDir = path.join(__dirname, "backups");
-const RESERVED_SUFFIXES = new Set(["dashboard", "settings", "api", "health", "usage", "my-usage", "v1", "login", "logout", "favicon", "robots", "js", "css"]);
+const RESERVED_SUFFIXES = new Set(["dashboard", "settings", "api", "health", "usage", "my-usage", "v1", "login", "logout", "favicon", "robots", "js", "css", "responses", "models"]);
 const PROFILE_SUFFIX_RE = /^[a-z0-9_-]{2,20}$/;
+
+// A profile serves exactly one client protocol. The two pools are strictly
+// isolated: routing, default groups and failover never cross protocols.
+function normalizeProfileProtocol(value) {
+  return String(value || "").trim().toLowerCase() === "responses" ? "responses" : "anthropic";
+}
 
 function totalUsageTokens(usage = {}) {
   return (usage.inputTokens ?? usage.input_tokens ?? usage.input ?? 0) +
@@ -486,6 +492,39 @@ function formatPeakHoursSummary(ranges) {
   }
 })();
 
+// Auto-migrate: per-profile protocol (anthropic | responses) + the responses
+// failover group. Existing profiles stay anthropic; the responses group only
+// ever holds responses profiles.
+(function migrateProfileProtocol() {
+  let migrated = false;
+  for (const profile of Object.values(config.profiles)) {
+    const protocol = normalizeProfileProtocol(profile.protocol);
+    if (profile.protocol !== protocol) {
+      profile.protocol = protocol;
+      migrated = true;
+    }
+  }
+  if (!Array.isArray(config.responsesProfileGroup)) {
+    config.responsesProfileGroup = [];
+    migrated = true;
+  } else {
+    const valid = [];
+    for (const name of config.responsesProfileGroup) {
+      if (config.profiles[name] && normalizeProfileProtocol(config.profiles[name].protocol) === "responses" && !valid.includes(name)) {
+        valid.push(name);
+      }
+    }
+    if (valid.length !== config.responsesProfileGroup.length) {
+      config.responsesProfileGroup = valid;
+      migrated = true;
+    }
+  }
+  if (migrated) {
+    saveConfig(config);
+    console.log(`[MIGRATE] Added profile protocol field; responses group: ${JSON.stringify(config.responsesProfileGroup)}`);
+  }
+})();
+
 function getDefaultProfileName() {
   const group = Array.isArray(config.defaultProfileGroup) ? config.defaultProfileGroup : [];
   for (const name of group) {
@@ -512,9 +551,11 @@ function getProfileNameBySuffix(suffix) {
 
 function listProfiles() {
   const group = Array.isArray(config.defaultProfileGroup) ? config.defaultProfileGroup : [];
+  const responsesGroup = Array.isArray(config.responsesProfileGroup) ? config.responsesProfileGroup : [];
   return Object.keys(config.profiles).map(name => ({
     name,
     suffix: normalizeProfileSuffix(config.profiles[name].suffix),
+    protocol: normalizeProfileProtocol(config.profiles[name].protocol),
     isDefault: !!config.profiles[name].isDefault,
     billingType: config.profiles[name].billingType || "on_demand",
     upstream: config.profiles[name].upstream,
@@ -527,6 +568,8 @@ function listProfiles() {
     configured: !!config.profiles[name].upstream,
     inDefaultGroup: group.includes(name),
     groupOrder: group.indexOf(name),
+    inResponsesGroup: responsesGroup.includes(name),
+    responsesGroupOrder: responsesGroup.indexOf(name),
   }));
 }
 
@@ -625,6 +668,7 @@ function createProfileRuntime(profileName, profile) {
   return {
     profileName,
     suffix: normalizeProfileSuffix(profile.suffix),
+    protocol: normalizeProfileProtocol(profile.protocol),
     isDefault: !!profile.isDefault,
     billingType: profile.billingType || "on_demand",
     upstream: profile.upstream,
@@ -694,6 +738,19 @@ function getDefaultRuntime() {
 
 function syncDefaultRuntime() {
   rt = getDefaultRuntime();
+}
+
+// Head of the responses failover group — the default entry for /v1/responses.
+// Returns null when no responses profile is configured.
+function getResponsesDefaultRuntime() {
+  const group = Array.isArray(config.responsesProfileGroup) ? config.responsesProfileGroup : [];
+  for (const name of group) {
+    const profile = config.profiles[name];
+    if (!profile) continue;
+    const runtime = runtimes[normalizeProfileSuffix(profile.suffix)];
+    if (runtime && runtime.protocol === "responses") return runtime;
+  }
+  return null;
 }
 
 // ─── Profile Route Resolver ─────────────────────────────────────────────────
@@ -1443,6 +1500,27 @@ function getAvailableDefaultProfiles(apiKey) {
     const suffix = normalizeProfileSuffix(profile.suffix);
     const runtime = runtimes[suffix];
     if (!runtime) continue;
+    if (runtime.protocol !== "anthropic") continue;
+    if (isRateLimited(name)) continue;
+    if (runtime.breaker.status().state === "OPEN") continue;
+    if (!canUseProfile(apiKey, runtime)) continue;
+    out.push({ name, suffix, runtime });
+  }
+  return out;
+}
+
+// Ordered failover candidates for the /v1/responses entry. Mirrors
+// getAvailableDefaultProfiles but reads the responses group and only ever
+// yields responses-protocol profiles.
+function getAvailableResponsesProfiles(apiKey) {
+  const group = Array.isArray(config.responsesProfileGroup) ? config.responsesProfileGroup : [];
+  const out = [];
+  for (const name of group) {
+    const profile = config.profiles[name];
+    if (!profile) continue;
+    const suffix = normalizeProfileSuffix(profile.suffix);
+    const runtime = runtimes[suffix];
+    if (!runtime || runtime.protocol !== "responses") continue;
     if (isRateLimited(name)) continue;
     if (runtime.breaker.status().state === "OPEN") continue;
     if (!canUseProfile(apiKey, runtime)) continue;
@@ -1620,6 +1698,7 @@ function getProfileSummaries() {
     return {
       name: profile.name,
       suffix: profile.suffix,
+      protocol: profile.protocol,
       isDefault: profile.isDefault,
       billingType: profile.billingType,
       peakHours: normalizePeakHours(profile.peakHours),
@@ -1631,6 +1710,8 @@ function getProfileSummaries() {
       rateLimit: getRateLimitInfo(profile.name),
       inDefaultGroup: profile.inDefaultGroup,
       groupOrder: profile.groupOrder,
+      inResponsesGroup: profile.inResponsesGroup,
+      responsesGroupOrder: profile.responsesGroupOrder,
     };
   });
 }
@@ -1786,11 +1867,105 @@ function resolveModel(model, _rt) {
   return model;
 }
 
-function isUnsupportedOpenAIPath(reqUrl) {
-  const pathname = new URL(reqUrl || "/", "http://localhost").pathname;
-  return pathname === "/v1/responses" || pathname.endsWith("/responses") ||
-    pathname === "/v1/chat/completions" || pathname.endsWith("/chat/completions") ||
-    pathname === "/v1/models" || pathname.endsWith("/models");
+// ─── Inbound Protocol Dispatch ───────────────────────────────────────────────
+// Codex speaks the OpenAI Responses API (POST /v1/responses) and probes
+// GET /v1/models; Claude Code speaks Anthropic Messages (POST /v1/messages).
+// The two profile pools are strictly isolated and never cross-route.
+function classifyInboundPath(reqUrl, method) {
+  const pathname = decodeURIComponent(new URL(reqUrl || "/", "http://localhost").pathname);
+  const upperMethod = String(method || "GET").toUpperCase();
+  const suffixSeg = pathname.match(/^\/([a-zA-Z0-9_-]{2,20})(\/.*)?$/);
+  const suffix = suffixSeg && !RESERVED_SUFFIXES.has(suffixSeg[1].toLowerCase())
+    ? suffixSeg[1].toLowerCase()
+    : null;
+
+  if (pathname.endsWith("/chat/completions")) {
+    return { kind: "unsupported", reason: "chat_completions" };
+  }
+  if (/\/(v1\/)?responses\/[^/]+$/.test(pathname)) {
+    // e.g. GET /v1/responses/{id} — Codex runs store:false and never retrieves.
+    return { kind: "unsupported", reason: "responses_retrieval" };
+  }
+
+  const isModels = pathname === "/v1/models" || pathname === "/models" ||
+    (!!suffix && (suffixSeg[2] === "/v1/models" || suffixSeg[2] === "/models"));
+  if (isModels) {
+    if (upperMethod !== "GET" && upperMethod !== "HEAD") return { kind: "unsupported", reason: "method" };
+    return { kind: "models", suffix, isDefaultEntry: !suffix };
+  }
+
+  const isResponses = pathname === "/v1/responses" || pathname === "/responses" ||
+    (!!suffix && (suffixSeg[2] === "/v1/responses" || suffixSeg[2] === "/responses"));
+  if (isResponses) {
+    if (upperMethod !== "POST") return { kind: "unsupported", reason: "method" };
+    return { kind: "responses", suffix, isDefaultEntry: !suffix };
+  }
+
+  return { kind: "anthropic", suffix, isDefaultEntry: pathname === "/v1" || pathname.startsWith("/v1/") };
+}
+
+function unsupportedInboundMessage(reason) {
+  if (reason === "chat_completions") return "Chat Completions is not supported. Codex must use the Responses API (POST /v1/responses) against a responses-protocol profile.";
+  if (reason === "responses_retrieval") return "Response retrieval is not supported: Codex runs with store:false and replays the full conversation each turn.";
+  if (reason === "method") return "Unsupported HTTP method for this endpoint.";
+  return "Unsupported endpoint.";
+}
+
+function sendOpenAiError(res, status, code, message, extraHeaders = {}) {
+  res.writeHead(status, { "Content-Type": "application/json", ...extraHeaders });
+  res.end(JSON.stringify({ error: { code, message } }));
+}
+
+// Codex probes GET /v1/models to build its model picker. Serve it locally from
+// the responses pool so client probes never touch upstream billing endpoints.
+function handleLocalModelsRequest(req, res, inbound) {
+  const apiKey = getApiKey(req);
+  const runtime = inbound.suffix ? runtimes[inbound.suffix] : getResponsesDefaultRuntime();
+  if (!runtime || runtime.protocol !== "responses") {
+    if (inbound.suffix) {
+      sendOpenAiError(res, 404, "profile_not_found", `No responses-protocol profile with suffix "${inbound.suffix}".`);
+    } else {
+      sendOpenAiError(res, 503, "no_responses_profile", "No responses profile configured yet. Create one in Settings to use Codex.");
+    }
+    return;
+  }
+  if (!canUseProfile(apiKey, runtime).allowed) {
+    sendOpenAiError(res, 401, "invalid_api_key", "Invalid API key for this profile.");
+    return;
+  }
+  const ids = new Set((runtime.allowedModels || []).filter((m) => m && m !== "*"));
+  const aliases = effectiveModelAliases(runtime);
+  for (const [alias, target] of Object.entries(aliases)) {
+    if (alias) ids.add(alias);
+    if (target) ids.add(target);
+  }
+  const body = JSON.stringify({
+    object: "list",
+    data: [...ids].map((id) => ({ id, object: "model", created: 0, owned_by: "cc-team" })),
+  });
+  res.writeHead(200, { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(body) });
+  res.end(req.method === "HEAD" ? undefined : body);
+}
+
+// Resolve the serving runtime for an inbound Responses request. Default entry
+// (/v1/responses) targets the responses group head; a suffix entry must hit a
+// responses-protocol profile or fail with a clear cross-protocol error.
+function resolveResponsesProfile(inbound, url) {
+  const query = url.includes("?") ? url.slice(url.indexOf("?")) : "";
+  const strippedUrl = "/v1/responses" + query;
+  if (inbound.suffix) {
+    const runtime = runtimes[inbound.suffix];
+    if (!runtime) return { error: `Unknown profile suffix "${inbound.suffix}"` };
+    if (runtime.protocol !== "responses") {
+      return {
+        error: `方案 "${runtime.profileName}" 是 Anthropic Messages 方案，不能通过 /v1/responses 访问。请为 Codex 创建 protocol 为 responses 的方案。`,
+      };
+    }
+    return { suffix: inbound.suffix, runtime, strippedUrl, isDefaultEntry: false };
+  }
+  const runtime = getResponsesDefaultRuntime();
+  if (!runtime) return { noResponsesProfile: true };
+  return { suffix: runtime.suffix, runtime, strippedUrl, isDefaultEntry: true };
 }
 
 function mergeUsageCounters(target, source) {
@@ -1809,7 +1984,11 @@ function mergeUsageCounters(target, source) {
     target.output_tokens = total;
   }
   const cacheCreation = toTokenNumber(source.cache_creation_input_tokens);
-  const cacheRead = toTokenNumber(source.cache_read_input_tokens);
+  // Responses API nests cached tokens under input_tokens_details; chat-completions
+  // upstreams use prompt_tokens_details. Both map onto the cache-read counter.
+  const cacheRead = toTokenNumber(source.cache_read_input_tokens ??
+    source.input_tokens_details?.cached_tokens ??
+    source.prompt_tokens_details?.cached_tokens);
   if (cacheCreation !== null) target.cache_creation_input_tokens = cacheCreation;
   if (cacheRead !== null) target.cache_read_input_tokens = cacheRead;
 }
@@ -1846,7 +2025,9 @@ function recordUsage(apiKey, usage, model, suffix, _rt) {
   let out = toTokenNumber(usage.output_tokens ?? usage.completion_tokens);
   if (!inp && !out && usage.total_tokens) out = toTokenNumber(usage.total_tokens);
   const cacheC = toTokenNumber(usage.cache_creation_input_tokens);
-  const cacheR = toTokenNumber(usage.cache_read_input_tokens);
+  const cacheR = toTokenNumber(usage.cache_read_input_tokens ??
+    usage.input_tokens_details?.cached_tokens ??
+    usage.prompt_tokens_details?.cached_tokens);
   const m = model || "unknown";
 
   pruneOldDataIfNewDay();
@@ -2335,25 +2516,55 @@ function sendUpstream(body, reqUrl, reqMethod, reqHeaders, timeout, _rt, clientS
 }
 
 function proxyRequest(req, res) {
-  if (isUnsupportedOpenAIPath(req.url)) {
-    res.writeHead(404, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ error: "OpenAI endpoints are not supported. Use the Anthropic Messages API with Claude Code." }));
+  const inbound = classifyInboundPath(req.url, req.method);
+  if (inbound.kind === "unsupported") {
+    sendOpenAiError(res, 404, "unsupported_endpoint", unsupportedInboundMessage(inbound.reason));
     return;
   }
-  // Resolve which profile this request targets
-  const resolvedProfile = resolveProfile(req.url);
+  if (inbound.kind === "models") {
+    handleLocalModelsRequest(req, res, inbound);
+    return;
+  }
+
+  // Resolve which profile this request targets, scoped to the inbound protocol.
+  const protocol = inbound.kind;
+  const resolvedProfile = protocol === "responses"
+    ? resolveResponsesProfile(inbound, req.url)
+    : resolveProfile(req.url);
+  if (resolvedProfile.noResponsesProfile) {
+    sendOpenAiError(res, 503, "no_responses_profile", "No responses profile configured yet. Create one in Settings to use Codex.");
+    return;
+  }
   if (resolvedProfile.error) {
-    res.writeHead(404, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ error: resolvedProfile.error }));
+    if (protocol === "responses") {
+      sendOpenAiError(res, 404, "invalid_request", resolvedProfile.error);
+    } else {
+      res.writeHead(404, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: resolvedProfile.error }));
+    }
     return;
   }
   const { suffix, runtime, strippedUrl } = resolvedProfile;
   if (!runtime) {
-    res.writeHead(503, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ error: "No configured proxy profile. Open Settings to configure an Anthropic upstream." }));
+    if (protocol === "responses") {
+      sendOpenAiError(res, 503, "no_responses_profile", "No responses profile configured yet. Create one in Settings to use Codex.");
+    } else {
+      res.writeHead(503, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "No configured proxy profile. Open Settings to configure an Anthropic upstream." }));
+    }
     return;
   }
   const apiKey = getApiKey(req);
+
+  // Cross-protocol guard: an Anthropic-protocol request must never be served by
+  // a responses profile, even via direct suffix access (and vice versa above).
+  if (protocol === "anthropic" && runtime.protocol !== "anthropic") {
+    res.writeHead(400, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ error: `方案 "${runtime.profileName}" 是 Responses(Codex) 方案，不能通过 /v1/messages 访问。请通过 /v1/responses 或 /${suffix}/v1/responses 使用。` }));
+    recordError(apiKey, 400, `cross_protocol: /${suffix} Responses 方案收到 /v1/messages 请求`, req.url, "unknown", suffix, runtime);
+    console.log(`[拦截] ${getUserName(apiKey, runtime)} 跨协议访问被拒 /${suffix} 是 Responses 方案`);
+    return;
+  }
 
   // Reject non-API requests (browser favicon, Chrome DevTools, etc.) before any group check.
   // These requests carry no auth header (apiKey === "unknown") and would otherwise be mis-logged
@@ -2364,22 +2575,29 @@ function proxyRequest(req, res) {
     return;
   }
 
-  // Group members (default-profile-group with ≥2 entries) are reachable only via /v1,
-  // which fails over across the group. Reject direct /<suffix>/... access so users can't
-  // bypass failover to pin an expensive on-demand profile.
-  const dpg = Array.isArray(config.defaultProfileGroup) ? config.defaultProfileGroup : [];
+  // Group members (default-profile-group with ≥2 entries) are reachable only via the
+  // protocol's /v1 entry, which fails over across the group. Reject direct /<suffix>/...
+  // access so users can't bypass failover to pin an expensive on-demand profile.
+  const dpg = protocol === "responses"
+    ? (Array.isArray(config.responsesProfileGroup) ? config.responsesProfileGroup : [])
+    : (Array.isArray(config.defaultProfileGroup) ? config.defaultProfileGroup : []);
+  const groupEntryPath = protocol === "responses" ? "/v1/responses" : "/v1/messages";
   if (config.restrictGroupSuffix !== false && !resolvedProfile.isDefaultEntry && dpg.length >= 2 && dpg.includes(runtime.profileName)) {
-    res.writeHead(403, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({
-      type: "error",
-      error: {
-        type: "group_member_restricted",
-        message: `方案 "${runtime.profileName}" 是默认方案组成员，请通过 /v1 入口使用（系统按 failover 顺序自动调度）。`
-      },
-      hint: "Use /v1/messages instead."
-    }));
-    recordError(apiKey, 403, `group_member_restricted: /${suffix} 直连被拒，引导走 /v1`, req.url, "unknown", suffix, runtime);
-    console.log(`[拦截] ${getUserName(apiKey, runtime)} 直连组内方案 /${suffix} 被拒 → 引导 /v1`);
+    if (protocol === "responses") {
+      sendOpenAiError(res, 403, "group_member_restricted", `方案 "${runtime.profileName}" 是 Responses 方案组成员，请通过 /v1/responses 入口使用（系统按 failover 顺序自动调度）。`);
+    } else {
+      res.writeHead(403, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({
+        type: "error",
+        error: {
+          type: "group_member_restricted",
+          message: `方案 "${runtime.profileName}" 是默认方案组成员，请通过 /v1 入口使用（系统按 failover 顺序自动调度）。`
+        },
+        hint: "Use /v1/messages instead."
+      }));
+    }
+    recordError(apiKey, 403, `group_member_restricted: /${suffix} 直连被拒，引导走 ${groupEntryPath}`, req.url, "unknown", suffix, runtime);
+    console.log(`[拦截] ${getUserName(apiKey, runtime)} 直连组内方案 /${suffix} 被拒 → 引导 ${groupEntryPath}`);
     return;
   }
 
@@ -2390,8 +2608,11 @@ function proxyRequest(req, res) {
   // Global IP rate limit
   const clientIp = getClientIp(req);
   if (!checkIpRateLimit(clientIp)) {
-    res.writeHead(429, { "Content-Type": "application/json", "Retry-After": "60" });
-    res.end(JSON.stringify({ error: "IP rate limit exceeded. Please slow down.", type: "ip_rate_limit_exceeded" }));
+    if (protocol === "responses") sendOpenAiError(res, 429, "ip_rate_limit_exceeded", "IP rate limit exceeded. Please slow down.", { "Retry-After": "60" });
+    else {
+      res.writeHead(429, { "Content-Type": "application/json", "Retry-After": "60" });
+      res.end(JSON.stringify({ error: "IP rate limit exceeded. Please slow down.", type: "ip_rate_limit_exceeded" }));
+    }
     recordError(apiKey, 429, `ip_rate_limit_exceeded: ${clientIp}`, req.url, "unknown", suffix, runtime);
     return;
   }
@@ -2423,8 +2644,11 @@ function proxyRequest(req, res) {
   // Reject unknown API keys and users not assigned to this profile before any upstream work.
   const earlyAccess = canUseProfile(apiKey, runtime);
   if (!earlyAccess.allowed) {
-    res.writeHead(403, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ error: earlyAccess.reason }));
+    if (protocol === "responses") sendOpenAiError(res, 403, "forbidden", earlyAccess.reason);
+    else {
+      res.writeHead(403, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: earlyAccess.reason }));
+    }
     console.log(`[拦截] ${apiKey.slice(0, 8)}**** profile=${runtime.profileName} ${req.method} ${targetUrl} ${earlyAccess.reason}`);
     return;
   }
@@ -2438,21 +2662,31 @@ function proxyRequest(req, res) {
       const parsed = sanitizeJson(JSON.parse(body.toString()));
       reqModel = parsed.model || "unknown";
       originalModel = reqModel;
-      // Detect request source: user input vs tool result vs subagent
-      const msgs = parsed.messages || [];
-      const lastMsg = msgs[msgs.length - 1];
-      if (lastMsg && lastMsg.role === "user") {
-        const content = lastMsg.content;
-        if (Array.isArray(content)) {
-          const hasToolResult = content.some(b => b.type === "tool_result");
-          const hasText = content.some(b => b.type === "text");
-          if (hasToolResult && !hasText) reqSource = "工具调用";
-          else if (hasToolResult && hasText) reqSource = "用户+工具";
+      if (protocol === "responses") {
+        // Responses input: a trailing tool-output item marks a tool-result turn.
+        const items = Array.isArray(parsed.input) ? parsed.input : [];
+        const lastItem = items[items.length - 1];
+        if (lastItem && typeof lastItem === "object" &&
+          (lastItem.type === "function_call_output" || lastItem.type === "custom_tool_call_output" || lastItem.type === "local_shell_call_output")) {
+          reqSource = "工具调用";
         }
-        const sys = typeof parsed.system === "string" ? parsed.system :
-          Array.isArray(parsed.system) ? parsed.system.map(b => b.text || "").join(" ") : "";
-        if (sys.includes("SUBAGENT_STOP")) {
-          reqSource = "子代理";
+      } else {
+        // Detect request source: user input vs tool result vs subagent
+        const msgs = parsed.messages || [];
+        const lastMsg = msgs[msgs.length - 1];
+        if (lastMsg && lastMsg.role === "user") {
+          const content = lastMsg.content;
+          if (Array.isArray(content)) {
+            const hasToolResult = content.some(b => b.type === "tool_result");
+            const hasText = content.some(b => b.type === "text");
+            if (hasToolResult && !hasText) reqSource = "工具调用";
+            else if (hasToolResult && hasText) reqSource = "用户+工具";
+          }
+          const sys = typeof parsed.system === "string" ? parsed.system :
+            Array.isArray(parsed.system) ? parsed.system.map(b => b.text || "").join(" ") : "";
+          if (sys.includes("SUBAGENT_STOP")) {
+            reqSource = "子代理";
+          }
         }
       }
     } catch {}
@@ -2461,10 +2695,10 @@ function proxyRequest(req, res) {
     // against its own modelAliases.
     const originalBody = body;
 
-    // Build the ordered candidate list. Default-group (/v1) entries fail over across
-    // the whole group; explicit /<suffix>/... requests stay pinned to one profile.
+    // Build the ordered candidate list. Default-group entries fail over across
+    // the whole protocol-matched group; explicit /<suffix>/... requests stay pinned.
     const candidateList = resolvedProfile.isDefaultEntry
-      ? getAvailableDefaultProfiles(apiKey)
+      ? (protocol === "responses" ? getAvailableResponsesProfiles(apiKey) : getAvailableDefaultProfiles(apiKey))
       : [{ name: runtime.profileName, suffix, runtime }];
     // If every default-group member is currently unavailable (all rate-limited / breaker
     // open / unauthorized), fall back to the resolved default so the normal error path runs.
@@ -2474,14 +2708,20 @@ function proxyRequest(req, res) {
 
     // Rate + concurrency are per-user, independent of which profile serves the request.
     if (!checkAndRecordRate(userKey)) {
-      res.writeHead(429, { "Content-Type": "application/json", "Retry-After": "60" });
-      res.end(JSON.stringify({ error: "Rate limit exceeded. Please slow down.", type: "rate_limit_exceeded" }));
+      if (protocol === "responses") sendOpenAiError(res, 429, "rate_limit_exceeded", "Rate limit exceeded. Please slow down.", { "Retry-After": "60" });
+      else {
+        res.writeHead(429, { "Content-Type": "application/json", "Retry-After": "60" });
+        res.end(JSON.stringify({ error: "Rate limit exceeded. Please slow down.", type: "rate_limit_exceeded" }));
+      }
       recordError(apiKey, 429, "rate_limit_exceeded", req.url, reqModel, suffix, runtime);
       return;
     }
     if (!tryAcquireConcurrency(userKey)) {
-      res.writeHead(429, { "Content-Type": "application/json", "Retry-After": "1" });
-      res.end(JSON.stringify({ error: "Too many concurrent requests. Please try again later.", type: "concurrency_exceeded" }));
+      if (protocol === "responses") sendOpenAiError(res, 429, "concurrency_exceeded", "Too many concurrent requests. Please try again later.", { "Retry-After": "1" });
+      else {
+        res.writeHead(429, { "Content-Type": "application/json", "Retry-After": "1" });
+        res.end(JSON.stringify({ error: "Too many concurrent requests. Please try again later.", type: "concurrency_exceeded" }));
+      }
       recordError(apiKey, 429, "concurrency_exceeded", req.url, reqModel, suffix, runtime);
       return;
     }
@@ -2575,7 +2815,37 @@ function proxyRequest(req, res) {
 
       // Every candidate failed: surface the last failure to the client.
       if (!served && lastFailure && !res.headersSent) {
-        if (lastFailure.kind === "model") {
+        if (protocol === "responses") {
+          // Responses-protocol clients (Codex) get OpenAI-style error bodies.
+          if (lastFailure.kind === "model") {
+            sendOpenAiError(res, 403, "model_not_allowed", lastFailure.message);
+            console.log(`[拦截] ${apiKey.slice(0, 8)}**** profile=${lastFailure.runtime.profileName} model 拒绝`);
+          } else if (lastFailure.kind === "breaker") {
+            const remaining = Math.ceil(lastFailure.runtime.breaker.status().cooldownRemaining / 1000);
+            sendOpenAiError(res, 503, "upstream_unavailable", `Upstream temporarily unavailable. Circuit open, retry in ${remaining}s.`);
+            recordError(apiKey, 503, "Circuit breaker open", req.url, reqModel, lastFailure.suffix, lastFailure.runtime);
+          } else if (lastFailure.kind === "quota") {
+            const q = lastFailure.quota;
+            const reqHost = req.headers.host || `localhost:${port}`;
+            const usageUrl = `http://${reqHost}/usage/${apiKey}`;
+            const retryAfter = secondsUntilNextCnMidnight();
+            sendOpenAiError(res, 429, "quota_exceeded",
+              `今日Token额度已用完。已用: ${q.used.toLocaleString()}, 限额: ${q.limit.toLocaleString()}。额度将于北京时间次日凌晨重置。查看用量详情: ${usageUrl}`,
+              { "Retry-After": String(retryAfter) });
+            recordError(apiKey, 429, `quota_exceeded: ${q.used}/${q.limit}, retry in ${retryAfter}s`, req.url, reqModel, lastFailure.suffix, lastFailure.runtime);
+          } else if (lastFailure.kind === "rate-limit") {
+            const retryAfter = Math.max(1, Math.ceil((lastFailure.err.resumeAt - Date.now()) / 1000));
+            sendOpenAiError(res, 429, "rate_limit_exceeded",
+              `所有可用方案均已限额，最早 ${new Date(lastFailure.err.resumeAt).toISOString()} 恢复。`,
+              { "Retry-After": String(retryAfter) });
+            recordError(apiKey, 429, `all profiles rate-limited until ${new Date(lastFailure.err.resumeAt).toISOString()}`, req.url, reqModel, lastFailure.suffix, lastFailure.runtime);
+          } else {
+            const status = lastFailure.status;
+            const label = status === 504 ? "Gateway Timeout" : "Bad Gateway";
+            sendOpenAiError(res, status, "proxy_error", `Proxy ${label}. Please try again later.`);
+            recordError(apiKey, status, `${label}: ${lastFailure.err.message}`, req.url, reqModel, lastFailure.suffix, lastFailure.runtime);
+          }
+        } else if (lastFailure.kind === "model") {
           res.writeHead(403, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ error: lastFailure.message }));
           console.log(`[拦截] ${apiKey.slice(0, 8)}**** profile=${lastFailure.runtime.profileName} model 拒绝`);
@@ -2772,6 +3042,7 @@ async function handleStreamingProxy(req, res, body, reqHeaders, apiKey, reqModel
       let buf = "", usage = { input_tokens: 0, output_tokens: 0 }, model = reqModel;
       let sseDataLines = 0;
       let rawSample = "";
+      let streamFailure = null;
 
       // Plan-exhaustion 429: buffer the full body, then hand off to the failover
       // layer WITHOUT writing anything to the client — so the next profile can own
@@ -2862,6 +3133,11 @@ async function handleStreamingProxy(req, res, body, reqHeaders, apiKey, reqModel
               mergeUsageCounters(usage, d.usage);
             }
             if (d.model) model = d.model;
+            // Responses API signals failures in-stream (HTTP stays 200): capture
+            // for the error log; usage stays absent on failed streams.
+            if (d.type === "response.failed" || d.type === "response.incomplete" || d.type === "error") {
+              streamFailure = `${d.type}: ${d.error?.message || d.response?.error?.message || "no detail"}`;
+            }
           } catch {}
         }
       });
@@ -2884,6 +3160,9 @@ async function handleStreamingProxy(req, res, body, reqHeaders, apiKey, reqModel
           console.log(`[Token] ${getUserName(apiKey, runtime)} [${reqSource}] model=${model} 输入=${usage.input_tokens} 输出=${usage.output_tokens} 缓存写=${usage.cache_creation_input_tokens || 0} 缓存读=${usage.cache_read_input_tokens || 0}`);
         } else {
           console.log(`[响应] ${getUserName(apiKey, runtime)} 流结束 无usage数据 model=${model} sse行数=${sseDataLines} 原始数据[0:200]=${rawSample.slice(0, 200).replace(/\n/g, "\\n")}`);
+        }
+        if (streamFailure) {
+          recordError(apiKey, 502, `Responses stream failed: ${streamFailure}`, req.url, model, suffix, runtime);
         }
         if (!clientGone) res.end();
         safeResolve();
@@ -2966,6 +3245,8 @@ function getPublicSettings() {
     globalUsers,
     activeProfile: getDefaultProfileName(),
     profiles: listProfiles(),
+    defaultProfileGroup: Array.isArray(config.defaultProfileGroup) ? config.defaultProfileGroup : [],
+    responsesProfileGroup: Array.isArray(config.responsesProfileGroup) ? config.responsesProfileGroup : [],
     selectedProfileSuffix: defaultSuffix,
     circuitBreaker: rt?.breaker?.status() || { state: "UNKNOWN", failureCount: 0, totalSuccesses: 0, totalFailures: 0, cooldownRemaining: 0 },
     port: port,
@@ -2992,7 +3273,17 @@ function settingsHtml(errorMsg) {
     const bt = p.billingType === "coding_plan" ? "Coding Plan" : p.billingType === "token_plan" ? "Token Plan" : "按量计费";
     return `<div class="group-item" data-name="${escHtml(name)}" style="display:flex;align-items:center;gap:8px;padding:6px 8px;border:1px solid var(--border);border-radius:6px;margin-bottom:6px"><span style="color:var(--blue);font-weight:600;min-width:20px">${i + 1}</span><span style="flex:1">${escHtml(name)} <span style="color:var(--dim);font-size:11px">${bt}</span></span><button type="button" class="btn btn-outline btn-sm" onclick="event.stopPropagation();moveDefaultGroup('${escJs(name)}',-1)" ${i === 0 ? "disabled" : ""}>↑</button><button type="button" class="btn btn-outline btn-sm" onclick="event.stopPropagation();moveDefaultGroup('${escJs(name)}',1)" ${i === dpg.length - 1 ? "disabled" : ""}>↓</button><button type="button" class="btn btn-outline btn-sm" onclick="event.stopPropagation();removeFromDefaultGroup('${escJs(name)}')">移出</button></div>`;
   }).join("");
-  const nonMembersHtml = Object.keys(config.profiles).filter(n => !dpg.includes(n) && config.profiles[n].upstream).map(name => `<button type="button" class="preset" onclick="event.stopPropagation();addToDefaultGroup('${escJs(name)}')">+ ${escHtml(name)}</button>`).join("");
+  const nonMembersHtml = Object.keys(config.profiles).filter(n => !dpg.includes(n) && config.profiles[n].upstream && normalizeProfileProtocol(config.profiles[n].protocol) === "anthropic").map(name => `<button type="button" class="preset" onclick="event.stopPropagation();addToDefaultGroup('${escJs(name)}')">+ ${escHtml(name)}</button>`).join("");
+
+  // Responses group (failover chain for /v1/responses) — protocol-pure by construction.
+  const rpg = (Array.isArray(config.responsesProfileGroup) ? config.responsesProfileGroup : [])
+    .filter(n => config.profiles[n] && normalizeProfileProtocol(config.profiles[n].protocol) === "responses");
+  const responsesGroupItemsHtml = rpg.map((name, i) => {
+    const p = config.profiles[name];
+    const bt = p.billingType === "coding_plan" ? "Coding Plan" : p.billingType === "token_plan" ? "Token Plan" : "按量计费";
+    return `<div class="group-item" data-name="${escHtml(name)}" style="display:flex;align-items:center;gap:8px;padding:6px 8px;border:1px solid var(--border);border-radius:6px;margin-bottom:6px"><span style="color:var(--blue);font-weight:600;min-width:20px">${i + 1}</span><span style="flex:1">${escHtml(name)} <span style="color:var(--dim);font-size:11px">${bt}</span></span><button type="button" class="btn btn-outline btn-sm" onclick="event.stopPropagation();moveResponsesGroup('${escJs(name)}',-1)" ${i === 0 ? "disabled" : ""}>↑</button><button type="button" class="btn btn-outline btn-sm" onclick="event.stopPropagation();moveResponsesGroup('${escJs(name)}',1)" ${i === rpg.length - 1 ? "disabled" : ""}>↓</button><button type="button" class="btn btn-outline btn-sm" onclick="event.stopPropagation();removeFromResponsesGroup('${escJs(name)}')">移出</button></div>`;
+  }).join("");
+  const responsesNonMembersHtml = Object.keys(config.profiles).filter(n => !rpg.includes(n) && config.profiles[n].upstream && normalizeProfileProtocol(config.profiles[n].protocol) === "responses").map(name => `<button type="button" class="preset" onclick="event.stopPropagation();addToResponsesGroup('${escJs(name)}')">+ ${escHtml(name)}</button>`).join("");
 
   const globalUserRows = Object.entries(s.globalUsers).map(([k, v]) => {
     const isObj = typeof v === "object" && v !== null;
@@ -3113,7 +3404,8 @@ td{padding:8px;border-bottom:1px solid #ecece8;font-size:12px}
 <div class="sidebar-hd"><h1>配置方案</h1><a href="/dashboard">返回面板</a></div>
 <div class="sidebar-list">${s.profiles.map(p => {
     const host = p.upstream.replace(/^https?:\/\//, "").replace(/\/.*/, "");
-    const suffixLabel = '<span style="color:var(--accent);font-size:10px">/'+ escHtml(p.suffix)+'</span>' + (p.isDefault ? ' <span style="color:var(--green);font-size:10px">默认入口</span>' : '');
+    const isResponses = p.protocol === "responses";
+    const suffixLabel = '<span style="color:var(--accent);font-size:10px">/'+ escHtml(p.suffix)+'</span>' + (p.isDefault ? ' <span style="color:var(--green);font-size:10px">默认入口</span>' : '') + (isResponses ? ' <span style="color:var(--blue);font-size:10px">Responses</span>' : '');
     const peakList = normalizePeakHours(p.peakHours);
     const peakLabel = peakList.length > 0
       ? `<div class="pl-users" style="${isInPeakHours(peakList) ? "color:var(--orange);font-weight:600" : ""}">${escHtml(formatPeakHoursSummary(peakList))}${isInPeakHours(peakList) ? " · 高峰中" : ""}</div>`
@@ -3124,7 +3416,7 @@ td{padding:8px;border-bottom:1px solid #ecece8;font-size:12px}
 <div class="pl-users">${p.userCount}位用户</div>
 ${peakLabel}
 <div class="pl-actions">
-  ${!p.isDefault ? '<button class="pl-activate" onclick="event.stopPropagation();setDefaultProfile(\'' + escJs(p.name) + '\')">设为默认</button>' : ''}
+  ${!p.isDefault ? '<button class="pl-activate" onclick="event.stopPropagation();setDefaultProfile(\'' + escJs(p.name) + '\',\'' + (isResponses ? "responses" : "anthropic") + '\')">设为默认</button>' : ''}
   ${!p.isDefault ? '<button class="pl-delete" onclick="event.stopPropagation();deleteProfile(\'' + escJs(p.name) + '\')">删除</button>' : ''}
 </div></div>`;
   }).join("")}</div>
@@ -3136,6 +3428,13 @@ ${peakLabel}
   </div>
   <div id="defaultGroupList" style="margin-bottom:6px">${groupItemsHtml || '<span style="font-size:11px;color:var(--dim)">组为空 — 至少加入 2 个方案以启用 failover</span>'}</div>
   ${nonMembersHtml ? `<div style="margin-top:6px;display:flex;align-items:center;gap:6px;flex-wrap:wrap"><span style="color:var(--dim);font-size:10px">加入：</span>${nonMembersHtml}</div>` : ''}
+</div>
+<div class="sidebar-global" style="padding:10px 12px">
+  <div style="font-size:11px;font-weight:650;margin-bottom:8px">
+    <span>Responses 方案组 <span style="color:var(--dim);font-weight:400;font-size:10px">/v1/responses failover · Codex</span></span>
+  </div>
+  <div id="responsesGroupList" style="margin-bottom:6px">${responsesGroupItemsHtml || '<span style="font-size:11px;color:var(--dim)">组为空 — Codex 请求将返回 503</span>'}</div>
+  ${responsesNonMembersHtml ? `<div style="margin-top:6px;display:flex;align-items:center;gap:6px;flex-wrap:wrap"><span style="color:var(--dim);font-size:10px">加入：</span>${responsesNonMembersHtml}</div>` : ''}
 </div>
 <div class="sidebar-ft" style="display:flex;gap:6px"><button class="btn btn-outline btn-sm" onclick="openUserModal()" style="flex:1">用户管理</button><button class="btn btn-outline btn-sm" onclick="openProfileModal()" style="flex:1">新增方案</button></div>
 </div>
@@ -3371,6 +3670,12 @@ ${s.profiles.map(p => `<option value="${escHtml(p.suffix)}" ${p.suffix === initi
 <div><label>方案名称<span class="req">*</span></label><input type="text" id="newProfileName" placeholder="如: GLM 项目组"></div>
 <div><label>URL 后缀<span class="req">*</span></label><input type="text" id="newProfileSuffix" placeholder="如: glm"></div>
 </div>
+<label>接口协议<span class="req">*</span></label>
+<select id="newProfileProtocol" onchange="updateNewProfileProtocolHint()" style="font-family:var(--font-body)">
+<option value="anthropic">Anthropic Messages — Claude Code</option>
+<option value="responses">OpenAI Responses — Codex</option>
+</select>
+<div class="note" id="newProfileProtocolNote">Claude Code 走 /v1/messages；Codex 走 /v1/responses。两种协议的方案完全隔离。</div>
 <label>上游 API 地址<span class="req">*</span></label><input type="text" id="newProfileUpstream" value="${escHtml(initialProfile.upstream || s.upstream || "")}" placeholder="https://open.bigmodel.cn/api/anthropic">
 <label>允许模型</label><input type="text" id="newProfileModels" value="${escHtml((initialProfile.allowedModels || s.allowedModels || []).join(","))}" placeholder="glm-5.1,qwen-max">
 <label>模型别名（每行 alias=实际模型，可选）</label><textarea id="newProfileAliases" rows="3" placeholder="jx-sonnet=glm-5.1&#10;jx-opus=glm-5.1&#10;jx-haiku=glm-5.1"></textarea>
@@ -3656,22 +3961,28 @@ async function editProfile(n){
   if(userSel){userSel.value=p.suffix||'';renderProfileUsers(p.suffix||'')}
   updateAccessUrl();
 }
+function updateNewProfileProtocolHint(){
+  var isResp=document.getElementById('newProfileProtocol').value==='responses';
+  document.getElementById('newProfileUpstream').placeholder=isResp?'https://open.bigmodel.cn/api/v1':'https://open.bigmodel.cn/api/anthropic';
+  document.getElementById('newProfileProtocolNote').textContent=isResp?'Codex 走 /v1/responses，上游必须是原生 Responses 端点（如智谱 /api/v1）。':'Claude Code 走 /v1/messages；Codex 走 /v1/responses。两种协议的方案完全隔离。';
+}
 async function createProfile(){
   const name=document.getElementById('newProfileName').value.trim();
   const suffix=document.getElementById('newProfileSuffix').value.trim();
   const upstream=document.getElementById('newProfileUpstream').value.trim();
   const models=document.getElementById('newProfileModels').value.trim();
   const modelAliases=document.getElementById('newProfileAliases').value.trim();
+  const protocol=document.getElementById('newProfileProtocol').value;
   if(!name||!suffix||!upstream){alert('方案名称、URL 后缀和上游 API 地址必填');return}
   const fm=document.forms.settingsForm;
   const r=await fetch('/api/profile/save',{method:'POST',headers:csrfHeaders({'Content-Type':'application/json'}),body:JSON.stringify({
     profile:name,suffix:suffix,upstream:upstream,allowedModels:models||fm.allowedModels.value,
-    modelAliases:modelAliases
+    modelAliases:modelAliases,protocol:protocol
   })});
   if(r.ok)toastThen('方案已创建',()=>location.reload());else{const e=await r.json();alert('创建失败: '+e.error)}
 }
-async function setDefaultProfile(n){
-  const r=await fetch('/api/profile/default',{method:'POST',headers:csrfHeaders({'Content-Type':'application/json'}),body:JSON.stringify({profile:n})});
+async function setDefaultProfile(n,protocol){
+  const r=await fetch('/api/profile/default',{method:'POST',headers:csrfHeaders({'Content-Type':'application/json'}),body:JSON.stringify({profile:n,protocol:protocol||'anthropic'})});
   if(r.ok)toastThen('已设为默认方案',()=>location.reload());else{const e=await r.json();alert('设置失败: '+e.error)}
 }
 async function deleteProfile(n){
@@ -3680,13 +3991,21 @@ async function deleteProfile(n){
   if(r.ok)toastThen('方案已删除',()=>location.reload());else{const e=await r.json();alert('删除失败: '+e.error)}
 }
 async function saveDefaultGroup(group){
-  const r=await fetch('/api/profile/default-group',{method:'POST',headers:csrfHeaders({'Content-Type':'application/json'}),body:JSON.stringify({group:group})});
+  const r=await fetch('/api/profile/default-group',{method:'POST',headers:csrfHeaders({'Content-Type':'application/json'}),body:JSON.stringify({group:group,protocol:'anthropic'})});
   if(r.ok)toastThen('默认方案组已保存',()=>location.reload());else{const e=await r.json().catch(()=>({}));alert('保存失败: '+(e.error||''))}
 }
 function currentDefaultGroupFromDom(){return Array.prototype.map.call(document.querySelectorAll('#defaultGroupList .group-item'),function(el){return el.dataset.name})}
 async function addToDefaultGroup(n){const g=currentDefaultGroupFromDom();if(!g.includes(n))g.push(n);saveDefaultGroup(g)}
 async function removeFromDefaultGroup(n){saveDefaultGroup(currentDefaultGroupFromDom().filter(function(x){return x!==n}))}
 async function moveDefaultGroup(n,d){const g=currentDefaultGroupFromDom();const i=g.indexOf(n);if(i<0)return;const j=i+d;if(j<0||j>=g.length)return;g.splice(i,1);g.splice(j,0,n);saveDefaultGroup(g)}
+async function saveResponsesGroup(group){
+  const r=await fetch('/api/profile/default-group',{method:'POST',headers:csrfHeaders({'Content-Type':'application/json'}),body:JSON.stringify({group:group,protocol:'responses'})});
+  if(r.ok)toastThen('Responses 方案组已保存',()=>location.reload());else{const e=await r.json().catch(()=>({}));alert('保存失败: '+(e.error||''))}
+}
+function currentResponsesGroupFromDom(){return Array.prototype.map.call(document.querySelectorAll('#responsesGroupList .group-item'),function(el){return el.dataset.name})}
+async function addToResponsesGroup(n){const g=currentResponsesGroupFromDom();if(!g.includes(n))g.push(n);saveResponsesGroup(g)}
+async function removeFromResponsesGroup(n){saveResponsesGroup(currentResponsesGroupFromDom().filter(function(x){return x!==n}))}
+async function moveResponsesGroup(n,d){const g=currentResponsesGroupFromDom();const i=g.indexOf(n);if(i<0)return;const j=i+d;if(j<0||j>=g.length)return;g.splice(i,1);g.splice(j,0,n);saveResponsesGroup(g)}
 async function deleteGlobalUser(k){
   if(!confirm('确定删除用户？该用户将从所有方案中移除。'))return;
   const r=await fetch('/api/global-user/delete',{method:'POST',headers:csrfHeaders({'Content-Type':'application/json'}),body:JSON.stringify({key:k})});
@@ -4052,7 +4371,7 @@ function render(){
   document.getElementById("cards").innerHTML=c("今日用量",todayTokens,"var(--accent)",1)+c("今日请求",tR,"var(--blue)",1)+c("总用量",allTokens,"var(--green)",1)+c("总请求",tr,"var(--orange)",1)+c("今日错误",(Array.isArray(D.errors)?D.errors:[]).filter(e=>e.time&&e.time.startsWith(td)).length,"var(--red)",1);
   runCountUps(document.getElementById("cards"));
   const psb=document.getElementById("profileSummaryBody"),profiles=Array.isArray(D.profileSummaries)?D.profileSummaries:[];
-  psb.innerHTML=profiles.length?profiles.map(p=>{const st=p.breakerState||"UNKNOWN";const rl=p.rateLimit;let col,led,stateLabel;if(rl){col='var(--red)';led='err';const rm=new Date(rl.resumeAt);stateLabel='限额中 '+String(rm.getHours()).padStart(2,'0')+':'+String(rm.getMinutes()).padStart(2,'0')+'恢复';}else{col=st==="CLOSED"?"var(--green)":st==="HALF_OPEN"?"var(--orange)":"var(--red)";led=st==="CLOSED"?"on":st==="HALF_OPEN"?"warn":"err";stateLabel=st==="CLOSED"?"正常":st==="HALF_OPEN"?"探测中":"熔断";}const current=currentProfile!=="all"&&p.suffix===currentProfile;const gBadge=p.inDefaultGroup?' <span style="color:var(--blue);font-size:10px;font-weight:600">默认组·'+(p.groupOrder+1)+'</span>':'';const bLabel=p.billingType==='coding_plan'?' <span style="color:var(--dim);font-size:10px">CP</span>':p.billingType==='token_plan'?' <span style="color:var(--dim);font-size:10px">TP</span>':'';const pk=(p.peakHours&&p.peakHours.length)?(function(rs){const now=new Date(),cur=((now.getTime()+8*3600000)%86400000)/60000;const tm=function(t){if(!t)return null;const a=t.split(':');return (+a[0])*60+(+a[1])};const inPk=rs.some(function(r){const s=tm(r.start),e=tm(r.end);return s!==null&&e!==null&&s!==e&&(s<e?(cur>=s&&cur<e):(cur>=s||cur<e))});return ' <span style="color:'+(inPk?'var(--orange)':'var(--dim)')+';font-size:10px" title="高峰时段(北京时间) '+rs.map(function(r){return r.start+'-'+r.end}).join(', ')+'">'+(inPk?'高峰中':rs.map(function(r){return r.start+'-'+r.end}).join(','))+'</span>'})(p.peakHours):'';const restricted=p.inDefaultGroup&&profiles.filter(x=>x.inDefaultGroup).length>=2;return'<tr'+(current?' class="profile-current" aria-current="true"':'')+'><td>'+escH(p.name)+(p.isDefault?' <span style="color:var(--green);font-size:11px;font-weight:600;vertical-align:middle">默认</span>':'')+gBadge+bLabel+pk+(current?' <span class="current-mark">当前</span>':'')+'</td><td>'+(restricted?'<code>/v1</code> <span style="color:var(--dim);font-size:10px">仅 /v1</span>':'<code>/'+escH(p.suffix)+'</code>'+(p.isDefault?' <span style="color:var(--dim)"> / <code>/v1</code></span>':''))+'</td><td style="font-size:12px;color:var(--dim);max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+escH((p.upstream||'').replace('https://','').replace('http://',''))+'</td><td class="n">'+fmtT(p.todayRequests||0)+'</td><td class="n hl">'+fmtT(p.todayTokens||0)+'</td><td><span class="led '+led+'"></span><span style="color:'+col+';font-size:12px">'+stateLabel+'</span></td></tr>'}).join(''):'<tr><td colspan="6" class="empty">暂无方案</td></tr>';
+  psb.innerHTML=profiles.length?profiles.map(p=>{const st=p.breakerState||"UNKNOWN";const rl=p.rateLimit;let col,led,stateLabel;if(rl){col='var(--red)';led='err';const rm=new Date(rl.resumeAt);stateLabel='限额中 '+String(rm.getHours()).padStart(2,'0')+':'+String(rm.getMinutes()).padStart(2,'0')+'恢复';}else{col=st==="CLOSED"?"var(--green)":st==="HALF_OPEN"?"var(--orange)":"var(--red)";led=st==="CLOSED"?"on":st==="HALF_OPEN"?"warn":"err";stateLabel=st==="CLOSED"?"正常":st==="HALF_OPEN"?"探测中":"熔断";}const current=currentProfile!=="all"&&p.suffix===currentProfile;const gBadge=p.inDefaultGroup?' <span style="color:var(--blue);font-size:10px;font-weight:600">默认组·'+(p.groupOrder+1)+'</span>':'';const rBadge=p.inResponsesGroup?' <span style="color:var(--blue);font-size:10px;font-weight:600">Resp组·'+(p.responsesGroupOrder+1)+'</span>':'';const protoBadge=p.protocol==='responses'?' <span style="color:var(--blue);font-size:10px">Codex</span>':'';const bLabel=p.billingType==='coding_plan'?' <span style="color:var(--dim);font-size:10px">CP</span>':p.billingType==='token_plan'?' <span style="color:var(--dim);font-size:10px">TP</span>':'';const pk=(p.peakHours&&p.peakHours.length)?(function(rs){const now=new Date(),cur=((now.getTime()+8*3600000)%86400000)/60000;const tm=function(t){if(!t)return null;const a=t.split(':');return (+a[0])*60+(+a[1])};const inPk=rs.some(function(r){const s=tm(r.start),e=tm(r.end);return s!==null&&e!==null&&s!==e&&(s<e?(cur>=s&&cur<e):(cur>=s||cur<e))});return ' <span style="color:'+(inPk?'var(--orange)':'var(--dim)')+';font-size:10px" title="高峰时段(北京时间) '+rs.map(function(r){return r.start+'-'+r.end}).join(', ')+'">'+(inPk?'高峰中':rs.map(function(r){return r.start+'-'+r.end}).join(','))+'</span>'})(p.peakHours):'';const restricted=(p.inDefaultGroup&&profiles.filter(x=>x.inDefaultGroup).length>=2)||(p.inResponsesGroup&&profiles.filter(x=>x.inResponsesGroup).length>=2);const entryCode=p.protocol==='responses'?'/v1/responses':'/v1';return'<tr'+(current?' class="profile-current" aria-current="true"':'')+'><td>'+escH(p.name)+(p.isDefault?' <span style="color:var(--green);font-size:11px;font-weight:600;vertical-align:middle">默认</span>':'')+gBadge+rBadge+protoBadge+bLabel+pk+(current?' <span class="current-mark">当前</span>':'')+'</td><td>'+(restricted?'<code>'+entryCode+'</code> <span style="color:var(--dim);font-size:10px">仅 '+entryCode+'</span>':'<code>/'+escH(p.suffix)+'</code>'+(p.isDefault?' <span style="color:var(--dim)"> / <code>'+entryCode+'</code></span>':''))+'</td><td style="font-size:12px;color:var(--dim);max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+escH((p.upstream||'').replace('https://','').replace('http://',''))+'</td><td class="n">'+fmtT(p.todayRequests||0)+'</td><td class="n hl">'+fmtT(p.todayTokens||0)+'</td><td><span class="led '+led+'"></span><span style="color:'+col+';font-size:12px">'+stateLabel+'</span></td></tr>'}).join(''):'<tr><td colspan="6" class="empty">暂无方案</td></tr>';
   const profileLabel=D.profileView||(currentProfile==="all"?"全部方案":"默认方案");
   document.getElementById("profileContext").textContent="当前查看："+profileLabel;
   const upstreamInfo=D.upstream?(" | 上游: "+D.upstream.replace("https://","").replace("http://","")):"";
@@ -4821,25 +5140,42 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  // Profile: set default entry alias — make this profile the head of the default
-  // group (other members kept after it). /v1 traffic fails over across the group.
+  // Profile: set default entry alias — make this profile the head of its
+  // protocol's group (other members kept after it). /v1 and /v1/responses
+  // traffic fails over across the matching group.
   if (req.method === "POST" && req.url === "/api/profile/default") {
     if (!checkAuth(req)) { res.writeHead(401); res.end("Unauthorized"); return; }
     if (!checkCsrf(req)) { res.writeHead(403); res.end("CSRF validation failed"); return; }
     readBody(req).then(buf => {
       try {
-        const { profile, suffix } = JSON.parse(buf.toString());
+        const { profile, suffix, protocol } = JSON.parse(buf.toString());
         const name = profile || getProfileNameBySuffix(suffix);
         if (!name || !config.profiles[name]) throw new Error(`Profile "${profile || suffix}" not found`);
-        if (!Array.isArray(config.defaultProfileGroup)) config.defaultProfileGroup = [];
-        config.defaultProfileGroup = [name, ...config.defaultProfileGroup.filter(n => n !== name)];
-        for (const [pname, p] of Object.entries(config.profiles)) {
-          p.isDefault = pname === config.defaultProfileGroup[0];
+        const proto = normalizeProfileProtocol(protocol);
+        if (normalizeProfileProtocol(config.profiles[name].protocol) !== proto) {
+          throw new Error(`方案 "${name}" 的协议是 ${normalizeProfileProtocol(config.profiles[name].protocol)}，不能设为 ${proto} 组的默认方案`);
+        }
+        if (proto === "responses") {
+          if (!Array.isArray(config.responsesProfileGroup)) config.responsesProfileGroup = [];
+          config.responsesProfileGroup = [name, ...config.responsesProfileGroup.filter(n => n !== name)];
+        } else {
+          if (!Array.isArray(config.defaultProfileGroup)) config.defaultProfileGroup = [];
+          config.defaultProfileGroup = [name, ...config.defaultProfileGroup.filter(n => n !== name)];
+          for (const [pname, p] of Object.entries(config.profiles)) {
+            p.isDefault = pname === config.defaultProfileGroup[0];
+          }
         }
         saveConfig(config);
         reloadAllRuntimes();
         res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ ok: true, defaultProfile: name, defaultProfileGroup: config.defaultProfileGroup, profiles: listProfiles() }));
+        res.end(JSON.stringify({
+          ok: true,
+          defaultProfile: name,
+          protocol: proto,
+          defaultProfileGroup: config.defaultProfileGroup,
+          responsesProfileGroup: config.responsesProfileGroup,
+          profiles: listProfiles(),
+        }));
       } catch (err) {
         res.writeHead(400, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ error: err.message }));
@@ -4850,28 +5186,45 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  // Profile: set the ordered default group (failover chain for /v1).
+  // Profile: set an ordered protocol group (failover chain). The group must be
+  // protocol-pure: anthropic profiles for /v1, responses profiles for /v1/responses.
   if (req.method === "POST" && req.url === "/api/profile/default-group") {
     if (!checkAuth(req)) { res.writeHead(401); res.end("Unauthorized"); return; }
     if (!checkCsrf(req)) { res.writeHead(403); res.end("CSRF validation failed"); return; }
     readBody(req).then(buf => {
       try {
-        const { group } = JSON.parse(buf.toString());
+        const { group, protocol } = JSON.parse(buf.toString());
         if (!Array.isArray(group)) throw new Error("group must be an array of profile names");
+        const proto = normalizeProfileProtocol(protocol);
         const valid = [];
         for (const name of group) {
-          if (config.profiles[name] && !valid.includes(name)) valid.push(name);
+          if (!config.profiles[name]) continue;
+          if (normalizeProfileProtocol(config.profiles[name].protocol) !== proto) {
+            throw new Error(`方案 "${name}" 不是 ${proto} 协议方案，不能加入该组`);
+          }
+          if (!valid.includes(name)) valid.push(name);
         }
-        if (valid.length === 0) throw new Error("默认方案组至少需要 1 个方案");
-        config.defaultProfileGroup = valid;
-        for (const [pname, p] of Object.entries(config.profiles)) {
-          p.isDefault = pname === valid[0];
+        if (proto === "anthropic") {
+          if (valid.length === 0) throw new Error("默认方案组至少需要 1 个方案");
+          config.defaultProfileGroup = valid;
+          for (const [pname, p] of Object.entries(config.profiles)) {
+            p.isDefault = pname === valid[0];
+          }
+        } else {
+          // The responses group may stay empty (Codex access then returns 503).
+          config.responsesProfileGroup = valid;
         }
         saveConfig(config);
         reloadAllRuntimes();
-        console.log(`[PROFILE] Default group set: ${JSON.stringify(valid)}`);
+        console.log(`[PROFILE] ${proto} group set: ${JSON.stringify(valid)}`);
         res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ ok: true, defaultProfileGroup: valid, profiles: listProfiles() }));
+        res.end(JSON.stringify({
+          ok: true,
+          protocol: proto,
+          defaultProfileGroup: config.defaultProfileGroup,
+          responsesProfileGroup: config.responsesProfileGroup,
+          profiles: listProfiles(),
+        }));
       } catch (err) {
         res.writeHead(400, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ error: err.message }));
@@ -4888,12 +5241,13 @@ const server = http.createServer((req, res) => {
     if (!checkCsrf(req)) { res.writeHead(403); res.end("CSRF validation failed"); return; }
     readBody(req).then(buf => {
       try {
-        const { profile, upstream, allowedModels, suffix, modelAliases, billingType } = JSON.parse(buf.toString());
+        const { profile, upstream, allowedModels, suffix, modelAliases, billingType, protocol } = JSON.parse(buf.toString());
         const name = (profile || "").trim();
         if (!name) throw new Error("Profile name required");
         if (config.profiles[name]) throw new Error(`方案 "${name}" 已存在`);
         const sfx = validateProfileSuffix(suffix, name);
         const aliases = parseModelAliasesInput(modelAliases);
+        const proto = normalizeProfileProtocol(protocol);
         const models = allowedModels ? allowedModels.split(",").map(s => s.trim()).filter(Boolean) : [...(rt?.allowedModels || [])];
         for (const m of Object.values(aliases)) {
           if (m && !models.includes(m)) models.push(m);
@@ -4906,15 +5260,16 @@ const server = http.createServer((req, res) => {
           peakModelAliases: {},
           users: {},
           suffix: sfx,
+          protocol: proto,
           isDefault: false,
           billingType: validBilling,
           peakHours: [],
         };
         saveConfig(config);
         reloadAllRuntimes();
-        console.log(`[PROFILE] Created new profile "${name}" (suffix: ${JSON.stringify(sfx)})`);
+        console.log(`[PROFILE] Created new profile "${name}" (suffix: ${JSON.stringify(sfx)}, protocol: ${proto})`);
         res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ ok: true, profile: name, suffix: sfx }));
+        res.end(JSON.stringify({ ok: true, profile: name, suffix: sfx, protocol: proto }));
       } catch (err) {
         res.writeHead(400, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ error: err.message }));
@@ -4941,6 +5296,10 @@ const server = http.createServer((req, res) => {
           const oldRt = runtimes[suffix];
           if (oldRt) oldRt.agent.destroy();
           delete runtimes[suffix];
+        }
+        // Drop the profile from the responses failover group as well.
+        if (Array.isArray(config.responsesProfileGroup)) {
+          config.responsesProfileGroup = config.responsesProfileGroup.filter(n => n !== profile);
         }
         delete config.profiles[profile];
         saveConfig(config);

@@ -136,6 +136,8 @@ node server.mjs
 
 `modelAliases` 是唯一的模型映射入口。别名目标会自动加入 `allowedModels`；不需要别名时可直接使用真实模型名。
 
+设置页的模型别名为一行一别名的结构化编辑器（别名 / 实际模型 / 每别名上下文长度一一对应，`jx-fable`/`jx-opus`/`jx-haiku`/`jx-sonnet` 可快捷添加也可自定义）；通用别名必填，`allowedModels` 由全部别名（含高峰期覆盖）的实际模型自动汇总生成，不可手填。每个别名的上下文长度写入成员 Codex 接入配置的 models.json。
+
 `jx-sonnet`、`jx-opus` 和 `jx-haiku` 没有特殊的独立配置入口，它们与其他别名一样统一写入 `modelAliases`。
 
 ### 粘性会话（缓存亲和）
@@ -168,20 +170,39 @@ export ANTHROPIC_API_KEY="jx-your-virtual-key"
 
 ## 接入 Codex
 
-Codex 使用 OpenAI Responses 协议。先在设置页创建一个接口协议为 **OpenAI Responses** 的方案，上游填原生 Responses 端点（例如智谱 GLM Coding Plan 的 `https://open.bigmodel.cn/api/v1`），并把该方案加入「Responses 方案组」。
+Codex 使用 OpenAI Responses 协议。先在设置页创建一个接口协议为 **OpenAI Responses** 的方案，上游填原生 Responses 端点（例如智谱 GLM Coding Plan 的 `https://open.bigmodel.cn/api/v1`），并把该方案加入「Responses 方案组」，给成员分配虚拟 Key。
+
+### 成员一键接入
+
+管理员把一个链接发给成员即可：`http://<服务器地址>:6789/setup/<成员的虚拟Key>`
+
+成员打开后按页面指引三选一：
+
+- **一键脚本**：终端执行 `curl -fsSL "http://<服务器地址>:6789/api/codex-setup/<Key>" | sh`——自动备份并更新 `~/.codex/config.toml`、写入 `~/.codex/models.json`、做连通性检查。脚本幂等可重复执行，只管理 ccteam 相关配置，成员已有的其他 provider、项目信任、MCP 配置全部保留
+- **模型目录来自方案配置**：models.json 完全由成员可访问的 Responses 方案里的别名（`modelAliases` + `peakModelAliases`，按配置顺序）生成，默认模型取第一个别名；方案未配任何别名时才回退到 `allowedModels`。管理员改别名后成员重新执行一次脚本即可同步
+- **上下文窗口在设置页选**：每个方案可配置「模型上下文窗口」（32K/64K/128K/200K/256K/400K/1M 下拉选择，默认 128K），生成 models.json 时写入每个别名的 `context_window`，Codex 用它显示上下文用量与做压缩阈值
+- **手动配置**：复制页面上生成好的 config.toml 片段与 models.json 全文
+- **cc-switch 用户**：把生成的 provider TOML 粘贴为自定义供应商；顶层键（`model_catalog_json` 等）建议放进 cc-switch 的公共配置段，切换后注意确认仍在
+
+服务器地址自动取自成员打开页面时使用的地址（`window.location.host`），可手动修改——成员怎么访问到页面，Codex 就怎么访问网关。个人用量页顶部也有「配置 Codex 接入」入口。
+
+### 手写配置参考
 
 默认入口（Responses 方案组按序 failover）：
 
 ```toml
 # ~/.codex/config.toml
-model_provider = "cc_team"
+model_provider = "ccteam"
 model = "glm-5.3"
+model_catalog_json = "~/.codex/models.json"
 
-[model_providers.cc_team]
-name = "CC Team"
+[model_providers.ccteam]
+name = "CC Team Gateway"
 base_url = "http://localhost:6789/v1"
-experimental_bearer_token = "jx-your-virtual-key"
 wire_api = "responses"
+requires_openai_auth = false
+supports_websockets = false
+experimental_bearer_token = "jx-your-virtual-key"
 ```
 
 指定方案时把 base_url 改为带后缀地址（`http://localhost:6789/<suffix>/v1`，如 `http://localhost:6789/glmcodex/v1`）。

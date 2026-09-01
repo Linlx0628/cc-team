@@ -563,6 +563,8 @@ function listProfiles() {
     allowedModels: config.profiles[name].allowedModels || [],
     modelAliases: getConfigurableModelAliases(config.profiles[name]),
     peakModelAliases: normalizeModelAliases(config.profiles[name].peakModelAliases || {}),
+    modelContextWindows: config.profiles[name].modelContextWindows || {},
+    contextWindow: config.profiles[name].contextWindow || 128000,
     dailyTokenLimit: config.profiles[name].dailyTokenLimit || 0,
     peakHours: normalizePeakHours(config.profiles[name].peakHours),
     configured: !!config.profiles[name].upstream,
@@ -3542,7 +3544,6 @@ ${peakLabel}
 <td><label style="display:inline-flex;align-items:center;gap:4px;margin:0;cursor:pointer"><input type="checkbox" name="pu_dis_${escHtml(k)}" ${profileDisabled ? "checked" : ""} style="width:auto;accent-color:var(--orange)"><span style="font-size:11px;color:${profileDisabled ? "var(--orange)" : "var(--dim)"}">${profileDisabled ? "已禁用" : "正常"}</span></label></td></tr>`;
   }).join("");
 
-  const aliasesText = formatModelAliasesInput(s.modelAliases || {});
   const peakAliasesText = formatModelAliasesInput(s.peakModelAliases || {});
   const settingsJson = JSON.stringify(s).replace(/</g, "\\x3c");
 
@@ -3599,7 +3600,7 @@ input[type=datetime-local]{color-scheme:light;cursor:pointer}
 .btn-sm{padding:5px 10px;font-size:11px}
 .cleanup-tab.on{background:var(--text);color:#fff;border-color:var(--text)}.cleanup-tab.on span{color:#cfcfcf}
 .n{text-align:right;font-variant-numeric:tabular-nums}
-.actions{position:fixed;left:260px;right:0;bottom:0;margin:0;padding:12px clamp(24px,4vw,56px) calc(12px + env(safe-area-inset-bottom));display:flex;gap:8px;justify-content:flex-end;background:rgba(255,255,255,.96);border-top:1px solid var(--border);backdrop-filter:blur(8px);z-index:40}
+.actions{position:fixed;left:360px;right:0;bottom:0;margin:0;padding:12px clamp(24px,4vw,56px) calc(12px + env(safe-area-inset-bottom));display:flex;gap:8px;justify-content:flex-end;background:rgba(255,255,255,.96);border-top:1px solid var(--border);backdrop-filter:blur(8px);z-index:40}
 table{width:100%;border-collapse:collapse;margin-top:8px}
 th{text-align:left;padding:8px;font-size:11px;font-weight:600;color:var(--dim);border-bottom:1px solid var(--border);white-space:nowrap}
 td{padding:8px;border-bottom:1px solid #ecece8;font-size:12px}
@@ -3633,14 +3634,26 @@ td{padding:8px;border-bottom:1px solid #ecece8;font-size:12px}
 .proto-pane-hd{font-size:11px;font-weight:650;padding:2px 12px 4px;display:flex;align-items:center;justify-content:space-between;gap:8px}
 .proto-pane-hd .proto-entry{font-size:10px;font-weight:400;color:var(--accent)}
 .proto-pane-hint{font-size:10px;color:var(--dim);padding:0 12px 8px;line-height:1.5}
+.alias-toolbar{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin-bottom:8px}
+.alias-head{display:grid;grid-template-columns:1fr 1.4fr 130px 34px;gap:8px;font-size:10px;font-weight:600;color:var(--dim);margin-bottom:4px}
+.alias-head.peak{grid-template-columns:1fr 1.4fr 34px}
+.alias-row{display:grid;grid-template-columns:1fr 1.4fr 130px 34px;gap:8px;margin-bottom:8px;align-items:center}
+.alias-row.peak{grid-template-columns:1fr 1.4fr 34px}
+.alias-row input,.alias-row select{width:100%;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:7px 10px;border-radius:5px;font-size:12px}
+.alias-row input:focus,.alias-row select:focus{border-color:var(--accent)}
+.alias-row .row-del{height:32px;background:transparent;border:1px solid var(--border);border-radius:5px;color:var(--dim);cursor:pointer;font-size:13px;line-height:1}
+.alias-row .row-del:hover{border-color:#f1c8c2;color:var(--red)}
+.tag-row{display:flex;flex-wrap:wrap;gap:6px;min-height:30px;align-items:center;background:var(--bg);border:1px dashed var(--border);border-radius:6px;padding:8px 10px}
+.tag-row .m-tag{font-size:11px;font-family:var(--font-mono);background:var(--accent-soft);color:var(--accent);padding:3px 10px;border-radius:10px}
+.tag-row .m-empty{font-size:11px;color:var(--dim)}
 @media(max-width:680px){body{overflow:auto;height:auto}.layout{flex-direction:column;height:auto;min-height:100vh}.sidebar{width:100%;min-width:0;max-height:none;border-right:0;border-bottom:1px solid var(--border)}.sidebar-list{display:flex;gap:6px;overflow-x:auto}.sidebar-dock .sidebar-global{max-height:none;overflow-y:visible}.sidebar-global{padding:8px 12px}.sidebar-tool{min-width:0}.pl-item{min-width:210px;margin:0}.main{overflow:visible;padding:22px 16px}.actions{left:0;padding-left:16px;padding-right:16px}.row,.row3{grid-template-columns:1fr}.modal{width:100%;max-height:90vh}.section{padding:15px;overflow-x:auto}.import-summary{grid-template-columns:1fr 1fr}.mapping-row{grid-template-columns:1fr}.mapping-arrow{display:none}.danger-copy{align-items:flex-start;flex-direction:column}}
 </style></head><body data-theme="editorial-light">
 <div class="layout">
 <div class="sidebar">
 <div class="sidebar-hd"><h1>配置方案</h1><a href="/dashboard">返回面板</a></div>
 <div class="proto-tabs" id="protoTabs">
-  <button type="button" class="proto-tab on" data-tab="anthropic" onclick="switchProtoTab('anthropic')">Claude Code<small>Anthropic · /v1</small></button>
-  <button type="button" class="proto-tab" data-tab="responses" onclick="switchProtoTab('responses')">Codex<small>Responses · /v1/responses</small></button>
+  <button type="button" class="proto-tab on" data-tab="anthropic" onclick="switchProtoTab('anthropic')">Anthropic<small>Claude Code · /v1</small></button>
+  <button type="button" class="proto-tab" data-tab="responses" onclick="switchProtoTab('responses')">OpenAI<small>Codex · /v1/responses</small></button>
 </div>
 <div class="proto-pane" data-proto="anthropic">
   <div class="proto-pane-hd"><span>Anthropic 方案 <span class="proto-entry">入口 /v1</span></span><button type="button" class="btn btn-outline btn-sm" onclick="openProfileModal('anthropic')">+ 新建</button></div>
@@ -3648,9 +3661,9 @@ td{padding:8px;border-bottom:1px solid #ecece8;font-size:12px}
   <div class="sidebar-list">${anthProfiles.map(profileCard).join("") || '<div style="padding:0 12px 8px;font-size:11px;color:var(--dim)">暂无 Anthropic 方案</div>'}</div>
 </div>
 <div class="proto-pane" data-proto="responses" style="display:none">
-  <div class="proto-pane-hd"><span>Responses 方案 <span class="proto-entry">入口 /v1/responses</span></span><button type="button" class="btn btn-outline btn-sm" onclick="openProfileModal('responses')">+ 新建</button></div>
+  <div class="proto-pane-hd"><span>OpenAI 方案 <span class="proto-entry">入口 /v1/responses</span></span><button type="button" class="btn btn-outline btn-sm" onclick="openProfileModal('responses')">+ 新建</button></div>
   <div class="proto-pane-hint">Codex 走这里（base_url 指向 http://&lt;host&gt;:端口/v1）。本协议的默认入口和方案组只影响 /v1/responses 请求，与 Claude Code 的 /v1 完全互不影响。</div>
-  <div class="sidebar-list">${respProfiles.map(profileCard).join("") || '<div style="padding:0 12px 8px;font-size:11px;color:var(--dim)">暂无 Responses 方案 — Codex 请求将返回 503</div>'}</div>
+  <div class="sidebar-list">${respProfiles.map(profileCard).join("") || '<div style="padding:0 12px 8px;font-size:11px;color:var(--dim)">暂无 OpenAI 方案 — Codex 请求将返回 503</div>'}</div>
 </div>
 <div class="sidebar-dock">
   <div class="sidebar-global" data-proto="anthropic" style="padding:10px 12px">
@@ -3663,7 +3676,7 @@ td{padding:8px;border-bottom:1px solid #ecece8;font-size:12px}
   </div>
   <div class="sidebar-global" data-proto="responses" style="padding:10px 12px;display:none">
     <div style="font-size:11px;font-weight:650;margin-bottom:8px;display:flex;align-items:center;justify-content:space-between">
-      <span>Responses 方案组 <span style="color:var(--dim);font-weight:400;font-size:10px">/v1/responses failover · Codex</span></span>
+      <span>OpenAI 方案组 <span style="color:var(--dim);font-weight:400;font-size:10px">/v1/responses failover · Codex</span></span>
       <label style="display:flex;align-items:center;gap:4px;cursor:pointer;font-size:10px;font-weight:400;white-space:nowrap" title="全局设置：同时作用于两个协议的方案组"><input type="checkbox" id="restrictGroupSuffixCb2" ${config.restrictGroupSuffix !== false ? "checked" : ""} onchange="setRestrictGroupSuffix(this.checked)" style="width:auto;accent-color:var(--accent)"> 限制直连</label>
     </div>
     <div id="responsesGroupList" style="margin-bottom:6px">${responsesGroupItemsHtml || '<span style="font-size:11px;color:var(--dim)">组为空 — Codex 请求将返回 503</span>'}</div>
@@ -3698,28 +3711,34 @@ ${errDiv}
 <div class="note" style="margin-top:8px">状态：${s.circuitBreaker.state === 'CLOSED' ? '正常运行' : s.circuitBreaker.state === 'HALF_OPEN' ? '探测恢复中' : s.circuitBreaker.state === 'OPEN' ? '熔断中(' + Math.ceil(s.circuitBreaker.cooldownRemaining / 1000) + 's)' : '等待配置上游'} | 失败 ${s.circuitBreaker.failureCount} | 成功 ${s.circuitBreaker.totalSuccesses} | 失败 ${s.circuitBreaker.totalFailures}</div>
 </div>
 
-<h2>模型别名</h2>
+<h2>模型别名<span class="req">*必填</span></h2>
 <div class="section">
-<label>通用模型别名 (每行 alias=实际模型，可选)</label>
-<textarea name="modelAliases" id="modelAliasesInput" rows="5" placeholder="jx-sonnet=glm-5.1&#10;jx-opus=glm-5.1&#10;jx-haiku=glm-5.1">${escHtml(aliasesText)}</textarea>
-<div class="note">Claude Code 使用的 jx-sonnet、jx-opus、jx-haiku 与其他自定义别名都在此统一配置。留空表示直接使用请求中的模型名。</div>
-<div class="presets">
-  <span style="font-size:11px;color:var(--dim);line-height:24px">快速填充：</span>
-  <button type="button" class="preset" onclick="fillAliases('deepseek-v4-pro','deepseek-v4-pro','deepseek-v4-flash')">DeepSeek</button>
-  <button type="button" class="preset" onclick="fillAliases('claude-sonnet-4-6','claude-opus-4-5','claude-haiku-4-5')">Anthropic Claude</button>
-  <button type="button" class="preset" onclick="fillAliases('glm-5.1','glm-5.1','glm-5.1')">智谱 GLM</button>
-  <button type="button" class="preset" onclick="fillAliases('qwen-max','qwen-max','qwen-plus')">通义千问</button>
+<label>通用模型别名 — 一行一个别名，别名与实际模型一一对应<span class="req">*必填</span></label>
+<div class="alias-toolbar">
+  <span style="font-size:11px;color:var(--dim);line-height:24px">快捷添加：</span>
+  <button type="button" class="preset" onclick="addAliasRow('jx-fable')">jx-fable</button>
+  <button type="button" class="preset" onclick="addAliasRow('jx-opus')">jx-opus</button>
+  <button type="button" class="preset" onclick="addAliasRow('jx-haiku')">jx-haiku</button>
+  <button type="button" class="preset" onclick="addAliasRow('jx-sonnet')">jx-sonnet</button>
+  <button type="button" class="preset" onclick="addAliasRow('')">＋自定义别名</button>
 </div>
-<label style="margin-top:14px">高峰期模型别名 (每行 alias=实际模型，可选)</label>
-<textarea name="peakModelAliases" id="peakModelAliasesInput" rows="3" placeholder="jx-opus=glm-5.3-flash">${escHtml(peakAliasesText)}</textarea>
-<div class="note">仅在下方「高峰时段」命中时生效（按北京时间判断）：这里配置的别名会覆盖上面的默认映射，未填写的别名沿用默认映射。可用来在高峰期把昂贵模型换成便宜的（如 jx-opus=glm-5.3-flash）。</div>
+<div class="alias-head"><span>别名</span><span>实际模型</span><span>上下文长度</span><span></span></div>
+<div id="aliasRows"></div>
+<datalist id="stdAliasList"><option value="jx-fable"></option><option value="jx-opus"></option><option value="jx-haiku"></option><option value="jx-sonnet"></option></datalist>
+<div class="note">至少配置 1 行完整别名。上下文长度写入成员 Codex 接入配置的 models.json（Codex 用它显示上下文用量与做压缩阈值，网关与上游不感知）。删除行后行号自动重排。</div>
+<label style="margin-top:14px">高峰期别名覆盖（可选，仅覆盖上方同名别名）</label>
+<div class="alias-toolbar">
+  <button type="button" class="preset" onclick="addPeakRow()">＋添加覆盖</button>
+</div>
+<div class="alias-head"><span>别名</span><span>实际模型</span><span></span></div>
+<div id="peakRows"></div>
+<div class="note">仅在下方「高峰时段」命中时生效（按北京时间判断）：被覆盖的别名在高峰期改用这里的实际模型，未覆盖的沿用默认映射。可用来在高峰期把昂贵模型换成便宜的。</div>
 </div>
 
-<h2>允许模型<span class="req">*必填</span></h2>
+<h2>允许模型<span style="font-size:11px;color:var(--dim);font-weight:400">由别名自动生成，不可手动编辑</span></h2>
 <div class="section">
-<label>可用模型列表 (逗号分隔，至少1个)<span class="req">*必填</span></label>
-<input type="text" name="allowedModels" id="allowedModelsInput" value="${(s.allowedModels || []).join(",")}" placeholder="必填，如: deepseek-v4-pro, deepseek-v4-flash" required>
-<div class="note" id="allowedModelsNote">不在列表中的模型请求将被拦截返回403。所有别名目标模型会自动添加到此列表。</div>
+<div id="allowedTags" class="tag-row"></div>
+<div class="note" id="allowedModelsNote">自动汇总上方所有别名（含高峰期覆盖）的实际模型并去重。不在列表中的模型请求将被拦截返回 403。</div>
 </div>
 
 <h2>计费类型</h2>
@@ -3756,7 +3775,20 @@ ${errDiv}
 <div class="note" style="margin:0">以下设置作用于整个系统（所有方案共用同一份代理参数与自动配额策略），切换左侧方案不会改变这里的值。</div>
 </div>
 
-<h2>超时 & 重试</h2>
+<div class="actions">
+<button type="button" class="btn btn-outline" onclick="location.href='/dashboard'">取消</button>
+<button type="submit" class="btn btn-primary">保存设置</button>
+</div>
+</form>
+
+<div id="dataManagementView" hidden aria-hidden="true">
+<div class="view-intro">
+  <h2>全局数据管理</h2>
+  <p>此处操作作用于整个系统，不属于任何单一配置方案。导入前请确认来源方案映射，危险操作执行前会自动创建本地备份。</p>
+</div>
+<h2>超时 &amp; 重试 <span style="font-size:11px;color:var(--dim);font-weight:400">全局代理配置，对所有方案生效</span></h2>
+<form method="post" action="/api/settings-save" id="globalForm">
+<input type="hidden" name="_csrf" value="${CSRF_TOKEN}">
 <div class="section">
 <div class="row">
 <div><label>JSON 请求超时 (ms)</label><input type="number" name="timeout" value="${s.proxy.timeout}" min="10000" max="600000"></div>
@@ -3776,7 +3808,7 @@ ${errDiv}
 </div>
 </div>
 
-<h2>流量控制</h2>
+<h2>流量控制 <span style="font-size:11px;color:var(--dim);font-weight:400">全局代理配置，对所有方案生效</span></h2>
 <div class="section">
 <div class="row">
 <div><label>每用户最大并发数</label><input type="number" name="maxConcurrentPerUser" value="${s.proxy.maxConcurrentPerUser}" min="1" max="100"></div>
@@ -3802,18 +3834,10 @@ ${errDiv}
 </div>
 ${((() => { const qa = stmts.quotaAdjustRecent.all(); return qa.length > 0 ? `<h4 style="font-size:13px;color:var(--accent);margin:16px 0 8px">调整历史</h4><table style="width:100%;border-collapse:collapse;font-size:12px"><thead><tr><th style="text-align:left;padding:4px 8px;border-bottom:1px solid var(--border)">时间</th><th style="text-align:left;padding:4px 8px;border-bottom:1px solid var(--border)">用户</th><th style="text-align:right;padding:4px 8px;border-bottom:1px solid var(--border)">旧配额</th><th style="text-align:right;padding:4px 8px;border-bottom:1px solid var(--border)">新配额</th><th style="text-align:right;padding:4px 8px;border-bottom:1px solid var(--border)">命中率</th><th style="text-align:right;padding:4px 8px;border-bottom:1px solid var(--border)">日均用量</th></tr></thead><tbody>${qa.map(h => `<tr><td style="padding:4px 8px">${h.date}</td><td style="padding:4px 8px">${h.user_name || h.user_key.slice(0, 8)}</td><td style="text-align:right;padding:4px 8px">${(h.old_quota || 0).toLocaleString()}</td><td style="text-align:right;padding:4px 8px;color:var(--green)">${(h.new_quota || 0).toLocaleString()}</td><td style="text-align:right;padding:4px 8px">${Math.round((h.hit_rate || 0) * 100)}%</td><td style="text-align:right;padding:4px 8px">${(h.avg_daily_usage || 0).toLocaleString()}</td></tr>`).join("")}</tbody></table>` : '<div class="note" style="margin-top:8px">暂无自动调整记录</div>'; })())}
 </div>
-
-<div class="actions">
-<button type="button" class="btn btn-outline" onclick="location.href='/dashboard'">取消</button>
-<button type="submit" class="btn btn-primary">保存设置</button>
+<div class="actions" style="position:static;padding:12px 0;background:transparent;border-top:0">
+<button type="submit" class="btn btn-primary">保存全局配置</button>
 </div>
 </form>
-
-<div id="dataManagementView" hidden aria-hidden="true">
-<div class="view-intro">
-  <h2>全局数据管理</h2>
-  <p>此处操作作用于整个系统，不属于任何单一配置方案。导入前请确认来源方案映射，危险操作执行前会自动创建本地备份。</p>
-</div>
 
 <h2>旧数据导入</h2>
 <div class="section">
@@ -3913,8 +3937,8 @@ ${s.profiles.map(p => `<option value="${escHtml(p.suffix)}" ${p.suffix === initi
 <div class="note" id="newProfileProtocolNote">Claude Code 走 /v1/messages；Codex 走 /v1/responses。两种协议的方案完全隔离。</div>
 <label>上游 API 地址<span class="req">*</span></label><input type="text" id="newProfileUpstream" value="${escHtml(initialProfile.upstream || s.upstream || "")}" placeholder="https://open.bigmodel.cn/api/anthropic">
 <label>允许模型</label><input type="text" id="newProfileModels" value="${escHtml((initialProfile.allowedModels || s.allowedModels || []).join(","))}" placeholder="glm-5.1,qwen-max">
-<label>模型别名（每行 alias=实际模型，可选）</label><textarea id="newProfileAliases" rows="3" placeholder="jx-sonnet=glm-5.1&#10;jx-opus=glm-5.1&#10;jx-haiku=glm-5.1"></textarea>
-<div class="note">创建后会出现在左侧方案列表。默认入口可在左侧点击“设为默认”。</div>
+<label>模型别名（每行 alias=实际模型，建议直接填 jx-fable / jx-opus / jx-haiku / jx-sonnet）</label><textarea id="newProfileAliases" rows="3" placeholder="jx-fable=glm-5.3&#10;jx-opus=glm-5.3&#10;jx-haiku=glm-5.3-flash&#10;jx-sonnet=glm-5.3-flash"></textarea>
+<div class="note">创建后会出现在左侧方案列表；进入编辑页后可用行编辑器逐行完善（含每别名上下文）。</div>
 <div style="margin-top:16px;display:flex;justify-content:flex-end;gap:8px">
 <button type="button" class="btn btn-outline btn-sm" onclick="closeProfileModal()">取消</button>
 <button type="button" class="btn btn-primary btn-sm" onclick="createProfile()">创建方案</button>
@@ -3941,7 +3965,6 @@ const PAGE_CSRF="${CSRF_TOKEN}";
 function getCsrf(){return PAGE_CSRF||(document.cookie.match(/tm_csrf=([^;]+)/)||[])[1]||''}
 function csrfHeaders(h){h=h||{};h['x-csrf-token']=getCsrf();return h}
 function h(v){return String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
-function aliasText(aliases){return Object.entries(aliases||{}).map(([a,m])=>a+'='+m).join('\\n')}
 function openDateTimePicker(input){if(typeof input.showPicker==='function'){try{input.showPicker()}catch{}}}
 let pendingImportData=null;
 let pendingImportPreview=null;
@@ -4021,8 +4044,6 @@ function switchProtoTab(tab){
   var first=(SETTINGS.profiles||[]).find(function(p){return (p.protocol==='responses')===(tab==='responses')});
   if(first&&first.name)editProfile(first.name);
 }
-(function(){var saved=null;try{saved=localStorage.getItem('tm_settings_proto_tab')}catch(e){}
-if(saved==='responses'){try{switchProtoTab('responses')}catch(e){}}})();
 function closeProfileModal(){document.getElementById('profileModal').classList.remove('open')}
 document.getElementById('profileModal').addEventListener('click',function(e){if(e.target===this)closeProfileModal()});
 async function switchToProfile(n){
@@ -4202,9 +4223,7 @@ async function editProfile(n){
   fm.upstream.value=p.upstream||'';
   document.getElementById('suffixInput').value=p.suffix||'';
   document.getElementById('profileNameInput').value=p.name||'';
-  if(p.allowedModels)fm.allowedModels.value=p.allowedModels.join(', ');
-  if(fm.modelAliases)fm.modelAliases.value=aliasText(p.modelAliases||{});
-  if(fm.peakModelAliases)fm.peakModelAliases.value=aliasText(p.peakModelAliases||{});
+  renderAliasRows(p);
   if(fm.profileQuota)fm.profileQuota.value=p.dailyTokenLimit||0;
   const bt=fm.querySelector('select[name="billingType"]');if(bt)bt.value=p.billingType||'on_demand';
   renderPeakHoursRows(p.peakHours||[]);
@@ -4231,7 +4250,7 @@ async function createProfile(){
   if(!name||!suffix||!upstream){alert('方案名称、URL 后缀和上游 API 地址必填');return}
   const fm=document.forms.settingsForm;
   const r=await fetch('/api/profile/save',{method:'POST',headers:csrfHeaders({'Content-Type':'application/json'}),body:JSON.stringify({
-    profile:name,suffix:suffix,upstream:upstream,allowedModels:models||fm.allowedModels.value,
+    profile:name,suffix:suffix,upstream:upstream,allowedModels:models,
     modelAliases:modelAliases,protocol:protocol
   })});
   if(r.ok)toastThen('方案已创建',()=>location.reload());else{const e=await r.json();alert('创建失败: '+e.error)}
@@ -4255,7 +4274,7 @@ async function removeFromDefaultGroup(n){saveDefaultGroup(currentDefaultGroupFro
 async function moveDefaultGroup(n,d){const g=currentDefaultGroupFromDom();const i=g.indexOf(n);if(i<0)return;const j=i+d;if(j<0||j>=g.length)return;g.splice(i,1);g.splice(j,0,n);saveDefaultGroup(g)}
 async function saveResponsesGroup(group){
   const r=await fetch('/api/profile/default-group',{method:'POST',headers:csrfHeaders({'Content-Type':'application/json'}),body:JSON.stringify({group:group,protocol:'responses'})});
-  if(r.ok)toastThen('Responses 方案组已保存',()=>location.reload());else{const e=await r.json().catch(()=>({}));alert('保存失败: '+(e.error||''))}
+  if(r.ok)toastThen('OpenAI 方案组已保存',()=>location.reload());else{const e=await r.json().catch(()=>({}));alert('保存失败: '+(e.error||''))}
 }
 function currentResponsesGroupFromDom(){return Array.prototype.map.call(document.querySelectorAll('#responsesGroupList .group-item'),function(el){return el.dataset.name})}
 async function addToResponsesGroup(n){const g=currentResponsesGroupFromDom();if(!g.includes(n))g.push(n);saveResponsesGroup(g)}
@@ -4330,12 +4349,97 @@ function addGlobalUser(){
   for(const p of SETTINGS.profiles){if(!SETTINGS.profileAssignments[p.suffix])SETTINGS.profileAssignments[p.suffix]={}}
   renderProfileUsers(document.getElementById('userProfileSel').value);
 }
-function fillAliases(s,o,h){
-  document.forms.settingsForm.modelAliases.value='jx-sonnet='+s+'\\njx-opus='+o+'\\njx-haiku='+h;
-}
 function fillUpstream(url){
   document.querySelector('[name=upstream]').value=url;
 }
+// ── 模型别名的结构化行编辑器 ─────────────────────────────────────────────
+// 通用别名行 ma_alias_N/ma_model_N/ma_ctx_N；高峰覆盖行 pa_alias_N/pa_model_N。
+// 行增删后统一重排索引；允许模型标签实时汇总所有实际模型。
+const CW_OPTIONS=[[32768,'32K（32,768）'],[65536,'64K（65,536）'],[128000,'128K（128,000）'],[200000,'200K（200,000）'],[262144,'256K（262,144）'],[400000,'400K（400,000）'],[1048576,'1M（1,048,576）']];
+function cwSelectHtml(name,val){return '<select name="'+name+'">'+CW_OPTIONS.map(o=>'<option value="'+o[0]+'"'+(String(o[0])===String(val||128000)?' selected':'')+'>'+o[1]+'</option>').join('')+'</select>'}
+function renumberRows(prefix){
+  const wrap=prefix==='ma'?document.getElementById('aliasRows'):document.getElementById('peakRows');
+  const rows=[...wrap.querySelectorAll('.alias-row')];
+  rows.forEach((row,i)=>{row.querySelectorAll('[name^="'+prefix+'_"]').forEach(el=>{
+    const parts=el.name.split('_');el.name=prefix+'_'+parts[1]+'_'+i;});});
+}
+function collectAliasRows(){
+  return [...document.querySelectorAll('#aliasRows .alias-row')].map(row=>({
+    alias:row.querySelector('[name^="ma_alias_"]').value.trim(),
+    model:row.querySelector('[name^="ma_model_"]').value.trim(),
+  }));
+}
+function refreshPeakSelects(){
+  const names=collectAliasRows().filter(r=>r.alias).map(r=>r.alias);
+  document.querySelectorAll('#peakRows .alias-row select[name^="pa_alias_"]').forEach(sel=>{
+    const keep=sel.value;sel.innerHTML='<option value="">选择别名…</option>'+names.map(n=>'<option value="'+n+'"'+(n===keep?' selected':'')+'>'+n+'</option>').join('');
+    if(keep&&!names.includes(keep))sel.value='';
+  });
+}
+function updateAllowedTags(){
+  const models=[...new Set([...document.querySelectorAll('#aliasRows [name^="ma_model_"], #peakRows [name^="pa_model_"]')].map(el=>el.value.trim()).filter(Boolean))];
+  const box=document.getElementById('allowedTags');
+  box.innerHTML=models.length?models.map(m=>'<span class="m-tag">'+m.replace(/</g,'&lt;')+'</span>').join(''):'<span class="m-empty">暂无——填入别名实际模型后自动生成</span>';
+}
+function aliasRowEl(alias,model,cw){
+  const div=document.createElement('div');div.className='alias-row';
+  div.innerHTML='<input type="text" name="ma_alias_0" value="'+String(alias||'').replace(/"/g,'&quot;')+'" placeholder="别名，如 jx-opus" list="stdAliasList">'
+    +'<input type="text" name="ma_model_0" value="'+String(model||'').replace(/"/g,'&quot;')+'" placeholder="实际模型，如 glm-5.3">'
+    +cwSelectHtml('ma_ctx_0',cw||128000)
+    +'<button type="button" class="row-del" title="删除该行">×</button>';
+  div.querySelector('.row-del').onclick=()=>{div.remove();renumberRows('ma');refreshPeakSelects();updateAllowedTags()};
+  return div;
+}
+function peakRowEl(alias,model){
+  const div=document.createElement('div');div.className='alias-row peak';
+  div.innerHTML='<select name="pa_alias_0"></select>'
+    +'<input type="text" name="pa_model_0" value="'+String(model||'').replace(/"/g,'&quot;')+'" placeholder="高峰期实际模型">'
+    +'<button type="button" class="row-del" title="删除该行">×</button>';
+  div.querySelector('.row-del').onclick=()=>{div.remove();renumberRows('pa');updateAllowedTags()};
+  return div;
+}
+function addAliasRow(presetName){
+  const row=aliasRowEl(presetName||'','',128000);
+  document.getElementById('aliasRows').appendChild(row);
+  renumberRows('ma');refreshPeakSelects();updateAllowedTags();
+  (presetName?row.querySelector('[name^="ma_model_"]'):row.querySelector('[name^="ma_alias_"]')).focus();
+}
+function addPeakRow(){document.getElementById('peakRows').appendChild(peakRowEl('',''));renumberRows('pa');refreshPeakSelects();updateAllowedTags()}
+function renderAliasRows(profile){
+  const wrap=document.getElementById('aliasRows');wrap.innerHTML='';
+  const aliases=profile.modelAliases||{},ctxs=profile.modelContextWindows||{};
+  const names=Object.keys(aliases);
+  if(names.length){names.forEach(n=>wrap.appendChild(aliasRowEl(n,aliases[n],ctxs[n]||profile.contextWindow||128000)))}
+  else{['jx-fable','jx-opus','jx-haiku','jx-sonnet'].forEach(n=>wrap.appendChild(aliasRowEl(n,'',ctxs[n]||128000)))}
+  renumberRows('ma');
+  const pwrap=document.getElementById('peakRows');pwrap.innerHTML='';
+  const peakEntries=Object.entries(profile.peakModelAliases||{});
+  peakEntries.forEach(([n,m])=>pwrap.appendChild(peakRowEl(n,m)));
+  renumberRows('pa');refreshPeakSelects();
+  // refreshPeakSelects rebuilds each select's options; now restore the saved
+  // alias choice per row (row order matches peakEntries order). A stale name
+  // not among the defined aliases gets an explicitly marked option so it is
+  // visible rather than silently dropped.
+  pwrap.querySelectorAll('.alias-row').forEach((row,i)=>{
+    const sel=row.querySelector('select[name^="pa_alias_"]');
+    if(sel&&peakEntries[i]){
+      const want=peakEntries[i][0];
+      if(want&&![...sel.options].some(o=>o.value===want)){
+        sel.insertAdjacentHTML('beforeend','<option value="'+want.replace(/"/g,'&quot;')+'">'+want.replace(/</g,'&lt;')+'（未在通用别名中定义）</option>');
+      }
+      sel.value=want;
+    }
+  });
+  updateAllowedTags();
+}
+document.getElementById('aliasRows').addEventListener('input',()=>{refreshPeakSelects();updateAllowedTags()});
+document.getElementById('peakRows').addEventListener('input',updateAllowedTags);
+// Init LAST: editProfile/switchProtoTab assign let-declared module state
+// (editingProfileName), so running this any earlier throws a TDZ ReferenceError
+// and leaves the alias rows unrendered.
+(function(){var saved=null;try{saved=localStorage.getItem('tm_settings_proto_tab')}catch(e){}
+if(saved==='responses'){try{switchProtoTab('responses')}catch(e){}}
+else{renderAliasRows(SETTINGS.profiles.find(p=>p.suffix===SETTINGS.selectedProfileSuffix)||SETTINGS.profiles[0]||{})}})();
 document.addEventListener("keydown",e=>{if(e.key==="Enter"&&e.target.tagName!=="TEXTAREA"&&e.target.tagName!=="INPUT")e.preventDefault()});
 </script>
 </body></html>`;
@@ -4853,6 +4957,280 @@ function go(){const k=document.getElementById('key').value.trim();if(k)location.
 </script></body></html>`;
 }
 
+// ─── Codex 一键接入（成员自助配置）───────────────────────────────────────────
+// Codex 模型目录完全由方案配置生成：成员可访问的 Responses 方案的
+// modelAliases + peakModelAliases 别名键（配置顺序）；只有当方案完全没配别名时
+// 才回退到 allowedModels。不额外添加任何真实模型名。
+// context_window 取方案设置页的「模型上下文窗口」（默认 128000）。
+function codexCatalogEntryJson(slug, target, priority, contextWindow) {
+  const cw = Number.isFinite(contextWindow) && contextWindow > 0 ? contextWindow : 128000;
+  return `    {
+      "slug": ${JSON.stringify(slug)},
+      "display_name": ${JSON.stringify(slug)},
+      "description": "CC-Team alias -> ${target}",
+      "default_reasoning_level": "high",
+      "supported_reasoning_levels": [
+        { "effort": "low", "description": "Light reasoning" },
+        { "effort": "medium", "description": "Balanced reasoning" },
+        { "effort": "high", "description": "Enhanced reasoning" }
+      ],
+      "shell_type": "shell_command",
+      "visibility": "list",
+      "supported_in_api": true,
+      "priority": ${priority},
+      "base_instructions": "",
+      "supports_reasoning_summaries": true,
+      "default_reasoning_summary": "none",
+      "support_verbosity": false,
+      "apply_patch_tool_type": "freeform",
+      "truncation_policy": { "mode": "bytes", "limit": 10000 },
+      "context_window": ${cw},
+      "max_context_window": ${cw},
+      "effective_context_window_percent": 95,
+      "supports_parallel_tool_calls": true,
+      "experimental_supported_tools": [],
+      "input_modalities": ["text"]
+    }`;
+}
+
+// Returns { entries: [{slug,target,contextWindow}], json, defaultModel } for one member key.
+function buildCodexModelCatalog(apiKey) {
+  const entries = [];
+  const seen = new Set();
+  const add = (slug, target, contextWindow) => {
+    slug = String(slug || "").trim();
+    if (!slug || slug === "*" || seen.has(slug)) return;
+    seen.add(slug);
+    entries.push({ slug, target: String(target || "").trim(), contextWindow: contextWindow || 128000 });
+  };
+  let fallbackRuntime = null;
+  for (const runtime of Object.values(runtimes)) {
+    if (runtime.protocol !== "responses") continue;
+    if (!canUseProfile(apiKey, runtime).allowed) continue;
+    const profileCfg = config.profiles[runtime.profileName] || {};
+    const aliases = { ...(runtime.modelAliases || {}), ...(runtime.peakModelAliases || {}) };
+    const aliasKeys = Object.keys(aliases);
+    for (const alias of aliasKeys) add(alias, aliases[alias], profileCfg.modelContextWindows?.[alias] || profileCfg.contextWindow || 128000);
+    if (aliasKeys.length === 0 && !fallbackRuntime) fallbackRuntime = runtime;
+  }
+  if (entries.length === 0 && fallbackRuntime) {
+    const profile = config.profiles[fallbackRuntime.profileName] || {};
+    const cw = profile.contextWindow || 128000;
+    for (const m of profile.allowedModels || []) add(m, m, cw);
+  }
+  const json = entries.length
+    ? "{\n  \"models\": [\n" + entries.map((e, i) => codexCatalogEntryJson(e.slug, e.target, i, e.contextWindow)).join(",\n") + "\n  ]\n}"
+    : "{\n  \"models\": []\n}";
+  return { entries, json, defaultModel: entries.length ? entries[0].slug : "" };
+}
+
+// The ccteam provider block Codex needs, with the member's key and the gateway
+// address baked in. Shared by the install script and the manual/cc-switch tabs.
+function codexProviderToml(host, key) {
+  return `[model_providers.ccteam]
+name = "CC Team Gateway"
+base_url = "http://${host}/v1"
+wire_api = "responses"
+requires_openai_auth = false
+supports_websockets = false
+experimental_bearer_token = "${key}"`;
+}
+
+function codexTopKeysToml(defaultModel) {
+  return `model_provider = "ccteam"
+${defaultModel ? `model = "${defaultModel}"
+` : ""}model_catalog_json = "~/.codex/models.json"`;
+}
+
+// POSIX sh installer for `curl … | sh`. Idempotent: only manages the ccteam
+// provider block and its top-level keys; every other section (projects, plugins,
+// other providers) passes through untouched. Backs up config.toml first.
+function buildCodexSetupScript(key, host, username, catalogJson, defaultModel) {
+  const provBlock = codexProviderToml(host, key);
+  const topKeys = codexTopKeysToml(defaultModel);
+  return `#!/bin/sh
+# CC-Team Codex 一键接入 — 成员: ${username}
+# 幂等脚本：可重复执行；只管理 ccteam 相关配置，不影响其他 provider
+set -e
+CODEX_DIR="\${CODEX_HOME:-\$HOME/.codex}"
+mkdir -p "\$CODEX_DIR"
+CONFIG="\$CODEX_DIR/config.toml"
+MODELS="\$CODEX_DIR/models.json"
+TS="\$(date +%Y%m%d%H%M%S)"
+CONFIG_BAK=""
+MODELS_BAK=""
+if [ -f "\$CONFIG" ]; then
+  CONFIG_BAK="\$CONFIG.backup-ccteam-\$TS"
+  cp "\$CONFIG" "\$CONFIG_BAK"
+  echo "已备份原配置 → config.toml.backup-ccteam-\$TS"
+fi
+
+echo "[1/3] 写入模型目录 \$CODEX_DIR/models.json ..."
+if [ -f "\$MODELS" ]; then
+  MODELS_BAK="\$MODELS.backup-ccteam-\$TS"
+  cp "\$MODELS" "\$MODELS_BAK"
+  echo "已备份原模型目录 → models.json.backup-ccteam-\$TS"
+fi
+cat > "\$MODELS" <<'CC_MODELS_EOF'
+${catalogJson}
+CC_MODELS_EOF
+
+echo "[2/3] 更新 \$CODEX_DIR/config.toml ..."
+TOP_BLOCK='${topKeys}'
+PROV_BLOCK='${provBlock}'
+rollback() {
+  echo "[提示] 配置更新失败，正在恢复原始文件 ..."
+  if [ -n "\$CONFIG_BAK" ] && [ -f "\$CONFIG_BAK" ]; then cp "\$CONFIG_BAK" "\$CONFIG"; fi
+  if [ -n "\$MODELS_BAK" ] && [ -f "\$MODELS_BAK" ]; then cp "\$MODELS_BAK" "\$MODELS"; fi
+  echo "[提示] 已恢复原始内容，你的数据未受影响。请把以下输出发给管理员排查。"
+  exit 1
+}
+if [ -f "\$CONFIG" ]; then
+  # BSD awk (macOS) rejects literal newlines in -v values, so the blocks are
+  # passed through the environment instead.
+  TOP_BLOCK="\$TOP_BLOCK" PROV_BLOCK="\$PROV_BLOCK" awk '
+    BEGIN { top_block = ENVIRON["TOP_BLOCK"]; prov_block = ENVIRON["PROV_BLOCK"]; in_top=1; printed=0; skip=0 }
+    /^\\[model_providers\\.ccteam\\]$/ { skip=1; next }
+    skip && /^\\[/ { skip=0 }
+    skip { next }
+    !printed && /^\\[/ { print top_block; print ""; printed=1 }
+    /^\\[/ { in_top=0 }
+    in_top && /^(model_provider|model|model_catalog_json)[[:space:]]*=/ { next }
+    { print }
+    END {
+      if (!printed) { print top_block; print "" }
+      print ""
+      print prov_block
+    }
+  ' "\$CONFIG" > "\$CONFIG.tmp" || rollback
+  # Sanity-check the rewritten file before replacing the original: non-empty
+  # and carrying the new provider block. Otherwise restore from this run's backup.
+  if [ -s "\$CONFIG.tmp" ] && grep -q "model_providers\\.ccteam" "\$CONFIG.tmp"; then
+    mv "\$CONFIG.tmp" "\$CONFIG"
+  else
+    rm -f "\$CONFIG.tmp"
+    rollback
+  fi
+else
+  printf '%s\\\\n\\\\n%s\\\\n' "\$TOP_BLOCK" "\$PROV_BLOCK" > "\$CONFIG" || rollback
+fi
+
+echo "[3/3] 检查网关连通性 ..."
+if command -v curl > /dev/null 2>&1 && curl -fsS -m 8 -H "Authorization: Bearer ${key}" "http://${host}/v1/models" > /dev/null 2>&1; then
+  echo "[OK] 网关连通正常"
+else
+  echo "[提示] 连通检查未通过——请确认本机可以访问 http://${host}（配置本身已完成）"
+fi
+
+echo ""
+echo "========== 本次操作摘要 =========="
+echo "1. 备份："
+if [ -n "\$CONFIG_BAK" ]; then echo "   原配置   → \$CONFIG_BAK"; fi
+if [ -n "\$MODELS_BAK" ]; then echo "   原模型目录 → \$MODELS_BAK"; fi
+if [ -z "\$CONFIG_BAK" ] && [ -z "\$MODELS_BAK" ]; then echo "   （首次安装，无需备份）"; fi
+echo "2. 写入 \$MODELS"
+echo "   内容：方案配置的模型别名目录${defaultModel ? `（默认模型 ${defaultModel}）` : ""}"
+echo "3. 更新 \$CONFIG"
+echo "   只改了 model_provider / model / model_catalog_json 三行顶层键，"
+echo "   并在末尾追加 [model_providers.ccteam] 一段；你的其他配置未动。"
+echo "----------------------------------"
+echo "下一步：完全退出 Codex（macOS: Cmd+Q）后重新打开即可使用。"
+echo "如需恢复原配置：把对应 .backup-ccteam-$TS 文件复制回原名即可"
+echo "（例如 cp \"\$CONFIG.backup-ccteam-$TS\" \"\$CONFIG\"）。"
+${defaultModel ? `echo "默认模型 ${defaultModel}；模型选择器中可切换方案配置的其他别名。"\n` : ""}`;
+}
+
+function codexSetupHtml(virtualKey, state, catalog) {
+  const key = virtualKey || "";
+  const cat = catalog || { entries: [], json: '{\n  "models": []\n}', defaultModel: "" };
+  const banner = state === "invalid"
+    ? `<div style="background:#fff2f0;border:1px solid #f1c8c2;color:var(--red);padding:10px 14px;border-radius:6px;margin-bottom:16px;font-size:13px">该 Key 不存在——请检查链接里的虚拟 Key 是否完整。</div>`
+    : state === "no-profile"
+    ? `<div style="background:#fff7e6;border:1px solid #ffe1a6;color:#a1662f;padding:10px 14px;border-radius:6px;margin-bottom:16px;font-size:13px">该 Key 尚未分配到任何 Responses(Codex) 方案——请联系管理员在设置页为其分配后再来配置。</div>`
+    : "";
+  return `<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>Codex 接入配置 - 团队AI Coding监控</title>
+<style>
+${UI_THEME}
+body{padding:28px clamp(18px,3vw,44px) 48px}
+body>div{max-width:880px;margin-left:auto;margin-right:auto}
+.top{margin-bottom:14px;padding-bottom:18px;border-bottom:1px solid var(--border)}
+.top h1{font-size:26px;font-weight:650;margin-bottom:6px}.top .sub{font-size:12px;color:var(--dim)}
+.host-row{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:16px;font-size:13px}
+.host-row code{font-size:11px;color:var(--dim)}
+#hostInput{font-size:13px;background:var(--surface);color:var(--text);border:1px solid var(--border);border-radius:5px;padding:7px 10px;width:240px;font-family:var(--font-mono)}
+.tabs{display:flex;gap:6px;margin-bottom:14px}
+.tabs button{font-size:13px;font-weight:600;padding:8px 16px;border:1px solid var(--border);border-radius:6px;background:var(--surface);color:var(--dim);cursor:pointer}
+.tabs button.on{border-color:var(--accent);background:var(--accent-soft);color:var(--accent)}
+.panel{display:none}.panel.on{display:block}
+.box{background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:16px;margin-bottom:14px}
+.box h3{font-size:13px;font-weight:650;margin-bottom:10px}
+.box ol{padding-left:20px;margin:0}.box li{font-size:13px;line-height:2}
+pre{position:relative;background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:14px;font-size:11.5px;line-height:1.6;overflow-x:auto;white-space:pre;font-family:var(--font-mono);margin:0 0 12px}
+.copy-btn{position:absolute;top:8px;right:8px;font-size:11px;border:1px solid var(--border);background:var(--surface);color:var(--text);padding:3px 10px;border-radius:4px;cursor:pointer}
+.copy-btn:hover{border-color:var(--accent);color:var(--accent)}
+.note{font-size:11px;color:var(--dim);line-height:1.7}
+.warn{background:#fff7e6;border:1px solid #ffe1a6;color:#a1662f;padding:8px 12px;border-radius:5px;font-size:12px;margin-top:10px}
+</style></head><body data-theme="editorial-light">
+<div class="top"><h1>Codex 接入配置</h1><div class="sub">把你的 Codex 指向团队网关 — 三种方式任选其一</div></div>
+${banner}
+<div class="host-row"><span>服务器地址：</span><span style="color:var(--dim)">http://</span><input id="hostInput" value="" oninput="renderAll()" spellcheck="false"><code>自动取自当前访问地址，可修改</code>${cat.entries.length ? ` <code>可用模型：${cat.entries.map(e => e.slug).join(" / ")}（来自方案配置的别名）</code>` : ""}</div>
+<div class="tabs">
+  <button class="on" data-tab="script" onclick="setTab('script')">一键脚本</button>
+  <button data-tab="manual" onclick="setTab('manual')">手动配置</button>
+  <button data-tab="ccswitch" onclick="setTab('ccswitch')">cc-switch 用户</button>
+</div>
+<div class="panel on" id="panel-script">
+  <div class="box"><h3>在终端执行一条命令</h3>
+    <pre><button class="copy-btn" onclick="copyPre(this)">复制</button><code id="curlCmd"></code></pre>
+    <ol>
+      <li>打开「终端」(Terminal)，粘贴执行上面的命令</li>
+      <li>脚本会自动备份并更新 <code>~/.codex/config.toml</code>、写入 <code>~/.codex/models.json</code></li>
+      <li><strong>完全退出 Codex（Cmd+Q）再重新打开</strong>，即可使用</li>
+    </ol>
+    <div class="note">脚本只管理 ccteam 相关配置，你已有的其他 provider / 项目配置全部保留；重复执行安全。</div>
+  </div>
+</div>
+<div class="panel" id="panel-manual">
+  <div class="box"><h3>① 追加到 ~/.codex/config.toml 顶部（若已有同名键则替换）</h3>
+    <pre style="max-height:300px;overflow:auto"><button class="copy-btn" onclick="copyPre(this)">复制</button><code id="tomlBlock"></code></pre>
+  </div>
+  <div class="box"><h3>② 另存为 ~/.codex/models.json</h3>
+    <pre style="max-height:300px;overflow:auto"><button class="copy-btn" onclick="copyPre(this)">复制</button><code id="modelsJson"></code></pre>
+    <div class="note">保存后完全退出 Codex（Cmd+Q）重新打开。</div>
+  </div>
+</div>
+<div class="panel" id="panel-ccswitch">
+  <div class="box"><h3>在 cc-switch 中添加自定义供应商</h3>
+    <ol>
+      <li>cc-switch → Codex → Add Provider → 自定义</li>
+      <li>把下面的 TOML 粘贴进供应商配置（name 可自定，字段保留）：</li>
+    </ol>
+    <pre style="max-height:260px;overflow:auto"><button class="copy-btn" onclick="copyPre(this)">复制</button><code id="tomlBlock2"></code></pre>
+    <div class="warn">注意：cc-switch 切换供应商时会重写 config.toml。请把 <code>model_catalog_json = "~/.codex/models.json"</code>${cat.defaultModel ? ` 与 <code>model = "${cat.defaultModel}"</code>` : ""} 放进它的「Shared Config Snippet / 公共配置」；且切换到 ccteam 后需确认这几个顶层键仍然存在，models.json 也要按「手动配置」页准备一次。</div>
+  </div>
+</div>
+<script>
+const KEY=${JSON.stringify(key)};
+const MODELS=${JSON.stringify(cat.json)};
+const DEFAULT_MODEL=${JSON.stringify(cat.defaultModel)};
+const TOP_KEYS='model_provider = "ccteam"\\n'+(DEFAULT_MODEL?'model = "'+DEFAULT_MODEL+'"\\n':'')+'model_catalog_json = "~/.codex/models.json"\\n';
+function host(){return (document.getElementById('hostInput').value||'').trim().replace(/^https?:\\/\\//,'').replace(/\\/$/,'')}
+function providerToml(h){return '[model_providers.ccteam]\\nname = "CC Team Gateway"\\nbase_url = "http://'+h+'/v1"\\nwire_api = "responses"\\nrequires_openai_auth = false\\nsupports_websockets = false\\nexperimental_bearer_token = "'+KEY+'"' }
+function renderAll(){
+  const h=host();if(!h)return;
+  document.getElementById('curlCmd').textContent='curl -fsSL "http://'+h+'/api/codex-setup/'+KEY+'" | sh';
+  document.getElementById('tomlBlock').textContent=TOP_KEYS+'\\n'+providerToml(h);
+  document.getElementById('tomlBlock2').textContent=providerToml(h);
+  document.getElementById('modelsJson').textContent=JSON.stringify(JSON.parse(MODELS),null,2);
+}
+function setTab(t){document.querySelectorAll('.tabs button').forEach(b=>b.classList.toggle('on',b.dataset.tab===t));document.querySelectorAll('.panel').forEach(p=>p.classList.toggle('on',p.id==='panel-'+t))}
+function copyPre(btn){const code=btn.parentElement.querySelector('code');navigator.clipboard.writeText(code.textContent).then(()=>{btn.textContent='已复制';setTimeout(()=>btn.textContent='复制',1500)})}
+document.getElementById('hostInput').value=location.host;
+renderAll();
+</script></body></html>`;
+}
+
 function personalUsageHtml(virtualKey) {
   return `<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
 <title>我的用量 - 团队AI Coding监控</title>
@@ -4873,7 +5251,7 @@ select{font-size:12px;background:var(--surface);color:var(--text);border:1px sol
 table{width:100%;border-collapse:collapse;min-width:560px}th{text-align:left;padding:9px 12px;font-size:11px;font-weight:550;color:var(--dim);border-bottom:1px solid var(--border);white-space:nowrap}td{padding:9px 12px;font-size:12px;border-bottom:1px solid #ecece8;white-space:nowrap}.n{text-align:right;font-variant-numeric:tabular-nums}tbody tr:hover td{background:#fafaf7}.tag{font-size:10px;background:var(--accent-soft);color:var(--accent);padding:2px 6px;border-radius:4px}
 @media(max-width:560px){body{padding:20px 14px 36px}.top h1{font-size:24px}.cards{grid-template-columns:1fr 1fr}.card .v{font-size:20px}.box{padding:14px}}
 </style></head><body data-theme="editorial-light">
-<div class="top"><div><h1>我的用量</h1><div class="sub">查看个人配额、趋势和模型明细</div></div><select id="profileSel" onchange="switchProfile(this.value)"><option value="all">全部可用方案</option></select></div>
+<div class="top"><div><h1>我的用量</h1><div class="sub">查看个人配额、趋势和模型明细 · <a href="/setup/${escJs(virtualKey)}" style="color:var(--accent)">配置 Codex 接入 →</a></div></div><select id="profileSel" onchange="switchProfile(this.value)"><option value="all">全部可用方案</option></select></div>
 <div class="meta" id="meta">加载中...</div>
 <div class="cards" id="cards"></div>
 <div class="box"><h3>今日24小时趋势</h3><canvas id="hourChart"></canvas></div>
@@ -4955,6 +5333,7 @@ function parseFormBody(body) {
 }
 
 function applySettings(formData) {
+  const isGlobalOnlySave = !formData.profileName && !formData.profileSuffix && formData.upstream === undefined;
   const editingProfileName = formData.profileName || getProfileNameBySuffix(formData.profileSuffix) || getDefaultProfileName();
   const editingProfile = config.profiles[editingProfileName];
   if (!editingProfile) throw new Error(`Profile "${editingProfileName}" not found`);
@@ -4987,19 +5366,19 @@ function applySettings(formData) {
   if (formData.circuitBreakerFailures) gProxy.circuitBreakerFailures = Math.max(1, Math.min(50, parseInt(formData.circuitBreakerFailures, 10) || 5));
   if (formData.circuitBreakerCooldown) gProxy.circuitBreakerCooldown = Math.max(1000, Math.min(300000, parseInt(formData.circuitBreakerCooldown, 10) || 30000));
 
-  // Update profile quota
-  if (formData.profileQuota !== undefined) {
+  // Update profile quota (profile form only — the global form carries no quota)
+  if (!isGlobalOnlySave && formData.profileQuota !== undefined) {
     const q = parseInt(formData.profileQuota, 10) || 0;
     editingProfile.dailyTokenLimit = q > 0 ? q : null;
   }
 
   // Update billing type (display label, drives no logic)
-  if (formData.billingType && ["coding_plan", "token_plan", "on_demand"].includes(formData.billingType)) {
+  if (!isGlobalOnlySave && formData.billingType && ["coding_plan", "token_plan", "on_demand"].includes(formData.billingType)) {
     editingProfile.billingType = formData.billingType;
   }
 
   // Update peak hours (display-only recurring daily time ranges)
-  if (formData.peakStart !== undefined) {
+  if (!isGlobalOnlySave && formData.peakStart !== undefined) {
     const starts = [].concat(formData.peakStart);
     const ends = [].concat(formData.peakEnd);
     editingProfile.peakHours = normalizePeakHours(starts.map((s, i) => ({ start: s, end: ends[i] })));
@@ -5030,32 +5409,62 @@ function applySettings(formData) {
       .filter(n => !isNaN(n));
   }
 
-  // Update allowed models (mandatory — at least 1 model required)
-  if (formData.allowedModels !== undefined) {
-    const raw = formData.allowedModels.trim();
-    if (!raw) throw new Error("至少需要设置 1 个允许模型");
-    editingProfile.allowedModels = raw.split(",").map(s => s.trim()).filter(Boolean);
-    if (editingProfile.allowedModels.length === 0) throw new Error("至少需要设置 1 个允许模型");
-  }
-
-  if (formData.modelAliases !== undefined) {
+  // ── 模型别名（结构化行编辑器）────────────────────────────────────────────
+  // 通用别名必填：行字段 ma_alias_N / ma_model_N / ma_ctx_N；至少 1 行完整、别名唯一。
+  // 高峰覆盖行 pa_alias_N / pa_model_N（可选，别名来自通用别名集合）。
+  // allowedModels 不再接受手填，完全由别名目标派生。
+  const hasAliasRows = Object.keys(formData).some(k => /^ma_alias_\d+$/.test(k));
+  if (hasAliasRows) {
+    const aliases = {};
+    const contextWindows = {};
+    for (let i = 0; formData["ma_alias_" + i] !== undefined || formData["ma_model_" + i] !== undefined; i++) {
+      const alias = String(formData["ma_alias_" + i] || "").trim();
+      const model = String(formData["ma_model_" + i] || "").trim();
+      if (!alias && !model) continue;   // blank row
+      if (!alias || !model) throw new Error(`第 ${i + 1} 行别名配置不完整：别名与实际模型都必须填写`);
+      if (aliases[alias]) throw new Error(`别名 "${alias}" 重复，每行别名必须唯一`);
+      aliases[alias] = model;
+      const cw = parseInt(formData["ma_ctx_" + i], 10);
+      contextWindows[alias] = Number.isFinite(cw) && cw > 0 ? cw : 128000;
+    }
+    if (Object.keys(aliases).length === 0) throw new Error("至少需要配置 1 个通用模型别名（可用快捷按钮添加 jx-fable / jx-opus / jx-haiku / jx-sonnet）");
+    editingProfile.modelAliases = aliases;
+    editingProfile.modelContextWindows = contextWindows;
+  } else if (formData.modelAliases !== undefined) {
+    // Legacy textarea path (older clients / API posts)
     const parsedAliases = parseModelAliasesInput(formData.modelAliases);
+    if (Object.keys(parsedAliases).length === 0) throw new Error("至少需要配置 1 个通用模型别名");
     editingProfile.modelAliases = parsedAliases;
-  } else {
-    editingProfile.modelAliases = getConfigurableModelAliases(editingProfile);
   }
 
-  if (formData.peakModelAliases !== undefined) {
+  if (Object.keys(formData).some(k => /^pa_alias_\d+$/.test(k))) {
+    const peakAliases = {};
+    for (let i = 0; formData["pa_alias_" + i] !== undefined || formData["pa_model_" + i] !== undefined; i++) {
+      const alias = String(formData["pa_alias_" + i] || "").trim();
+      const model = String(formData["pa_model_" + i] || "").trim();
+      if (!alias && !model) continue;
+      if (!alias || !model) throw new Error(`高峰期第 ${i + 1} 行不完整：别名与实际模型都必须填写`);
+      if (peakAliases[alias]) throw new Error(`高峰期别名 "${alias}" 重复`);
+      peakAliases[alias] = model;
+    }
+    editingProfile.peakModelAliases = peakAliases;
+  } else if (formData.peakModelAliases !== undefined) {
     editingProfile.peakModelAliases = formData.peakModelAliases.trim()
       ? parseModelAliasesInput(formData.peakModelAliases)
       : {};
   }
 
-  // Ensure alias targets are always in allowedModels
-  if (!Array.isArray(editingProfile.allowedModels)) editingProfile.allowedModels = [];
-  for (const m of Object.values({ ...getProfileModelAliases(editingProfile), ...normalizeModelAliases(editingProfile.peakModelAliases || {}) })) {
-    if (m && !editingProfile.allowedModels.includes(m)) {
-      editingProfile.allowedModels.push(m);
+  // allowedModels = 去重后的全部别名目标（唯一来源，不可手填）。
+  // Only recomputed on profile-form saves; a global-only save carries no alias
+  // fields and must not touch the profile's allowedModels.
+  if (!isGlobalOnlySave) {
+    const aliasTargets = Object.values({
+      ...normalizeModelAliases(editingProfile.modelAliases || {}),
+      ...normalizeModelAliases(editingProfile.peakModelAliases || {}),
+    }).filter(Boolean);
+    editingProfile.allowedModels = [...new Set(aliasTargets)];
+    if (editingProfile.allowedModels.length === 0) {
+      throw new Error("允许模型列表为空——请先在上方配置模型别名");
     }
   }
 
@@ -5941,6 +6350,43 @@ const server = http.createServer((req, res) => {
     }).catch(() => {
       res.writeHead(413); res.end("Request too large");
     });
+    return;
+  }
+
+  // Codex one-click setup pages (member self-service)
+  if (req.method === "GET" && (req.url === "/setup" || req.url.startsWith("/setup/"))) {
+    const vk = req.url === "/setup" ? "" : decodeURIComponent(req.url.slice(7).split("?")[0]);
+    let state = "ok";
+    let catalog = null;
+    if (vk) {
+      const exists = Object.values(runtimes).some(r => r.users[vk]);
+      if (!exists) state = "invalid";
+      else if (!getAccessibleProfiles(vk).some(p => p.protocol === "responses")) state = "no-profile";
+      else catalog = buildCodexModelCatalog(vk);
+    }
+    res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+    res.end(codexSetupHtml(vk, state, catalog));
+    return;
+  }
+  // Codex installer script, personalized per member key. The Host header tells
+  // us which address the member's machine already reaches the gateway on.
+  if (req.method === "GET" && req.url.startsWith("/api/codex-setup/")) {
+    const vk = decodeURIComponent(req.url.slice("/api/codex-setup/".length).split("?")[0]);
+    const assignedRuntime = Object.values(runtimes).find(r => r.protocol === "responses" && r.users[vk]);
+    const profileUser = assignedRuntime ? assignedRuntime.users[vk] : null;
+    const profileUserDisabled = profileUser && typeof profileUser === "object" ? !!profileUser.disabled : false;
+    const username = config.users?.[vk]?.username || vk;
+    const globallyDisabled = !config.users?.[vk] || !!config.users[vk].disabled;
+    if (!assignedRuntime || globallyDisabled || profileUserDisabled) {
+      res.writeHead(404, { "Content-Type": "text/plain; charset=utf-8" });
+      res.end("# 无效的虚拟 Key 或该 Key 未分配到 Responses(Codex) 方案");
+      return;
+    }
+    const rawHost = String(req.headers.host || "");
+    const host = /^[A-Za-z0-9._:\-\[\]]+$/.test(rawHost) ? rawHost : `localhost:${port}`;
+    const catalog = buildCodexModelCatalog(vk);
+    res.writeHead(200, { "Content-Type": "text/x-shellscript; charset=utf-8" });
+    res.end(buildCodexSetupScript(vk, host, username, catalog.json, catalog.defaultModel));
     return;
   }
 

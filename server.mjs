@@ -728,6 +728,12 @@ gProxy.retryableStatusCodes = gProxy.retryableStatusCodes || [429, 502, 503, 504
 gProxy.maxConcurrentPerUser = gProxy.maxConcurrentPerUser || 5;
 gProxy.rateLimitPerMinute = gProxy.rateLimitPerMinute || 60;
 gProxy.rateLimitFallbackSeconds = gProxy.rateLimitFallbackSeconds || 120;
+// Idle watchdog for SSE streams: abort when no bytes arrive for this long (0 = off).
+// Much tighter than streamTimeout, which stays as the socket-level backstop.
+gProxy.streamIdleTimeout = gProxy.streamIdleTimeout ?? 120000;
+// Sticky-session TTL in seconds: same conversation keeps hitting the same group
+// profile so the upstream prompt cache stays warm (0 = off).
+gProxy.stickySessionTtlSeconds = gProxy.stickySessionTtlSeconds ?? 300;
 
 // Backward-compat: rt → default profile runtime (used by non-request-path code)
 let rt;
@@ -1469,10 +1475,24 @@ function fallbackResumeAtMs() {
   return Date.now() + secs * 1000;
 }
 
+// Honor an upstream Retry-After header (delta-seconds or HTTP-date) when a 429
+// was classified as a plan limit — more precise than the flat fallback window.
+function parseRetryAfterMs(headerValue) {
+  if (typeof headerValue !== "string") return null;
+  const v = headerValue.trim();
+  if (/^\d+$/.test(v)) return parseInt(v, 10) * 1000;
+  const ms = Date.parse(v);
+  return Number.isFinite(ms) ? ms - Date.now() : null;
+}
+function clampRetryAfterMs(ms) {
+  if (!Number.isFinite(ms) || ms <= 0) return null;
+  return Math.min(600_000, Math.max(15_000, ms));
+}
+
 // Classify an upstream response as a plan limit we should fail over from.
 // Returns { resumeAt, source } when it is, or null for a plain burst 429
 // (which should follow the normal same-upstream retry path).
-function classifyRateLimit(statusCode, text) {
+function classifyRateLimit(statusCode, text, headers) {
   if (statusCode !== 429) return null;
   const body = String(text || "");
   const parsed = parseRateLimitReset(body);
@@ -1486,7 +1506,102 @@ function classifyRateLimit(statusCode, text) {
   // Plan exhaustion: GLM 1310 用量上限 / 1113 欠费 / 1311 套餐未开放模型权限,
   // Aliyun Throttling.AllocationQuota (free allocated quota exceeded), DeepSeek 429 quota.
   const looksLikePlanLimit = /"code"\s*:\s*1(310|311|113)|使用上限|usage limit|plan limit|额度已耗尽|quota exceeded|AllocationQuota|free allocated quota/i.test(body);
-  return looksLikePlanLimit ? { resumeAt: fallbackResumeAtMs(), source: "fallback" } : null;
+  if (!looksLikePlanLimit) return null;
+  const retryAfter = clampRetryAfterMs(parseRetryAfterMs(headers?.["retry-after"]));
+  return retryAfter
+    ? { resumeAt: Date.now() + retryAfter, source: "retry-after" }
+    : { resumeAt: fallbackResumeAtMs(), source: "fallback" };
+}
+
+// ─── Sticky sessions (cache affinity) ────────────────────────────────────────
+// Both supported protocols are stateless replays: every turn re-sends the whole
+// conversation. If failover round-robins a conversation across group members,
+// each switch re-pays the entire prompt at full price and cold cache. Binding a
+// conversation to one profile keeps the upstream prompt cache warm (idea after
+// sub2api's sticky sessions; their digest-chain trick is simplified to a
+// first-turn digest). Availability always wins: candidates are filtered before
+// the reorder runs, so an unavailable bound profile is simply not in the list.
+const STICKY_BINDINGS_CAP = 1000;
+const stickyBindings = new Map();   // "proto|userKey|signal" → { profile, expiresAt }
+
+function stickyTtlMs() {
+  const secs = Number(gProxy.stickySessionTtlSeconds);
+  return Number.isFinite(secs) && secs > 0 ? secs * 1000 : 0;
+}
+
+// Deterministic JSON regardless of the client's key ordering.
+function canonicalJson(value) {
+  if (Array.isArray(value)) return value.map(canonicalJson);
+  if (value && typeof value === "object") {
+    const out = {};
+    for (const k of Object.keys(value).sort()) out[k] = canonicalJson(value[k]);
+    return out;
+  }
+  return value;
+}
+function shortDigest(value) {
+  return crypto.createHash("sha256").update(JSON.stringify(canonicalJson(value))).digest("hex").slice(0, 16);
+}
+
+// Resolve a stable per-conversation signal, in priority order:
+// 1. explicit session headers (Codex sends `session_id` on /v1/responses),
+// 2. the Responses API `prompt_cache_key` body field,
+// 3. digest of the conversation's first turn — replay protocols append at the
+//    tail, so item[0] (plus the constant system/instructions) is identical on
+//    every turn of the same conversation. Collisions between conversations that
+//    happen to share the first turn only cost cache locality, never correctness.
+function extractSessionSignal(protocol, reqHeaders, parsed) {
+  const hdr = reqHeaders["session_id"] || reqHeaders["x-session-id"] || reqHeaders["x-claude-code-session-id"];
+  if (typeof hdr === "string" && hdr.trim()) return "hdr:" + hdr.trim().slice(0, 128);
+  const pck = parsed?.prompt_cache_key;
+  if (typeof pck === "string" && pck.trim()) return "pck:" + pck.trim().slice(0, 128);
+  try {
+    let prefix;
+    if (protocol === "responses") {
+      const items = Array.isArray(parsed?.input) ? parsed.input : [];
+      if (items.length === 0) return null;
+      prefix = { instructions: parsed?.instructions ?? null, first: items[0] };
+    } else {
+      const msgs = Array.isArray(parsed?.messages) ? parsed.messages : [];
+      if (msgs.length === 0) return null;
+      prefix = { system: parsed?.system ?? null, first: msgs[0] };
+    }
+    return "dig:" + shortDigest(prefix);
+  } catch {
+    return null;
+  }
+}
+
+function getStickyProfile(protocol, userKey, signal) {
+  if (!stickyTtlMs() || !signal) return null;
+  const key = `${protocol}|${userKey}|${signal}`;
+  const binding = stickyBindings.get(key);
+  if (!binding) return null;
+  if (Date.now() >= binding.expiresAt) {
+    stickyBindings.delete(key);
+    return null;
+  }
+  return binding.profile;
+}
+
+function setStickyProfile(protocol, userKey, signal, profileName) {
+  if (!stickyTtlMs() || !signal || !profileName) return;
+  const key = `${protocol}|${userKey}|${signal}`;
+  stickyBindings.delete(key);   // re-insert at the tail so recency drives eviction
+  stickyBindings.set(key, { profile: profileName, expiresAt: Date.now() + stickyTtlMs() });
+  if (stickyBindings.size > STICKY_BINDINGS_CAP) {
+    stickyBindings.delete(stickyBindings.keys().next().value);
+  }
+}
+
+// Move a live binding to the front of the ordered candidate list. Pure reorder:
+// the list was already availability-filtered by the caller.
+function applyStickyReorder(candidates, boundProfile) {
+  if (!boundProfile || candidates.length < 2) return candidates;
+  const idx = candidates.findIndex(c => c.name === boundProfile);
+  if (idx <= 0) return candidates;
+  const [bound] = candidates.splice(idx, 1);
+  return [bound, ...candidates];
 }
 
 // Ordered list of currently-usable default-group profiles for a given user key.
@@ -2658,8 +2773,9 @@ function proxyRequest(req, res) {
     let reqModel = "unknown";
     let reqSource = "用户请求";
     let originalModel = "unknown";
+    let parsedBody = null;
     try {
-      const parsed = sanitizeJson(JSON.parse(body.toString()));
+      const parsed = parsedBody = sanitizeJson(JSON.parse(body.toString()));
       reqModel = parsed.model || "unknown";
       originalModel = reqModel;
       if (protocol === "responses") {
@@ -2691,15 +2807,21 @@ function proxyRequest(req, res) {
       }
     } catch {}
 
+    // Sticky-session signal for cache-affinity routing (group entries only).
+    const sessionSignal = extractSessionSignal(protocol, req.headers, parsedBody);
+
     // Save the pre-resolve body so each failover candidate can re-resolve the model
     // against its own modelAliases.
     const originalBody = body;
 
     // Build the ordered candidate list. Default-group entries fail over across
     // the whole protocol-matched group; explicit /<suffix>/... requests stay pinned.
-    const candidateList = resolvedProfile.isDefaultEntry
+    let candidateList = resolvedProfile.isDefaultEntry
       ? (protocol === "responses" ? getAvailableResponsesProfiles(apiKey) : getAvailableDefaultProfiles(apiKey))
       : [{ name: runtime.profileName, suffix, runtime }];
+    if (resolvedProfile.isDefaultEntry) {
+      candidateList = applyStickyReorder(candidateList, getStickyProfile(protocol, userKey, sessionSignal));
+    }
     // If every default-group member is currently unavailable (all rate-limited / breaker
     // open / unauthorized), fall back to the resolved default so the normal error path runs.
     if (candidateList.length === 0) {
@@ -2728,6 +2850,7 @@ function proxyRequest(req, res) {
 
     let lastFailure = null;   // { kind, status?, message?, runtime, suffix, quota?, err? }
     let served = false;
+    let servedBy = null;      // profile that actually served (for sticky binding)
     try {
       for (let ci = 0; ci < candidateList.length; ci++) {
         const cand = candidateList[ci];
@@ -2794,6 +2917,7 @@ function proxyRequest(req, res) {
             await handleJsonProxy(req, res, cbody, reqHeaders, apiKey, creqModel, timeout, reqSource, cruntime, csuffix, strippedUrl, clientState);
           }
           served = true;
+          servedBy = cand.name;
           break;
         } catch (err) {
           if (err?.isRateLimited) {
@@ -2880,6 +3004,12 @@ function proxyRequest(req, res) {
           recordError(apiKey, status, `${label}: ${lastFailure.err.message}`, req.url, reqModel, lastFailure.suffix, lastFailure.runtime);
         }
       }
+
+      // Cache-affinity binding: remember which group member served this
+      // conversation so the next turn reorders it to the front.
+      if (servedBy && resolvedProfile.isDefaultEntry && sessionSignal) {
+        setStickyProfile(protocol, userKey, sessionSignal, servedBy);
+      }
     } finally {
       releaseConcurrency(userKey);
       console.log(`── 请求结束 ── ${getUserName(apiKey, runtime)} ──`);
@@ -2917,7 +3047,7 @@ async function handleJsonProxy(req, res, body, reqHeaders, apiKey, reqModel, tim
       }
 
       // Plan-exhaustion 429: hand off to the failover layer (do not retry same upstream).
-      const rateLimitHit = classifyRateLimit(upRes.statusCode, text);
+      const rateLimitHit = classifyRateLimit(upRes.statusCode, text, upRes.headers);
       if (rateLimitHit) throw new RateLimitedError(rateLimitHit.resumeAt, rateLimitHit.source);
 
       // Retryable status codes
@@ -3009,9 +3139,28 @@ async function handleStreamingProxy(req, res, body, reqHeaders, apiKey, reqModel
     let resolved = false;
     let cleanupUpstream = () => {};
     let cleanupClientAbort = () => {};
+    // Idle watchdog: SSE streams rarely pause for long — a long silent gap means
+    // the upstream hung. Cut it at streamIdleTimeout instead of waiting out the
+    // socket-level streamTimeout backstop. Timer re-arms on every chunk.
+    let idleTimer = null;
+    function clearIdleTimer() {
+      if (idleTimer) { clearTimeout(idleTimer); idleTimer = null; }
+    }
+    function armIdleTimer() {
+      const idleMs = Number(gProxy.streamIdleTimeout);
+      if (!Number.isFinite(idleMs) || idleMs <= 0) return;
+      if (idleTimer) clearTimeout(idleTimer);
+      idleTimer = setTimeout(() => {
+        idleTimer = null;
+        console.log(`[超时] ${getUserName(apiKey, runtime)} 流式空闲超过 ${idleMs}ms，中断上游 model=${reqModel}`);
+        upReq.destroy(new Error(`Upstream stream idle timeout (${idleMs}ms)`));
+      }, idleMs);
+      idleTimer.unref?.();
+    }
     function safeResolve() {
       if (!resolved) {
         resolved = true;
+        clearIdleTimer();
         cleanupClientAbort();
         cleanupUpstream();
         resolve();
@@ -3020,6 +3169,7 @@ async function handleStreamingProxy(req, res, body, reqHeaders, apiKey, reqModel
     function safeReject(err) {
       if (!resolved) {
         resolved = true;
+        clearIdleTimer();
         cleanupClientAbort();
         cleanupUpstream();
         reject(err);
@@ -3051,7 +3201,7 @@ async function handleStreamingProxy(req, res, body, reqHeaders, apiKey, reqModel
         let errBuf = "";
         upRes.on("data", (c) => { if (!clientGone) errBuf += c.toString(); });
         upRes.on("end", () => {
-          const rl = classifyRateLimit(upRes.statusCode, errBuf);
+          const rl = classifyRateLimit(upRes.statusCode, errBuf, upRes.headers);
           if (rl) {
             recordError(apiKey, upRes.statusCode, errBuf.slice(0, 200), req.url, reqModel, suffix, runtime);
             safeReject(new RateLimitedError(rl.resumeAt, rl.source));
@@ -3085,8 +3235,10 @@ async function handleStreamingProxy(req, res, body, reqHeaders, apiKey, reqModel
 
       res.writeHead(upRes.statusCode, h);
       runtime.breaker.recordSuccess();
+      armIdleTimer();
 
       upRes.on("data", (chunk) => {
+        armIdleTimer();
         if (clientGone) return;
         res.write(chunk);
         const text = chunk.toString();
@@ -3143,6 +3295,7 @@ async function handleStreamingProxy(req, res, body, reqHeaders, apiKey, reqModel
       });
 
       upRes.on("end", () => {
+        clearIdleTimer();
         if (buf.startsWith("data: ")) {
           try {
             const tail = buf.slice(6).trim();
@@ -3185,6 +3338,7 @@ async function handleStreamingProxy(req, res, body, reqHeaders, apiKey, reqModel
         safeResolve();
         return;
       }
+      clearIdleTimer();
       runtime.breaker.recordFailure();
       const isTimeout = err.message.includes("timeout");
       const status = isTimeout ? 504 : 502;
@@ -3193,6 +3347,11 @@ async function handleStreamingProxy(req, res, body, reqHeaders, apiKey, reqModel
       if (!res.headersSent && !clientGone) {
         res.writeHead(status, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ error: `Proxy ${label}. Please try again later.` }));
+      } else if (!clientGone && !res.writableEnded) {
+        // Mid-stream upstream death (idle watchdog, network reset, ...): close the
+        // SSE response so the client sees the cut instead of hanging until its own
+        // timeout. Closing without a terminal SSE event is the standard abnormal end.
+        res.end();
       }
       safeResolve();
     });

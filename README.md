@@ -120,13 +120,16 @@ node server.mjs
   "proxy": {
     "timeout": 180000,
     "streamTimeout": 600000,
+    "streamIdleTimeout": 120000,
+    "stickySessionTtlSeconds": 300,
     "maxRetries": 3,
     "retryDelay": 1000,
     "retryableStatusCodes": [429, 502, 503, 504],
     "maxConcurrentPerUser": 5,
     "rateLimitPerMinute": 60,
     "circuitBreakerFailures": 5,
-    "circuitBreakerCooldown": 30000
+    "circuitBreakerCooldown": 30000,
+    "rateLimitFallbackSeconds": 120
   }
 }
 ```
@@ -134,6 +137,16 @@ node server.mjs
 `modelAliases` 是唯一的模型映射入口。别名目标会自动加入 `allowedModels`；不需要别名时可直接使用真实模型名。
 
 `jx-sonnet`、`jx-opus` 和 `jx-haiku` 没有特殊的独立配置入口，它们与其他别名一样统一写入 `modelAliases`。
+
+### 粘性会话（缓存亲和）
+
+两种协议都是无状态回放：每轮对话重发完整历史。如果同一会话在组内不同方案间来回切换，每次切换都要重新支付完整 prompt（缓存冷启动）。网关会按会话把请求粘在同一方案上，会话信号按优先级取：`session_id` 请求头（Codex 原生发送）→ 请求体 `prompt_cache_key` → 首轮对话内容摘要。failover 切换后绑定自动改写到新方案；方案恢复健康后已建立的会话仍留在切换后的方案上。可用性永远优先于粘性：被限流/熔断的方案不会因为绑定而被选中。`stickySessionTtlSeconds` 控制绑定有效期（默认 300 秒，0 关闭）。
+
+### 流式空闲看门狗
+
+SSE 流超过 `streamIdleTimeout`（默认 120000ms，0 关闭）没有任何字节到达时，网关立即中断上游并结束客户端响应，同时记录 504，而不是等满 `streamTimeout`。正常思考/输出间隙远小于该值，不受影响。
+
+上游 429 标记方案限流时，若响应带 `Retry-After` 头（秒数或 HTTP 日期），按其指示的时长（15–600s 钳制）标记，比固定 `rateLimitFallbackSeconds` 更精确。
 
 ## 接入 Claude Code
 

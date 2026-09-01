@@ -1725,53 +1725,71 @@ removeLegacyOpenAIData();
 
 // Aggregate all profiles for "all profiles" view, assembled via SQL GROUP BY.
 // Returns the same nested shape as loadProfileSnapshot so sanitizeStore and the
-// frontend work unchanged.
-function getAggregatedStore() {
+// frontend work unchanged. `suffixFilter` (optional array) restricts every query
+// to those profile suffixes — used for protocol-scoped views. An empty array
+// yields an empty store (sentinel matches nothing), NOT the full aggregation.
+function getAggregatedStore(suffixFilter) {
   const agg = { users: {}, daily: {}, dailyModels: {}, dailyHourly: {}, models: {}, hourly: {}, errors: [] };
+  const hasFilter = Array.isArray(suffixFilter);
+  const binds = hasFilter ? (suffixFilter.length ? suffixFilter : ["\u0000none"]) : [];
+  const where = hasFilter ? `WHERE profile IN (${binds.map(() => "?").join(",")})` : "";
+  const q = (sql) => hasFilter
+    ? db.prepare(sql.replace("__WHERE__", where)).all(...binds)
+    : db.prepare(sql.replace("__WHERE__", "")).all();
 
   // users: GROUP BY user_key across all profiles
-  for (const r of db.prepare(`SELECT user_key, MAX(name) AS name, SUM(total_input) AS ti, SUM(total_output) AS tout, SUM(total_requests) AS tr, SUM(cache_creation) AS cc, SUM(cache_read) AS cr, MAX(last_active) AS la FROM users GROUP BY user_key`).all()) {
+  for (const r of q(`SELECT user_key, MAX(name) AS name, SUM(total_input) AS ti, SUM(total_output) AS tout, SUM(total_requests) AS tr, SUM(cache_creation) AS cc, SUM(cache_read) AS cr, MAX(last_active) AS la FROM users __WHERE__ GROUP BY user_key`)) {
     agg.users[r.user_key] = { name: r.name, totalInputTokens: r.ti||0, totalOutputTokens: r.tout||0, totalRequests: r.tr||0, cacheCreationTokens: r.cc||0, cacheReadTokens: r.cr||0, lastActive: r.la };
   }
   // daily: GROUP BY date, user_key
-  for (const r of db.prepare(`SELECT date, user_key, SUM(input_tokens) AS ti, SUM(output_tokens) AS tout, SUM(requests) AS tr, SUM(cache_creation) AS cc, SUM(cache_read) AS cr FROM usage_daily GROUP BY date, user_key`).all()) {
+  for (const r of q(`SELECT date, user_key, SUM(input_tokens) AS ti, SUM(output_tokens) AS tout, SUM(requests) AS tr, SUM(cache_creation) AS cc, SUM(cache_read) AS cr FROM usage_daily __WHERE__ GROUP BY date, user_key`)) {
     if (!agg.daily[r.date]) agg.daily[r.date] = {};
     agg.daily[r.date][r.user_key] = { inputTokens: r.ti||0, outputTokens: r.tout||0, requests: r.tr||0, cacheCreationTokens: r.cc||0, cacheReadTokens: r.cr||0 };
   }
   // models: GROUP BY model
-  for (const r of db.prepare(`SELECT model, SUM(tokens) AS t, SUM(requests) AS r FROM usage_model GROUP BY model`).all()) {
+  for (const r of q(`SELECT model, SUM(tokens) AS t, SUM(requests) AS r FROM usage_model __WHERE__ GROUP BY model`)) {
     agg.models[r.model] = { tokens: r.t||0, requests: r.r||0 };
   }
   // hourly: GROUP BY date, hour
-  for (const r of db.prepare(`SELECT date, hour, SUM(requests) AS r, SUM(input_tokens) AS ti, SUM(output_tokens) AS tout, SUM(cache_creation) AS cc, SUM(cache_read) AS cr FROM usage_hourly GROUP BY date, hour`).all()) {
+  for (const r of q(`SELECT date, hour, SUM(requests) AS r, SUM(input_tokens) AS ti, SUM(output_tokens) AS tout, SUM(cache_creation) AS cc, SUM(cache_read) AS cr FROM usage_hourly __WHERE__ GROUP BY date, hour`)) {
     if (!agg.hourly[r.date]) agg.hourly[r.date] = {};
     agg.hourly[r.date][r.hour] = { requests: r.r||0, inputTokens: r.ti||0, outputTokens: r.tout||0, cacheCreationTokens: r.cc||0, cacheReadTokens: r.cr||0 };
   }
   // dailyModels: GROUP BY date, user_key, model
-  for (const r of db.prepare(`SELECT date, user_key, model, SUM(input_tokens) AS ti, SUM(output_tokens) AS tout, SUM(requests) AS tr FROM usage_daily_model GROUP BY date, user_key, model`).all()) {
+  for (const r of q(`SELECT date, user_key, model, SUM(input_tokens) AS ti, SUM(output_tokens) AS tout, SUM(requests) AS tr FROM usage_daily_model __WHERE__ GROUP BY date, user_key, model`)) {
     if (!agg.dailyModels[r.date]) agg.dailyModels[r.date] = {};
     if (!agg.dailyModels[r.date][r.user_key]) agg.dailyModels[r.date][r.user_key] = {};
     agg.dailyModels[r.date][r.user_key][r.model] = { inputTokens: r.ti||0, outputTokens: r.tout||0, requests: r.tr||0 };
   }
   // dailyHourly: GROUP BY date, user_key, hour
-  for (const r of db.prepare(`SELECT date, user_key, hour, SUM(requests) AS r, SUM(input_tokens) AS ti, SUM(output_tokens) AS tout, SUM(cache_creation) AS cc, SUM(cache_read) AS cr FROM usage_daily_hourly GROUP BY date, user_key, hour`).all()) {
+  for (const r of q(`SELECT date, user_key, hour, SUM(requests) AS r, SUM(input_tokens) AS ti, SUM(output_tokens) AS tout, SUM(cache_creation) AS cc, SUM(cache_read) AS cr FROM usage_daily_hourly __WHERE__ GROUP BY date, user_key, hour`)) {
     if (!agg.dailyHourly[r.date]) agg.dailyHourly[r.date] = {};
     if (!agg.dailyHourly[r.date][r.user_key]) agg.dailyHourly[r.date][r.user_key] = {};
     agg.dailyHourly[r.date][r.user_key][r.hour] = { requests: r.r||0, inputTokens: r.ti||0, outputTokens: r.tout||0, cacheCreationTokens: r.cc||0, cacheReadTokens: r.cr||0 };
   }
   // errors: merge all profiles (most recent 200)
-  agg.errors = db.prepare("SELECT time, user_name AS user, user_key AS userKey, status_code AS statusCode, error, path, model FROM errors ORDER BY id DESC LIMIT 200").all();
+  agg.errors = q(`SELECT time, user_name AS user, user_key AS userKey, status_code AS statusCode, error, path, model FROM errors __WHERE__ ORDER BY id DESC LIMIT 200`);
   return agg;
 }
 
 // Load hourly-per-model usage for the 24h model trend chart. `suffix` null =
-// all profiles. Shape: { date: { hour: { model: { requests, inputTokens, outputTokens } } } }
+// all profiles; `suffixFilter` (array) narrows to a protocol when no single
+// suffix is given. Shape: { date: { hour: { model: { requests, inputTokens, outputTokens } } } }
 // (already aggregated across users; no cache columns — same scope as usage_daily_model).
-function loadHourlyModels(suffix) {
+function loadHourlyModels(suffix, suffixFilter) {
   const out = {};
+  let where = "";
+  let binds = [];
+  if (suffix) {
+    where = "WHERE profile=?";
+    binds = [suffix];
+  } else if (Array.isArray(suffixFilter)) {
+    binds = suffixFilter.length ? suffixFilter : ["\u0000none"];
+    where = `WHERE profile IN (${binds.map(() => "?").join(",")})`;
+  }
   const sql = `SELECT date, hour, model, SUM(requests) AS r, SUM(input_tokens) AS ti, SUM(output_tokens) AS tout
-    FROM usage_hourly_model ${suffix ? "WHERE profile=?" : ""} GROUP BY date, hour, model`;
-  const rows = suffix ? db.prepare(sql).all(suffix) : db.prepare(sql).all();
+    FROM usage_hourly_model ${where} GROUP BY date, hour, model`;
+  const rows = db.prepare(sql).all(...binds);
   for (const row of rows) {
     if (!out[row.date]) out[row.date] = {};
     if (!out[row.date][row.hour]) out[row.date][row.hour] = {};
@@ -1781,11 +1799,16 @@ function loadHourlyModels(suffix) {
 }
 
 // Load per-profile daily usage (with cache) for the profile request chart.
-// Always covers ALL profiles — the chart is a cross-profile dimension.
+// Covers ALL profiles by default — the chart is a cross-profile dimension;
+// `suffixFilter` narrows it to one protocol's profiles.
 // Shape: { [suffix]: { [date]: { requests, inputTokens, outputTokens, cacheCreationTokens, cacheReadTokens } } }
-function loadProfileDaily() {
+function loadProfileDaily(suffixFilter) {
   const out = {};
-  for (const r of db.prepare(`SELECT profile, date, SUM(requests) AS r, SUM(input_tokens) AS ti, SUM(output_tokens) AS tout, SUM(cache_creation) AS cc, SUM(cache_read) AS cr FROM usage_daily GROUP BY profile, date`).all()) {
+  const hasFilter = Array.isArray(suffixFilter);
+  const binds = hasFilter ? (suffixFilter.length ? suffixFilter : ["\u0000none"]) : [];
+  const where = hasFilter ? `WHERE profile IN (${binds.map(() => "?").join(",")})` : "";
+  const sql = `SELECT profile, date, SUM(requests) AS r, SUM(input_tokens) AS ti, SUM(output_tokens) AS tout, SUM(cache_creation) AS cc, SUM(cache_read) AS cr FROM usage_daily ${where} GROUP BY profile, date`;
+  for (const r of db.prepare(sql).all(...binds)) {
     if (!out[r.profile]) out[r.profile] = {};
     out[r.profile][r.date] = { requests: r.r || 0, inputTokens: r.ti || 0, outputTokens: r.tout || 0, cacheCreationTokens: r.cc || 0, cacheReadTokens: r.cr || 0 };
   }
@@ -1793,14 +1816,31 @@ function loadProfileDaily() {
 }
 
 // Load per-profile daily per-model usage (no cache) — used by the profile
-// request chart when a model filter is active.
+// request chart when a model filter is active. Same filtering as loadProfileDaily.
 // Shape: { [suffix]: { [date]: { [model]: { requests, inputTokens, outputTokens } } } }
-function loadProfileDailyModels() {
+function loadProfileDailyModels(suffixFilter) {
   const out = {};
-  for (const r of db.prepare(`SELECT profile, date, model, SUM(requests) AS r, SUM(input_tokens) AS ti, SUM(output_tokens) AS tout FROM usage_daily_model GROUP BY profile, date, model`).all()) {
+  const hasFilter = Array.isArray(suffixFilter);
+  const binds = hasFilter ? (suffixFilter.length ? suffixFilter : ["\u0000none"]) : [];
+  const where = hasFilter ? `WHERE profile IN (${binds.map(() => "?").join(",")})` : "";
+  const sql = `SELECT profile, date, model, SUM(requests) AS r, SUM(input_tokens) AS ti, SUM(output_tokens) AS tout FROM usage_daily_model ${where} GROUP BY profile, date, model`;
+  for (const r of db.prepare(sql).all(...binds)) {
     if (!out[r.profile]) out[r.profile] = {};
     if (!out[r.profile][r.date]) out[r.profile][r.date] = {};
     out[r.profile][r.date][r.model] = { requests: r.r || 0, inputTokens: r.ti || 0, outputTokens: r.tout || 0 };
+  }
+  return out;
+}
+
+// Suffixes of every profile running one protocol. Feeds /api/stats?protocol=
+// so the dashboard can split Anthropic vs Responses views without any schema
+// change — the stats tables only know the profile suffix.
+function protocolSuffixes(proto) {
+  const out = [];
+  for (const profile of Object.values(config.profiles || {})) {
+    if (normalizeProfileProtocol(profile.protocol) !== proto) continue;
+    const suffix = normalizeProfileSuffix(profile.suffix);
+    if (suffix && runtimes[suffix]) out.push(suffix);
   }
   return out;
 }
@@ -1815,6 +1855,7 @@ function getProfileSummaries() {
       suffix: profile.suffix,
       protocol: profile.protocol,
       isDefault: profile.isDefault,
+      isResponsesDefault: !!profile.inResponsesGroup && profile.responsesGroupOrder === 0,
       billingType: profile.billingType,
       peakHours: normalizePeakHours(profile.peakHours),
       upstream: profile.upstream,
@@ -1949,7 +1990,7 @@ function getAccessibleProfiles(apiKey) {
   for (const profile of listProfiles()) {
     const runtime = runtimes[profile.suffix];
     if (runtime && canUseProfile(apiKey, runtime).allowed) {
-      out.push({ suffix: profile.suffix, name: profile.name, isDefault: profile.isDefault });
+      out.push({ suffix: profile.suffix, name: profile.name, isDefault: profile.isDefault, protocol: profile.protocol });
     }
   }
   return out;
@@ -3444,6 +3485,32 @@ function settingsHtml(errorMsg) {
   }).join("");
   const responsesNonMembersHtml = Object.keys(config.profiles).filter(n => !rpg.includes(n) && config.profiles[n].upstream && normalizeProfileProtocol(config.profiles[n].protocol) === "responses").map(name => `<button type="button" class="preset" onclick="event.stopPropagation();addToResponsesGroup('${escJs(name)}')">+ ${escHtml(name)}</button>`).join("");
 
+  // Sidebar profile card, protocol-aware: the group HEAD of each protocol gets
+  // the 默认入口 badge (anthropic head via isDefault, responses head via group
+  // order), and the activate button targets that protocol's default entry.
+  const profileCard = (p) => {
+    const host = p.upstream.replace(/^https?:\/\//, "").replace(/\/.*/, "");
+    const isResponses = p.protocol === "responses";
+    const isRespDefault = p.inResponsesGroup && p.responsesGroupOrder === 0;
+    const isHead = p.isDefault || isRespDefault;
+    const suffixLabel = '<span style="color:var(--accent);font-size:10px">/'+ escHtml(p.suffix)+'</span>' + (isHead ? ' <span style="color:var(--green);font-size:10px">默认入口</span>' : '') + (isResponses ? ' <span style="color:var(--blue);font-size:10px">Responses</span>' : '');
+    const peakList = normalizePeakHours(p.peakHours);
+    const peakLabel = peakList.length > 0
+      ? `<div class="pl-users" style="${isInPeakHours(peakList) ? "color:var(--orange);font-weight:600" : ""}">${escHtml(formatPeakHoursSummary(peakList))}${isInPeakHours(peakList) ? " · 高峰中" : ""}</div>`
+      : "";
+    return `<div class="pl-item${p.suffix === initialSuffix ? " active" : ""}" id="pl-${escHtml(p.name)}" onclick="editProfile('${escJs(p.name)}')">
+<div class="pl-name">${escHtml(p.name)} ${suffixLabel}</div>
+<div class="pl-host">${escHtml(host)}</div>
+<div class="pl-users">${p.userCount}位用户</div>
+${peakLabel}
+<div class="pl-actions">
+  ${!isHead ? '<button class="pl-activate" onclick="event.stopPropagation();setDefaultProfile(\'' + escJs(p.name) + '\',\'' + (isResponses ? "responses" : "anthropic") + '\')">设为默认入口</button>' : ''}
+  ${!p.isDefault ? '<button class="pl-delete" onclick="event.stopPropagation();deleteProfile(\'' + escJs(p.name) + '\')">删除</button>' : ''}
+</div></div>`;
+  };
+  const anthProfiles = s.profiles.filter(p => p.protocol !== "responses");
+  const respProfiles = s.profiles.filter(p => p.protocol === "responses");
+
   const globalUserRows = Object.entries(s.globalUsers).map(([k, v]) => {
     const isObj = typeof v === "object" && v !== null;
     const username = isObj ? (v.username || "") : (typeof v === "string" ? v : "");
@@ -3487,7 +3554,7 @@ ${UI_THEME}
 ${TOAST_CSS}
 body{padding:0;overflow:hidden;height:100vh}
 .layout{display:flex;height:100vh}
-.sidebar{width:260px;min-width:260px;background:var(--surface);border-right:1px solid var(--border);display:flex;flex-direction:column;overflow:hidden}
+.sidebar{width:360px;min-width:360px;background:var(--surface);border-right:1px solid var(--border);display:flex;flex-direction:column;overflow:hidden}
 .sidebar-hd{min-height:64px;padding:16px 18px;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between;gap:12px}
 .sidebar-hd h1{font-size:17px;font-weight:650;white-space:nowrap}
 .sidebar-hd a{color:var(--dim);font-size:12px;text-decoration:none;white-space:nowrap}
@@ -3501,7 +3568,7 @@ body{padding:0;overflow:hidden;height:100vh}
 .pl-item:hover{background:var(--surface-subtle)}
 .pl-item.active{border-color:var(--border);background:var(--accent-soft)}
 .pl-name{font-size:13px;font-weight:600;margin-bottom:3px;padding-right:74px}
-.pl-host{font-size:11px;color:var(--dim);font-family:var(--font-mono);word-break:break-all;margin-bottom:3px}
+.pl-host{font-size:11px;color:var(--dim);font-family:var(--font-mono);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-bottom:3px}
 .pl-users{font-size:11px;color:var(--dim)}
 .pl-actions{display:none;position:absolute;top:8px;right:8px;gap:3px}
 .pl-item:hover .pl-actions,.pl-item.active .pl-actions{display:flex}
@@ -3556,46 +3623,55 @@ td{padding:8px;border-bottom:1px solid #ecece8;font-size:12px}
 .modal-hd h3{font-size:15px;font-weight:650}.modal-close{background:none;border:none;color:var(--dim);font-size:12px;cursor:pointer;padding:5px 7px}.modal-close:hover{color:var(--text);background:var(--surface-subtle)}
 .modal-body{padding:18px 20px;overflow-y:auto;flex:1}
 @media(max-width:900px){.row3{grid-template-columns:1fr 1fr}.main{padding:24px}}
-@media(max-width:680px){body{overflow:auto;height:auto}.layout{flex-direction:column;height:auto;min-height:100vh}.sidebar{width:100%;min-width:0;max-height:none;border-right:0;border-bottom:1px solid var(--border)}.sidebar-list{display:flex;gap:6px;overflow-x:auto}.sidebar-global{padding:8px 12px}.sidebar-tool{min-width:0}.pl-item{min-width:210px;margin:0}.main{overflow:visible;padding:22px 16px}.actions{left:0;padding-left:16px;padding-right:16px}.row,.row3{grid-template-columns:1fr}.modal{width:100%;max-height:90vh}.section{padding:15px;overflow-x:auto}.import-summary{grid-template-columns:1fr 1fr}.mapping-row{grid-template-columns:1fr}.mapping-arrow{display:none}.danger-copy{align-items:flex-start;flex-direction:column}}
+.proto-tabs{display:flex;gap:6px;padding:0 12px;margin-bottom:8px;justify-content:center}
+.proto-tab{font-size:12px;font-weight:650;padding:8px 14px;border:1px solid var(--border);border-radius:6px;background:var(--surface);color:var(--dim);cursor:pointer;display:flex;flex-direction:column;gap:2px;align-items:center}
+.proto-tab small{font-size:9px;font-weight:400;white-space:nowrap}
+.proto-tab.on{border-color:var(--accent);background:var(--accent-soft);color:var(--accent)}
+.proto-pane{flex:1;min-height:0;display:flex;flex-direction:column;overflow:hidden}
+.sidebar-dock{flex-shrink:0}
+.sidebar-dock .sidebar-global{max-height:38vh;overflow-y:auto}
+.proto-pane-hd{font-size:11px;font-weight:650;padding:2px 12px 4px;display:flex;align-items:center;justify-content:space-between;gap:8px}
+.proto-pane-hd .proto-entry{font-size:10px;font-weight:400;color:var(--accent)}
+.proto-pane-hint{font-size:10px;color:var(--dim);padding:0 12px 8px;line-height:1.5}
+@media(max-width:680px){body{overflow:auto;height:auto}.layout{flex-direction:column;height:auto;min-height:100vh}.sidebar{width:100%;min-width:0;max-height:none;border-right:0;border-bottom:1px solid var(--border)}.sidebar-list{display:flex;gap:6px;overflow-x:auto}.sidebar-dock .sidebar-global{max-height:none;overflow-y:visible}.sidebar-global{padding:8px 12px}.sidebar-tool{min-width:0}.pl-item{min-width:210px;margin:0}.main{overflow:visible;padding:22px 16px}.actions{left:0;padding-left:16px;padding-right:16px}.row,.row3{grid-template-columns:1fr}.modal{width:100%;max-height:90vh}.section{padding:15px;overflow-x:auto}.import-summary{grid-template-columns:1fr 1fr}.mapping-row{grid-template-columns:1fr}.mapping-arrow{display:none}.danger-copy{align-items:flex-start;flex-direction:column}}
 </style></head><body data-theme="editorial-light">
 <div class="layout">
 <div class="sidebar">
 <div class="sidebar-hd"><h1>配置方案</h1><a href="/dashboard">返回面板</a></div>
-<div class="sidebar-list">${s.profiles.map(p => {
-    const host = p.upstream.replace(/^https?:\/\//, "").replace(/\/.*/, "");
-    const isResponses = p.protocol === "responses";
-    const suffixLabel = '<span style="color:var(--accent);font-size:10px">/'+ escHtml(p.suffix)+'</span>' + (p.isDefault ? ' <span style="color:var(--green);font-size:10px">默认入口</span>' : '') + (isResponses ? ' <span style="color:var(--blue);font-size:10px">Responses</span>' : '');
-    const peakList = normalizePeakHours(p.peakHours);
-    const peakLabel = peakList.length > 0
-      ? `<div class="pl-users" style="${isInPeakHours(peakList) ? "color:var(--orange);font-weight:600" : ""}">${escHtml(formatPeakHoursSummary(peakList))}${isInPeakHours(peakList) ? " · 高峰中" : ""}</div>`
-      : "";
-    return `<div class="pl-item${p.suffix === initialSuffix ? " active" : ""}" id="pl-${escHtml(p.name)}" onclick="editProfile('${escJs(p.name)}')">
-<div class="pl-name">${escHtml(p.name)} ${suffixLabel}</div>
-<div class="pl-host">${escHtml(host)}</div>
-<div class="pl-users">${p.userCount}位用户</div>
-${peakLabel}
-<div class="pl-actions">
-  ${!p.isDefault ? '<button class="pl-activate" onclick="event.stopPropagation();setDefaultProfile(\'' + escJs(p.name) + '\',\'' + (isResponses ? "responses" : "anthropic") + '\')">设为默认</button>' : ''}
-  ${!p.isDefault ? '<button class="pl-delete" onclick="event.stopPropagation();deleteProfile(\'' + escJs(p.name) + '\')">删除</button>' : ''}
-</div></div>`;
-  }).join("")}</div>
+<div class="proto-tabs" id="protoTabs">
+  <button type="button" class="proto-tab on" data-tab="anthropic" onclick="switchProtoTab('anthropic')">Claude Code<small>Anthropic · /v1</small></button>
+  <button type="button" class="proto-tab" data-tab="responses" onclick="switchProtoTab('responses')">Codex<small>Responses · /v1/responses</small></button>
+</div>
+<div class="proto-pane" data-proto="anthropic">
+  <div class="proto-pane-hd"><span>Anthropic 方案 <span class="proto-entry">入口 /v1</span></span><button type="button" class="btn btn-outline btn-sm" onclick="openProfileModal('anthropic')">+ 新建</button></div>
+  <div class="proto-pane-hint">Claude Code 走这里。本协议的默认入口和方案组只影响 /v1 请求，与 Codex 的 /v1/responses 完全互不影响。</div>
+  <div class="sidebar-list">${anthProfiles.map(profileCard).join("") || '<div style="padding:0 12px 8px;font-size:11px;color:var(--dim)">暂无 Anthropic 方案</div>'}</div>
+</div>
+<div class="proto-pane" data-proto="responses" style="display:none">
+  <div class="proto-pane-hd"><span>Responses 方案 <span class="proto-entry">入口 /v1/responses</span></span><button type="button" class="btn btn-outline btn-sm" onclick="openProfileModal('responses')">+ 新建</button></div>
+  <div class="proto-pane-hint">Codex 走这里（base_url 指向 http://&lt;host&gt;:端口/v1）。本协议的默认入口和方案组只影响 /v1/responses 请求，与 Claude Code 的 /v1 完全互不影响。</div>
+  <div class="sidebar-list">${respProfiles.map(profileCard).join("") || '<div style="padding:0 12px 8px;font-size:11px;color:var(--dim)">暂无 Responses 方案 — Codex 请求将返回 503</div>'}</div>
+</div>
+<div class="sidebar-dock">
+  <div class="sidebar-global" data-proto="anthropic" style="padding:10px 12px">
+    <div style="font-size:11px;font-weight:650;margin-bottom:8px;display:flex;align-items:center;justify-content:space-between">
+      <span>默认方案组 <span style="color:var(--dim);font-weight:400;font-size:10px">/v1 failover</span></span>
+      <label style="display:flex;align-items:center;gap:4px;cursor:pointer;font-size:10px;font-weight:400;white-space:nowrap" title="全局设置：同时作用于两个协议的方案组"><input type="checkbox" id="restrictGroupSuffixCb" ${config.restrictGroupSuffix !== false ? "checked" : ""} onchange="setRestrictGroupSuffix(this.checked)" style="width:auto;accent-color:var(--accent)"> 限制直连</label>
+    </div>
+    <div id="defaultGroupList" style="margin-bottom:6px">${groupItemsHtml || '<span style="font-size:11px;color:var(--dim)">组为空 — 至少加入 2 个方案以启用 failover</span>'}</div>
+    ${nonMembersHtml ? `<div style="margin-top:6px;display:flex;align-items:center;gap:6px;flex-wrap:wrap"><span style="color:var(--dim);font-size:10px">加入：</span>${nonMembersHtml}</div>` : ''}
+  </div>
+  <div class="sidebar-global" data-proto="responses" style="padding:10px 12px;display:none">
+    <div style="font-size:11px;font-weight:650;margin-bottom:8px;display:flex;align-items:center;justify-content:space-between">
+      <span>Responses 方案组 <span style="color:var(--dim);font-weight:400;font-size:10px">/v1/responses failover · Codex</span></span>
+      <label style="display:flex;align-items:center;gap:4px;cursor:pointer;font-size:10px;font-weight:400;white-space:nowrap" title="全局设置：同时作用于两个协议的方案组"><input type="checkbox" id="restrictGroupSuffixCb2" ${config.restrictGroupSuffix !== false ? "checked" : ""} onchange="setRestrictGroupSuffix(this.checked)" style="width:auto;accent-color:var(--accent)"> 限制直连</label>
+    </div>
+    <div id="responsesGroupList" style="margin-bottom:6px">${responsesGroupItemsHtml || '<span style="font-size:11px;color:var(--dim)">组为空 — Codex 请求将返回 503</span>'}</div>
+    ${responsesNonMembersHtml ? `<div style="margin-top:6px;display:flex;align-items:center;gap:6px;flex-wrap:wrap"><span style="color:var(--dim);font-size:10px">加入：</span>${responsesNonMembersHtml}</div>` : ''}
+  </div>
 <div class="sidebar-global"><button type="button" class="pl-item sidebar-tool" id="dataManagementNav" onclick="openDataManagementView()"><span class="pl-name">全局数据管理</span><span class="pl-users">导入、备份与清空</span></button></div>
-<div class="sidebar-global" style="padding:10px 12px">
-  <div style="font-size:11px;font-weight:650;margin-bottom:8px;display:flex;align-items:center;justify-content:space-between">
-    <span>默认方案组 <span style="color:var(--dim);font-weight:400;font-size:10px">/v1 failover</span></span>
-    <label style="display:flex;align-items:center;gap:4px;cursor:pointer;font-size:10px;font-weight:400;white-space:nowrap"><input type="checkbox" id="restrictGroupSuffixCb" ${config.restrictGroupSuffix !== false ? "checked" : ""} onchange="document.getElementById('restrictGroupSuffixHidden').value=this.checked?'on':'off'" style="width:auto;accent-color:var(--accent)"> 限制直连</label>
-  </div>
-  <div id="defaultGroupList" style="margin-bottom:6px">${groupItemsHtml || '<span style="font-size:11px;color:var(--dim)">组为空 — 至少加入 2 个方案以启用 failover</span>'}</div>
-  ${nonMembersHtml ? `<div style="margin-top:6px;display:flex;align-items:center;gap:6px;flex-wrap:wrap"><span style="color:var(--dim);font-size:10px">加入：</span>${nonMembersHtml}</div>` : ''}
-</div>
-<div class="sidebar-global" style="padding:10px 12px">
-  <div style="font-size:11px;font-weight:650;margin-bottom:8px">
-    <span>Responses 方案组 <span style="color:var(--dim);font-weight:400;font-size:10px">/v1/responses failover · Codex</span></span>
-  </div>
-  <div id="responsesGroupList" style="margin-bottom:6px">${responsesGroupItemsHtml || '<span style="font-size:11px;color:var(--dim)">组为空 — Codex 请求将返回 503</span>'}</div>
-  ${responsesNonMembersHtml ? `<div style="margin-top:6px;display:flex;align-items:center;gap:6px;flex-wrap:wrap"><span style="color:var(--dim);font-size:10px">加入：</span>${responsesNonMembersHtml}</div>` : ''}
-</div>
 <div class="sidebar-ft" style="display:flex;gap:6px"><button class="btn btn-outline btn-sm" onclick="openUserModal()" style="flex:1">用户管理</button><button class="btn btn-outline btn-sm" onclick="openProfileModal()" style="flex:1">新增方案</button></div>
+</div>
 </div>
 <div class="main">
 ${errDiv}
@@ -3926,7 +4002,27 @@ async function clearAllData(){
 function openUserModal(){const sfx=document.getElementById('profileSuffixInput').value||SETTINGS.selectedProfileSuffix;document.getElementById('userProfileSel').value=sfx;renderProfileUsers(sfx);document.getElementById('userModal').classList.add('open')}
 function closeUserModal(){document.getElementById('userModal').classList.remove('open')}
 document.getElementById('userModal').addEventListener('click',function(e){if(e.target===this)closeUserModal()});
-function openProfileModal(){document.getElementById('profileModal').classList.add('open');document.getElementById('newProfileName').focus()}
+function openProfileModal(protocol){document.getElementById('profileModal').classList.add('open');if(protocol){var sel=document.getElementById('newProfileProtocol');sel.value=protocol;updateNewProfileProtocolHint()}document.getElementById('newProfileName').focus()}
+// 限制直连 is ONE shared setting rendered in both protocol panes — keep the
+// two checkboxes and the hidden form field in sync whichever one is toggled.
+function setRestrictGroupSuffix(checked){
+  document.getElementById('restrictGroupSuffixHidden').value=checked?'on':'off';
+  var a=document.getElementById('restrictGroupSuffixCb'),b=document.getElementById('restrictGroupSuffixCb2');
+  if(a)a.checked=checked;if(b)b.checked=checked;
+}
+// Protocol tabs: each pane owns its protocol's profiles; the failover group
+// editors live in the bottom dock and swap with the same toggle. Switching tabs
+// auto-selects the first profile of that protocol so the edit form and the
+// highlighted card always match the visible tab. Persists across reloads.
+function switchProtoTab(tab){
+  document.querySelectorAll('#protoTabs .proto-tab').forEach(function(b){b.classList.toggle('on',b.dataset.tab===tab)});
+  document.querySelectorAll('[data-proto]').forEach(function(p){p.style.display=(p.dataset.proto===tab)?'':'none'});
+  try{localStorage.setItem('tm_settings_proto_tab',tab)}catch(e){}
+  var first=(SETTINGS.profiles||[]).find(function(p){return (p.protocol==='responses')===(tab==='responses')});
+  if(first&&first.name)editProfile(first.name);
+}
+(function(){var saved=null;try{saved=localStorage.getItem('tm_settings_proto_tab')}catch(e){}
+if(saved==='responses'){try{switchProtoTab('responses')}catch(e){}}})();
 function closeProfileModal(){document.getElementById('profileModal').classList.remove('open')}
 document.getElementById('profileModal').addEventListener('click',function(e){if(e.target===this)closeProfileModal()});
 async function switchToProfile(n){
@@ -4277,6 +4373,11 @@ body{padding:16px clamp(14px,2vw,28px) 28px}
 .chart-filters .detail-field{width:150px}
 .chart-filters .chart-date{width:140px}
 .chart-filter-hint{font-size:10px;color:var(--dim);font-weight:400;align-self:center}
+.proto-seg{display:inline-flex;border:1px solid var(--border);border-radius:6px;overflow:hidden;background:var(--surface);height:30px;align-self:end}
+.proto-seg button{font-size:11px;font-weight:600;padding:0 14px;border:none;background:transparent;color:var(--dim);cursor:pointer}
+.proto-seg button+button{border-left:1px solid var(--border)}
+.proto-seg button.on{background:var(--accent-soft);color:var(--accent)}
+#profileSummaryBody .proto-row td{background:var(--surface-subtle);font-size:10px;font-weight:650;color:var(--dim);letter-spacing:.04em;padding:6px 12px}
 .chart-note{font-size:10px;color:var(--dim);font-weight:400;white-space:nowrap}
 .chart-workspace{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));grid-template-rows:repeat(3,minmax(0,1fr));gap:8px;min-height:660px}
 .chart-panel{background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:10px 12px;min-width:0;min-height:0;display:flex;flex-direction:column;overflow:hidden}
@@ -4329,6 +4430,9 @@ td{padding:8px 12px;font-size:11px;border-bottom:1px solid #ecece8;white-space:n
 </header>
 <section class="metric-strip" id="cards" aria-label="用量摘要"></section>
 <section class="chart-filters" aria-label="图表筛选">
+  <div class="proto-seg" id="protoSeg" role="group" aria-label="协议分类">
+    <button type="button" class="on" data-proto="">全部</button><button type="button" data-proto="anthropic">Claude Code</button><button type="button" data-proto="responses">Codex</button>
+  </div>
   <div class="tabs" id="globalTabs" aria-label="统计周期">
     <button class="tab on" data-p="day">按日</button><button class="tab" data-p="week">按周</button><button class="tab" data-p="month">按月</button><button class="tab" data-p="year">按年</button>
   </div>
@@ -4384,7 +4488,7 @@ td{padding:8px 12px;font-size:11px;border-bottom:1px solid #ecece8;white-space:n
 ${UI_HELPERS}
 ${TOAST_JS}
 Chart.defaults.color='#686863';Chart.defaults.font.family='-apple-system,BlinkMacSystemFont,"SF Pro Text","PingFang SC","Microsoft YaHei","Segoe UI",sans-serif';Chart.defaults.font.size=11;
-let D=null,P="day",C={t:null,p:null,m:null,h:null,hm:null,pr:null},errPage=1,autoRefresh=true,refreshTimer=null,currentProfile="all";
+let D=null,P="day",C={t:null,p:null,m:null,h:null,hm:null,pr:null},errPage=1,autoRefresh=true,refreshTimer=null,currentProfile="all",PROTO="";
 let MDL="all",USR="all",MT="tokens";
 let DS="",DE="";
 let activeWorkspaceTab="users";
@@ -4497,6 +4601,13 @@ function renderDetail(){
   document.getElementById("detailPages").innerHTML=periods.length?'<span>第 '+detailPage+' / '+totalPages+' 页</span><button type="button" onclick="setDetailPage('+(detailPage-1)+')" '+(detailPage<=1?'disabled':'')+'>上一页</button><button type="button" onclick="setDetailPage('+(detailPage+1)+')" '+(detailPage>=totalPages?'disabled':'')+'>下一页</button>':'';
 }
 function switchProfileView(v){currentProfile=v||"all";resetDetailGrouping();load()}
+// Protocol segmented control: switches the "all profiles" aggregation between
+// Anthropic (Claude Code) and Responses (Codex) views. Selecting a specific
+// profile overrides it — the segment then mirrors that profile's protocol.
+function setProtoSeg(proto){document.querySelectorAll("#protoSeg button").forEach(b=>b.classList.toggle("on",b.dataset.proto===(proto||"")))}
+function switchProtocolView(proto){PROTO=proto||"";if(currentProfile!=="all"){currentProfile="all";const sel=document.getElementById("profileSel");if(sel)sel.value="all"}setProtoSeg(PROTO);resetDetailGrouping();load()}
+document.querySelectorAll("#protoSeg button").forEach(b=>b.addEventListener("click",()=>switchProtocolView(b.dataset.proto)));
+const protoLabel=proto=>proto==="anthropic"?"Claude Code (Anthropic)":proto==="responses"?"Codex (Responses)":"";
 function render(){
   if(!D)return;
   // Populate profile dropdown
@@ -4504,8 +4615,8 @@ function render(){
   if(sel.options.length<=1 && D.profiles){
     sel.innerHTML='<option value="all">全部方案</option>';
     for(const p of D.profiles){
-      const sfx="/"+p.suffix+(p.isDefault?" · 默认入口":"");
-      sel.innerHTML+='<option value="'+escH(p.suffix)+'">'+escH(p.name)+' '+sfx+'</option>';
+      const sfx="/"+p.suffix+(p.isDefault?" · 默认入口":"")+(p.protocol==="responses"?" · Codex":" · Claude Code");
+      sel.innerHTML+='<option value="'+escH(p.suffix)+'">'+escH(p.name)+' '+escH(sfx)+'</option>';
     }
     sel.value=currentProfile==="all"?"all":currentProfile;
   }
@@ -4530,11 +4641,20 @@ function render(){
   document.getElementById("cards").innerHTML=c("今日用量",todayTokens,"var(--accent)",1)+c("今日请求",tR,"var(--blue)",1)+c("总用量",allTokens,"var(--green)",1)+c("总请求",tr,"var(--orange)",1)+c("今日错误",(Array.isArray(D.errors)?D.errors:[]).filter(e=>e.time&&e.time.startsWith(td)).length,"var(--red)",1);
   runCountUps(document.getElementById("cards"));
   const psb=document.getElementById("profileSummaryBody"),profiles=Array.isArray(D.profileSummaries)?D.profileSummaries:[];
-  psb.innerHTML=profiles.length?profiles.map(p=>{const st=p.breakerState||"UNKNOWN";const rl=p.rateLimit;let col,led,stateLabel;if(rl){col='var(--red)';led='err';const rm=new Date(rl.resumeAt);stateLabel='限额中 '+String(rm.getHours()).padStart(2,'0')+':'+String(rm.getMinutes()).padStart(2,'0')+'恢复';}else{col=st==="CLOSED"?"var(--green)":st==="HALF_OPEN"?"var(--orange)":"var(--red)";led=st==="CLOSED"?"on":st==="HALF_OPEN"?"warn":"err";stateLabel=st==="CLOSED"?"正常":st==="HALF_OPEN"?"探测中":"熔断";}const current=currentProfile!=="all"&&p.suffix===currentProfile;const gBadge=p.inDefaultGroup?' <span style="color:var(--blue);font-size:10px;font-weight:600">默认组·'+(p.groupOrder+1)+'</span>':'';const rBadge=p.inResponsesGroup?' <span style="color:var(--blue);font-size:10px;font-weight:600">Resp组·'+(p.responsesGroupOrder+1)+'</span>':'';const protoBadge=p.protocol==='responses'?' <span style="color:var(--blue);font-size:10px">Codex</span>':'';const bLabel=p.billingType==='coding_plan'?' <span style="color:var(--dim);font-size:10px">CP</span>':p.billingType==='token_plan'?' <span style="color:var(--dim);font-size:10px">TP</span>':'';const pk=(p.peakHours&&p.peakHours.length)?(function(rs){const now=new Date(),cur=((now.getTime()+8*3600000)%86400000)/60000;const tm=function(t){if(!t)return null;const a=t.split(':');return (+a[0])*60+(+a[1])};const inPk=rs.some(function(r){const s=tm(r.start),e=tm(r.end);return s!==null&&e!==null&&s!==e&&(s<e?(cur>=s&&cur<e):(cur>=s||cur<e))});return ' <span style="color:'+(inPk?'var(--orange)':'var(--dim)')+';font-size:10px" title="高峰时段(北京时间) '+rs.map(function(r){return r.start+'-'+r.end}).join(', ')+'">'+(inPk?'高峰中':rs.map(function(r){return r.start+'-'+r.end}).join(','))+'</span>'})(p.peakHours):'';const restricted=(p.inDefaultGroup&&profiles.filter(x=>x.inDefaultGroup).length>=2)||(p.inResponsesGroup&&profiles.filter(x=>x.inResponsesGroup).length>=2);const entryCode=p.protocol==='responses'?'/v1/responses':'/v1';return'<tr'+(current?' class="profile-current" aria-current="true"':'')+'><td>'+escH(p.name)+(p.isDefault?' <span style="color:var(--green);font-size:11px;font-weight:600;vertical-align:middle">默认</span>':'')+gBadge+rBadge+protoBadge+bLabel+pk+(current?' <span class="current-mark">当前</span>':'')+'</td><td>'+(restricted?'<code>'+entryCode+'</code> <span style="color:var(--dim);font-size:10px">仅 '+entryCode+'</span>':'<code>/'+escH(p.suffix)+'</code>'+(p.isDefault?' <span style="color:var(--dim)"> / <code>'+entryCode+'</code></span>':''))+'</td><td style="font-size:12px;color:var(--dim);max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+escH((p.upstream||'').replace('https://','').replace('http://',''))+'</td><td class="n">'+fmtT(p.todayRequests||0)+'</td><td class="n hl">'+fmtT(p.todayTokens||0)+'</td><td><span class="led '+led+'"></span><span style="color:'+col+';font-size:12px">'+stateLabel+'</span></td></tr>'}).join(''):'<tr><td colspan="6" class="empty">暂无方案</td></tr>';
+  const rowOf=p=>{const st=p.breakerState||"UNKNOWN";const rl=p.rateLimit;let col,led,stateLabel;if(rl){col='var(--red)';led='err';const rm=new Date(rl.resumeAt);stateLabel='限额中 '+String(rm.getHours()).padStart(2,'0')+':'+String(rm.getMinutes()).padStart(2,'0')+'恢复';}else{col=st==="CLOSED"?"var(--green)":st==="HALF_OPEN"?"var(--orange)":"var(--red)";led=st==="CLOSED"?"on":st==="HALF_OPEN"?"warn":"err";stateLabel=st==="CLOSED"?"正常":st==="HALF_OPEN"?"探测中":"熔断";}const current=currentProfile!=="all"&&p.suffix===currentProfile;const gBadge=p.inDefaultGroup?' <span style="color:var(--blue);font-size:10px;font-weight:600">默认组·'+(p.groupOrder+1)+'</span>':'';const rBadge=p.inResponsesGroup?' <span style="color:var(--blue);font-size:10px;font-weight:600">Resp组·'+(p.responsesGroupOrder+1)+'</span>':'';const protoBadge=p.protocol==='responses'?' <span style="color:var(--blue);font-size:10px">Codex</span>':'';const bLabel=p.billingType==='coding_plan'?' <span style="color:var(--dim);font-size:10px">CP</span>':p.billingType==='token_plan'?' <span style="color:var(--dim);font-size:10px">TP</span>':'';const pk=(p.peakHours&&p.peakHours.length)?(function(rs){const now=new Date(),cur=((now.getTime()+8*3600000)%86400000)/60000;const tm=function(t){if(!t)return null;const a=t.split(':');return (+a[0])*60+(+a[1])};const inPk=rs.some(function(r){const s=tm(r.start),e=tm(r.end);return s!==null&&e!==null&&s!==e&&(s<e?(cur>=s&&cur<e):(cur>=s||cur<e))});return ' <span style="color:'+(inPk?'var(--orange)':'var(--dim)')+';font-size:10px" title="高峰时段(北京时间) '+rs.map(function(r){return r.start+'-'+r.end}).join(', ')+'">'+(inPk?'高峰中':rs.map(function(r){return r.start+'-'+r.end}).join(','))+'</span>'})(p.peakHours):'';const restricted=(p.inDefaultGroup&&profiles.filter(x=>x.inDefaultGroup).length>=2)||(p.inResponsesGroup&&profiles.filter(x=>x.inResponsesGroup).length>=2);const entryCode=p.protocol==='responses'?'/v1/responses':'/v1';const defBadge=(p.isDefault||p.isResponsesDefault)?' <span style="color:var(--green);font-size:11px;font-weight:600;vertical-align:middle">默认</span>':'';return'<tr'+(current?' class="profile-current" aria-current="true"':'')+'><td>'+escH(p.name)+defBadge+gBadge+rBadge+protoBadge+bLabel+pk+(current?' <span class="current-mark">当前</span>':'')+'</td><td>'+(restricted?'<code>'+entryCode+'</code> <span style="color:var(--dim);font-size:10px">仅 '+entryCode+'</span>':'<code>/'+escH(p.suffix)+'</code>'+((p.isDefault||p.isResponsesDefault)?' <span style="color:var(--dim)">/ <code>'+entryCode+'</code></span>':''))+'</td><td style="font-size:12px;color:var(--dim);max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+escH((p.upstream||'').replace('https://','').replace('http://',''))+'</td><td class="n">'+fmtT(p.todayRequests||0)+'</td><td class="n hl">'+fmtT(p.todayTokens||0)+'</td><td><span class="led '+led+'"></span><span style="color:'+col+';font-size:12px">'+stateLabel+'</span></td></tr>'};
+  const anthProfiles=profiles.filter(p=>p.protocol!=="responses"),respProfiles=profiles.filter(p=>p.protocol==="responses");
+  const protoRow=(label,entry,count)=>'<tr class="proto-row"><td colspan="6">'+label+' · 入口 '+entry+' · '+count+' 个方案</td></tr>';
+  let psbHtml="";
+  if(anthProfiles.length)psbHtml+=protoRow("Anthropic · Claude Code","/v1",anthProfiles.length)+anthProfiles.map(rowOf).join("");
+  if(respProfiles.length)psbHtml+=protoRow("Responses · Codex","/v1/responses",respProfiles.length)+respProfiles.map(rowOf).join("");
+  psb.innerHTML=profiles.length?psbHtml:'<tr><td colspan="6" class="empty">暂无方案</td></tr>';
   const profileLabel=D.profileView||(currentProfile==="all"?"全部方案":"默认方案");
-  document.getElementById("profileContext").textContent="当前查看："+profileLabel;
+  const curProtoProf=(D.profiles||[]).find(p=>p.suffix===currentProfile);
+  setProtoSeg(currentProfile!=="all"?((curProtoProf&&curProtoProf.protocol)||""):PROTO);
+  const protoSuffix=protoLabel(currentProfile!=="all"?((curProtoProf&&curProtoProf.protocol)||""):PROTO);
+  document.getElementById("profileContext").textContent="当前查看："+profileLabel+(protoSuffix?" · "+protoSuffix:"");
   const upstreamInfo=D.upstream?(" | 上游: "+D.upstream.replace("https://","").replace("http://","")):"";
-  document.getElementById("meta").innerHTML='<span style="color:var(--accent);font-weight:600">方案: '+profileLabel+'</span>'+upstreamInfo+' &nbsp;|&nbsp; 更新于 '+(function(){const d=new Date();const utc=d.getTime()+d.getTimezoneOffset()*60000;return new Date(utc+8*3600000).toLocaleTimeString("zh-CN")})()+" (北京时间) | 每30秒刷新";
+  document.getElementById("meta").innerHTML='<span style="color:var(--accent);font-weight:600">方案: '+profileLabel+(protoSuffix?' · '+protoSuffix:'')+'</span>'+upstreamInfo+' &nbsp;|&nbsp; 更新于 '+(function(){const d=new Date();const utc=d.getTime()+d.getTimezoneOffset()*60000;return new Date(utc+8*3600000).toLocaleTimeString("zh-CN")})()+" (北京时间) | 每30秒刷新";
 
   // Charts —— 六图共用全局筛选：P 周期 / MT 指标 / MDL 模型 / USR 用户 / DS+DE 日期范围。
   // 四张非 24h 图的窗口用 effBounds()(日期范围生效时优先,否则周期窗口);两张 24h 图恒用 winBounds()。
@@ -4652,13 +4772,13 @@ function render(){
   document.getElementById("errorHint").textContent=allErrs.length>0?(allErrs.length+'条错误'):'暂无错误';
   renderWorkspaceSummaries();
 }
-async function load(){try{const profile=currentProfile==="all"?"all":currentProfile;const r=await fetch("/api/stats"+(profile?"?profile="+encodeURIComponent(profile):""));D=await r.json();render()}catch(e){document.getElementById("meta").textContent="Error: "+e.message}}
+async function load(){try{const profile=currentProfile==="all"?"all":currentProfile;const qs=[];if(profile!=="all")qs.push("profile="+encodeURIComponent(profile));else if(PROTO)qs.push("protocol="+PROTO);const r=await fetch("/api/stats"+(qs.length?"?"+qs.join("&"):""));D=await r.json();render()}catch(e){document.getElementById("meta").textContent="Error: "+e.message}}
 function toggleSec(id){const body=document.getElementById(id+"Body");const icon=document.getElementById(id+"Icon");const open=body.classList.toggle("open");icon.classList.toggle("open",open)}
 document.querySelectorAll(".tab").forEach(b=>b.addEventListener("click",()=>{document.querySelectorAll(".tab").forEach(x=>x.classList.remove("on"));b.classList.add("on");P=b.dataset.p;resetDetailGrouping();render()}));
 document.getElementById("metricSel").addEventListener("change",e=>{MT=e.target.value;render()});
 document.getElementById("modelSel").addEventListener("change",e=>{MDL=e.target.value;resetDetailGrouping();render()});
 document.getElementById("userSel").addEventListener("change",e=>{USR=e.target.value;render()});
-function resetChartFilters(){P="day";MT="tokens";MDL="all";USR="all";DS="";DE="";document.querySelectorAll("#globalTabs .tab").forEach(x=>x.classList.toggle("on",x.dataset.p==="day"));document.getElementById("metricSel").value="tokens";document.getElementById("modelSel").value="all";document.getElementById("userSel").value="all";document.getElementById("dateStart").value="";document.getElementById("dateEnd").value="";resetDetailGrouping();render()}
+function resetChartFilters(){P="day";MT="tokens";MDL="all";USR="all";DS="";DE="";PROTO="";setProtoSeg("");document.querySelectorAll("#globalTabs .tab").forEach(x=>x.classList.toggle("on",x.dataset.p==="day"));document.getElementById("metricSel").value="tokens";document.getElementById("modelSel").value="all";document.getElementById("userSel").value="all";document.getElementById("dateStart").value="";document.getElementById("dateEnd").value="";if(currentProfile!=="all"){currentProfile="all";document.getElementById("profileSel").value="all"}resetDetailGrouping();load()}
 document.querySelectorAll(".workspace-tab").forEach(button=>{button.addEventListener("click",()=>setWorkspaceTab(button.id.replace("workspace-tab-","")));button.addEventListener("keydown",handleWorkspaceTabKeydown)});
 document.getElementById("clearErrors").addEventListener("click",async()=>{if(confirm("确定清除所有错误记录？")){const csrf=(document.cookie.match(/tm_csrf=([^;]+)/)||[])[1]||'';await fetch("/api/clear-errors",{method:"POST",headers:{"x-csrf-token":csrf}});toast('错误记录已清除');errPage=1;load()}});
 function startAutoRefresh(){if(refreshTimer)clearInterval(refreshTimer);refreshTimer=setInterval(()=>{if(autoRefresh)load()},30000)}
@@ -4780,13 +4900,15 @@ function render(){
   if(!D)return;
   const sel=document.getElementById('profileSel');
   if(sel.options.length<=1){
-    sel.innerHTML='<option value="all">全部可用方案</option>'+(D.availableProfiles||[]).map(p=>'<option value="'+p.suffix+'">'+p.name+' /'+p.suffix+(p.isDefault?' · 默认入口':'')+'</option>').join('');
+    sel.innerHTML='<option value="all">全部可用方案</option>'+(D.availableProfiles||[]).map(p=>'<option value="'+p.suffix+'">'+p.name+' /'+p.suffix+(p.isDefault?' · 默认入口':'')+(p.protocol==='responses'?' · Codex':' · Claude Code')+'</option>').join('');
   }
   sel.value=currentProfile;
+  const curProto=(D.availableProfiles||[]).find(p=>p.suffix===currentProfile)?.protocol;
+  const linkTag=currentProfile==='all'?'':' · 链路: '+(curProto==='responses'?'Codex (Responses)':'Claude Code (Anthropic)');
   const q=D.quota,t=D.today;
   const pct=q.limit>0?Math.min(100,Math.round(q.used/q.limit*100)):0;
   const color=pct>90?'var(--red)':pct>70?'var(--orange)':'var(--green)';
-  document.getElementById('meta').innerHTML=D.username+' · 方案: '+D.profile+(q.limit>0?' · <span style="color:'+color+'">'+pct+'% 已用</span> '+hpBar(pct,16)+(q.autoAdjusted?' <span class="tag">AUTO</span>':''):' · 无配额限制');
+  document.getElementById('meta').innerHTML=D.username+' · 方案: '+D.profile+linkTag+(q.limit>0?' · <span style="color:'+color+'">'+pct+'% 已用</span> '+hpBar(pct,16)+(q.autoAdjusted?' <span class="tag">AUTO</span>':''):' · 无配额限制');
   document.getElementById('cards').innerHTML=
     '<div class="card"><div class="l">今日用量 <span style="font-size:9px;color:var(--dim);font-weight:400">输入+输出</span></div><div class="v" data-cu="'+ioTokens(t)+'" data-cu-k style="color:var(--accent)">0</div></div>'+
     '<div class="card"><div class="l">今日请求</div><div class="v" data-cu="'+t.requests+'" data-cu-k style="color:var(--blue)">0</div></div>'+
@@ -5591,12 +5713,23 @@ const server = http.createServer((req, res) => {
     if (!checkAuth(req)) { res.writeHead(401); res.end("Unauthorized"); return; }
     const url = new URL(req.url, `http://localhost`);
     const profileSuffix = url.searchParams.get("profile") || "all";
+    // Optional protocol split for the "all" view: anthropic|responses. Ignored
+    // when a specific profile is selected (a profile already belongs to one
+    // protocol). Missing/invalid value = current unfiltered behavior.
+    const protocolParam = url.searchParams.get("protocol");
+    let protocolView = null;
+    let protoFilter = null;
+    if (profileSuffix === "all" && (protocolParam === "anthropic" || protocolParam === "responses")) {
+      protocolView = protocolParam;
+      protoFilter = protocolSuffixes(protocolParam);
+    }
     let data;
     if (profileSuffix === "all") {
-      // Aggregate all profiles
-      const agg = getAggregatedStore();
+      // Aggregate all profiles (optionally narrowed to one protocol)
+      const agg = getAggregatedStore(protoFilter);
       data = sanitizeStore(agg);
       data.profileView = "all";
+      data.protocolView = protocolView;
     } else {
       const targetSuffix = normalizeProfileSuffix(profileSuffix);
       const targetRt = runtimes[targetSuffix];
@@ -5625,9 +5758,9 @@ const server = http.createServer((req, res) => {
     // cross-profile daily aggregates (always all profiles — the profile chart
     // is a cross-profile dimension and must not shrink with the profile filter).
     const scopedSuffix = profileSuffix === "all" ? null : normalizeProfileSuffix(profileSuffix);
-    data.hourlyModels = loadHourlyModels(scopedSuffix);
-    data.profileDaily = loadProfileDaily();
-    data.profileDailyModels = loadProfileDailyModels();
+    data.hourlyModels = loadHourlyModels(scopedSuffix, protoFilter);
+    data.profileDaily = loadProfileDaily(protoFilter);
+    data.profileDailyModels = loadProfileDailyModels(protoFilter);
     sendJson(res, data, req);
     return;
   }

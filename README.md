@@ -242,11 +242,19 @@ wire_api = "responses"
 
 | 页面 | 地址 | 说明 |
 | --- | --- | --- |
-| 管理面板 | `http://localhost:6789/dashboard` | 单屏查看指标、图表、用户、周期明细、方案和错误 |
-| 设置 | `http://localhost:6789/settings` | 方案、成员、配额与独立的全局数据管理 |
-| 个人用量 | `http://localhost:6789/usage/虚拟Key` | 指定成员的用量页面 |
+| 管理面板 | `http://localhost:6789/dashboard` | 单屏查看指标、图表、用户、周期明细、方案和错误；顶部"全部 / Claude Code / Codex"三段开关可按协议切换全部统计视角 |
+| 设置 | `http://localhost:6789/settings` | 双标签页（Claude Code / Codex）分别管理各自协议的方案、默认入口与方案组 |
+| 个人用量 | `http://localhost:6789/usage/虚拟Key` | 指定成员的用量页面，方案下拉标注所属协议 |
 | Key 查询 | `http://localhost:6789/my-usage` | 输入虚拟 Key 查询 |
 | 健康检查 | `http://localhost:6789/health` | 服务与熔断状态 |
+
+### 两种协议的默认入口互不影响
+
+Anthropic 默认组只管 Claude Code 的 `/v1` 入口，Responses 组只管 Codex 的 `/v1/responses` 入口；把某个 Codex 方案设为 Responses 默认，Claude Code 的请求路径、路由和 failover 完全不变（反之亦然）。设置页的两个标签页分别展示各自的"默认入口"徽章和方案组编辑器，两边的操作只在各自协议内生效。
+
+### Dashboard 协议分类
+
+`/api/stats` 支持可选的 `protocol=anthropic|responses` 参数（不传则聚合全部，行为与旧版一致）。管理面板的三段开关切换后，卡片、六张图表、用户表、错误表和明细表整体切换到该协议的方案集合；方案中心表格按协议分节展示，两个协议的组头都带"默认"徽章。
 
 ## 主要接口
 
@@ -259,7 +267,7 @@ Anthropic Messages 代理使用虚拟 Key 鉴权。管理类写入接口除登�
 | `/v1/responses` | POST | Responses 方案组的 OpenAI Responses 代理（Codex 入口，组内 failover） |
 | `/:suffix/v1/responses` | POST | 指定 Responses 方案的代理 |
 | `/v1/models`、`/:suffix/v1/models` | GET | 本地合成的模型列表（Responses 池，需虚拟 Key） |
-| `/api/stats` | GET | 团队统计 |
+| `/api/stats` | GET | 团队统计；可选 `protocol=anthropic\|responses` 按协议过滤 |
 | `/api/my-usage` | GET | Bearer Key 对应的个人统计 |
 | `/api/settings` | GET / POST | 读取或更新设置 |
 | `/api/settings-save` | POST | 保存设置页表单 |

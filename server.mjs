@@ -285,8 +285,13 @@ const removedOpenAIUserKeys = new Set();
     if (profile.peakModelAliases === undefined) { profile.peakModelAliases = {}; migrated = true; }
     profile.peakModelAliases = normalizeModelAliases(profile.peakModelAliases || {});
     if (!Array.isArray(profile.allowedModels)) profile.allowedModels = [];
-    for (const target of Object.values({ ...aliases, ...profile.peakModelAliases })) {
-      if (target && !profile.allowedModels.includes(target)) profile.allowedModels.push(target);
+    // Union of BOTH maps' values — spreading them by key would let a peak alias
+    // with the same key drop the default target from the allowed list.
+    for (const target of [...Object.values(aliases), ...Object.values(profile.peakModelAliases)]) {
+      if (target && !profile.allowedModels.includes(target)) {
+        profile.allowedModels.push(target);
+        migrated = true;
+      }
     }
     for (const field of ["defaultModels", "apiProtocol", "openaiStreamUsage", "responsesAdapter"]) {
       if (field in profile) {
@@ -1939,7 +1944,10 @@ function previewList(values, fallback = "none") {
 }
 
 function modelNotAllowedMessage(model, runtime) {
-  return `Model "${model}" is not allowed. Use jx-sonnet/jx-opus/jx-haiku or a model from the allowed list.`;
+  const allowed = (runtime?.allowedModels || []).join(", ") || "(空)";
+  const aliases = Object.keys(effectiveModelAliases(runtime || rt)).join(", ");
+  const aliasHint = aliases ? `，或该方案的别名: ${aliases}` : "";
+  return `Model "${model}" is not allowed on profile "${runtime?.profileName || "?"}". 允许的模型: ${allowed}${aliasHint}`;
 }
 
 function generateVirtualKey(_rt) {
@@ -3082,7 +3090,7 @@ function proxyRequest(req, res) {
         } catch {}
 
         if (!checkModelAllowed(creqModel, cruntime)) {
-          lastFailure = { kind: "model", status: 403, message: modelNotAllowedMessage(creqModel, cruntime), runtime: cruntime, suffix: csuffix };
+          lastFailure = { kind: "model", status: 403, model: creqModel, originalModel, message: modelNotAllowedMessage(creqModel, cruntime), runtime: cruntime, suffix: csuffix };
           if (!isLastCandidate) continue;
           break;
         }
@@ -3166,7 +3174,7 @@ function proxyRequest(req, res) {
           // Responses-protocol clients (Codex) get OpenAI-style error bodies.
           if (lastFailure.kind === "model") {
             sendOpenAiError(res, 403, "model_not_allowed", lastFailure.message);
-            console.log(`[拦截] ${apiKey.slice(0, 8)}**** profile=${lastFailure.runtime.profileName} model 拒绝`);
+            console.log(`[拦截] ${apiKey.slice(0, 8)}**** profile=${lastFailure.runtime.profileName} model 拒绝 请求模型=${lastFailure.originalModel} 解析后=${lastFailure.model} 允许=${(lastFailure.runtime.allowedModels || []).join(",")}`);
           } else if (lastFailure.kind === "breaker") {
             const remaining = Math.ceil(lastFailure.runtime.breaker.status().cooldownRemaining / 1000);
             sendOpenAiError(res, 503, "upstream_unavailable", `Upstream temporarily unavailable. Circuit open, retry in ${remaining}s.`);
@@ -3195,7 +3203,7 @@ function proxyRequest(req, res) {
         } else if (lastFailure.kind === "model") {
           res.writeHead(403, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ error: lastFailure.message }));
-          console.log(`[拦截] ${apiKey.slice(0, 8)}**** profile=${lastFailure.runtime.profileName} model 拒绝`);
+          console.log(`[拦截] ${apiKey.slice(0, 8)}**** profile=${lastFailure.runtime.profileName} model 拒绝 请求模型=${lastFailure.originalModel} 解析后=${lastFailure.model} 允许=${(lastFailure.runtime.allowedModels || []).join(",")}`);
         } else if (lastFailure.kind === "breaker") {
           const remaining = Math.ceil(lastFailure.runtime.breaker.status().cooldownRemaining / 1000);
           res.writeHead(503, { "Content-Type": "application/json" });
@@ -5889,11 +5897,15 @@ function applySettings(formData) {
   // allowedModels = 去重后的全部别名目标（唯一来源，不可手填）。
   // Only recomputed on profile-form saves; a global-only save carries no alias
   // fields and must not touch the profile's allowedModels.
+  // NOTE: the two alias maps are merged by VALUES, not by spread — spreading
+  // would let a peak alias with the same key silently drop the default target
+  // from the allowed list (jx-opus=glm-5.3 + peak jx-opus=flash used to yield
+  // an allowed list of just [flash], 403-ing every off-peak jx-opus request).
   if (!isGlobalOnlySave) {
-    const aliasTargets = Object.values({
-      ...normalizeModelAliases(editingProfile.modelAliases || {}),
-      ...normalizeModelAliases(editingProfile.peakModelAliases || {}),
-    }).filter(Boolean);
+    const aliasTargets = [
+      ...Object.values(normalizeModelAliases(editingProfile.modelAliases || {})),
+      ...Object.values(normalizeModelAliases(editingProfile.peakModelAliases || {})),
+    ].filter(Boolean);
     editingProfile.allowedModels = [...new Set(aliasTargets)];
     if (editingProfile.allowedModels.length === 0) {
       throw new Error("允许模型列表为空——请先在上方配置模型别名");

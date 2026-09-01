@@ -564,6 +564,8 @@ function listProfiles() {
     modelAliases: getConfigurableModelAliases(config.profiles[name]),
     peakModelAliases: normalizeModelAliases(config.profiles[name].peakModelAliases || {}),
     modelContextWindows: config.profiles[name].modelContextWindows || {},
+    modelMultimodal: config.profiles[name].modelMultimodal || {},
+    imageBridge: config.profiles[name].imageBridge || { enabled: false, model: "" },
     contextWindow: config.profiles[name].contextWindow || 128000,
     dailyTokenLimit: config.profiles[name].dailyTokenLimit || 0,
     peakHours: normalizePeakHours(config.profiles[name].peakHours),
@@ -1596,6 +1598,11 @@ function setStickyProfile(protocol, userKey, signal, profileName) {
   }
 }
 
+function deleteStickyProfile(protocol, userKey, signal) {
+  if (!signal) return;
+  stickyBindings.delete(`${protocol}|${userKey}|${signal}`);
+}
+
 // Move a live binding to the front of the ordered candidate list. Pure reorder:
 // the list was already availability-filtered by the caller.
 function applyStickyReorder(candidates, boundProfile) {
@@ -2498,13 +2505,19 @@ function getAggregatedPersonalUsage(apiKey, availableProfiles) {
   };
 }
 
-function getPersonalUsageData(apiKey, requestedProfile = "all") {
-  const availableProfiles = getAccessibleProfiles(apiKey);
+function getPersonalUsageData(apiKey, requestedProfile = "all", protocol = "") {
+  let availableProfiles = getAccessibleProfiles(apiKey);
   const username = getUserName(apiKey, rt) || apiKey.slice(0, 8);
   const profile = requestedProfile || "all";
 
+  // Optional protocol split for the "all" view (mirrors /api/stats?protocol=):
+  // narrows both the aggregated numbers and the profile list handed to the page.
+  if (profile === "all" && (protocol === "anthropic" || protocol === "responses")) {
+    availableProfiles = availableProfiles.filter(p => p.protocol === protocol);
+  }
+
   if (profile === "all") {
-    return { username, availableProfiles, ...getAggregatedPersonalUsage(apiKey, availableProfiles) };
+    return { username, availableProfiles, protocolView: protocol || null, ...getAggregatedPersonalUsage(apiKey, availableProfiles) };
   }
 
   const suffix = normalizeProfileSuffix(profile);
@@ -2624,6 +2637,160 @@ function buildUpstreamPath(reqUrl, runtime) {
     return upstreamPath + reqUrl;
   }
   return upstreamPath + reqUrl;
+}
+
+// ─── 图片识别桥接（vision bridge）───────────────────────────────────────────
+// 目标别名不支持视觉时，先用方案指定的辅助模型把图片转成文字描述，再替换
+// 请求里的图片块交给原模型——Codex 端对所有别名放行贴图（见 models.json 的
+// modalities 联动），纯文本模型实际收到的是图片的文字转述。
+// 转述按图片内容 sha256 缓存（对话每轮重发历史，同图重放零额外成本）。
+const imageBridgeCache = new Map();   // sha256 -> { text, ts }
+const IMAGE_BRIDGE_CACHE_MAX = 500;
+const IMAGE_BRIDGE_MAX_IMAGES = 8;
+const IMAGE_BRIDGE_MAX_B64 = 12 * 1024 * 1024;
+
+function bridgeCacheGet(hash) {
+  const hit = imageBridgeCache.get(hash);
+  if (!hit) return null;
+  return hit.text;
+}
+function bridgeCacheSet(hash, text) {
+  imageBridgeCache.set(hash, { text, ts: Date.now() });
+  if (imageBridgeCache.size > IMAGE_BRIDGE_CACHE_MAX) {
+    let oldest = null, oldestKey = null;
+    for (const [k, v] of imageBridgeCache) {
+      if (!oldest || v.ts < oldest) { oldest = v.ts; oldestKey = k; }
+    }
+    if (oldestKey) imageBridgeCache.delete(oldestKey);
+  }
+}
+
+// Extract data:URL images from a parsed Responses request body (input items).
+// Returns the parsed input array (same ref) plus { index, hash } markers.
+function extractImagesFromResponsesBody(parsed) {
+  const images = [];
+  const items = Array.isArray(parsed?.input) ? parsed.input : [];
+  for (let i = 0; i < items.length; i++) {
+    const item = items[i];
+    if (!item || typeof item !== "object" || item.type !== "message") continue;
+    const content = Array.isArray(item.content) ? item.content : [];
+    for (let j = 0; j < content.length; j++) {
+      const block = content[j];
+      if (!block || block.type !== "input_image") continue;
+      const raw = String(block.image_url || "");
+      const m = /^data:image\/[a-zA-Z0-9.+-]+;base64,([A-Za-z0-9+/=]+)$/.exec(raw);
+      if (!m) continue;
+      const b64 = m[1];
+      if (b64.length > IMAGE_BRIDGE_MAX_B64) continue;
+      images.push({ i, j, b64 });
+    }
+  }
+  return images;
+}
+
+// Bridge one request body (Buffer) through the profile's helper model.
+// `alias` is the model alias the client asked for: aliases marked multimodal
+// pass through untouched (native support); non-multimodal aliases with images
+// are rewritten via the helper. Returns the rewritten Buffer, or null to
+// passthrough (no images, or the alias natively supports images).
+async function bridgeImagesInRequest(body, runtime, clientState, alias) {
+  const profileCfg = config.profiles[runtime.profileName] || {};
+  const mm = profileCfg.modelMultimodal || {};
+  // Native support (or unknown alias) → passthrough, zero cost.
+  if (mm[alias] !== false) return null;
+  let parsed;
+  try { parsed = JSON.parse(body.toString()); } catch { return null; }
+  const images = extractImagesFromResponsesBody(parsed);
+  if (images.length === 0) return null;
+  if (images.length > IMAGE_BRIDGE_MAX_IMAGES) {
+    const err = new Error(`单次请求图片数量超过上限（${IMAGE_BRIDGE_MAX_IMAGES} 张），请分批发送`);
+    err.statusCode = 400;
+    throw err;
+  }
+  // Helper model: manually configured one, else the first multimodal alias.
+  const helperModel = resolveBridgeHelperModel(profileCfg, mm);
+  if (!helperModel) {
+    const err = new Error(`模型 "${alias}" 未标记为原生支持图片，且方案未配置任何可参与图片识别的辅助模型（请在别名中勾选至少一个支持多模态的模型）`);
+    err.statusCode = 400;
+    throw err;
+  }
+  const items = parsed.input;
+  for (const { i, j, b64 } of images) {
+    const hash = crypto.createHash("sha256").update(b64).digest("hex");
+    let desc = bridgeCacheGet(hash);
+    if (desc === null) {
+      desc = await describeImageViaHelper(b64, helperModel, runtime, clientState, profileCfg);
+      if (desc === null) {
+        const err = new Error("图片识别失败：辅助模型未能生成图片描述，请稍后重试或改用原生支持视觉的别名");
+        err.statusCode = 502;
+        throw err;
+      }
+      bridgeCacheSet(hash, desc);
+    }
+    // Replace the image block with a text description (keep surrounding context).
+    items[i].content[j] = { type: "input_text", text: `[图片内容] ${desc}` };
+  }
+  return Buffer.from(JSON.stringify(parsed));
+}
+
+// Pick the helper model: imageBridge.model (manual override) → first alias
+// marked multimodal. Returns "" when the pool is empty.
+function resolveBridgeHelperModel(profileCfg, mm) {
+  const manual = profileCfg.imageBridge && profileCfg.imageBridge.model;
+  if (manual) return manual;
+  const aliases = profileCfg.modelAliases || {};
+  const first = Object.keys(aliases).find(a => mm[a] !== false);
+  return first ? aliases[first] : "";
+}
+
+// Ask the helper model to describe a base64 image. Returns the description text
+// or null on any failure. Uses the profile's real upstream + key (same auth).
+async function describeImageViaHelper(b64, helperModel, runtime, clientState, profileCfg) {
+  const body = JSON.stringify({
+    model: helperModel,
+    instructions: "你是图片描述助手。请用简体中文详细描述这张图片的内容，包括主体、布局、文字、颜色等，供另一个语言模型理解。只输出描述本身。",
+    input: [
+      { type: "message", role: "user", content: [
+        { type: "input_image", image_url: `data:image/png;base64,${b64}` },
+      ] },
+    ],
+    store: false,
+    stream: false,
+  });
+  const headers = {
+    "content-type": "application/json",
+    "content-length": Buffer.byteLength(body),
+    host: runtime.upstreamUrl.host,
+    authorization: `Bearer ${getRealKeyFromProfile(profileCfg)}`,
+  };
+  try {
+    const upRes = await sendUpstream(Buffer.from(body), "/v1/responses", "POST", headers, 60000, runtime, clientState);
+    if (upRes.statusCode !== 200) return null;
+    const json = JSON.parse(upRes.body.toString());
+    const out = json?.output || [];
+    const text = out
+      .filter(o => o && o.type === "message")
+      .flatMap(o => (Array.isArray(o.content) ? o.content : []))
+      .filter(c => c && c.type === "output_text")
+      .map(c => c.text || "")
+      .join("\n")
+      .trim();
+    return text || null;
+  } catch {
+    return null;
+  }
+}
+
+// Resolve the real upstream key for a profile config (used by the bridge helper
+// call which bypasses the normal virtual-key mapping for a synthetic request).
+function getRealKeyFromProfile(profileCfg) {
+  // Take the first non-empty user key configured on this profile.
+  const users = profileCfg.users || {};
+  for (const v of Object.values(users)) {
+    const k = typeof v === "string" ? v : (v && v.key);
+    if (k) return k;
+  }
+  return "";
 }
 
 function sendUpstream(body, reqUrl, reqMethod, reqHeaders, timeout, _rt, clientState) {
@@ -2951,6 +3118,19 @@ function proxyRequest(req, res) {
           const isStreamRequest = (req.headers["accept"] || "").includes("text/event-stream") ||
             (function() { try { return JSON.parse(cbody.toString()).stream; } catch { return false; } })();
 
+          // Image-recognition bridge (Responses only): non-multimodal aliases
+          // with images are rewritten into helper-model descriptions before the
+          // request goes upstream. Runs for both streaming and JSON requests
+          // (only the request body is touched; the response mode is unaffected).
+          if (protocol === "responses") {
+            const bridged = await bridgeImagesInRequest(cbody, cruntime, clientState, originalModel);
+            if (bridged) {
+              cbody = bridged;
+              reqHeaders["content-length"] = cbody.length;
+              console.log(`[图片桥接] ${getUserName(apiKey, cruntime)} 已把图片转述后发往 ${creqModel}`);
+            }
+          }
+
           proxyPhase = isStreamRequest ? "streaming-proxy" : "json-proxy";
           const timeout = isStreamRequest ? gProxy.streamTimeout : gProxy.timeout;
 
@@ -3048,10 +3228,20 @@ function proxyRequest(req, res) {
         }
       }
 
-      // Cache-affinity binding: remember which group member served this
-      // conversation so the next turn reorders it to the front.
+      // Cache-affinity binding: the binding may only ever point at the protocol's
+      // group head. A normal turn served by the head refreshes it (cache affinity
+      // across turns); a turn served by a failover member clears it — so once the
+      // head recovers from a limit/breaker it naturally returns to the front
+      // instead of the conversation staying pinned to the fallback profile.
       if (servedBy && resolvedProfile.isDefaultEntry && sessionSignal) {
-        setStickyProfile(protocol, userKey, sessionSignal, servedBy);
+        const headName = protocol === "responses"
+          ? (Array.isArray(config.responsesProfileGroup) ? config.responsesProfileGroup[0] : null)
+          : (Array.isArray(config.defaultProfileGroup) ? config.defaultProfileGroup[0] : null);
+        if (headName && servedBy === headName) {
+          setStickyProfile(protocol, userKey, sessionSignal, servedBy);
+        } else {
+          deleteStickyProfile(protocol, userKey, sessionSignal);
+        }
       }
     } finally {
       releaseConcurrency(userKey);
@@ -3276,15 +3466,34 @@ async function handleStreamingProxy(req, res, body, reqHeaders, apiKey, reqModel
         return;
       }
 
-      res.writeHead(upRes.statusCode, h);
-      runtime.breaker.recordSuccess();
-      armIdleTimer();
+      // Streamed 200 responses: the upstream may signal a plan-limit *in-band*
+      // (HTTP 200 + SSE `response.failed`/`error`) before any business data. To
+      // fail over cleanly to the next group candidate we must not send headers
+      // or bytes to the client until we've confirmed it's a real stream — so we
+      // buffer a short prelude, and only writeHead once a content event arrives.
+      let prelude = "";
+      let started = false;
+      const PRELUDE_LIMIT = 64 * 1024;
+      const flushPrelude = () => {
+        if (started) return;
+        started = true;
+        res.writeHead(upRes.statusCode, h);
+        runtime.breaker.recordSuccess();
+        armIdleTimer();
+        if (prelude) res.write(prelude);
+        prelude = "";
+      };
 
       upRes.on("data", (chunk) => {
         armIdleTimer();
         if (clientGone) return;
-        res.write(chunk);
         const text = chunk.toString();
+        if (started) {
+          res.write(chunk);
+        } else {
+          prelude += text;
+          if (prelude.length > PRELUDE_LIMIT) flushPrelude();
+        }
         buf += text;
         // Save sample of raw response for debug
         if (rawSample.length < 500) rawSample += text;
@@ -3332,13 +3541,36 @@ async function handleStreamingProxy(req, res, body, reqHeaders, apiKey, reqModel
             // for the error log; usage stays absent on failed streams.
             if (d.type === "response.failed" || d.type === "response.incomplete" || d.type === "error") {
               streamFailure = `${d.type}: ${d.error?.message || d.response?.error?.message || "no detail"}`;
+              if (!started) {
+                const msg = d.error?.message || d.response?.error?.message || "";
+                const rl = classifyRateLimit(429, msg, upRes.headers);
+                if (rl) {
+                  // Plan-limit signalled in the first frame, before any bytes
+                  // reached the client: hand off to the failover layer (next
+                  // group candidate) without sending headers or data.
+                  recordError(apiKey, 429, msg.slice(0, 200) || streamFailure, req.url, reqModel, suffix, runtime);
+                  clientGone = true;
+                  safeReject(new RateLimitedError(rl.resumeAt, rl.source));
+                  upReq.destroy();
+                  return;
+                }
+              }
+            } else if (!started && d.type !== "response.created") {
+              // A real content event (output_item.added / .delta / .completed / …):
+              // only now do we commit to forwarding this stream to the client.
+              flushPrelude();
             }
           } catch {}
         }
       });
 
       upRes.on("end", () => {
+        if (resolved) return;
         clearIdleTimer();
+        // Stream ended before any content event arrived (e.g. a non-limit error
+        // stream or an empty stream): still commit headers + buffered prelude so
+        // the client sees the upstream text (matches pre-fix passthrough).
+        if (!started) flushPrelude();
         if (buf.startsWith("data: ")) {
           try {
             const tail = buf.slice(6).trim();
@@ -3376,6 +3608,7 @@ async function handleStreamingProxy(req, res, body, reqHeaders, apiKey, reqModel
     });
 
     upReq.on("error", (err) => {
+      if (resolved) return;   // already failover'd or resolved — don't write a 502
       if (isClientAbortError(err) || clientState?.aborted) {
         console.log(`[取消] ${getUserName(apiKey, runtime)} 流式客户端断开 model=${reqModel}`);
         safeResolve();
@@ -3635,10 +3868,12 @@ td{padding:8px;border-bottom:1px solid #ecece8;font-size:12px}
 .proto-pane-hd .proto-entry{font-size:10px;font-weight:400;color:var(--accent)}
 .proto-pane-hint{font-size:10px;color:var(--dim);padding:0 12px 8px;line-height:1.5}
 .alias-toolbar{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin-bottom:8px}
-.alias-head{display:grid;grid-template-columns:1fr 1.4fr 130px 34px;gap:8px;font-size:10px;font-weight:600;color:var(--dim);margin-bottom:4px}
-.alias-head.peak{grid-template-columns:1fr 1.4fr 34px}
-.alias-row{display:grid;grid-template-columns:1fr 1.4fr 130px 34px;gap:8px;margin-bottom:8px;align-items:center}
-.alias-row.peak{grid-template-columns:1fr 1.4fr 34px}
+.alias-head{display:grid;grid-template-columns:1fr 1.25fr 118px 56px 30px;gap:8px;font-size:10px;font-weight:600;color:var(--dim);margin-bottom:4px}
+.alias-head.peak{grid-template-columns:1fr 1.4fr 30px}
+.alias-row{display:grid;grid-template-columns:1fr 1.25fr 118px 56px 30px;gap:8px;margin-bottom:8px;align-items:center}
+.alias-row.peak{grid-template-columns:1fr 1.4fr 30px}
+.alias-row .mm-cell{display:flex;align-items:center;gap:4px;font-size:10px;color:var(--dim);cursor:pointer;white-space:nowrap}
+.alias-row .mm-cell input{width:auto;accent-color:var(--accent);margin:0;cursor:pointer}
 .alias-row input,.alias-row select{width:100%;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:7px 10px;border-radius:5px;font-size:12px}
 .alias-row input:focus,.alias-row select:focus{border-color:var(--accent)}
 .alias-row .row-del{height:32px;background:transparent;border:1px solid var(--border);border-radius:5px;color:var(--dim);cursor:pointer;font-size:13px;line-height:1}
@@ -3722,10 +3957,10 @@ ${errDiv}
   <button type="button" class="preset" onclick="addAliasRow('jx-sonnet')">jx-sonnet</button>
   <button type="button" class="preset" onclick="addAliasRow('')">＋自定义别名</button>
 </div>
-<div class="alias-head"><span>别名</span><span>实际模型</span><span>上下文长度</span><span></span></div>
+<div class="alias-head"><span>别名</span><span>实际模型</span><span>上下文长度</span><span>多模态</span><span></span></div>
 <div id="aliasRows"></div>
 <datalist id="stdAliasList"><option value="jx-fable"></option><option value="jx-opus"></option><option value="jx-haiku"></option><option value="jx-sonnet"></option></datalist>
-<div class="note">至少配置 1 行完整别名。上下文长度写入成员 Codex 接入配置的 models.json（Codex 用它显示上下文用量与做压缩阈值，网关与上游不感知）。删除行后行号自动重排。</div>
+<div class="note">至少配置 1 行完整别名。「多模态」勾选表示该别名原生支持图片（直通，不转述）；不勾选的别名贴图时网关会自动转述（见下方辅助模型设置）。上下文长度写入成员 Codex 接入配置的 models.json。删除行后行号自动重排。</div>
 <label style="margin-top:14px">高峰期别名覆盖（可选，仅覆盖上方同名别名）</label>
 <div class="alias-toolbar">
   <button type="button" class="preset" onclick="addPeakRow()">＋添加覆盖</button>
@@ -3739,6 +3974,19 @@ ${errDiv}
 <div class="section">
 <div id="allowedTags" class="tag-row"></div>
 <div class="note" id="allowedModelsNote">自动汇总上方所有别名（含高峰期覆盖）的实际模型并去重。不在列表中的模型请求将被拦截返回 403。</div>
+</div>
+
+<h2>图片识别辅助模型<span style="font-size:11px;color:var(--dim);font-weight:400">仅 OpenAI(Codex) 方案</span></h2>
+<div class="section">
+<div class="row">
+<div><label>辅助模型（用于识别图片，可选）</label>
+<select name="imgBridgeModel" id="imgBridgeModel">
+<option value="">自动（勾选多模态的别名中取第一个）</option>
+${(() => { const mm = initialProfile.modelMultimodal || {}; const aliases = initialProfile.modelAliases || {}; return Object.keys(aliases).filter(a => mm[a] !== false).map(a => `<option value="${escHtml(aliases[a])}" ${initialProfile.imageBridge?.model === aliases[a] ? "selected" : ""}>${escHtml(a)} → ${escHtml(aliases[a])}</option>`).join("") })()}
+</select>
+</div>
+<div style="align-self:flex-end"><span class="note">所有别名在 Codex 里都允许上传图片：勾选了「多模态」的别名会原样直通；未勾选的别名收到图片时，会自动用此辅助模型转述后再交给原模型。同图自动缓存，多轮对话不重复识别。辅助模型的每次新图片识别会产生少量额外 token。</span></div>
+</div>
 </div>
 
 <h2>计费类型</h2>
@@ -3785,6 +4033,11 @@ ${errDiv}
 <div class="view-intro">
   <h2>全局数据管理</h2>
   <p>此处操作作用于整个系统，不属于任何单一配置方案。导入前请确认来源方案映射，危险操作执行前会自动创建本地备份。</p>
+</div>
+<div class="section" style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
+  <button type="button" class="btn btn-outline" onclick="clearRateLimitState()">清除限流状态（所有方案立即恢复参与 failover）</button>
+  <button type="button" class="btn btn-outline" onclick="clearStickyBindings()">清除粘性绑定（下次请求回到各组默认方案）</button>
+  <span class="note">限流状态在数据库持久化，重启不会自动清除。若确认某个方案额度实际已恢复（如 Coding Plan 重置），可点「清除限流状态」让它立即回到组头接管；若额度确已用尽，下一请求会再次触发限流并自动切到备用方案。清除粘性绑定则让所有会话的下一轮请求从各组组头重新开始。</span>
 </div>
 <h2>超时 &amp; 重试 <span style="font-size:11px;color:var(--dim);font-weight:400">全局代理配置，对所有方案生效</span></h2>
 <form method="post" action="/api/settings-save" id="globalForm">
@@ -3964,6 +4217,18 @@ const SETTINGS=${settingsJson};
 const PAGE_CSRF="${CSRF_TOKEN}";
 function getCsrf(){return PAGE_CSRF||(document.cookie.match(/tm_csrf=([^;]+)/)||[])[1]||''}
 function csrfHeaders(h){h=h||{};h['x-csrf-token']=getCsrf();return h}
+async function clearStickyBindings(){
+  if(!confirm('确定清除所有粘性会话绑定？\\n清除后，所有会话的下一轮请求将从各自协议组头（默认方案）重新开始。'))return;
+  const r=await fetch('/api/sticky/clear',{method:'POST',headers:csrfHeaders({})});
+  if(r.ok){toast('粘性绑定已清除，请求将从各组默认方案重新开始')}
+  else{alert('清除失败')}
+}
+async function clearRateLimitState(){
+  if(!confirm('确定清除所有方案的限流状态？\\n清除后，所有方案立即恢复参与 failover，组头（如 Coding Plan）将在下一请求重新接管。'))return;
+  const r=await fetch('/api/rate-limit/clear',{method:'POST',headers:csrfHeaders({})});
+  if(r.ok){toast('限流状态已清除，各方案恢复参与 failover')}
+  else{alert('清除失败')}
+}
 function h(v){return String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
 function openDateTimePicker(input){if(typeof input.showPicker==='function'){try{input.showPicker()}catch{}}}
 let pendingImportData=null;
@@ -4227,6 +4492,7 @@ async function editProfile(n){
   if(fm.profileQuota)fm.profileQuota.value=p.dailyTokenLimit||0;
   const bt=fm.querySelector('select[name="billingType"]');if(bt)bt.value=p.billingType||'on_demand';
   renderPeakHoursRows(p.peakHours||[]);
+  refreshBridgeSelect(p);
   document.querySelectorAll('.pl-item').forEach(el=>el.classList.remove('active'));
   const el=document.getElementById('pl-'+n);
   if(el)el.classList.add('active');
@@ -4381,11 +4647,13 @@ function updateAllowedTags(){
   const box=document.getElementById('allowedTags');
   box.innerHTML=models.length?models.map(m=>'<span class="m-tag">'+m.replace(/</g,'&lt;')+'</span>').join(''):'<span class="m-empty">暂无——填入别名实际模型后自动生成</span>';
 }
-function aliasRowEl(alias,model,cw){
+function aliasRowEl(alias,model,cw,mm){
   const div=document.createElement('div');div.className='alias-row';
   div.innerHTML='<input type="text" name="ma_alias_0" value="'+String(alias||'').replace(/"/g,'&quot;')+'" placeholder="别名，如 jx-opus" list="stdAliasList">'
     +'<input type="text" name="ma_model_0" value="'+String(model||'').replace(/"/g,'&quot;')+'" placeholder="实际模型，如 glm-5.3">'
     +cwSelectHtml('ma_ctx_0',cw||128000)
+    +'<label class="mm-cell" title="勾选=该别名原生支持视觉（图片直通，且可作为图片识别辅助模型）；不勾选=该别名贴图时由网关自动转述">'
+    +'<input type="checkbox" name="ma_mm_0"'+(mm!==false?' checked':'')+'>图</label>'
     +'<button type="button" class="row-del" title="删除该行">×</button>';
   div.querySelector('.row-del').onclick=()=>{div.remove();renumberRows('ma');refreshPeakSelects();updateAllowedTags()};
   return div;
@@ -4399,7 +4667,7 @@ function peakRowEl(alias,model){
   return div;
 }
 function addAliasRow(presetName){
-  const row=aliasRowEl(presetName||'','',128000);
+  const row=aliasRowEl(presetName||'','',128000,true);
   document.getElementById('aliasRows').appendChild(row);
   renumberRows('ma');refreshPeakSelects();updateAllowedTags();
   (presetName?row.querySelector('[name^="ma_model_"]'):row.querySelector('[name^="ma_alias_"]')).focus();
@@ -4407,10 +4675,10 @@ function addAliasRow(presetName){
 function addPeakRow(){document.getElementById('peakRows').appendChild(peakRowEl('',''));renumberRows('pa');refreshPeakSelects();updateAllowedTags()}
 function renderAliasRows(profile){
   const wrap=document.getElementById('aliasRows');wrap.innerHTML='';
-  const aliases=profile.modelAliases||{},ctxs=profile.modelContextWindows||{};
+  const aliases=profile.modelAliases||{},ctxs=profile.modelContextWindows||{},mms=profile.modelMultimodal||{};
   const names=Object.keys(aliases);
-  if(names.length){names.forEach(n=>wrap.appendChild(aliasRowEl(n,aliases[n],ctxs[n]||profile.contextWindow||128000)))}
-  else{['jx-fable','jx-opus','jx-haiku','jx-sonnet'].forEach(n=>wrap.appendChild(aliasRowEl(n,'',ctxs[n]||128000)))}
+  if(names.length){names.forEach(n=>wrap.appendChild(aliasRowEl(n,aliases[n],ctxs[n]||profile.contextWindow||128000,mms[n]!==false)))}
+  else{['jx-fable','jx-opus','jx-haiku','jx-sonnet'].forEach(n=>wrap.appendChild(aliasRowEl(n,'',ctxs[n]||128000,true)))}
   renumberRows('ma');
   const pwrap=document.getElementById('peakRows');pwrap.innerHTML='';
   const peakEntries=Object.entries(profile.peakModelAliases||{});
@@ -4430,7 +4698,20 @@ function renderAliasRows(profile){
       sel.value=want;
     }
   });
+  refreshBridgeSelect(profile);
   updateAllowedTags();
+}
+// Rebuild the image-bridge helper-model dropdown from the profile's multimodal
+// aliases, keeping the current selection when still valid.
+function refreshBridgeSelect(profile){
+  const sel=document.getElementById('imgBridgeModel');
+  if(!sel)return;
+  const aliases=profile.modelAliases||{},mms=profile.modelMultimodal||{};
+  const keep=sel.value;
+  const options=Object.keys(aliases).filter(a=>mms[a]!==false).map(a=>'<option value="'+String(aliases[a]).replace(/"/g,'&quot;')+'"'+(String(aliases[a])===keep?' selected':'')+'>'+a+' → '+String(aliases[a]).replace(/</g,'&lt;')+'</option>').join('');
+  sel.innerHTML='<option value="">未选择</option>'+options;
+  if(keep&&![...sel.options].some(o=>o.value===keep))sel.value='';
+  else sel.value=keep;
 }
 document.getElementById('aliasRows').addEventListener('input',()=>{refreshPeakSelects();updateAllowedTags()});
 document.getElementById('peakRows').addEventListener('input',updateAllowedTags);
@@ -4535,7 +4816,7 @@ td{padding:8px 12px;font-size:11px;border-bottom:1px solid #ecece8;white-space:n
 <section class="metric-strip" id="cards" aria-label="用量摘要"></section>
 <section class="chart-filters" aria-label="图表筛选">
   <div class="proto-seg" id="protoSeg" role="group" aria-label="协议分类">
-    <button type="button" class="on" data-proto="">全部</button><button type="button" data-proto="anthropic">Claude Code</button><button type="button" data-proto="responses">Codex</button>
+    <button type="button" class="on" data-proto="">全部</button><button type="button" data-proto="anthropic">Anthropic</button><button type="button" data-proto="responses">OpenAI</button>
   </div>
   <div class="tabs" id="globalTabs" aria-label="统计周期">
     <button class="tab on" data-p="day">按日</button><button class="tab" data-p="week">按周</button><button class="tab" data-p="month">按月</button><button class="tab" data-p="year">按年</button>
@@ -4711,7 +4992,7 @@ function switchProfileView(v){currentProfile=v||"all";resetDetailGrouping();load
 function setProtoSeg(proto){document.querySelectorAll("#protoSeg button").forEach(b=>b.classList.toggle("on",b.dataset.proto===(proto||"")))}
 function switchProtocolView(proto){PROTO=proto||"";if(currentProfile!=="all"){currentProfile="all";const sel=document.getElementById("profileSel");if(sel)sel.value="all"}setProtoSeg(PROTO);resetDetailGrouping();load()}
 document.querySelectorAll("#protoSeg button").forEach(b=>b.addEventListener("click",()=>switchProtocolView(b.dataset.proto)));
-const protoLabel=proto=>proto==="anthropic"?"Claude Code (Anthropic)":proto==="responses"?"Codex (Responses)":"";
+const protoLabel=proto=>proto==="anthropic"?"Anthropic":proto==="responses"?"OpenAI":"";
 function render(){
   if(!D)return;
   // Populate profile dropdown
@@ -4749,8 +5030,8 @@ function render(){
   const anthProfiles=profiles.filter(p=>p.protocol!=="responses"),respProfiles=profiles.filter(p=>p.protocol==="responses");
   const protoRow=(label,entry,count)=>'<tr class="proto-row"><td colspan="6">'+label+' · 入口 '+entry+' · '+count+' 个方案</td></tr>';
   let psbHtml="";
-  if(anthProfiles.length)psbHtml+=protoRow("Anthropic · Claude Code","/v1",anthProfiles.length)+anthProfiles.map(rowOf).join("");
-  if(respProfiles.length)psbHtml+=protoRow("Responses · Codex","/v1/responses",respProfiles.length)+respProfiles.map(rowOf).join("");
+  if(anthProfiles.length)psbHtml+=protoRow("Anthropic","/v1",anthProfiles.length)+anthProfiles.map(rowOf).join("");
+  if(respProfiles.length)psbHtml+=protoRow("OpenAI","/v1/responses",respProfiles.length)+respProfiles.map(rowOf).join("");
   psb.innerHTML=profiles.length?psbHtml:'<tr><td colspan="6" class="empty">暂无方案</td></tr>';
   const profileLabel=D.profileView||(currentProfile==="all"?"全部方案":"默认方案");
   const curProtoProf=(D.profiles||[]).find(p=>p.suffix===currentProfile);
@@ -4961,9 +5242,11 @@ function go(){const k=document.getElementById('key').value.trim();if(k)location.
 // Codex 模型目录完全由方案配置生成：成员可访问的 Responses 方案的
 // modelAliases + peakModelAliases 别名键（配置顺序）；只有当方案完全没配别名时
 // 才回退到 allowedModels。不额外添加任何真实模型名。
-// context_window 取方案设置页的「模型上下文窗口」（默认 128000）。
-function codexCatalogEntryJson(slug, target, priority, contextWindow) {
+// context_window 与多模态按别名取方案设置（modelContextWindows/modelMultimodal，
+// 未配置时默认 128000、支持图片输入）。
+function codexCatalogEntryJson(slug, target, priority, contextWindow, multimodal) {
   const cw = Number.isFinite(contextWindow) && contextWindow > 0 ? contextWindow : 128000;
+  const modalities = multimodal === false ? ["text"] : ["text", "image"];
   return `    {
       "slug": ${JSON.stringify(slug)},
       "display_name": ${JSON.stringify(slug)},
@@ -4989,19 +5272,19 @@ function codexCatalogEntryJson(slug, target, priority, contextWindow) {
       "effective_context_window_percent": 95,
       "supports_parallel_tool_calls": true,
       "experimental_supported_tools": [],
-      "input_modalities": ["text"]
+      "input_modalities": ${JSON.stringify(modalities)}
     }`;
 }
 
-// Returns { entries: [{slug,target,contextWindow}], json, defaultModel } for one member key.
+// Returns { entries: [{slug,target,contextWindow,multimodal}], json, defaultModel } for one member key.
 function buildCodexModelCatalog(apiKey) {
   const entries = [];
   const seen = new Set();
-  const add = (slug, target, contextWindow) => {
+  const add = (slug, target, contextWindow, multimodal) => {
     slug = String(slug || "").trim();
     if (!slug || slug === "*" || seen.has(slug)) return;
     seen.add(slug);
-    entries.push({ slug, target: String(target || "").trim(), contextWindow: contextWindow || 128000 });
+    entries.push({ slug, target: String(target || "").trim(), contextWindow: contextWindow || 128000, multimodal: multimodal !== false });
   };
   let fallbackRuntime = null;
   for (const runtime of Object.values(runtimes)) {
@@ -5010,7 +5293,14 @@ function buildCodexModelCatalog(apiKey) {
     const profileCfg = config.profiles[runtime.profileName] || {};
     const aliases = { ...(runtime.modelAliases || {}), ...(runtime.peakModelAliases || {}) };
     const aliasKeys = Object.keys(aliases);
-    for (const alias of aliasKeys) add(alias, aliases[alias], profileCfg.modelContextWindows?.[alias] || profileCfg.contextWindow || 128000);
+    for (const alias of aliasKeys) {
+      // 准入恒开：所有别名在 Codex 里都允许上传图片（input_modalities 含
+      // image）。多模态勾选只决定网关侧是「直通」还是「自动转述」，见
+      // bridgeImagesInRequest，不影响目录。
+      add(alias, aliases[alias],
+        profileCfg.modelContextWindows?.[alias] || profileCfg.contextWindow || 128000,
+        true);
+    }
     if (aliasKeys.length === 0 && !fallbackRuntime) fallbackRuntime = runtime;
   }
   if (entries.length === 0 && fallbackRuntime) {
@@ -5019,17 +5309,17 @@ function buildCodexModelCatalog(apiKey) {
     for (const m of profile.allowedModels || []) add(m, m, cw);
   }
   const json = entries.length
-    ? "{\n  \"models\": [\n" + entries.map((e, i) => codexCatalogEntryJson(e.slug, e.target, i, e.contextWindow)).join(",\n") + "\n  ]\n}"
+    ? "{\n  \"models\": [\n" + entries.map((e, i) => codexCatalogEntryJson(e.slug, e.target, i, e.contextWindow, e.multimodal)).join(",\n") + "\n  ]\n}"
     : "{\n  \"models\": []\n}";
   return { entries, json, defaultModel: entries.length ? entries[0].slug : "" };
 }
 
 // The ccteam provider block Codex needs, with the member's key and the gateway
 // address baked in. Shared by the install script and the manual/cc-switch tabs.
-function codexProviderToml(host, key) {
+function codexProviderToml(host, key, proto) {
   return `[model_providers.ccteam]
 name = "CC Team Gateway"
-base_url = "http://${host}/v1"
+base_url = "${proto || "http"}://${host}/v1"
 wire_api = "responses"
 requires_openai_auth = false
 supports_websockets = false
@@ -5045,8 +5335,9 @@ ${defaultModel ? `model = "${defaultModel}"
 // POSIX sh installer for `curl … | sh`. Idempotent: only manages the ccteam
 // provider block and its top-level keys; every other section (projects, plugins,
 // other providers) passes through untouched. Backs up config.toml first.
-function buildCodexSetupScript(key, host, username, catalogJson, defaultModel) {
-  const provBlock = codexProviderToml(host, key);
+function buildCodexSetupScript(key, host, username, catalogJson, defaultModel, proto) {
+  const scheme = proto || "http";
+  const provBlock = codexProviderToml(host, key, scheme);
   const topKeys = codexTopKeysToml(defaultModel);
   return `#!/bin/sh
 # CC-Team Codex 一键接入 — 成员: ${username}
@@ -5116,10 +5407,10 @@ else
 fi
 
 echo "[3/3] 检查网关连通性 ..."
-if command -v curl > /dev/null 2>&1 && curl -fsS -m 8 -H "Authorization: Bearer ${key}" "http://${host}/v1/models" > /dev/null 2>&1; then
+if command -v curl > /dev/null 2>&1 && curl -fsS -m 8 -H "Authorization: Bearer ${key}" "${scheme}://${host}/v1/models" > /dev/null 2>&1; then
   echo "[OK] 网关连通正常"
 else
-  echo "[提示] 连通检查未通过——请确认本机可以访问 http://${host}（配置本身已完成）"
+  echo "[提示] 连通检查未通过——请确认本机可以访问 ${scheme}://${host}（配置本身已完成）"
 fi
 
 echo ""
@@ -5138,6 +5429,107 @@ echo "下一步：完全退出 Codex（macOS: Cmd+Q）后重新打开即可使�
 echo "如需恢复原配置：把对应 .backup-ccteam-$TS 文件复制回原名即可"
 echo "（例如 cp \"\$CONFIG.backup-ccteam-$TS\" \"\$CONFIG\"）。"
 ${defaultModel ? `echo "默认模型 ${defaultModel}；模型选择器中可切换方案配置的其他别名。"\n` : ""}`;
+}
+
+// Windows (PowerShell 5.1+) twin of the sh installer: same backup / rewrite /
+// validate-rollback / summary behavior. Differences: %USERPROFILE%\.codex home,
+// model_catalog_json written as an absolute forward-slash path (tilde is not
+// reliably expanded by Codex on Windows), and BOM-less UTF-8 writes via .NET so
+// models.json stays parseable.
+function buildCodexSetupScriptWin(key, host, username, catalogJson, defaultModel, proto) {
+  const scheme = proto || "http";
+  const provBlock = codexProviderToml(host, key, scheme);
+  return `$ErrorActionPreference = "Stop"
+# CC-Team Codex 一键接入 (Windows) — 成员: ${username}
+# 幂等脚本：可重复执行；只管理 ccteam 相关配置，不影响其他 provider
+$codex = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $env:USERPROFILE ".codex" }
+New-Item -ItemType Directory -Force -Path $codex | Out-Null
+$configPath = Join-Path $codex "config.toml"
+$modelsPath = Join-Path $codex "models.json"
+$ts = Get-Date -Format "yyyyMMddHHmmss"
+$configBak = $null
+$modelsBak = $null
+if (Test-Path $configPath) {
+  $configBak = "$configPath.backup-ccteam-$ts"
+  Copy-Item $configPath $configBak
+  Write-Host "已备份原配置 → config.toml.backup-ccteam-$ts"
+}
+
+Write-Host "[1/3] 写入模型目录 $modelsPath ..."
+if (Test-Path $modelsPath) {
+  $modelsBak = "$modelsPath.backup-ccteam-$ts"
+  Copy-Item $modelsPath $modelsBak
+  Write-Host "已备份原模型目录 → models.json.backup-ccteam-$ts"
+}
+$catalog = @'
+${catalogJson}
+'@
+[System.IO.File]::WriteAllText($modelsPath, $catalog)
+
+Write-Host "[2/3] 更新 $configPath ..."
+$topBlock = @'
+${codexTopKeysToml(defaultModel)}
+'@
+$provBlock = @'
+${provBlock}
+'@
+$modelsRef = $modelsPath -replace '\\\\', '/'
+$topBlock = $topBlock -replace '~/.codex/models.json', $modelsRef
+function Rollback {
+  Write-Host "[提示] 配置更新失败，正在恢复原始文件 ..."
+  if ($configBak -and (Test-Path $configBak)) { Copy-Item $configBak $configPath -Force }
+  if ($modelsBak -and (Test-Path $modelsBak)) { Copy-Item $modelsBak $modelsPath -Force }
+  Write-Host "[提示] 已恢复原始内容，你的数据未受影响。请把以上输出发给管理员排查。"
+  exit 1
+}
+if (Test-Path $configPath) {
+  $lines = [System.IO.File]::ReadAllLines($configPath)
+  $out = New-Object System.Collections.Generic.List[string]
+  $inTop = $true; $printed = $false; $skip = $false
+  foreach ($line in $lines) {
+    if ($line -match '^\\[model_providers\\.ccteam\\]\\s*$') { $skip = $true; continue }
+    if ($skip -and $line -match '^\\[') { $skip = $false }
+    if ($skip) { continue }
+    if (-not $printed -and $line -match '^\\[') { $out.Add($topBlock); $out.Add(""); $printed = $true }
+    if ($line -match '^\\[') { $inTop = $false }
+    if ($inTop -and $line -match '^(model_provider|model|model_catalog_json)\\s*=') { continue }
+    $out.Add($line)
+  }
+  if (-not $printed) { $out.Add($topBlock); $out.Add("") }
+  $out.Add(""); $out.Add($provBlock)
+  $nl = [string][char]13 + [char]10
+  $new = ($out -join $nl) + $nl
+  if ($new.Length -gt 0 -and $new.Contains("[model_providers.ccteam]")) {
+    [System.IO.File]::WriteAllText($configPath, $new)
+  } else { Rollback }
+} else {
+  $nl = [string][char]13 + [char]10
+  [System.IO.File]::WriteAllText($configPath, $topBlock + $nl + $nl + $provBlock + $nl)
+}
+
+Write-Host "[3/3] 检查网关连通性 ..."
+try {
+  $null = Invoke-WebRequest -UseBasicParsing -Uri "${scheme}://${host}/v1/models" -Headers @{ Authorization = "Bearer ${key}" } -TimeoutSec 8
+  Write-Host "[OK] 网关连通正常"
+} catch {
+  Write-Host "[提示] 连通检查未通过——请确认本机可以访问 ${scheme}://${host}（配置本身已完成）"
+}
+
+Write-Host ""
+Write-Host "========== 本次操作摘要 =========="
+Write-Host "1. 备份："
+if ($configBak) { Write-Host "   原配置   → $configBak" }
+if ($modelsBak) { Write-Host "   原模型目录 → $modelsBak" }
+if (-not $configBak -and -not $modelsBak) { Write-Host "   （首次安装，无需备份）" }
+Write-Host "2. 写入 $modelsPath"
+Write-Host "   内容：方案配置的模型别名目录${defaultModel ? `（默认模型 ${defaultModel}）` : ""}"
+Write-Host "3. 更新 $configPath"
+Write-Host "   只改了 model_provider / model / model_catalog_json 三行顶层键，"
+Write-Host "   并在末尾追加 [model_providers.ccteam] 一段；你的其他配置未动。"
+Write-Host "----------------------------------"
+Write-Host "下一步：完全退出 Codex 后重新打开即可使用。"
+Write-Host "如需恢复原配置：把对应 .backup-ccteam-$ts 文件复制回原名即可。"
+${defaultModel ? `Write-Host "默认模型 ${defaultModel}；模型选择器中可切换方案配置的其他别名。"\n` : ""}`;
 }
 
 function codexSetupHtml(virtualKey, state, catalog) {
@@ -5174,21 +5566,25 @@ pre{position:relative;background:var(--bg);border:1px solid var(--border);border
 </style></head><body data-theme="editorial-light">
 <div class="top"><h1>Codex 接入配置</h1><div class="sub">把你的 Codex 指向团队网关 — 三种方式任选其一</div></div>
 ${banner}
-<div class="host-row"><span>服务器地址：</span><span style="color:var(--dim)">http://</span><input id="hostInput" value="" oninput="renderAll()" spellcheck="false"><code>自动取自当前访问地址，可修改</code>${cat.entries.length ? ` <code>可用模型：${cat.entries.map(e => e.slug).join(" / ")}（来自方案配置的别名）</code>` : ""}</div>
+<div class="host-row"><span>服务器地址：</span><span style="color:var(--dim)" id="schemeLabel">http://</span><input id="hostInput" value="" oninput="renderAll()" spellcheck="false"><code>自动取自当前访问地址（含 https），可修改</code>${cat.entries.length ? ` <code>可用模型：${cat.entries.map(e => e.slug).join(" / ")}（来自方案配置的别名）</code>` : ""}</div>
 <div class="tabs">
   <button class="on" data-tab="script" onclick="setTab('script')">一键脚本</button>
   <button data-tab="manual" onclick="setTab('manual')">手动配置</button>
   <button data-tab="ccswitch" onclick="setTab('ccswitch')">cc-switch 用户</button>
 </div>
 <div class="panel on" id="panel-script">
-  <div class="box"><h3>在终端执行一条命令</h3>
+  <div class="box"><h3>macOS / Linux — 在「终端」执行</h3>
     <pre><button class="copy-btn" onclick="copyPre(this)">复制</button><code id="curlCmd"></code></pre>
+  </div>
+  <div class="box"><h3>Windows — 在 PowerShell 执行</h3>
+    <pre><button class="copy-btn" onclick="copyPre(this)">复制</button><code id="psCmd"></code></pre>
+  </div>
+  <div class="box"><h3>执行后</h3>
     <ol>
-      <li>打开「终端」(Terminal)，粘贴执行上面的命令</li>
-      <li>脚本会自动备份并更新 <code>~/.codex/config.toml</code>、写入 <code>~/.codex/models.json</code></li>
-      <li><strong>完全退出 Codex（Cmd+Q）再重新打开</strong>，即可使用</li>
+      <li>脚本会自动备份并更新 <code>~/.codex/config.toml</code>、写入 <code>~/.codex/models.json</code>（Windows 为 <code>%USERPROFILE%\.codex</code>）</li>
+      <li><strong>完全退出 Codex（macOS: Cmd+Q）再重新打开</strong>，即可使用</li>
     </ol>
-    <div class="note">脚本只管理 ccteam 相关配置，你已有的其他 provider / 项目配置全部保留；重复执行安全。</div>
+    <div class="note">脚本只管理 ccteam 相关配置，你已有的其他 provider / 项目配置全部保留；重复执行安全；结束时打印本次操作摘要与回滚方法。</div>
   </div>
 </div>
 <div class="panel" id="panel-manual">
@@ -5216,10 +5612,13 @@ const MODELS=${JSON.stringify(cat.json)};
 const DEFAULT_MODEL=${JSON.stringify(cat.defaultModel)};
 const TOP_KEYS='model_provider = "ccteam"\\n'+(DEFAULT_MODEL?'model = "'+DEFAULT_MODEL+'"\\n':'')+'model_catalog_json = "~/.codex/models.json"\\n';
 function host(){return (document.getElementById('hostInput').value||'').trim().replace(/^https?:\\/\\//,'').replace(/\\/$/,'')}
-function providerToml(h){return '[model_providers.ccteam]\\nname = "CC Team Gateway"\\nbase_url = "http://'+h+'/v1"\\nwire_api = "responses"\\nrequires_openai_auth = false\\nsupports_websockets = false\\nexperimental_bearer_token = "'+KEY+'"' }
+function scheme(){return location.protocol==='https:'?'https':'http'}
+function providerToml(h){return '[model_providers.ccteam]\\nname = "CC Team Gateway"\\nbase_url = "'+scheme()+'://'+h+'/v1"\\nwire_api = "responses"\\nrequires_openai_auth = false\\nsupports_websockets = false\\nexperimental_bearer_token = "'+KEY+'"' }
 function renderAll(){
   const h=host();if(!h)return;
-  document.getElementById('curlCmd').textContent='curl -fsSL "http://'+h+'/api/codex-setup/'+KEY+'" | sh';
+  document.getElementById('schemeLabel').textContent=scheme()+'://';
+  document.getElementById('curlCmd').textContent='curl -fsSL "'+scheme()+'://'+h+'/api/codex-setup/'+KEY+'" | sh';
+  document.getElementById('psCmd').textContent='[Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12; irm "'+scheme()+'://'+h+'/api/codex-setup-win/'+KEY+'" | iex';
   document.getElementById('tomlBlock').textContent=TOP_KEYS+'\\n'+providerToml(h);
   document.getElementById('tomlBlock2').textContent=providerToml(h);
   document.getElementById('modelsJson').textContent=JSON.stringify(JSON.parse(MODELS),null,2);
@@ -5240,6 +5639,10 @@ ${UI_THEME}
 ${TOAST_CSS}
 body{padding:28px clamp(18px,3vw,44px) 48px}
 body>div{max-width:1120px;margin-left:auto;margin-right:auto}
+.proto-seg{display:inline-flex;border:1px solid var(--border);border-radius:6px;overflow:hidden;background:var(--surface)}
+.proto-seg button{font-size:11px;font-weight:600;padding:6px 12px;border:none;background:transparent;color:var(--dim);cursor:pointer}
+.proto-seg button+button{border-left:1px solid var(--border)}
+.proto-seg button.on{background:var(--accent-soft);color:var(--accent)}
 .top{display:flex;align-items:flex-start;justify-content:space-between;gap:24px;flex-wrap:wrap;margin-bottom:14px;padding-bottom:20px;border-bottom:1px solid var(--border)}
 .top h1{font-size:28px;font-weight:650;line-height:1.15;margin-bottom:7px}.top .sub{font-size:12px;color:var(--dim)}
 select{font-size:12px;background:var(--surface);color:var(--text);border:1px solid var(--border);border-radius:5px;padding:7px 10px;cursor:pointer}select:hover{background:var(--surface-subtle)}select:focus{border-color:var(--accent)}
@@ -5251,7 +5654,7 @@ select{font-size:12px;background:var(--surface);color:var(--text);border:1px sol
 table{width:100%;border-collapse:collapse;min-width:560px}th{text-align:left;padding:9px 12px;font-size:11px;font-weight:550;color:var(--dim);border-bottom:1px solid var(--border);white-space:nowrap}td{padding:9px 12px;font-size:12px;border-bottom:1px solid #ecece8;white-space:nowrap}.n{text-align:right;font-variant-numeric:tabular-nums}tbody tr:hover td{background:#fafaf7}.tag{font-size:10px;background:var(--accent-soft);color:var(--accent);padding:2px 6px;border-radius:4px}
 @media(max-width:560px){body{padding:20px 14px 36px}.top h1{font-size:24px}.cards{grid-template-columns:1fr 1fr}.card .v{font-size:20px}.box{padding:14px}}
 </style></head><body data-theme="editorial-light">
-<div class="top"><div><h1>我的用量</h1><div class="sub">查看个人配额、趋势和模型明细 · <a href="/setup/${escJs(virtualKey)}" style="color:var(--accent)">配置 Codex 接入 →</a></div></div><select id="profileSel" onchange="switchProfile(this.value)"><option value="all">全部可用方案</option></select></div>
+<div class="top"><div><h1>我的用量</h1><div class="sub">查看个人配额、趋势和模型明细 · <a href="/setup/${escJs(virtualKey)}" style="color:var(--accent)">配置 Codex 接入 →</a></div></div><div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap"><div class="proto-seg" id="protoSeg" role="group" aria-label="协议分类"><button type="button" class="on" data-proto="">全部</button><button type="button" data-proto="anthropic">Anthropic</button><button type="button" data-proto="responses">OpenAI</button></div><select id="profileSel" onchange="switchProfile(this.value)"><option value="all">全部可用方案</option></select></div></div>
 <div class="meta" id="meta">加载中...</div>
 <div class="cards" id="cards"></div>
 <div class="box"><h3>今日24小时趋势</h3><canvas id="hourChart"></canvas></div>
@@ -5262,27 +5665,44 @@ ${UI_HELPERS}
 ${TOAST_JS}
 Chart.defaults.color='#686863';Chart.defaults.font.family='-apple-system,BlinkMacSystemFont,"SF Pro Text","PingFang SC","Microsoft YaHei","Segoe UI",sans-serif';Chart.defaults.font.size=11;
 const VK='${escJs(virtualKey)}';
-let D=null,C={h:null,t:null},currentProfile='all';
+let D=null,C={h:null,t:null},currentProfile='all',PROTO='';
 const fmtT=n=>n.toLocaleString("zh-CN");
 const fmtTk=n=>{if(n>=1e6)return(n/1e6).toFixed(1)+"M";if(n>=1e3)return(n/1e3).toFixed(1)+"k";return n.toString()};
 const COL=["#2f6e50","#4a6fa5","#c2604f","#c4a23a","#7a6bb0","#d4824a","#4a9ba8","#c47a99","#6ba368","#5a6bc4","#8a6db5","#5a9b8e"];
 async function load(){
   try{
-    const r=await fetch('/api/my-usage?profile='+encodeURIComponent(currentProfile),{headers:{'Authorization':'Bearer '+VK}});
+    const qs=['profile='+encodeURIComponent(currentProfile)];
+    if(currentProfile==='all'&&PROTO)qs.push('protocol='+PROTO);
+    const r=await fetch('/api/my-usage?'+qs.join('&'),{headers:{'Authorization':'Bearer '+VK}});
     if(!r.ok){document.getElementById('meta').textContent='认证失败';return}
     D=await r.json();render();
   }catch(e){document.getElementById('meta').textContent='Error: '+e.message}
 }
 function switchProfile(v){currentProfile=v||'all';load()}
+function renderProtoSeg(){document.querySelectorAll('#protoSeg button').forEach(b=>b.classList.toggle('on',b.dataset.proto===(currentProfile==='all'?PROTO:'')))}
+function rebuildProfileOptions(){
+  const sel=document.getElementById('profileSel');
+  sel.innerHTML='<option value="all">'+(PROTO==='anthropic'?'全部 Anthropic 方案':PROTO==='responses'?'全部 OpenAI 方案':'全部可用方案')+'</option>'
+    +(D&&(D.availableProfiles||[]).filter(p=>!PROTO||p.protocol===PROTO)||[]).map(p=>'<option value="'+p.suffix+'">'+p.name+' /'+p.suffix+(p.isDefault?' · 默认入口':'')+(p.protocol==='responses'?' · Codex':' · Claude Code')+'</option>').join('');
+}
+function switchProtocolView(proto){
+  PROTO=proto||'';
+  if(currentProfile!=='all'){currentProfile='all'}
+  rebuildProfileOptions();
+  const sel=document.getElementById('profileSel');sel.value='all';
+  renderProtoSeg();
+  if(D)load();
+}
+document.querySelectorAll('#protoSeg button').forEach(b=>b.addEventListener('click',()=>switchProtocolView(b.dataset.proto)));
 function render(){
   if(!D)return;
   const sel=document.getElementById('profileSel');
-  if(sel.options.length<=1){
-    sel.innerHTML='<option value="all">全部可用方案</option>'+(D.availableProfiles||[]).map(p=>'<option value="'+p.suffix+'">'+p.name+' /'+p.suffix+(p.isDefault?' · 默认入口':'')+(p.protocol==='responses'?' · Codex':' · Claude Code')+'</option>').join('');
-  }
+  // Always rebuild from the freshest D.availableProfiles (the backend narrows
+  // the list when a protocol filter is active); keep the current selection.
+  rebuildProfileOptions();
   sel.value=currentProfile;
   const curProto=(D.availableProfiles||[]).find(p=>p.suffix===currentProfile)?.protocol;
-  const linkTag=currentProfile==='all'?'':' · 链路: '+(curProto==='responses'?'Codex (Responses)':'Claude Code (Anthropic)');
+  const linkTag=currentProfile==='all'?(PROTO?' · 链路: '+(PROTO==='responses'?'OpenAI (Codex)':'Anthropic (Claude Code)'):''):' · 链路: '+(curProto==='responses'?'Codex (Responses)':'Claude Code (Anthropic)');
   const q=D.quota,t=D.today;
   const pct=q.limit>0?Math.min(100,Math.round(q.used/q.limit*100)):0;
   const color=pct>90?'var(--red)':pct>70?'var(--orange)':'var(--green)';
@@ -5417,6 +5837,7 @@ function applySettings(formData) {
   if (hasAliasRows) {
     const aliases = {};
     const contextWindows = {};
+    const multimodal = {};
     for (let i = 0; formData["ma_alias_" + i] !== undefined || formData["ma_model_" + i] !== undefined; i++) {
       const alias = String(formData["ma_alias_" + i] || "").trim();
       const model = String(formData["ma_model_" + i] || "").trim();
@@ -5426,15 +5847,26 @@ function applySettings(formData) {
       aliases[alias] = model;
       const cw = parseInt(formData["ma_ctx_" + i], 10);
       contextWindows[alias] = Number.isFinite(cw) && cw > 0 ? cw : 128000;
+      multimodal[alias] = formData["ma_mm_" + i] === "on";
     }
     if (Object.keys(aliases).length === 0) throw new Error("至少需要配置 1 个通用模型别名（可用快捷按钮添加 jx-fable / jx-opus / jx-haiku / jx-sonnet）");
     editingProfile.modelAliases = aliases;
     editingProfile.modelContextWindows = contextWindows;
+    editingProfile.modelMultimodal = multimodal;
   } else if (formData.modelAliases !== undefined) {
     // Legacy textarea path (older clients / API posts)
     const parsedAliases = parseModelAliasesInput(formData.modelAliases);
     if (Object.keys(parsedAliases).length === 0) throw new Error("至少需要配置 1 个通用模型别名");
     editingProfile.modelAliases = parsedAliases;
+  }
+
+  // Image-recognition helper model (Responses profiles). Access is always on —
+  // non-multimodal aliases are transcribed automatically; the legacy
+  // imgBridgeEnabled checkbox is ignored (kept for config compatibility).
+  if (formData.imgBridgeModel !== undefined) {
+    if (!editingProfile.imageBridge) editingProfile.imageBridge = { model: "" };
+    editingProfile.imageBridge.model = String(formData.imgBridgeModel).trim();
+    if (!editingProfile.imageBridge.model) delete editingProfile.imageBridge.model;
   }
 
   if (Object.keys(formData).some(k => /^pa_alias_\d+$/.test(k))) {
@@ -6184,6 +6616,33 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+  // Clear sticky-session bindings (admin). Clears all; the next request from any
+  // conversation starts again at its protocol's group head.
+  if (req.method === "POST" && req.url === "/api/sticky/clear") {
+    if (!checkAuth(req)) { res.writeHead(401); res.end("Unauthorized"); return; }
+    if (!checkCsrf(req)) { res.writeHead(403); res.end("CSRF validation failed"); return; }
+    const cleared = stickyBindings.size;
+    stickyBindings.clear();
+    console.log(`[Sticky] 已手动清除 ${cleared} 条粘性会话绑定`);
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ ok: true, cleared }));
+    return;
+  }
+
+  // Clear rate-limit state (admin). Every profile becomes immediately eligible
+  // for failover again — the group head can re-take the conversation right away.
+  if (req.method === "POST" && req.url === "/api/rate-limit/clear") {
+    if (!checkAuth(req)) { res.writeHead(401); res.end("Unauthorized"); return; }
+    if (!checkCsrf(req)) { res.writeHead(403); res.end("CSRF validation failed"); return; }
+    const cleared = Object.keys(rateLimitState).length;
+    for (const k of Object.keys(rateLimitState)) delete rateLimitState[k];
+    persistRateLimitState();
+    console.log(`[RateLimit] 已手动清除 ${cleared} 个方案的限流状态`);
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ ok: true, cleared }));
+    return;
+  }
+
   // Delete global user
   if (req.method === "POST" && req.url === "/api/global-user/delete") {
     if (!checkAuth(req)) { res.writeHead(401); res.end("Unauthorized"); return; }
@@ -6368,10 +6827,12 @@ const server = http.createServer((req, res) => {
     res.end(codexSetupHtml(vk, state, catalog));
     return;
   }
-  // Codex installer script, personalized per member key. The Host header tells
-  // us which address the member's machine already reaches the gateway on.
-  if (req.method === "GET" && req.url.startsWith("/api/codex-setup/")) {
-    const vk = decodeURIComponent(req.url.slice("/api/codex-setup/".length).split("?")[0]);
+  // Codex installer scripts, personalized per member key. The Host header tells
+  // us which address the member's machine already reaches the gateway on, and
+  // x-forwarded-proto (reverse proxy) / socket encryption tells us the scheme.
+  if (req.method === "GET" && (req.url.startsWith("/api/codex-setup/") || req.url.startsWith("/api/codex-setup-win/"))) {
+    const isWin = req.url.startsWith("/api/codex-setup-win/");
+    const vk = decodeURIComponent(req.url.slice((isWin ? "/api/codex-setup-win/" : "/api/codex-setup/").length).split("?")[0]);
     const assignedRuntime = Object.values(runtimes).find(r => r.protocol === "responses" && r.users[vk]);
     const profileUser = assignedRuntime ? assignedRuntime.users[vk] : null;
     const profileUserDisabled = profileUser && typeof profileUser === "object" ? !!profileUser.disabled : false;
@@ -6384,9 +6845,12 @@ const server = http.createServer((req, res) => {
     }
     const rawHost = String(req.headers.host || "");
     const host = /^[A-Za-z0-9._:\-\[\]]+$/.test(rawHost) ? rawHost : `localhost:${port}`;
+    const xfProto = String(req.headers["x-forwarded-proto"] || "").split(",")[0].trim();
+    const proto = xfProto === "https" || req.socket.encrypted ? "https" : "http";
     const catalog = buildCodexModelCatalog(vk);
-    res.writeHead(200, { "Content-Type": "text/x-shellscript; charset=utf-8" });
-    res.end(buildCodexSetupScript(vk, host, username, catalog.json, catalog.defaultModel));
+    res.writeHead(200, { "Content-Type": "text/plain; charset=utf-8" });
+    if (isWin) res.end(buildCodexSetupScriptWin(vk, host, username, catalog.json, catalog.defaultModel, proto));
+    else res.end(buildCodexSetupScript(vk, host, username, catalog.json, catalog.defaultModel, proto));
     return;
   }
 
@@ -6420,6 +6884,7 @@ const server = http.createServer((req, res) => {
     const apiKey = getApiKey(req);
     const url = new URL(req.url, `http://localhost`);
     const profileSuffix = url.searchParams.get("profile") || "all";
+    const protocolParam = url.searchParams.get("protocol") || "";
     if (!getAccessibleProfiles(apiKey).length) {
       const knownUser = hasGlobalUser(apiKey);
       res.writeHead(knownUser ? 403 : 401, { "Content-Type": "application/json" });
@@ -6427,7 +6892,7 @@ const server = http.createServer((req, res) => {
       return;
     }
     try {
-      const payload = getPersonalUsageData(apiKey, profileSuffix);
+      const payload = getPersonalUsageData(apiKey, profileSuffix, protocolParam);
       res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
       res.end(JSON.stringify(payload, null, 2));
     } catch (err) {

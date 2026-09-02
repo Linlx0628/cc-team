@@ -585,6 +585,7 @@ function listProfiles() {
 // ─── Circuit Breaker ─────────────────────────────────────────────────────────
 class CircuitBreaker {
   constructor(opts = {}) {
+    this.profileName = opts.profileName || "";
     this.failureThreshold = opts.failureThreshold || 5;
     this.cooldownMs = opts.cooldownMs || 30000;
     this.halfOpenMaxRequests = opts.halfOpenMaxRequests || 2;
@@ -606,6 +607,7 @@ class CircuitBreaker {
           this.state = "HALF_OPEN";
           this.halfOpenRequests = 0;
           console.log("[CB] Circuit OPEN → HALF_OPEN, probing upstream");
+          recordAudit("system", "breaker.halfopen", this.profileName, `方案 "${this.profileName}" 熔断冷却结束，进入半开探测状态`);
           return true;
         }
         return false;
@@ -625,6 +627,7 @@ class CircuitBreaker {
         this.state = "CLOSED";
         this.failureCount = 0;
         console.log("[CB] Circuit HALF_OPEN → CLOSED, upstream recovered");
+        recordAudit("system", "breaker.closed", this.profileName, `方案 "${this.profileName}" 半开探测成功，熔断关闭，上游已恢复`);
       }
     } else if (this.state === "CLOSED") {
       this.failureCount = 0;
@@ -638,9 +641,11 @@ class CircuitBreaker {
     if (this.state === "HALF_OPEN") {
       this.state = "OPEN";
       console.log("[CB] Circuit HALF_OPEN → OPEN, probe failed");
+      recordAudit("system", "breaker.open", this.profileName, `方案 "${this.profileName}" 半开探测失败，重新熔断 ${Math.round(this.cooldownMs / 1000)}s`);
     } else if (this.state === "CLOSED" && this.failureCount >= this.failureThreshold) {
       this.state = "OPEN";
       console.log(`[CB] Circuit CLOSED → OPEN, ${this.failureCount} consecutive failures`);
+      recordAudit("system", "breaker.open", this.profileName, `方案 "${this.profileName}" 连续 ${this.failureCount} 次失败，熔断开启 ${Math.round(this.cooldownMs / 1000)}s，期间请求自动切换到备选方案`);
     }
   }
 
@@ -689,6 +694,7 @@ function createProfileRuntime(profileName, profile) {
     peakModelAliases: normalizeModelAliases(profile.peakModelAliases || {}),
     globalUsers: { ...(config.users || {}) },
     breaker: new CircuitBreaker({
+      profileName,
       failureThreshold: (config.proxy || {}).circuitBreakerFailures || 5,
       cooldownMs: (config.proxy || {}).circuitBreakerCooldown || 30000,
     }),
@@ -1080,6 +1086,16 @@ function initDb() {
       updated_at TEXT,
       PRIMARY KEY (profile, user_key, date)
     );
+    CREATE TABLE IF NOT EXISTS audit_log (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      time TEXT NOT NULL,
+      actor TEXT NOT NULL,
+      action TEXT NOT NULL,
+      target TEXT,
+      detail TEXT,
+      ip TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_audit_time ON audit_log(time);
   `);
 
   // ── Write statements (UPSERT / INSERT) ──
@@ -1133,6 +1149,9 @@ function initDb() {
   stmts.deleteQuotaDailyOp = db.prepare(`DELETE FROM quota_daily_ops WHERE profile=? AND user_key=? AND date=?`);
   stmts.pruneQuotaDailyOps = db.prepare(`DELETE FROM quota_daily_ops WHERE date < ?`);
   stmts.upsertMeta = db.prepare(`INSERT INTO kv_meta (key,value) VALUES (@k,@v) ON CONFLICT(key) DO UPDATE SET value=excluded.value`);
+  stmts.insertAudit = db.prepare(`INSERT INTO audit_log (time,actor,action,target,detail,ip)
+    VALUES (@time,@actor,@action,@target,@detail,@ip)`);
+  stmts.trimAudit = db.prepare(`DELETE FROM audit_log WHERE id NOT IN (SELECT id FROM audit_log ORDER BY id DESC LIMIT 1000)`);
 
   // ── Read statements ──
   stmts.todayUsageForQuota = db.prepare(`SELECT COALESCE(SUM(input_tokens+output_tokens),0) AS used FROM usage_daily WHERE profile=? AND date=? AND user_key=?`);
@@ -1145,6 +1164,16 @@ function initDb() {
   stmts.quotaAdjustRecent = db.prepare(`SELECT * FROM quota_adjust_history ORDER BY id DESC LIMIT 20`);
   stmts.getQuotaDailyOp = db.prepare(`SELECT * FROM quota_daily_ops WHERE profile=? AND user_key=? AND date=?`);
   stmts.todayQuotaOps = db.prepare(`SELECT * FROM quota_daily_ops WHERE date=?`);
+  stmts.auditPage = db.prepare(`SELECT * FROM audit_log ORDER BY id DESC LIMIT ? OFFSET ?`);
+  stmts.auditPageForActor = db.prepare(`SELECT * FROM audit_log WHERE actor=? ORDER BY id DESC LIMIT ? OFFSET ?`);
+  stmts.auditTotal = db.prepare(`SELECT COUNT(*) AS c FROM audit_log`);
+  stmts.auditTotalForActor = db.prepare(`SELECT COUNT(*) AS c FROM audit_log WHERE actor=?`);
+  stmts.auditPageAdmin = db.prepare(`SELECT * FROM audit_log WHERE actor='admin' AND action NOT LIKE 'auth.%' ORDER BY id DESC LIMIT ? OFFSET ?`);
+  stmts.auditPageSystem = db.prepare(`SELECT * FROM audit_log WHERE actor='system' ORDER BY id DESC LIMIT ? OFFSET ?`);
+  stmts.auditPageAuth = db.prepare(`SELECT * FROM audit_log WHERE action LIKE 'auth.%' ORDER BY id DESC LIMIT ? OFFSET ?`);
+  stmts.auditTotalAdmin = db.prepare(`SELECT COUNT(*) AS c FROM audit_log WHERE actor='admin' AND action NOT LIKE 'auth.%'`);
+  stmts.auditTotalSystem = db.prepare(`SELECT COUNT(*) AS c FROM audit_log WHERE actor='system'`);
+  stmts.auditTotalAuth = db.prepare(`SELECT COUNT(*) AS c FROM audit_log WHERE action LIKE 'auth.%'`);
   stmts.defaultDailyForUser = db.prepare(`SELECT date,input_tokens,output_tokens,cache_creation,cache_read FROM usage_daily WHERE profile=? AND user_key=? AND date>=?`);
 }
 
@@ -1456,15 +1485,25 @@ function persistRateLimitState() {
 
 function markRateLimited(profileName, resumeAtMs, source) {
   if (!profileName || !Number.isFinite(resumeAtMs)) return;
+  const prev = rateLimitState[profileName];
   rateLimitState[profileName] = { resumeAt: resumeAtMs, source: source || "unknown", updatedAt: Date.now() };
   persistRateLimitState();
   console.log(`[RateLimit] "${profileName}" marked limited until ${new Date(resumeAtMs).toISOString()} (source: ${source || "unknown"})`);
+  // Audit only the unlimited→limited transition: while the profile stays
+  // limited, every subsequent 429 just refreshes the same state.
+  if (!prev || Date.now() >= prev.resumeAt) {
+    recordAudit("system", "ratelimit.mark", profileName,
+      `方案 "${profileName}" 被上游限流（来源: ${source || "unknown"}），暂停至 ${new Date(resumeAtMs).toISOString()}，后续请求自动切换到备选方案`);
+  }
 }
 
-function clearRateLimited(profileName) {
+function clearRateLimited(profileName, reason) {
   if (profileName && rateLimitState[profileName]) {
     delete rateLimitState[profileName];
     persistRateLimitState();
+    if (reason === "expire") {
+      recordAudit("system", "ratelimit.expire", profileName, `方案 "${profileName}" 限流到期，自动恢复参与 failover`);
+    }
   }
 }
 
@@ -1472,14 +1511,14 @@ function clearRateLimited(profileName) {
 function isRateLimited(profileName) {
   const st = rateLimitState[profileName];
   if (!st) return false;
-  if (Date.now() >= st.resumeAt) { clearRateLimited(profileName); return false; }
+  if (Date.now() >= st.resumeAt) { clearRateLimited(profileName, "expire"); return false; }
   return true;
 }
 
 function getRateLimitInfo(profileName) {
   const st = rateLimitState[profileName];
   if (!st) return null;
-  if (Date.now() >= st.resumeAt) { clearRateLimited(profileName); return null; }
+  if (Date.now() >= st.resumeAt) { clearRateLimited(profileName, "expire"); return null; }
   return { resumeAt: st.resumeAt, source: st.source };
 }
 
@@ -1625,6 +1664,42 @@ function setStickyProfile(protocol, userKey, signal, profileName) {
 function deleteStickyProfile(protocol, userKey, signal) {
   if (!signal) return;
   stickyBindings.delete(`${protocol}|${userKey}|${signal}`);
+}
+
+// ─── Group-level failover audit (deduped) ────────────────────────────────────
+// A single Map entry per group head records which member is currently taking
+// over its traffic, so a sustained outage logs one "switch" (and one
+// "recover") instead of one line per request.
+const failoverActive = new Map(); // head profile name → { member, at }
+
+function getRuntimeByProfileName(name) {
+  for (const r of Object.values(runtimes)) {
+    if (r.profileName === name) return r;
+  }
+  return null;
+}
+
+function noteFailoverServed(protocol, servedBy, userName) {
+  const headName = protocol === "responses"
+    ? (Array.isArray(config.responsesProfileGroup) ? config.responsesProfileGroup[0] : null)
+    : (Array.isArray(config.defaultProfileGroup) ? config.defaultProfileGroup[0] : null);
+  if (!headName || servedBy === headName) {
+    if (headName && servedBy === headName && failoverActive.has(headName)) {
+      const prev = failoverActive.get(headName);
+      failoverActive.delete(headName);
+      recordAudit("system", "failover.recover", headName,
+        `组头 "${headName}" 恢复接管（此前由 "${prev.member}" 代答），流量切回`);
+    }
+    return;
+  }
+  const prev = failoverActive.get(headName);
+  if (!prev || prev.member !== servedBy) {
+    const headRt = getRuntimeByProfileName(headName);
+    const why = isRateLimited(headName) ? "被限流" : (headRt && headRt.breaker.status().state === "OPEN" ? "熔断" : "");
+    failoverActive.set(headName, { member: servedBy, at: Date.now() });
+    recordAudit("system", "failover.switch", `${headName} → ${servedBy}`,
+      `组头 "${headName}"${why ? `因${why}不可用` : "不可用"}，请求自动切换到备选方案 "${servedBy}"${userName ? `（触发用户: ${userName}）` : ""}`);
+  }
 }
 
 // Move a live binding to the front of the ordered candidate list. Pure reorder:
@@ -2371,6 +2446,8 @@ function evaluateAutoQuotaAdjustments() {
 
     saveConfig(config);
     console.log(`[配额调整] ${getUserName(vk)} ${userQuota.toLocaleString()} → ${newQuota.toLocaleString()} (命中率${Math.round(actualHitRate * 100)}%, 均值${Math.round(avgDaily).toLocaleString()})`);
+    recordAudit("system", "quota.auto_adjust", `${defaultSuffix} · ${maskAuditKey(vk)}`,
+      `自动配额调整：${getUserName(vk)} 每日配额 ${userQuota.toLocaleString()} → ${newQuota.toLocaleString()}（近${period}天命中率 ${Math.round(actualHitRate * 100)}%，日均 ${Math.round(avgDaily).toLocaleString()}）`);
   }
 }
 
@@ -2390,6 +2467,34 @@ function recordError(apiKey, statusCode, errorMessage, path, model, suffix, _rt)
   });
   tx();
   console.log(`[错误] ${getUserName(key, runtime)} ${statusCode} ${errorMessage} ${path} model=${model || "unknown"}`);
+}
+
+// ─── Audit Log ────────────────────────────────────────────────────────────────
+// Every config mutation and runtime state transition (failover / breaker /
+// rate-limit / auto quota) lands here. Never throws into the caller.
+function recordAudit(actor, action, target, detail, ip) {
+  try {
+    stmts.insertAudit.run({
+      time: new Date().toISOString(),
+      actor: String(actor || "system"),
+      action: String(action || "unknown"),
+      target: String(target || ""),
+      detail: String(detail || ""),
+      ip: String(ip || ""),
+    });
+    stmts.trimAudit.run();
+  } catch (err) {
+    console.error("[审计] 写入失败:", err.message);
+  }
+}
+
+function recordAdminAudit(req, action, target, detail) {
+  recordAudit("admin", action, target, detail, getClientIp(req));
+}
+
+function maskAuditKey(key) {
+  const s = String(key || "");
+  return s.length > 8 ? s.slice(0, 8) + "****" : s;
 }
 
 // ─── Personal Usage ───────────────────────────────────────────────────────────
@@ -3284,6 +3389,11 @@ function proxyRequest(req, res) {
           deleteStickyProfile(protocol, userKey, sessionSignal);
         }
       }
+
+      // Failover audit: one "switch"/"recover" per state change, not per request.
+      if (servedBy && resolvedProfile.isDefaultEntry) {
+        noteFailoverServed(protocol, servedBy, getUserName(apiKey, runtime));
+      }
     } finally {
       releaseConcurrency(userKey);
       console.log(`── 请求结束 ── ${getUserName(apiKey, runtime)} ──`);
@@ -3865,7 +3975,7 @@ body{padding:0;overflow:hidden;height:100vh}
 .pl-delete:hover{border-color:#e5b8b2;color:var(--red);background:#fff5f3}
 .pl-badge{font-size:10px;padding:2px 7px;border-radius:4px;background:var(--accent-soft);color:var(--accent);white-space:nowrap}
 .main{flex:1;overflow-y:auto;padding:28px clamp(24px,4vw,56px);scrollbar-gutter:stable}
-.main form,#dataManagementView{max-width:1180px;margin:0 auto}
+.main form,#dataManagementView,#auditLogView{max-width:1180px;margin:0 auto}
 #settingsForm{padding-bottom:72px}
 .view-intro{margin-bottom:24px}.view-intro h2{margin-bottom:7px}.view-intro p{color:var(--dim);font-size:12px;line-height:1.65}
 .main h2{font-size:16px;font-weight:650;margin:30px 0 10px;padding-bottom:10px;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between}
@@ -3972,6 +4082,7 @@ td{padding:8px;border-bottom:1px solid #ecece8;font-size:12px}
     ${responsesNonMembersHtml ? `<div style="margin-top:6px;display:flex;align-items:center;gap:6px;flex-wrap:wrap"><span style="color:var(--dim);font-size:10px">加入：</span>${responsesNonMembersHtml}</div>` : ''}
   </div>
 <div class="sidebar-global"><button type="button" class="pl-item sidebar-tool" id="dataManagementNav" onclick="openDataManagementView()"><span class="pl-name">全局数据管理</span><span class="pl-users">导入、备份与清空</span></button></div>
+<div class="sidebar-global"><button type="button" class="pl-item sidebar-tool" id="auditLogNav" onclick="openAuditLogView()"><span class="pl-name">操作日志</span><span class="pl-users">谁在何时改了什么</span></button></div>
 <div class="sidebar-ft" style="display:flex;gap:6px"><button class="btn btn-outline btn-sm" onclick="openUserModal()" style="flex:1">用户管理</button><button class="btn btn-outline btn-sm" onclick="openProfileModal()" style="flex:1">新增方案</button></div>
 </div>
 </div>
@@ -4193,6 +4304,30 @@ ${((() => { const qa = stmts.quotaAdjustRecent.all(); return qa.length > 0 ? `<h
 <h2 style="color:var(--red)">危险操作</h2>
 <div class="section danger-section">
   <div class="danger-copy"><div><strong>清空全部数据</strong><div class="note" style="margin:0">清除方案、用户、密钥、配额、统计、错误和导入记录。系统端口、后台密码与代理参数会保留，执行前自动创建备份。</div></div><button type="button" class="btn btn-danger" id="dataClearButton" onclick="openDataClearModal()">清空全部数据</button></div>
+</div>
+</div>
+
+<div id="auditLogView" hidden aria-hidden="true">
+<h2>操作日志</h2>
+<div class="note" style="margin-bottom:12px">记录全部管理操作与系统自动事件（failover 切换/恢复、熔断、限流、自动配额调整）。最多保留最近 1000 条；「清空全部数据」不会删除审计记录。</div>
+<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:12px">
+  <select id="auditFilter" onchange="switchAuditFilter()" style="background:var(--bg);border:1px solid var(--border);color:var(--text);padding:5px 8px;border-radius:4px;font-size:12px">
+    <option value="">全部记录</option>
+    <option value="admin">管理操作</option>
+    <option value="system">系统自动事件</option>
+    <option value="auth">认证事件</option>
+  </select>
+  <button type="button" class="btn btn-outline btn-sm" onclick="loadAuditLog(true)">刷新</button>
+  <span class="inline-status" id="auditStatus" role="status"></span>
+</div>
+<div class="section" style="padding:0;overflow-x:auto">
+  <table>
+    <thead><tr><th style="width:150px">时间</th><th style="width:70px">角色</th><th style="width:140px">操作</th><th style="width:170px">对象</th><th>详情</th><th style="width:110px">IP</th></tr></thead>
+    <tbody id="auditBody"><tr><td colspan="6" style="color:var(--dim);text-align:center;padding:18px">打开本页时自动加载</td></tr></tbody>
+  </table>
+</div>
+<div style="display:flex;justify-content:center;margin-top:12px">
+  <button type="button" class="btn btn-outline btn-sm" id="auditMoreBtn" onclick="loadMoreAudit()" hidden>加载更多</button>
 </div>
 </div>
 </div>
@@ -4476,6 +4611,8 @@ setInterval(updatePeakHoursStatus,30000);
 })();
 function openDataManagementView(){
   const form=document.getElementById('settingsForm');
+  document.getElementById('auditLogView').hidden=true;
+  document.getElementById('auditLogNav').classList.remove('active');
   const view=document.getElementById('dataManagementView');
   form.hidden=true;
   view.hidden=false;
@@ -4486,10 +4623,73 @@ function openDataManagementView(){
 function showProfileSettings(){
   const form=document.getElementById('settingsForm');
   const view=document.getElementById('dataManagementView');
+  const audit=document.getElementById('auditLogView');
   form.hidden=false;
   view.hidden=true;
   view.setAttribute('aria-hidden','true');
+  audit.hidden=true;
+  audit.setAttribute('aria-hidden','true');
   document.getElementById('dataManagementNav').classList.remove('active');
+  document.getElementById('auditLogNav').classList.remove('active');
+}
+// ─── 操作日志（audit_log）───
+let auditRows=[],auditOffset=0,auditCategory='',auditLoaded=false,auditTotal=0;
+const AUDIT_PAGE=100;
+function openAuditLogView(){
+  const form=document.getElementById('settingsForm');
+  const dm=document.getElementById('dataManagementView');
+  dm.hidden=true;dm.setAttribute('aria-hidden','true');
+  form.hidden=true;
+  const view=document.getElementById('auditLogView');
+  view.hidden=false;view.setAttribute('aria-hidden','false');
+  document.querySelectorAll('.pl-item').forEach(function(el){el.classList.remove('active')});
+  document.getElementById('auditLogNav').classList.add('active');
+  if(!auditLoaded)loadAuditLog(true);
+}
+function auditActorBadge(a){
+  if(a==='admin')return '<span style="color:var(--accent);font-weight:600">管理员</span>';
+  if(a==='system')return '<span style="color:var(--blue);font-weight:600">系统</span>';
+  return '<span style="color:var(--orange);font-weight:600">'+h(a||'?')+'</span>';
+}
+function auditTime(iso){
+  const d=new Date(iso);function p(n){return String(n).padStart(2,'0')}
+  return d.getFullYear()+'-'+p(d.getMonth()+1)+'-'+p(d.getDate())+' '+p(d.getHours())+':'+p(d.getMinutes())+':'+p(d.getSeconds());
+}
+async function loadAuditLog(reset){
+  const status=document.getElementById('auditStatus');
+  if(reset){auditOffset=0;auditRows=[]}
+  status.textContent='加载中...';status.className='inline-status';
+  try{
+    const qs=['limit='+AUDIT_PAGE,'offset='+auditOffset];
+    if(auditCategory)qs.push('category='+auditCategory);
+    const r=await fetch('/api/audit-log?'+qs.join('&'));
+    if(!r.ok)throw new Error('加载失败');
+    const data=await r.json();
+    auditRows=auditRows.concat(data.rows||[]);auditTotal=data.total||0;auditLoaded=true;
+    renderAuditLog();
+    status.textContent='共 '+auditTotal+' 条';status.className='inline-status';
+  }catch(e){status.textContent=e.message||'加载失败';status.className='inline-status error'}
+}
+function loadMoreAudit(){auditOffset+=AUDIT_PAGE;loadAuditLog(false)}
+function switchAuditFilter(){
+  const v=document.getElementById('auditFilter').value;
+  auditCategory=(v==='admin'||v==='system'||v==='auth')?v:'';
+  loadAuditLog(true);
+}
+function renderAuditLog(){
+  const tb=document.getElementById('auditBody');
+  if(!auditRows.length){tb.innerHTML='<tr><td colspan="6" style="color:var(--dim);text-align:center;padding:18px">暂无记录</td></tr>'}
+  else{
+    tb.innerHTML=auditRows.map(function(r){
+      return '<tr><td style="font-size:11px;color:var(--dim);white-space:nowrap">'+auditTime(r.time)+'</td>'
+        +'<td>'+auditActorBadge(r.actor)+'</td>'
+        +'<td><code style="font-size:11px;color:var(--accent)">'+h(r.action)+'</code></td>'
+        +'<td style="font-size:11px">'+h(r.target||'-')+'</td>'
+        +'<td style="font-size:12px;min-width:260px">'+h(r.detail||'')+'</td>'
+        +'<td style="font-size:11px;color:var(--dim)">'+h(r.ip||'-')+'</td></tr>';
+    }).join('');
+  }
+  document.getElementById('auditMoreBtn').hidden=auditRows.length>=auditTotal;
 }
 // ─── Stats cleanup (residual user/model stats) ───
 let cleanupData={users:[],models:[]},cleanupTab='users',cleanupLoaded=false;
@@ -5922,6 +6122,46 @@ function parseFormBody(body) {
   return data;
 }
 
+// ── Settings audit: snapshot before applySettings, diff after ────────────────
+function settingsAuditSnapshot() {
+  return {
+    proxy: JSON.stringify(config.proxy || {}),
+    autoQuotaAdjust: JSON.stringify(config.autoQuotaAdjust || {}),
+    users: JSON.stringify(Object.fromEntries(Object.entries(config.users || {}).map(([k, v]) => [maskAuditKey(k), v]))),
+    profiles: Object.fromEntries(Object.entries(config.profiles || {}).map(([n, p]) => [n, JSON.stringify(p)])),
+  };
+}
+
+function jsonChangedKeys(beforeJson, afterJson) {
+  const before = JSON.parse(beforeJson || "{}");
+  const after = JSON.parse(afterJson || "{}");
+  const keys = new Set([...Object.keys(before), ...Object.keys(after)]);
+  const changed = [];
+  for (const k of keys) {
+    if (JSON.stringify(before[k]) !== JSON.stringify(after[k])) changed.push(k);
+  }
+  return changed;
+}
+
+function settingsAuditDiff(snap, now) {
+  const parts = [];
+  let target = "";
+  const profileNames = new Set([...Object.keys(snap.profiles), ...Object.keys(now.profiles)]);
+  for (const name of profileNames) {
+    const a = snap.profiles[name], b = now.profiles[name];
+    if (a === b) continue;
+    const changed = jsonChangedKeys(a, b);
+    parts.push(`方案 "${name}"${changed.length ? `(${changed.join(", ")})` : ""}`);
+    if (!target) target = name;
+  }
+  const proxyChanged = jsonChangedKeys(snap.proxy, now.proxy);
+  if (proxyChanged.length) parts.push(`全局代理(${proxyChanged.join(", ")})`);
+  const quotaChanged = jsonChangedKeys(snap.autoQuotaAdjust, now.autoQuotaAdjust);
+  if (quotaChanged.length) parts.push(`自动配额(${quotaChanged.join(", ")})`);
+  if (snap.users !== now.users) parts.push("全局用户配置");
+  return { target, text: parts.join("；") };
+}
+
 function applySettings(formData) {
   const isGlobalOnlySave = !formData.profileName && !formData.profileSuffix && formData.upstream === undefined;
   const editingProfileName = formData.profileName || getProfileNameBySuffix(formData.profileSuffix) || getDefaultProfileName();
@@ -6226,12 +6466,14 @@ const server = http.createServer((req, res) => {
             ],
           });
           res.end(JSON.stringify({ ok: true }));
+          recordAudit("admin", "auth.login", "", `管理员登录成功`, ip);
         } else {
           recordLoginFailure(ip);
           const remaining = checkLoginRate(ip).remaining;
           res.writeHead(401, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ error: "wrong password", attemptsRemaining: remaining }));
           console.log(`[安全] IP ${ip} 登录失败，剩余尝试次数: ${remaining}`);
+          recordAudit("guest", "auth.login_fail", "", `登录失败（密码错误，剩余尝试 ${remaining} 次）`, ip);
         }
       } catch {
         res.writeHead(400, { "Content-Type": "application/json" });
@@ -6254,6 +6496,7 @@ const server = http.createServer((req, res) => {
       ],
     });
     res.end(JSON.stringify({ ok: true }));
+    recordAdminAudit(req, "auth.logout", "", "管理员退出登录");
     return;
   }
 
@@ -6325,8 +6568,10 @@ const server = http.createServer((req, res) => {
           stmts.upsertMeta.run({ k: `dataImport:${actualHash}`, v: new Date().toISOString() });
         });
         tx();
+        const summary = summarizeLegacyImport(normalized);
         res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ ok: true, summary: summarizeLegacyImport(normalized) }));
+        res.end(JSON.stringify({ ok: true, summary }));
+        recordAdminAudit(req, "data.import", "", `导入旧版数据（${payload.mode === "replace" ? "替换模式" : "合并模式"}）：用户 ${summary.users || 0}、请求 ${summary.requests || 0}、记录 ${summary.records || 0}`);
       } catch (err) {
         res.writeHead(400, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ error: err.message }));
@@ -6369,6 +6614,7 @@ const server = http.createServer((req, res) => {
         console.log("[DATA] All configuration and request data cleared");
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ ok: true }));
+        recordAdminAudit(req, "data.clear", "全局", "清空全部数据（方案、用户、密钥、配额、统计、错误），已自动备份；审计日志保留");
       } catch (err) {
         res.writeHead(400, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ error: err.message }));
@@ -6400,7 +6646,10 @@ const server = http.createServer((req, res) => {
           return;
         }
         const formData = parseFormBody(body);
+        const auditSnap = settingsAuditSnapshot();
         applySettings(formData);
+        const auditDiff = settingsAuditDiff(auditSnap, settingsAuditSnapshot());
+        recordAdminAudit(req, "settings.save", auditDiff.target, `保存设置（设置页表单）${auditDiff.text ? "，变更: " + auditDiff.text : "（无实际变化）"}`);
         res.writeHead(302, { "Location": "/settings?saved=1" });
         res.end();
       } catch (err) {
@@ -6424,6 +6673,7 @@ const server = http.createServer((req, res) => {
         // No longer need exclusive switch — all profiles are always active
         // Just reload its runtime to apply any config changes
         reloadProfileRuntime(profile);
+        recordAdminAudit(req, "profile.reload", profile, `重新加载方案 "${profile}" 运行时（兼容端点）`);
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ ok: true, profiles: listProfiles() }));
       } catch (err) {
@@ -6463,6 +6713,7 @@ const server = http.createServer((req, res) => {
         }
         saveConfig(config);
         reloadAllRuntimes();
+        recordAdminAudit(req, "profile.default", name, `将方案 "${name}" 设为 ${proto === "responses" ? "OpenAI (Responses)" : "Anthropic"} 协议组的默认入口（组头）`);
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify({
           ok: true,
@@ -6513,6 +6764,7 @@ const server = http.createServer((req, res) => {
         saveConfig(config);
         reloadAllRuntimes();
         console.log(`[PROFILE] ${proto} group set: ${JSON.stringify(valid)}`);
+        recordAdminAudit(req, "profile.group_set", `${proto} 组`, `设置${proto === "responses" ? "OpenAI (Responses)" : "Anthropic"}协议 failover 链: ${valid.join(" → ") || "（空）"}`);
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify({
           ok: true,
@@ -6564,6 +6816,7 @@ const server = http.createServer((req, res) => {
         saveConfig(config);
         reloadAllRuntimes();
         console.log(`[PROFILE] Created new profile "${name}" (suffix: ${JSON.stringify(sfx)}, protocol: ${proto})`);
+        recordAdminAudit(req, "profile.create", name, `新建方案 "${name}"（后缀 /${sfx}，协议 ${proto === "responses" ? "OpenAI Responses" : "Anthropic"}，上游 ${upstream || "继承默认"}）`);
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ ok: true, profile: name, suffix: sfx, protocol: proto }));
       } catch (err) {
@@ -6600,6 +6853,7 @@ const server = http.createServer((req, res) => {
         delete config.profiles[profile];
         saveConfig(config);
         console.log(`[PROFILE] Deleted profile "${profile}"`);
+        recordAdminAudit(req, "profile.delete", profile, `删除方案 "${profile}"（后缀 /${p ? p.suffix : "?"}）`);
         res.end(JSON.stringify({ ok: true }));
       } catch (err) {
         res.writeHead(400, { "Content-Type": "application/json" });
@@ -6660,7 +6914,10 @@ const server = http.createServer((req, res) => {
             }
           }
         }
+        const apiAuditSnap = settingsAuditSnapshot();
         applySettings(formData);
+        const apiAuditDiff = settingsAuditDiff(apiAuditSnap, settingsAuditSnapshot());
+        recordAdminAudit(req, "settings.api", apiAuditDiff.target, `程序化更新设置（POST /api/settings）${apiAuditDiff.text ? "，变更: " + apiAuditDiff.text : "（无实际变化）"}`);
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ ok: true, settings: getPublicSettings() }));
       } catch (err) {
@@ -6684,11 +6941,13 @@ const server = http.createServer((req, res) => {
       targetRt.breaker.reset();
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ ok: true, status: targetRt.breaker.status(), profile: targetRt.profileName }));
+      recordAdminAudit(req, "breaker.reset", targetRt.profileName, `手动重置方案 "${targetRt.profileName}" 的熔断器`);
     } else {
       // Reset all
       for (const r of Object.values(runtimes)) r.breaker.reset();
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ ok: true }));
+      recordAdminAudit(req, "breaker.reset", "全局", "手动重置全部方案的熔断器");
     }
     return;
   }
@@ -6703,10 +6962,12 @@ const server = http.createServer((req, res) => {
       clearRateLimited(profileName);
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ ok: true, profile: profileName }));
+      recordAdminAudit(req, "ratelimit.reset", profileName, `手动重置方案 "${profileName}" 的限流状态`);
     } else {
       for (const name of Object.keys(rateLimitState)) clearRateLimited(name);
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ ok: true }));
+      recordAdminAudit(req, "ratelimit.reset", "全局", "手动重置全部方案的限流状态");
     }
     return;
   }
@@ -6793,6 +7054,7 @@ const server = http.createServer((req, res) => {
     db.prepare("DELETE FROM errors").run();
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ ok: true }));
+    recordAdminAudit(req, "errors.clear", "全局", "清空全部错误记录");
     return;
   }
 
@@ -6804,6 +7066,7 @@ const server = http.createServer((req, res) => {
     const cleared = stickyBindings.size;
     stickyBindings.clear();
     console.log(`[Sticky] 已手动清除 ${cleared} 条粘性会话绑定`);
+    recordAdminAudit(req, "sticky.clear", "全局", `手动清除 ${cleared} 条粘性会话绑定，下一请求从各组头重新开始`);
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ ok: true, cleared }));
     return;
@@ -6818,6 +7081,7 @@ const server = http.createServer((req, res) => {
     for (const k of Object.keys(rateLimitState)) delete rateLimitState[k];
     persistRateLimitState();
     console.log(`[RateLimit] 已手动清除 ${cleared} 个方案的限流状态`);
+    recordAdminAudit(req, "ratelimit.clear", "全局", `手动清除 ${cleared} 个方案的限流状态，立即恢复参与 failover`);
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ ok: true, cleared }));
     return;
@@ -6871,6 +7135,15 @@ const server = http.createServer((req, res) => {
         } else {
           stmts.upsertQuotaDailyOp.run({ profile: sfx, key, date: today, bonus, baseline, resetTime, updatedAt: now });
         }
+        if (action === "bonus") {
+          recordAdminAudit(req, "quota.bonus", `/${sfx} · ${maskAuditKey(key)}`,
+            `设置 ${userName} 当日临时加量：${(op.bonus || 0).toLocaleString()} → ${bonus.toLocaleString()}（基础 ${baseLimit.toLocaleString()}，明日自动失效）`);
+        } else if (action === "reset") {
+          recordAdminAudit(req, "quota.reset", `/${sfx} · ${maskAuditKey(key)}`,
+            `重置 ${userName} 今日用量（基线 ${rawUsed.toLocaleString()}，配额恢复满额，统计保留）`);
+        } else {
+          recordAdminAudit(req, "quota.clear", `/${sfx} · ${maskAuditKey(key)}`, `撤销 ${userName} 今日全部手工额度操作`);
+        }
 
         const quota = checkTokenQuota(key, sfx, runtime);
         res.writeHead(200, { "Content-Type": "application/json" });
@@ -6892,6 +7165,7 @@ const server = http.createServer((req, res) => {
       try {
         const { key } = JSON.parse(buf.toString());
         if (!key) throw new Error("Key required");
+        const deletedUserName = getUserName(key);
         delete config.users[key];
         for (const pname of Object.keys(config.profiles)) {
           delete config.profiles[pname].users[key];
@@ -6907,6 +7181,7 @@ const server = http.createServer((req, res) => {
         delete userRateBucket[key];
         reloadAllRuntimes();
         console.log(`[USER] Deleted global user and history: ${key.slice(0, 8)}****`);
+        recordAdminAudit(req, "user.delete", maskAuditKey(key), `删除用户 ${deletedUserName}（${maskAuditKey(key)}）及其全部方案分配与历史数据`);
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ ok: true }));
       } catch (err) {
@@ -6916,6 +7191,35 @@ const server = http.createServer((req, res) => {
     }).catch(() => {
       res.writeHead(413); res.end("Request too large");
     });
+    return;
+  }
+
+  // Audit log query (admin): paginated, newest first, optional category/actor filter.
+  if (req.method === "GET" && req.url.startsWith("/api/audit-log")) {
+    if (!checkAuth(req)) { res.writeHead(401); res.end("Unauthorized"); return; }
+    const url = new URL(req.url, `http://localhost`);
+    const limit = Math.min(500, Math.max(1, parseInt(url.searchParams.get("limit") || "100", 10) || 100));
+    const offset = Math.max(0, parseInt(url.searchParams.get("offset") || "0", 10) || 0);
+    const actor = url.searchParams.get("actor") || "";
+    const category = url.searchParams.get("category") || "";
+    const pairs = {
+      admin: [stmts.auditPageAdmin, stmts.auditTotalAdmin],
+      system: [stmts.auditPageSystem, stmts.auditTotalSystem],
+      auth: [stmts.auditPageAuth, stmts.auditTotalAuth],
+    };
+    let rows, total;
+    if (pairs[category]) {
+      rows = pairs[category][0].all(limit, offset);
+      total = pairs[category][1].get().c;
+    } else if (actor) {
+      rows = stmts.auditPageForActor.all(actor, limit, offset);
+      total = stmts.auditTotalForActor.get(actor).c;
+    } else {
+      rows = stmts.auditPage.all(limit, offset);
+      total = stmts.auditTotal.get().c;
+    }
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ rows, total }));
     return;
   }
 
@@ -6960,6 +7264,7 @@ const server = http.createServer((req, res) => {
         });
         tx();
         console.log(`[STATS] Deleted residual stats for user: ${key.slice(0, 8)}****`);
+        recordAdminAudit(req, "stats.user_delete", maskAuditKey(key), `删除用户 ${maskAuditKey(key)} 的残留统计数据（已自动备份，配置不动）`);
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ ok: true }));
       } catch (err) {
@@ -6988,6 +7293,7 @@ const server = http.createServer((req, res) => {
         });
         tx();
         console.log(`[STATS] Deleted residual stats for model: ${model}`);
+        recordAdminAudit(req, "stats.model_delete", model, `删除模型 "${model}" 的残留统计数据（已自动备份）`);
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ ok: true }));
       } catch (err) {
@@ -7009,6 +7315,7 @@ const server = http.createServer((req, res) => {
         if (!Array.isArray(users) || users.length === 0) throw new Error("No users provided");
         const targetSuffix = normalizeProfileSuffix(profileSuffix);
         if (!targetSuffix) throw new Error("profileSuffix is required");
+        const prevGlobalUsers = { ...(config.users || {}) };
         const newGlobalUsers = {};
         for (const u of users) {
           if (!u.key) continue;
@@ -7019,16 +7326,18 @@ const server = http.createServer((req, res) => {
         const targetRt = runtimes[targetSuffix];
         if (!targetRt) throw new Error(`Profile suffix "${targetSuffix}" not found`);
         const targetProfileName = targetRt.profileName;
+        const prevProfileUsers = { ...((config.profiles[targetProfileName] || {}).users || {}) };
         // Update profile users (real keys + profile disable)
+        let newProfileUsers = null;
         if (Array.isArray(profileUsers)) {
-          const newPU = {};
+          newProfileUsers = {};
           for (const pu of profileUsers) {
             if (!pu.key) continue;
-            newPU[pu.key] = { key: pu.realKey || "", disabled: !!pu.disabled, dailyTokenLimit: pu.dailyTokenLimit || null };
+            newProfileUsers[pu.key] = { key: pu.realKey || "", disabled: !!pu.disabled, dailyTokenLimit: pu.dailyTokenLimit || null };
           }
           const ap = config.profiles[targetProfileName];
           if (ap) {
-            ap.users = newPU;
+            ap.users = newProfileUsers;
           }
         } else {
           const ap = config.profiles[targetProfileName];
@@ -7041,6 +7350,29 @@ const server = http.createServer((req, res) => {
         saveConfig(config);
         reloadAllRuntimes();
         console.log(`[USER] Saved ${Object.keys(newGlobalUsers).length} global users`);
+        // Per-user diff: quota changes, disables and membership moves — the
+        // "who changed whose quota" question the audit log exists to answer.
+        const changes = [];
+        if (newProfileUsers) {
+          const nameOf = k => (newGlobalUsers[k] || prevGlobalUsers[k] || {}).username || k.slice(0, 8);
+          for (const k of new Set([...Object.keys(prevProfileUsers), ...Object.keys(newProfileUsers)])) {
+            const a = prevProfileUsers[k] || null, b = newProfileUsers[k] || null;
+            if (!a && b) { changes.push(`新增分配 ${nameOf(k)}${b.dailyTokenLimit ? `（配额 ${b.dailyTokenLimit.toLocaleString()}）` : ""}`); continue; }
+            if (a && !b) { changes.push(`移除分配 ${nameOf(k)}`); continue; }
+            const aq = a.dailyTokenLimit || 0, bq = b.dailyTokenLimit || 0;
+            if (aq !== bq) changes.push(`${nameOf(k)} 配额 ${aq ? aq.toLocaleString() : "不限"} → ${bq ? bq.toLocaleString() : "不限"}`);
+            if (!!a.disabled !== !!b.disabled) changes.push(`${nameOf(k)} 方案内${b.disabled ? "禁用" : "启用"}`);
+          }
+        }
+        const added = Object.keys(newGlobalUsers).filter(k => !prevGlobalUsers[k]).length;
+        const removed = Object.keys(prevGlobalUsers).filter(k => !newGlobalUsers[k]).length;
+        const disabledGlobal = Object.entries(newGlobalUsers).filter(([k, v]) => v.disabled && !(prevGlobalUsers[k] || {}).disabled).length;
+        const parts = [];
+        if (added) parts.push(`新增用户 ${added} 名`);
+        if (removed) parts.push(`删除用户 ${removed} 名`);
+        if (disabledGlobal) parts.push(`全局禁用 ${disabledGlobal} 名`);
+        if (changes.length) parts.push(changes.slice(0, 12).join("；") + (changes.length > 12 ? ` 等 ${changes.length} 项变更` : ""));
+        recordAdminAudit(req, "user.save", `/${targetSuffix}`, `保存用户管理（方案 /${targetSuffix}）：${parts.length ? parts.join("；") : "无实质变化"}`);
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ ok: true }));
       } catch (err) {

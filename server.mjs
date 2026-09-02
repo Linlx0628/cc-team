@@ -5793,6 +5793,16 @@ body>div{max-width:1120px;margin-left:auto;margin-right:auto}
 .top h1{font-size:28px;font-weight:650;line-height:1.15;margin-bottom:7px}.top .sub{font-size:12px;color:var(--dim)}
 select{font-size:12px;background:var(--surface);color:var(--text);border:1px solid var(--border);border-radius:5px;padding:7px 10px;cursor:pointer}select:hover{background:var(--surface-subtle)}select:focus{border-color:var(--accent)}
 .meta{font-size:12px;color:var(--dim);margin-bottom:18px}
+.qnotice{display:none;gap:12px;align-items:flex-start;border-radius:6px;padding:13px 16px;margin-bottom:12px;font-size:12.5px;line-height:1.7}
+.qnotice.show{display:flex}
+.qnotice .qi{flex:none;width:24px;height:24px;border-radius:5px;display:flex;align-items:center;justify-content:center;font-size:12px;font-weight:700;color:#fff;margin-top:1px}
+.qnotice b{font-weight:650}
+.qnotice.bonus{border:1px solid #cfe0d5;border-left:3px solid var(--green);background:var(--accent-soft)}
+.qnotice.bonus .qi{background:var(--green)}
+.qnotice.bonus .hl{color:var(--green);font-weight:700;font-size:14px}
+.qnotice.reset{border:1px solid #eadfc3;border-left:3px solid var(--orange);background:#faf5e6}
+.qnotice.reset b{color:var(--orange)}
+.qnotice.reset .qi{background:var(--orange)}
 .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin-bottom:20px}
 .card{background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:15px 16px;min-height:88px}.card:first-child{border-top:2px solid var(--accent)}
 .card .l{font-size:11px;font-weight:550;color:var(--dim);margin-bottom:12px}.card .v{font-size:22px;line-height:1;font-weight:650;font-variant-numeric:tabular-nums;color:var(--text)!important}
@@ -5802,6 +5812,7 @@ table{width:100%;border-collapse:collapse;min-width:560px}th{text-align:left;pad
 </style></head><body data-theme="editorial-light">
 <div class="top"><div><h1>我的用量</h1><div class="sub">查看个人配额、趋势和模型明细 · <a href="/setup/${escJs(virtualKey)}" style="color:var(--accent)">配置 Codex 接入 →</a></div></div><div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap"><div class="proto-seg" id="protoSeg" role="group" aria-label="协议分类"><button type="button" class="on" data-proto="">全部</button><button type="button" data-proto="anthropic">Anthropic</button><button type="button" data-proto="responses">OpenAI</button></div><select id="profileSel" onchange="switchProfile(this.value)"><option value="all">全部可用方案</option></select></div></div>
 <div class="meta" id="meta">加载中...</div>
+<div id="qNotice"></div>
 <div class="cards" id="cards"></div>
 <div class="box"><h3>今日24小时趋势</h3><canvas id="hourChart"></canvas></div>
 <div class="box"><h3>近7天趋势</h3><canvas id="trendChart"></canvas></div>
@@ -5840,6 +5851,18 @@ function switchProtocolView(proto){
   if(D)load();
 }
 document.querySelectorAll('#protoSeg button').forEach(b=>b.addEventListener('click',()=>switchProtocolView(b.dataset.proto)));
+function renderQNotice(q){
+  const el=document.getElementById('qNotice');
+  let html='';
+  if(q.limit>0&&q.bonus>0){
+    const base=q.limit-q.bonus;
+    html+='<div class="qnotice bonus show"><span class="qi">加</span><div><b>今日临时加量已生效</b> — 管理员为你追加 <span class="hl">+'+fmtTk(q.bonus)+'</span> 临时额度（'+fmtT(q.bonus)+' tokens）。今日总额度 <b>'+fmtT(q.limit)+'</b>（基础 '+fmtT(base)+' + 临时 '+fmtTk(q.bonus)+'），将于<b>明日零点自动恢复</b>为基础额度，无需任何操作。</div></div>';
+  }
+  if(q.resetApplied){
+    html+='<div class="qnotice reset show"><span class="qi">重</span><div><b>今日用量已被管理员重置</b> — 配额已恢复满额，可立即继续使用。下方「今日用量」等统计数字仍为今日实际消耗（统计报表保留），配额判定已从重置时刻重新计算。</div></div>';
+  }
+  el.innerHTML=html;
+}
 function render(){
   if(!D)return;
   const sel=document.getElementById('profileSel');
@@ -5853,11 +5876,12 @@ function render(){
   const pct=q.limit>0?Math.min(100,Math.round(q.used/q.limit*100)):0;
   const color=pct>90?'var(--red)':pct>70?'var(--orange)':'var(--green)';
   document.getElementById('meta').innerHTML=D.username+' · 方案: '+D.profile+linkTag+(q.limit>0?' · <span style="color:'+color+'">'+pct+'% 已用</span> '+hpBar(pct,16)+(q.autoAdjusted?' <span class="tag">AUTO</span>':'')+(q.bonus>0?' <span class="tag" style="background:rgba(46,164,79,.12);color:var(--green)" title="管理员今日临时加量，明日自动失效">临时+'+fmtTk(q.bonus)+'</span>':'')+(q.resetApplied?' <span class="tag" title="管理员已重置今日用量，统计数据保留">已重置</span>':''):' · 无配额限制');
+  renderQNotice(q);
   document.getElementById('cards').innerHTML=
     '<div class="card"><div class="l">今日用量 <span style="font-size:9px;color:var(--dim);font-weight:400">输入+输出</span></div><div class="v" data-cu="'+ioTokens(t)+'" data-cu-k style="color:var(--accent)">0</div></div>'+
     '<div class="card"><div class="l">今日请求</div><div class="v" data-cu="'+t.requests+'" data-cu-k style="color:var(--blue)">0</div></div>'+
-    (q.limit>0?'<div class="card"><div class="l">剩余额度</div><div class="v" data-cu="'+q.remaining+'" data-cu-k style="color:'+color+'">0</div><div style="margin-top:8px">'+hpBar(pct,16)+'</div></div>'+
-    '<div class="card"><div class="l">每日限额'+(q.bonus>0?' <span style="font-size:9px;color:var(--green);font-weight:400">含临时+'+fmtTk(q.bonus)+'</span>':'')+'</div><div class="v" data-cu="'+q.limit+'" data-cu-k style="color:var(--dim)">0</div></div>':'')+
+    (q.limit>0?'<div class="card"'+(q.bonus>0?' style="border-top:2px solid var(--green)"':'')+'><div class="l">剩余额度'+(q.bonus>0?' <span class="tag" style="background:rgba(47,110,80,.1);color:var(--green)">含临时加量</span>':'')+'</div><div class="v" data-cu="'+q.remaining+'" data-cu-k style="color:'+color+'">0</div><div style="margin-top:8px">'+hpBar(pct,16)+'</div></div>'+
+    '<div class="card"><div class="l">每日限额</div><div class="v" data-cu="'+q.limit+'" data-cu-k style="color:var(--dim)">0</div>'+(q.bonus>0?'<div style="margin-top:6px;font-size:10px;color:var(--green);font-weight:550">基础 '+fmtTk(q.limit-q.bonus)+' + 临时 '+fmtTk(q.bonus)+'</div>':'')+'</div>':'')+
     '<div class="card"><div class="l">今日输入</div><div class="v" data-cu="'+t.input+'" data-cu-k style="color:var(--green)">0</div></div>'+
     '<div class="card"><div class="l">今日输出</div><div class="v" data-cu="'+t.output+'" data-cu-k style="color:var(--orange)">0</div></div>'+
     '<div class="card"><div class="l">今日缓存写入</div><div class="v" data-cu="'+t.cacheWrite+'" data-cu-k>0</div></div>'+

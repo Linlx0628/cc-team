@@ -1072,6 +1072,14 @@ function initDb() {
       avg_daily_usage INTEGER, auto INTEGER DEFAULT 1, time TEXT NOT NULL
     );
     CREATE TABLE IF NOT EXISTS kv_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS quota_daily_ops (
+      profile TEXT NOT NULL, user_key TEXT NOT NULL, date TEXT NOT NULL,
+      bonus INTEGER NOT NULL DEFAULT 0,
+      reset_baseline INTEGER NOT NULL DEFAULT 0,
+      reset_time TEXT,
+      updated_at TEXT,
+      PRIMARY KEY (profile, user_key, date)
+    );
   `);
 
   // ── Write statements (UPSERT / INSERT) ──
@@ -1115,7 +1123,15 @@ function initDb() {
   stmts.pruneHourlyModel = db.prepare(`DELETE FROM usage_hourly_model WHERE date < ?`);
   stmts.insertQuotaAdjust = db.prepare(`INSERT INTO quota_adjust_history (user_key,user_name,date,old_quota,new_quota,hit_rate,avg_daily_usage,auto,time)
     VALUES (@user,@username,@date,@oldQuota,@newQuota,@hitRate,@avgDailyUsage,1,@time)`);
+  stmts.insertQuotaAdjustManual = db.prepare(`INSERT INTO quota_adjust_history (user_key,user_name,date,old_quota,new_quota,hit_rate,avg_daily_usage,auto,time)
+    VALUES (@user,@username,@date,@oldQuota,@newQuota,NULL,NULL,0,@time)`);
   stmts.trimQuotaAdjust = db.prepare(`DELETE FROM quota_adjust_history WHERE id NOT IN (SELECT id FROM quota_adjust_history ORDER BY id DESC LIMIT 100)`);
+  stmts.upsertQuotaDailyOp = db.prepare(`INSERT INTO quota_daily_ops (profile,user_key,date,bonus,reset_baseline,reset_time,updated_at)
+    VALUES (@profile,@key,@date,@bonus,@baseline,@resetTime,@updatedAt)
+    ON CONFLICT(profile,user_key,date) DO UPDATE SET
+      bonus=@bonus, reset_baseline=@baseline, reset_time=@resetTime, updated_at=@updatedAt`);
+  stmts.deleteQuotaDailyOp = db.prepare(`DELETE FROM quota_daily_ops WHERE profile=? AND user_key=? AND date=?`);
+  stmts.pruneQuotaDailyOps = db.prepare(`DELETE FROM quota_daily_ops WHERE date < ?`);
   stmts.upsertMeta = db.prepare(`INSERT INTO kv_meta (key,value) VALUES (@k,@v) ON CONFLICT(key) DO UPDATE SET value=excluded.value`);
 
   // ── Read statements ──
@@ -1125,8 +1141,10 @@ function initDb() {
   stmts.profileDailyHourlyRows = db.prepare(`SELECT hour,requests,input_tokens,output_tokens,cache_creation,cache_read FROM usage_daily_hourly WHERE profile=? AND date=? AND user_key=?`);
   stmts.profileDailyTrend = db.prepare(`SELECT date,input_tokens,output_tokens,requests,cache_creation,cache_read FROM usage_daily WHERE profile=? AND user_key=? AND date>=? ORDER BY date`);
   stmts.profileSummaryToday = db.prepare(`SELECT COALESCE(SUM(input_tokens+output_tokens+cache_creation+cache_read),0) AS tokens, COALESCE(SUM(requests),0) AS requests FROM usage_daily WHERE profile=? AND date=?`);
-  stmts.lastQuotaAdjust = db.prepare(`SELECT * FROM quota_adjust_history WHERE user_key=? ORDER BY id DESC LIMIT 1`);
+  stmts.lastQuotaAdjust = db.prepare(`SELECT * FROM quota_adjust_history WHERE user_key=? AND auto=1 ORDER BY id DESC LIMIT 1`);
   stmts.quotaAdjustRecent = db.prepare(`SELECT * FROM quota_adjust_history ORDER BY id DESC LIMIT 20`);
+  stmts.getQuotaDailyOp = db.prepare(`SELECT * FROM quota_daily_ops WHERE profile=? AND user_key=? AND date=?`);
+  stmts.todayQuotaOps = db.prepare(`SELECT * FROM quota_daily_ops WHERE date=?`);
   stmts.defaultDailyForUser = db.prepare(`SELECT date,input_tokens,output_tokens,cache_creation,cache_read FROM usage_daily WHERE profile=? AND user_key=? AND date>=?`);
 }
 
@@ -1148,6 +1166,7 @@ function pruneOldDataIfNewDay() {
     stmts.pruneHourlyModel.run(cutoffDailyModel);
     stmts.pruneDailyHourly.run(cutoff);
     stmts.pruneErrors.run(cutoff7d);
+    stmts.pruneQuotaDailyOps.run(cutoff);
   });
   tx();
 }
@@ -1239,7 +1258,7 @@ function migrateFromJsonIfNeeded() {
   }
 }
 
-const REQUEST_DATA_TABLES = ["users", "usage_daily", "usage_daily_model", "usage_daily_hourly", "usage_model", "usage_hourly", "errors", "quota_adjust_history"];
+const REQUEST_DATA_TABLES = ["users", "usage_daily", "usage_daily_model", "usage_daily_hourly", "usage_model", "usage_hourly", "errors", "quota_adjust_history", "quota_daily_ops"];
 
 function legacyProfileData(raw = {}) {
   return {
@@ -2241,21 +2260,29 @@ function checkTokenQuota(apiKey, suffix, _rt) {
   const key = resolveUserKey(apiKey, runtime);
   const sfx = normalizeProfileSuffix(suffix) || runtime?.suffix || "";
   const today = cnDate();
-  const used = stmts.todayUsageForQuota.get(sfx, today, key).used;
+  const rawUsed = stmts.todayUsageForQuota.get(sfx, today, key).used;
+  // Manual daily ops (bonus / reset baseline) are keyed by Beijing date, so
+  // yesterday's row stops matching automatically — no cleanup job needed.
+  const op = stmts.getQuotaDailyOp.get(sfx, key, today) || {};
+  const used = Math.max(0, rawUsed - (op.reset_baseline || 0));
 
   // User quota overrides profile quota
   const userQuota = getUserQuota(apiKey, runtime);
   const profileQuota = getProfileQuota(suffix);
-  const limit = userQuota > 0 ? userQuota : profileQuota;
+  const baseLimit = userQuota > 0 ? userQuota : profileQuota;
+  const bonus = op.bonus > 0 ? op.bonus : 0;
 
-  if (limit <= 0) return { allowed: true, limit: 0, used, remaining: Infinity, source: "无限制" };
+  if (baseLimit <= 0) return { allowed: true, limit: 0, used, remaining: Infinity, source: "无限制", bonus: 0, resetApplied: !!op.reset_baseline };
 
+  const limit = baseLimit + bonus;
   return {
     allowed: used < limit,
     limit,
     used,
     remaining: Math.max(0, limit - used),
     source: userQuota > 0 ? "个人配额" : "方案配额",
+    bonus,
+    resetApplied: !!op.reset_baseline,
   };
 }
 
@@ -2422,7 +2449,7 @@ function getProfilePersonalUsage(apiKey, suffix, runtime) {
   return {
     profile: runtime.profileName,
     profileSuffix: suffix,
-    quota: { type: quota.source, limit: quota.limit, used: quota.used, remaining: quota.remaining, autoAdjusted: quotaAutoAdjusted },
+    quota: { type: quota.source, limit: quota.limit, used: quota.used, remaining: quota.remaining, autoAdjusted: quotaAutoAdjusted, bonus: quota.bonus || 0, resetApplied: !!quota.resetApplied },
     today: { input: todayUsage.inputTokens||0, output: todayUsage.outputTokens||0, requests: todayUsage.requests||0, cacheWrite: todayUsage.cacheCreationTokens||0, cacheRead: todayUsage.cacheReadTokens||0, total: totalUsageTokens(todayUsage) },
     models: todayModels,
     hourly: todayHourly,
@@ -2438,6 +2465,8 @@ function getAggregatedPersonalUsage(apiKey, availableProfiles) {
   const trendByDate = {};
   let totalQuotaLimit = 0;
   let totalQuotaUsed = 0;
+  let totalQuotaBonus = 0;
+  let hasQuotaReset = false;
   let hasUnlimitedQuota = false;
 
   const trendStart = new Date(Date.now() + 8 * 3600 * 1000);
@@ -2493,6 +2522,8 @@ function getAggregatedPersonalUsage(apiKey, availableProfiles) {
     totalQuotaUsed += quota.used || 0;
     if (quota.limit > 0) totalQuotaLimit += quota.limit;
     else hasUnlimitedQuota = true;
+    totalQuotaBonus += quota.bonus || 0;
+    if (quota.resetApplied) hasQuotaReset = true;
   }
 
   const limit = hasUnlimitedQuota ? 0 : totalQuotaLimit;
@@ -2505,6 +2536,8 @@ function getAggregatedPersonalUsage(apiKey, availableProfiles) {
       used: totalQuotaUsed,
       remaining: limit > 0 ? Math.max(0, limit - totalQuotaUsed) : Infinity,
       autoAdjusted: false,
+      bonus: totalQuotaBonus,
+      resetApplied: hasQuotaReset,
     },
     today: { input: todayUsage.inputTokens, output: todayUsage.outputTokens, requests: todayUsage.requests, cacheWrite: todayUsage.cacheCreationTokens || 0, cacheRead: todayUsage.cacheReadTokens || 0, total: totalUsageTokens(todayUsage) },
     models: todayModels,
@@ -3754,6 +3787,14 @@ ${peakLabel}
   const anthProfiles = s.profiles.filter(p => p.protocol !== "responses");
   const respProfiles = s.profiles.filter(p => p.protocol === "responses");
 
+  // Today's manual quota ops (bonus / reset) keyed by "profile<TAB>userKey" so
+  // the user modal can badge rows and stay in sync without a reload.
+  const quotaOpsMap = {};
+  for (const r of stmts.todayQuotaOps.all(cnDate())) {
+    quotaOpsMap[`${r.profile}\t${r.user_key}`] = { bonus: r.bonus || 0, reset_baseline: r.reset_baseline || 0 };
+  }
+  const quotaOpsJson = JSON.stringify(quotaOpsMap).replace(/</g, "\\x3c");
+
   const globalUserRows = Object.entries(s.globalUsers).map(([k, v]) => {
     const isObj = typeof v === "object" && v !== null;
     const username = isObj ? (v.username || "") : (typeof v === "string" ? v : "");
@@ -3777,11 +3818,16 @@ ${peakLabel}
     const profileDisabled = pu ? (typeof pu === "object" ? !!pu.disabled : false) : false;
     const userQuota = (pu && typeof pu === "object") ? (pu.dailyTokenLimit || 0) : 0;
     const rowStyle = globalDisabled ? "opacity:0.4" : "";
+    const qop = quotaOpsMap[`${initialSuffix}\t${k}`];
+    const qCompact = n => n >= 1e6 ? (n / 1e6).toFixed(1) + "M" : n >= 1e3 ? (n / 1e3).toFixed(1) + "k" : String(n);
+    const qBadges = qop ? ((qop.bonus > 0 ? `<span style="font-size:10px;color:var(--green);border:1px solid var(--green);border-radius:3px;padding:0 3px;white-space:nowrap" title="今日临时加量，明日自动失效">+${qCompact(qop.bonus)}</span>` : "") + (qop.reset_baseline > 0 ? `<span style="font-size:10px;color:var(--accent);border:1px solid var(--accent);border-radius:3px;padding:0 3px;white-space:nowrap" title="今日用量已重置（统计保留）">已重置</span>` : "")) : "";
+    const qCell = pu ? `<div style="display:flex;align-items:center;gap:3px;flex-wrap:wrap">${qBadges}<button type="button" class="btn btn-outline btn-sm" data-k="${escHtml(k)}" onclick="openQuotaOp(this.dataset.k)" style="font-size:11px;padding:2px 8px;white-space:nowrap">临时额度</button></div>` : '<span style="color:var(--dim);font-size:11px">—</span>';
     return `<tr style="${rowStyle}">
 <td><code style="font-size:11px;color:var(--accent)">${escHtml(k)}</code></td>
 <td>${escHtml(username)}</td>
 <td><input type="text" name="pu_rk_${escHtml(k)}" value="${escHtml(realKey)}" style="width:100%;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:4px 8px;border-radius:4px;font-size:12px;font-family:monospace" placeholder="真实Key (必填)"></td>
 <td><input type="number" name="pu_quota_${escHtml(k)}" value="${userQuota}" style="width:100%;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:4px 8px;border-radius:4px;font-size:12px" min="0" step="100000" placeholder="0=不限"></td>
+<td>${qCell}</td>
 <td><label style="display:inline-flex;align-items:center;gap:4px;margin:0;cursor:pointer"><input type="checkbox" name="pu_dis_${escHtml(k)}" ${profileDisabled ? "checked" : ""} style="width:auto;accent-color:var(--orange)"><span style="font-size:11px;color:${profileDisabled ? "var(--orange)" : "var(--dim)"}">${profileDisabled ? "已禁用" : "正常"}</span></label></td></tr>`;
   }).join("");
 
@@ -4093,7 +4139,7 @@ ${(() => { const mm = initialProfile.modelMultimodal || {}; const aliases = init
 <div><label>配额上限</label><input type="number" name="aqMaxQuota" value="${s.autoQuotaAdjust?.maxAutoQuota ?? 10000000}" min="0" step="100000"><span class="note">自动调整不超过此值</span></div>
 <div><label>冷却天数</label><input type="number" name="aqCooldown" value="${s.autoQuotaAdjust?.cooldownDays ?? 3}" min="1" max="30"><span class="note">两次调整最小间隔</span></div>
 </div>
-${((() => { const qa = stmts.quotaAdjustRecent.all(); return qa.length > 0 ? `<h4 style="font-size:13px;color:var(--accent);margin:16px 0 8px">调整历史</h4><table style="width:100%;border-collapse:collapse;font-size:12px"><thead><tr><th style="text-align:left;padding:4px 8px;border-bottom:1px solid var(--border)">时间</th><th style="text-align:left;padding:4px 8px;border-bottom:1px solid var(--border)">用户</th><th style="text-align:right;padding:4px 8px;border-bottom:1px solid var(--border)">旧配额</th><th style="text-align:right;padding:4px 8px;border-bottom:1px solid var(--border)">新配额</th><th style="text-align:right;padding:4px 8px;border-bottom:1px solid var(--border)">命中率</th><th style="text-align:right;padding:4px 8px;border-bottom:1px solid var(--border)">日均用量</th></tr></thead><tbody>${qa.map(h => `<tr><td style="padding:4px 8px">${h.date}</td><td style="padding:4px 8px">${h.user_name || h.user_key.slice(0, 8)}</td><td style="text-align:right;padding:4px 8px">${(h.old_quota || 0).toLocaleString()}</td><td style="text-align:right;padding:4px 8px;color:var(--green)">${(h.new_quota || 0).toLocaleString()}</td><td style="text-align:right;padding:4px 8px">${Math.round((h.hit_rate || 0) * 100)}%</td><td style="text-align:right;padding:4px 8px">${(h.avg_daily_usage || 0).toLocaleString()}</td></tr>`).join("")}</tbody></table>` : '<div class="note" style="margin-top:8px">暂无自动调整记录</div>'; })())}
+${((() => { const qa = stmts.quotaAdjustRecent.all(); return qa.length > 0 ? `<h4 style="font-size:13px;color:var(--accent);margin:16px 0 8px">调整历史</h4><table style="width:100%;border-collapse:collapse;font-size:12px"><thead><tr><th style="text-align:left;padding:4px 8px;border-bottom:1px solid var(--border)">时间</th><th style="text-align:left;padding:4px 8px;border-bottom:1px solid var(--border)">用户</th><th style="text-align:left;padding:4px 8px;border-bottom:1px solid var(--border)">方式</th><th style="text-align:right;padding:4px 8px;border-bottom:1px solid var(--border)">旧配额</th><th style="text-align:right;padding:4px 8px;border-bottom:1px solid var(--border)">新配额</th><th style="text-align:right;padding:4px 8px;border-bottom:1px solid var(--border)">命中率</th><th style="text-align:right;padding:4px 8px;border-bottom:1px solid var(--border)">日均用量</th></tr></thead><tbody>${qa.map(h => `<tr><td style="padding:4px 8px">${h.date}</td><td style="padding:4px 8px">${h.user_name || h.user_key.slice(0, 8)}</td><td style="padding:4px 8px">${h.auto === 0 ? '<span style="color:var(--accent);border:1px solid var(--accent);border-radius:3px;padding:0 4px;font-size:11px" title="管理员当日临时加量，次日自动失效">手动·当日</span>' : '<span style="color:var(--dim)">自动</span>'}</td><td style="text-align:right;padding:4px 8px">${(h.old_quota || 0).toLocaleString()}</td><td style="text-align:right;padding:4px 8px;color:var(--green)">${(h.new_quota || 0).toLocaleString()}</td><td style="text-align:right;padding:4px 8px">${h.auto === 0 ? "-" : Math.round((h.hit_rate || 0) * 100) + "%"}</td><td style="text-align:right;padding:4px 8px">${h.auto === 0 ? "-" : (h.avg_daily_usage || 0).toLocaleString()}</td></tr>`).join("")}</tbody></table>` : '<div class="note" style="margin-top:8px">暂无调整记录</div>'; })())}
 </div>
 <div class="actions" style="position:static;padding:12px 0;background:transparent;border-top:0">
 <button type="submit" class="btn btn-primary">保存全局配置</button>
@@ -4171,7 +4217,7 @@ ${s.profiles.map(p => `<option value="${escHtml(p.suffix)}" ${p.suffix === initi
 </select>
 </h4>
 <table id="profileUsersTable">
-<thead><tr><th>虚拟 Key</th><th>用户名称</th><th>真实 Key</th><th style="width:120px">每日配额</th><th style="width:80px">方案禁用</th></tr></thead>
+<thead><tr><th>虚拟 Key</th><th>用户名称</th><th>真实 Key</th><th style="width:120px">每日配额</th><th style="width:170px">今日临时额度</th><th style="width:80px">方案禁用</th></tr></thead>
 <tbody>${profileUserRows}</tbody>
 </table>
 <div class="note" style="margin-top:6px">全局禁用的用户灰色显示。真实Key必填才能使用此方案。</div>
@@ -4179,6 +4225,28 @@ ${s.profiles.map(p => `<option value="${escHtml(p.suffix)}" ${p.suffix === initi
 <button type="button" class="btn btn-outline btn-sm" onclick="closeUserModal()">取消</button>
 <button type="button" class="btn btn-primary btn-sm" onclick="saveUsers()">保存全部</button>
 </div>
+</div>
+</div>
+</div>
+<div class="modal-overlay" id="quotaOpModal">
+<div class="modal" style="max-width:540px">
+<div class="modal-hd"><h3 id="qoTitle">临时额度</h3><button class="modal-close" onclick="closeQuotaOpModal()">关闭</button></div>
+<div class="modal-body">
+<div id="qoInfo" style="font-size:12px;color:var(--dim);margin-bottom:10px"></div>
+<div id="qoStatus" style="margin-bottom:10px;display:flex;gap:6px;align-items:center;flex-wrap:wrap"></div>
+<label style="font-size:12px">今日临时加量（token 数，0 = 清除；只今天生效，明日自动失效，不改动永久每日配额）</label>
+<div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin:6px 0 2px">
+<input type="number" id="qoBonusInput" min="0" step="10000" placeholder="0" style="width:150px;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:5px 8px;border-radius:4px;font-size:12px">
+<button type="button" class="btn btn-outline btn-sm" onclick="qoQuickAdd(100000)" style="font-size:11px">+10万</button>
+<button type="button" class="btn btn-outline btn-sm" onclick="qoQuickAdd(500000)" style="font-size:11px">+50万</button>
+<button type="button" class="btn btn-outline btn-sm" onclick="qoQuickAdd(1000000)" style="font-size:11px">+100万</button>
+</div>
+<div style="display:flex;justify-content:flex-end;gap:8px;margin-top:14px;flex-wrap:wrap">
+<button type="button" class="btn btn-outline btn-sm" id="qoClearBtn" onclick="qoClear()">撤销今日手工操作</button>
+<button type="button" class="btn btn-outline btn-sm" id="qoResetBtn" onclick="qoReset()">重置今日用量</button>
+<button type="button" class="btn btn-primary btn-sm" id="qoSetBtn" onclick="qoSetBonus()">设置临时加量</button>
+</div>
+<div class="note" style="margin-top:8px">重置后该用户配额立即恢复满额，可继续使用；用量统计与报表数据保留不动。以上操作均只对当日（北京时间）生效。</div>
 </div>
 </div>
 </div>
@@ -4222,6 +4290,7 @@ ${s.profiles.map(p => `<option value="${escHtml(p.suffix)}" ${p.suffix === initi
 <script>
 ${TOAST_JS}
 const SETTINGS=${settingsJson};
+const QUOTA_OPS=${quotaOpsJson};
 const PAGE_CSRF="${CSRF_TOKEN}";
 function getCsrf(){return PAGE_CSRF||(document.cookie.match(/tm_csrf=([^;]+)/)||[])[1]||''}
 function csrfHeaders(h){h=h||{};h['x-csrf-token']=getCsrf();return h}
@@ -4565,16 +4634,20 @@ function renderProfileUsers(suffix){
   tbody.innerHTML=Object.entries(SETTINGS.globalUsers).map(([k,v])=>{
     const username=v.username||'';
     const globalDisabled=!!v.disabled;
-    const pu=assignments[k]||{};
-    const realKey=pu.key||'';
-    const profileDisabled=!!pu.disabled;
-    const userQuota=pu.dailyTokenLimit||0;
+    const pu=assignments[k]||null;
+    const realKey=(pu&&pu.key)||'';
+    const profileDisabled=!!(pu&&pu.disabled);
+    const userQuota=(pu&&pu.dailyTokenLimit)||0;
     const rowStyle=globalDisabled?'opacity:0.4':'';
+    const qop=QUOTA_OPS[suffix+'	'+k];
+    const qBadges=(qop?((qop.bonus>0?'<span style="font-size:10px;color:var(--green);border:1px solid var(--green);border-radius:3px;padding:0 3px;white-space:nowrap" title="今日临时加量，明日自动失效">+'+qFmt(qop.bonus)+'</span>':'')+(qop.reset_baseline>0?'<span style="font-size:10px;color:var(--accent);border:1px solid var(--accent);border-radius:3px;padding:0 3px;white-space:nowrap" title="今日用量已重置（统计保留）">已重置</span>':'')):'');
+    const qCell=pu?'<div style="display:flex;align-items:center;gap:3px;flex-wrap:wrap">'+qBadges+'<button type="button" class="btn btn-outline btn-sm" data-k="'+h(k)+'" onclick="openQuotaOp(this.dataset.k)" style="font-size:11px;padding:2px 8px;white-space:nowrap">临时额度</button></div>':'<span style="color:var(--dim);font-size:11px">—</span>';
     return '<tr style="'+rowStyle+'">'
       +'<td><code style="font-size:11px;color:var(--accent)">'+h(k)+'</code></td>'
       +'<td>'+h(username)+'</td>'
       +'<td><input type="text" name="pu_rk_'+h(k)+'" value="'+h(realKey)+'" style="width:100%;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:4px 8px;border-radius:4px;font-size:12px;font-family:monospace" placeholder="真实Key (留空=不可用此方案)"></td>'
       +'<td><input type="number" name="pu_quota_'+h(k)+'" value="'+h(userQuota)+'" style="width:100%;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:4px 8px;border-radius:4px;font-size:12px" min="0" step="100000" placeholder="0=不限"></td>'
+      +'<td>'+qCell+'</td>'
       +'<td><label style="display:inline-flex;align-items:center;gap:4px;margin:0;cursor:pointer"><input type="checkbox" name="pu_dis_'+h(k)+'" '+(profileDisabled?'checked':'')+' style="width:auto;accent-color:var(--orange)"><span style="font-size:11px;color:'+(profileDisabled?'var(--orange)':'var(--dim)')+'">'+(profileDisabled?'已禁用':'正常')+'</span></label></td></tr>';
   }).join('');
 }
@@ -4607,6 +4680,71 @@ async function saveUsers(){
   const profileSuffix=document.getElementById('userProfileSel').value;
   const r=await fetch('/api/global-user/save',{method:'POST',headers:csrfHeaders({'Content-Type':'application/json'}),body:JSON.stringify({users,profileUsers,profileSuffix})});
   if(r.ok){toastThen('用户配置已保存',()=>location.reload())}else{const e=await r.json();alert('保存失败: '+e.error)}
+}
+// ── 今日临时额度（bonus / reset）弹窗 ──────────────────────────────────────
+function qFmt(n){n=Number(n)||0;if(n>=1e6)return(n/1e6).toFixed(1)+'M';if(n>=1e3)return(n/1e3).toFixed(1)+'k';return String(n)}
+const QUOTA_OP_CTX={suffix:'',key:''};
+function qoKey(suffix,key){return suffix+'	'+key}
+function qoOp(){return QUOTA_OPS[qoKey(QUOTA_OP_CTX.suffix,QUOTA_OP_CTX.key)]}
+function openQuotaOp(key){
+  const suffix=document.getElementById('userProfileSel').value;
+  QUOTA_OP_CTX.suffix=suffix;QUOTA_OP_CTX.key=key;
+  const username=((SETTINGS.globalUsers||{})[key]||{}).username||key.slice(0,8);
+  const pu=((SETTINGS.profileAssignments||{})[suffix]||{})[key];
+  const profile=(SETTINGS.profiles||[]).find(p=>p.suffix===suffix)||{};
+  const base=(pu&&pu.dailyTokenLimit>0)?pu.dailyTokenLimit:(profile.dailyTokenLimit||0);
+  document.getElementById('qoTitle').textContent='临时额度 · '+username;
+  document.getElementById('qoInfo').innerHTML='方案：'+h(profile.name||suffix)+' /'+h(suffix)+' · 基础每日配额：'+(base>0?(base.toLocaleString('zh-CN')+(pu&&pu.dailyTokenLimit>0?'（个人）':'（方案级）')):'<span style="color:var(--orange)">未设置（当前无限制）</span>');
+  document.getElementById('qoBonusInput').value='';
+  const noBase=!(base>0);
+  document.getElementById('qoSetBtn').disabled=noBase;
+  document.getElementById('qoResetBtn').disabled=noBase;
+  document.getElementById('qoResetBtn').title=noBase?'方案与用户均未设置每日配额，无限制状态下无需重置':'';
+  qoRenderStatus();
+  document.getElementById('quotaOpModal').classList.add('open');
+}
+function closeQuotaOpModal(){document.getElementById('quotaOpModal').classList.remove('open')}
+document.getElementById('quotaOpModal').addEventListener('click',function(e){if(e.target===this)closeQuotaOpModal()});
+function qoRenderStatus(q){
+  const op=qoOp();
+  const parts=[];
+  if(op&&op.bonus>0)parts.push('<span style="font-size:11px;color:var(--green);border:1px solid var(--green);border-radius:3px;padding:1px 5px">今日临时 +'+qFmt(op.bonus)+'</span>');
+  if(op&&op.reset_baseline>0)parts.push('<span style="font-size:11px;color:var(--accent);border:1px solid var(--accent);border-radius:3px;padding:1px 5px">今日已重置</span>');
+  if(q&&q.limit>0)parts.push('<span style="font-size:11px;color:var(--dim)">生效额度 '+q.limit.toLocaleString('zh-CN')+' · 已用 '+q.used.toLocaleString('zh-CN')+' · 剩余 '+q.remaining.toLocaleString('zh-CN')+'</span>');
+  if(!op&&!q)parts.push('<span style="font-size:12px;color:var(--dim)">今日暂无手工操作</span>');
+  document.getElementById('qoStatus').innerHTML=parts.join(' ');
+  document.getElementById('qoClearBtn').style.display=op?'':'none';
+}
+function qoQuickAdd(n){const el=document.getElementById('qoBonusInput');el.value=((parseInt(el.value,10)||0)+n)}
+async function qoPost(action,amount){
+  let r,data;
+  try{
+    r=await fetch('/api/quota/daily-op',{method:'POST',headers:csrfHeaders({'Content-Type':'application/json'}),body:JSON.stringify({profileSuffix:QUOTA_OP_CTX.suffix,key:QUOTA_OP_CTX.key,action:action,amount:amount})});
+    data=await r.json();
+  }catch(err){alert('操作失败: '+err.message);return null}
+  if(!r.ok){alert('操作失败: '+(data&&data.error?data.error:r.status));return null}
+  const kk=qoKey(QUOTA_OP_CTX.suffix,QUOTA_OP_CTX.key);
+  if(data.quota&&(data.quota.bonus>0||data.quota.resetApplied))QUOTA_OPS[kk]={bonus:data.quota.bonus||0,reset_baseline:data.quota.resetApplied?1:0};
+  else delete QUOTA_OPS[kk];
+  renderProfileUsers(QUOTA_OP_CTX.suffix);
+  return data.quota;
+}
+async function qoSetBonus(){
+  const raw=document.getElementById('qoBonusInput').value.trim();
+  const n=parseInt(raw===''?'0':raw,10);
+  if(isNaN(n)||n<0){alert('请输入 ≥0 的整数 token 数');return}
+  const q=await qoPost('bonus',n);
+  if(q){toast(n>0?('已设置今日临时加量 +'+qFmt(n)+'，明日自动失效'):'已清除今日临时加量');qoRenderStatus(q)}
+}
+async function qoReset(){
+  if(!confirm('确定重置该用户今日用量？\\n配额将立即恢复满额，可继续使用；用量统计与报表数据保留不动。'))return;
+  const q=await qoPost('reset');
+  if(q){toast('今日用量已重置');qoRenderStatus(q)}
+}
+async function qoClear(){
+  if(!confirm('确定撤销该用户今日全部手工额度操作（临时加量与重置）？'))return;
+  const q=await qoPost('clear');
+  if(q){toast('已撤销今日手工额度操作');qoRenderStatus(q)}
 }
 function genVK(){const c="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";const a=new Uint8Array(24);crypto.getRandomValues(a);let k="jx-";for(let i=0;i<24;i++)k+=c[a[i]%c.length];return k}
 function addGlobalUser(){
@@ -5148,7 +5286,7 @@ function render(){
   // User table
   const ut=document.querySelector("#uTable tbody");
   const ul=Object.entries(D.users).sort((a,b)=>totalTokens(b[1])-totalTokens(a[1]));
-  if(!ul.length){ut.innerHTML='<tr><td colspan="11" class="empty">暂无数据</td></tr>'}else{ut.innerHTML=ul.map(([uk,u],idx)=>{const on=u.lastActive&&Date.now()-new Date(u.lastActive).getTime()<36e5;const uq=(D.userQuotas||{})[uk]||D.profileQuota||0;const td2=(D.daily||{})[td]||{};const tdu=td2[uk]||{};const used=ioTokens(tdu);const qPct=uq>0?Math.min(100,Math.round(used/uq*100)):0;const rank='<span class="rank">'+(idx+1)+'.</span>';const qCell=uq>0?'<span style="color:var(--accent);font-size:12px">'+qPct+'%</span> '+quotaBar(qPct):'<span style="color:var(--dim)">-</span>';return'<tr><td>'+rank+escH(u.name)+'</td><td><span class="led '+(on?'on':'')+'"></span><span style="color:'+(on?'var(--green)':'var(--dim)')+';font-size:12px">'+(on?'在线':'离线')+'</span></td><td class="n">'+fmtT(u.totalRequests)+'</td><td class="n">'+fmtT(u.totalInputTokens)+'</td><td class="n">'+fmtT(u.totalOutputTokens)+'</td><td class="n">'+fmtT(u.cacheCreationTokens || 0)+'</td><td class="n">'+fmtT(u.cacheReadTokens || 0)+'</td><td class="n hl">'+fmtT(ioTokens(u))+'</td><td class="n">'+fmtT(ioTokens(tdu))+'</td><td class="n" style="white-space:nowrap">'+qCell+'</td><td style="font-size:12px;color:var(--dim)">'+ago(u.lastActive)+'</td></tr>'}).join("")}
+  if(!ul.length){ut.innerHTML='<tr><td colspan="11" class="empty">暂无数据</td></tr>'}else{ut.innerHTML=ul.map(([uk,u],idx)=>{const on=u.lastActive&&Date.now()-new Date(u.lastActive).getTime()<36e5;const effQ=(D.userQuotaEff||{})[uk];const uq=effQ?effQ.limit:((D.userQuotas||{})[uk]||D.profileQuota||0);const td2=(D.daily||{})[td]||{};const tdu=td2[uk]||{};const used=effQ?effQ.used:ioTokens(tdu);const qPct=uq>0?Math.min(100,Math.round(used/uq*100)):0;const rank='<span class="rank">'+(idx+1)+'.</span>';const qTag=effQ&&effQ.bonus>0?' <span style="font-size:10px;color:var(--green);border:1px solid var(--green);border-radius:3px;padding:0 3px;white-space:nowrap" title="今日临时加量，明日自动失效">+'+fmtTk(effQ.bonus)+'</span>':(effQ&&effQ.resetApplied?' <span style="font-size:10px;color:var(--accent);border:1px solid var(--accent);border-radius:3px;padding:0 3px;white-space:nowrap" title="今日用量已重置（统计保留）">已重置</span>':'');const qCell=uq>0?'<span style="color:var(--accent);font-size:12px">'+qPct+'%</span> '+quotaBar(qPct)+qTag:'<span style="color:var(--dim)">-</span>';return'<tr><td>'+rank+escH(u.name)+'</td><td><span class="led '+(on?'on':'')+'"></span><span style="color:'+(on?'var(--green)':'var(--dim)')+';font-size:12px">'+(on?'在线':'离线')+'</span></td><td class="n">'+fmtT(u.totalRequests)+'</td><td class="n">'+fmtT(u.totalInputTokens)+'</td><td class="n">'+fmtT(u.totalOutputTokens)+'</td><td class="n">'+fmtT(u.cacheCreationTokens || 0)+'</td><td class="n">'+fmtT(u.cacheReadTokens || 0)+'</td><td class="n hl">'+fmtT(ioTokens(u))+'</td><td class="n">'+fmtT(ioTokens(tdu))+'</td><td class="n" style="white-space:nowrap">'+qCell+'</td><td style="font-size:12px;color:var(--dim)">'+ago(u.lastActive)+'</td></tr>'}).join("")}
 
   renderDetail();
 
@@ -5714,12 +5852,12 @@ function render(){
   const q=D.quota,t=D.today;
   const pct=q.limit>0?Math.min(100,Math.round(q.used/q.limit*100)):0;
   const color=pct>90?'var(--red)':pct>70?'var(--orange)':'var(--green)';
-  document.getElementById('meta').innerHTML=D.username+' · 方案: '+D.profile+linkTag+(q.limit>0?' · <span style="color:'+color+'">'+pct+'% 已用</span> '+hpBar(pct,16)+(q.autoAdjusted?' <span class="tag">AUTO</span>':''):' · 无配额限制');
+  document.getElementById('meta').innerHTML=D.username+' · 方案: '+D.profile+linkTag+(q.limit>0?' · <span style="color:'+color+'">'+pct+'% 已用</span> '+hpBar(pct,16)+(q.autoAdjusted?' <span class="tag">AUTO</span>':'')+(q.bonus>0?' <span class="tag" style="background:rgba(46,164,79,.12);color:var(--green)" title="管理员今日临时加量，明日自动失效">临时+'+fmtTk(q.bonus)+'</span>':'')+(q.resetApplied?' <span class="tag" title="管理员已重置今日用量，统计数据保留">已重置</span>':''):' · 无配额限制');
   document.getElementById('cards').innerHTML=
     '<div class="card"><div class="l">今日用量 <span style="font-size:9px;color:var(--dim);font-weight:400">输入+输出</span></div><div class="v" data-cu="'+ioTokens(t)+'" data-cu-k style="color:var(--accent)">0</div></div>'+
     '<div class="card"><div class="l">今日请求</div><div class="v" data-cu="'+t.requests+'" data-cu-k style="color:var(--blue)">0</div></div>'+
     (q.limit>0?'<div class="card"><div class="l">剩余额度</div><div class="v" data-cu="'+q.remaining+'" data-cu-k style="color:'+color+'">0</div><div style="margin-top:8px">'+hpBar(pct,16)+'</div></div>'+
-    '<div class="card"><div class="l">每日限额</div><div class="v" data-cu="'+q.limit+'" data-cu-k style="color:var(--dim)">0</div></div>':'')+
+    '<div class="card"><div class="l">每日限额'+(q.bonus>0?' <span style="font-size:9px;color:var(--green);font-weight:400">含临时+'+fmtTk(q.bonus)+'</span>':'')+'</div><div class="v" data-cu="'+q.limit+'" data-cu-k style="color:var(--dim)">0</div></div>':'')+
     '<div class="card"><div class="l">今日输入</div><div class="v" data-cu="'+t.input+'" data-cu-k style="color:var(--green)">0</div></div>'+
     '<div class="card"><div class="l">今日输出</div><div class="v" data-cu="'+t.output+'" data-cu-k style="color:var(--orange)">0</div></div>'+
     '<div class="card"><div class="l">今日缓存写入</div><div class="v" data-cu="'+t.cacheWrite+'" data-cu-k>0</div></div>'+
@@ -6594,9 +6732,15 @@ const server = http.createServer((req, res) => {
         data.upstream = targetRt.upstream;
         data.profileQuota = getProfileQuota(targetSuffix);
         data.userQuotas = {};
+        // Effective quota per user (base + today's manual bonus, usage minus
+        // reset baseline) so the dashboard quota bar matches what the proxy
+        // actually enforces, while usage columns keep the real statistics.
+        data.userQuotaEff = {};
         for (const k of Object.keys(targetRt.users)) {
           const q = getUserQuota(k, targetRt);
           if (q > 0) data.userQuotas[k.slice(0, 8) + "****"] = q;
+          const eff = checkTokenQuota(k, targetSuffix, targetRt);
+          if (eff.limit > 0) data.userQuotaEff[k.slice(0, 8) + "****"] = { limit: eff.limit, used: eff.used, bonus: eff.bonus || 0, resetApplied: !!eff.resetApplied };
         }
       } else {
         res.writeHead(404, { "Content-Type": "application/json" });
@@ -6655,6 +6799,67 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+  // Manual daily quota ops (admin): same-day bonus / reset today's usage baseline.
+  // Rows are keyed by Beijing date, so they stop matching at midnight and the
+  // permanent dailyTokenLimit is never touched — no revert job needed.
+  if (req.method === "POST" && req.url === "/api/quota/daily-op") {
+    if (!checkAuth(req)) { res.writeHead(401); res.end("Unauthorized"); return; }
+    if (!checkCsrf(req)) { res.writeHead(403); res.end("CSRF validation failed"); return; }
+    readBody(req).then(buf => {
+      try {
+        const { profileSuffix, key, action, amount } = JSON.parse(buf.toString());
+        const sfx = normalizeProfileSuffix(profileSuffix);
+        const runtime = runtimes[sfx];
+        if (!sfx || !runtime) throw new Error(`未知方案 "${profileSuffix}"`);
+        if (!key || !runtime.users[key]) throw new Error("该方案下不存在此用户 Key");
+        if (!["bonus", "reset", "clear"].includes(action)) throw new Error("action 必须为 bonus | reset | clear");
+
+        const baseLimit = getUserQuota(key, runtime) || getProfileQuota(sfx);
+        if (baseLimit <= 0) throw new Error("该用户与方案均未设置每日配额（当前无限制），无需临时加量或重置");
+
+        const today = cnDate();
+        const op = stmts.getQuotaDailyOp.get(sfx, key, today) || { bonus: 0, reset_baseline: 0 };
+        const rawUsed = stmts.todayUsageForQuota.get(sfx, today, key).used;
+        const now = new Date().toISOString();
+        let bonus = op.bonus || 0, baseline = op.reset_baseline || 0, resetTime = op.reset_time || null;
+        const userName = getUserName(key, runtime);
+
+        if (action === "bonus") {
+          const n = Number(amount);
+          if (!Number.isInteger(n) || n < 0 || n > 1e10) throw new Error("amount 必须为 0~100亿 的整数（token 数）");
+          bonus = n;
+          stmts.insertQuotaAdjustManual.run({
+            user: key, username: userName, date: today,
+            oldQuota: baseLimit + (op.bonus || 0), newQuota: baseLimit + bonus, time: now,
+          });
+          stmts.trimQuotaAdjust.run();
+          console.log(`[临时额度] ${userName} /${sfx} 当日加量 ${(op.bonus || 0).toLocaleString()} → ${bonus.toLocaleString()}（明日自动失效）`);
+        } else if (action === "reset") {
+          baseline = rawUsed;
+          resetTime = now;
+          console.log(`[临时额度] ${userName} /${sfx} 今日用量已重置（基线 ${rawUsed.toLocaleString()}，统计数据保留）`);
+        } else {
+          console.log(`[临时额度] ${userName} /${sfx} 已撤销今日全部手工额度操作`);
+        }
+
+        if (action === "clear" || (bonus === 0 && baseline === 0)) {
+          stmts.deleteQuotaDailyOp.run(sfx, key, today);
+        } else {
+          stmts.upsertQuotaDailyOp.run({ profile: sfx, key, date: today, bonus, baseline, resetTime, updatedAt: now });
+        }
+
+        const quota = checkTokenQuota(key, sfx, runtime);
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: true, quota }));
+      } catch (err) {
+        console.error("[临时额度] 操作失败:", err.message);
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: err.message }));
+      }
+    });
+    return;
+  }
+
   // Delete global user
   if (req.method === "POST" && req.url === "/api/global-user/delete") {
     if (!checkAuth(req)) { res.writeHead(401); res.end("Unauthorized"); return; }
@@ -6668,7 +6873,7 @@ const server = http.createServer((req, res) => {
           delete config.profiles[pname].users[key];
         }
         const tx = db.transaction(() => {
-          for (const table of ["users", "usage_daily", "usage_daily_model", "usage_daily_hourly", "usage_hourly_model", "errors", "quota_adjust_history"]) {
+          for (const table of ["users", "usage_daily", "usage_daily_model", "usage_daily_hourly", "usage_hourly_model", "errors", "quota_adjust_history", "quota_daily_ops"]) {
             db.prepare(`DELETE FROM ${table} WHERE user_key=?`).run(key);
           }
           saveConfig(config);
@@ -6725,7 +6930,7 @@ const server = http.createServer((req, res) => {
         if (!key) throw new Error("Key required");
         backupDatabaseSync("stats-user-delete");
         const tx = db.transaction(() => {
-          for (const table of ["users", "usage_daily", "usage_daily_model", "usage_daily_hourly", "usage_hourly_model", "errors", "quota_adjust_history"]) {
+          for (const table of ["users", "usage_daily", "usage_daily_model", "usage_daily_hourly", "usage_hourly_model", "errors", "quota_adjust_history", "quota_daily_ops"]) {
             db.prepare(`DELETE FROM ${table} WHERE user_key=?`).run(key);
           }
         });

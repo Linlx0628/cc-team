@@ -2528,6 +2528,87 @@ function maskAuditKey(key) {
   return s.length > 8 ? s.slice(0, 8) + "****" : s;
 }
 
+// ─── Request Log (daily JSONL files under logs/) ──────────────────────────────
+// One line of metadata per proxied request, for after-the-fact tracing. Never
+// stores conversation content — same privacy boundary as the rest of the system.
+const REQUEST_LOG_DIR = path.join(__dirname, "logs");
+const REQUEST_LOG_RETENTION_DAYS = 30;
+let requestLogStream = null;
+let requestLogDate = null;
+let requestLogBroken = false;
+
+function pruneRequestLogs() {
+  try {
+    const cutoff = new Date(cnNow().getTime() - REQUEST_LOG_RETENTION_DAYS * 86400000).toISOString().slice(0, 10);
+    for (const name of fs.readdirSync(REQUEST_LOG_DIR)) {
+      const m = name.match(/^requests-(\d{4}-\d{2}-\d{2})\.log$/);
+      if (m && m[1] < cutoff) {
+        try { fs.unlinkSync(path.join(REQUEST_LOG_DIR, name)); } catch {}
+      }
+    }
+  } catch {}
+}
+
+function openRequestLog(dateStr) {
+  try {
+    fs.mkdirSync(REQUEST_LOG_DIR, { recursive: true });
+    if (requestLogStream) { requestLogStream.end(); requestLogStream = null; }
+    requestLogDate = dateStr;
+    requestLogStream = fs.createWriteStream(path.join(REQUEST_LOG_DIR, `requests-${dateStr}.log`), { flags: "a" });
+    requestLogStream.on("error", (err) => {
+      console.error("[请求日志] 写入失败，已停用:", err.message);
+      requestLogBroken = true;
+      try { requestLogStream.destroy(); } catch {}
+      requestLogStream = null;
+    });
+    pruneRequestLogs();
+  } catch (err) {
+    console.error("[请求日志] 打开失败:", err.message);
+    requestLogBroken = true;
+  }
+}
+
+function appendRequestLine(obj) {
+  if (requestLogBroken) return;
+  const date = cnDate();
+  if (date !== requestLogDate || !requestLogStream) openRequestLog(date);
+  if (!requestLogStream) return;
+  try { requestLogStream.write(JSON.stringify(obj) + "\n"); } catch {}
+}
+
+// Attach the finish/close bookkeeping to a proxied response. The reqLog holder
+// starts with the fields known at clientState creation and is enriched later by
+// the readBody callback (model / source / serving profile / usage).
+function attachRequestLogger(res, clientState, reqLog) {
+  let logged = false;
+  const write = (aborted) => {
+    if (logged) return;
+    logged = true;
+    const usage = clientState.lastUsage;
+    appendRequestLine({
+      t: new Date().toISOString(),
+      user: reqLog.user,
+      key: reqLog.key,
+      ip: reqLog.ip,
+      proto: reqLog.proto,
+      src: reqLog.src || "",
+      model: reqLog.model || "",
+      servedModel: (usage && usage.model) || "",
+      profile: reqLog.profile || "",
+      in: usage ? (usage.usage.input_tokens || 0) : 0,
+      out: usage ? (usage.usage.output_tokens || 0) : 0,
+      cacheC: usage ? (usage.usage.cache_creation_input_tokens || 0) : 0,
+      cacheR: usage ? (usage.usage.cache_read_input_tokens || 0) : 0,
+      status: res.statusCode || 0,
+      ms: Date.now() - reqLog.start,
+      aborted: aborted === true,
+    });
+  };
+  res.on("finish", () => write(false));
+  res.on("close", () => { if (!res.writableEnded) write(true); });
+}
+
+
 // ─── System-Event Notifier (webhook push) ─────────────────────────────────────
 // Pushes failure/recovery audit events to IM bots and phone-push channels.
 // Best-effort and fully async: never blocks the proxy, never throws, and never
@@ -3181,6 +3262,20 @@ function proxyRequest(req, res) {
   }
   const apiKey = getApiKey(req);
 
+  // Request log: attach as soon as the user context exists so every
+  // user-visible outcome below (403/429/5xx/proxied traffic) is captured.
+  // The readBody callback enriches the holder with model / source / profile.
+  const reqLog = {
+    start: Date.now(),
+    user: getUserName(apiKey, runtime),
+    key: maskAuditKey(apiKey),
+    ip: getClientIp(req),
+    proto: protocol,
+    src: "",
+    model: "",
+    profile: "",
+  };
+
   // Cross-protocol guard: an Anthropic-protocol request must never be served by
   // a responses profile, even via direct suffix access (and vice versa above).
   if (protocol === "anthropic" && runtime.protocol !== "anthropic") {
@@ -3229,6 +3324,8 @@ function proxyRequest(req, res) {
   const proxyStartTime = Date.now();
   let proxyPhase = "init";
   const clientState = createClientAbortState();
+  clientState.reqLog = reqLog;
+  attachRequestLogger(res, clientState, reqLog);
 
   // Global IP rate limit
   const clientIp = getClientIp(req);
@@ -3316,6 +3413,10 @@ function proxyRequest(req, res) {
         }
       }
     } catch {}
+
+    // Enrich the request log with what only the parsed body reveals.
+    reqLog.model = originalModel;
+    reqLog.src = reqSource;
 
     // Sticky-session signal for cache-affinity routing (group entries only).
     const sessionSignal = extractSessionSignal(protocol, req.headers, parsedBody);
@@ -3441,6 +3542,7 @@ function proxyRequest(req, res) {
           }
           served = true;
           servedBy = cand.name;
+          reqLog.profile = servedBy;
           break;
         } catch (err) {
           if (err?.isRateLimited) {
@@ -3609,6 +3711,7 @@ async function handleJsonProxy(req, res, body, reqHeaders, apiKey, reqModel, tim
           const usage = json.usage || json.token_usage || json.usage_info;
           if (usage) {
             recordUsage(apiKey, usage, json.model, suffix, runtime);
+            clientState.lastUsage = { usage, model: json.model || reqModel };
             const modelName = json.model || reqModel;
             console.log(`[Token] ${getUserName(apiKey, runtime)} [${reqSource}] model=${modelName} 输入=${usage.input_tokens || usage.prompt_tokens || 0} 输出=${usage.output_tokens || usage.completion_tokens || 0} 缓存写=${usage.cache_creation_input_tokens || 0} 缓存读=${usage.cache_read_input_tokens || 0}`);
           } else {
@@ -3890,6 +3993,7 @@ async function handleStreamingProxy(req, res, body, reqHeaders, apiKey, reqModel
         }
         if (usageHasTokens(usage)) {
           recordUsage(apiKey, usage, model, suffix, runtime);
+          clientState.lastUsage = { usage, model };
           console.log(`[Token] ${getUserName(apiKey, runtime)} [${reqSource}] model=${model} 输入=${usage.input_tokens} 输出=${usage.output_tokens} 缓存写=${usage.cache_creation_input_tokens || 0} 缓存读=${usage.cache_read_input_tokens || 0}`);
         } else {
           console.log(`[响应] ${getUserName(apiKey, runtime)} 流结束 无usage数据 model=${model} sse行数=${sseDataLines} 原始数据[0:200]=${rawSample.slice(0, 200).replace(/\n/g, "\\n")}`);

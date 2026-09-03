@@ -10,6 +10,7 @@ data.db
 data.db-shm
 data.db-wal
 backups/
+logs/
 
 # Worktree temporary directories
 .claude/*

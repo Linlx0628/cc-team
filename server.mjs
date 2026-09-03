@@ -670,6 +670,12 @@ function listProfiles() {
 }
 
 // ─── Circuit Breaker ─────────────────────────────────────────────────────────
+// Each failed half-open probe doubles the cooldown (capped) so a long outage does
+// not cost one user-visible error every base-cooldown seconds, while a transient
+// blip still recovers after one base cooldown.
+const CB_MAX_BACKOFF_FACTOR = 8;
+const CB_MAX_COOLDOWN_MS = 5 * 60 * 1000;
+
 class CircuitBreaker {
   constructor(opts = {}) {
     this.profileName = opts.profileName || "";
@@ -680,8 +686,26 @@ class CircuitBreaker {
     this.lastFailureTime = 0;
     this.state = "CLOSED"; // CLOSED | OPEN | HALF_OPEN
     this.halfOpenRequests = 0;
+    this.consecutiveProbeFailures = 0;
     this.totalFailures = 0;
     this.totalSuccesses = 0;
+  }
+
+  currentCooldownMs() {
+    const factor = Math.min(2 ** this.consecutiveProbeFailures, CB_MAX_BACKOFF_FACTOR);
+    return Math.min(this.cooldownMs * factor, CB_MAX_COOLDOWN_MS);
+  }
+
+  // Non-mutating "is this profile worth routing to right now?". The candidate
+  // filter needs this WITHOUT performing the OPEN → HALF_OPEN transition, which
+  // stays the exclusive job of allowRequest(). Reading state directly here is
+  // what used to strand a recovered group head OPEN forever: the filter excluded
+  // it, so allowRequest() never ran and the transition never happened — traffic
+  // stayed on the fallback and the head's plan quota went unused.
+  isAvailable() {
+    if (this.state === "CLOSED") return true;
+    if (this.state === "HALF_OPEN") return this.halfOpenRequests < this.halfOpenMaxRequests;
+    return Date.now() - this.lastFailureTime >= this.currentCooldownMs();
   }
 
   allowRequest() {
@@ -690,7 +714,7 @@ class CircuitBreaker {
         return true;
       case "OPEN": {
         const elapsed = Date.now() - this.lastFailureTime;
-        if (elapsed >= this.cooldownMs) {
+        if (elapsed >= this.currentCooldownMs()) {
           this.state = "HALF_OPEN";
           this.halfOpenRequests = 0;
           console.log("[CB] Circuit OPEN → HALF_OPEN, probing upstream");
@@ -709,6 +733,7 @@ class CircuitBreaker {
   recordSuccess() {
     this.totalSuccesses++;
     if (this.state === "HALF_OPEN") {
+      this.consecutiveProbeFailures = 0;   // upstream answered — drop the backoff
       this.halfOpenRequests++;
       if (this.halfOpenRequests >= this.halfOpenMaxRequests) {
         this.state = "CLOSED";
@@ -727,12 +752,14 @@ class CircuitBreaker {
     this.lastFailureTime = Date.now();
     if (this.state === "HALF_OPEN") {
       this.state = "OPEN";
-      console.log("[CB] Circuit HALF_OPEN → OPEN, probe failed");
-      recordAudit("system", "breaker.open", this.profileName, `方案 "${this.profileName}" 半开探测失败，重新熔断 ${Math.round(this.cooldownMs / 1000)}s`);
+      this.consecutiveProbeFailures++;
+      const wait = Math.round(this.currentCooldownMs() / 1000);
+      console.log(`[CB] Circuit HALF_OPEN → OPEN, probe failed (next probe in ${wait}s)`);
+      recordAudit("system", "breaker.open", this.profileName, `方案 "${this.profileName}" 半开探测失败，重新熔断 ${wait}s（连续探测失败 ${this.consecutiveProbeFailures} 次，冷却已退避延长）`);
     } else if (this.state === "CLOSED" && this.failureCount >= this.failureThreshold) {
       this.state = "OPEN";
       console.log(`[CB] Circuit CLOSED → OPEN, ${this.failureCount} consecutive failures`);
-      recordAudit("system", "breaker.open", this.profileName, `方案 "${this.profileName}" 连续 ${this.failureCount} 次失败，熔断开启 ${Math.round(this.cooldownMs / 1000)}s，期间请求自动切换到备选方案`);
+      recordAudit("system", "breaker.open", this.profileName, `方案 "${this.profileName}" 连续 ${this.failureCount} 次失败，熔断开启 ${Math.round(this.currentCooldownMs() / 1000)}s，期间请求自动切换到备选方案`);
     }
   }
 
@@ -740,6 +767,7 @@ class CircuitBreaker {
     this.state = "CLOSED";
     this.failureCount = 0;
     this.halfOpenRequests = 0;
+    this.consecutiveProbeFailures = 0;
   }
 
   status() {
@@ -748,8 +776,10 @@ class CircuitBreaker {
       failureCount: this.failureCount,
       totalFailures: this.totalFailures,
       totalSuccesses: this.totalSuccesses,
+      probeFailures: this.consecutiveProbeFailures,
+      cooldownMs: this.currentCooldownMs(),
       cooldownRemaining: this.state === "OPEN"
-        ? Math.max(0, this.cooldownMs - (Date.now() - this.lastFailureTime))
+        ? Math.max(0, this.currentCooldownMs() - (Date.now() - this.lastFailureTime))
         : 0,
     };
   }
@@ -1854,7 +1884,9 @@ function getAvailableDefaultProfiles(apiKey) {
     if (!runtime) continue;
     if (runtime.protocol !== "anthropic") continue;
     if (isRateLimited(name)) continue;
-    if (runtime.breaker.status().state === "OPEN") continue;
+    // isAvailable() (not status().state) so a profile whose cooldown has elapsed
+    // is offered again — allowRequest() then performs the half-open transition.
+    if (!runtime.breaker.isAvailable()) continue;
     if (!canUseProfile(apiKey, runtime)) continue;
     out.push({ name, suffix, runtime });
   }
@@ -1874,7 +1906,7 @@ function getAvailableResponsesProfiles(apiKey) {
     const runtime = runtimes[suffix];
     if (!runtime || runtime.protocol !== "responses") continue;
     if (isRateLimited(name)) continue;
-    if (runtime.breaker.status().state === "OPEN") continue;
+    if (!runtime.breaker.isAvailable()) continue;
     if (!canUseProfile(apiKey, runtime)) continue;
     out.push({ name, suffix, runtime });
   }
@@ -2102,6 +2134,9 @@ function getProfileSummaries() {
       todayTokens: row.tokens || 0,
       todayRequests: row.requests || 0,
       breakerState: runtime?.breaker?.status().state || "UNKNOWN",
+      // Seconds until the next automatic probe, so the dashboard can say "熔断中
+      // (12s 后探测)" rather than implying a dead end.
+      breakerCooldownRemaining: runtime?.breaker?.status().cooldownRemaining || 0,
       rateLimit: getRateLimitInfo(profile.name),
       inDefaultGroup: profile.inDefaultGroup,
       groupOrder: profile.groupOrder,
@@ -4551,7 +4586,8 @@ ${errDiv}
   <button type="button" class="preset" onclick="fillUpstream('https://api.deepseek.com/anthropic')">DeepSeek</button>
   <button type="button" class="preset" onclick="fillUpstream('https://token-plan.cn-beijing.maas.aliyuncs.com/apps/anthropic')">阿里 Token Plan</button>
 </div>
-<div class="note" style="margin-top:8px">状态：${s.circuitBreaker.state === 'CLOSED' ? '正常运行' : s.circuitBreaker.state === 'HALF_OPEN' ? '探测恢复中' : s.circuitBreaker.state === 'OPEN' ? '熔断中(' + Math.ceil(s.circuitBreaker.cooldownRemaining / 1000) + 's)' : '等待配置上游'} | 失败 ${s.circuitBreaker.failureCount} | 成功 ${s.circuitBreaker.totalSuccesses} | 失败 ${s.circuitBreaker.totalFailures}</div>
+<div class="note" style="margin-top:8px">状态：${s.circuitBreaker.state === 'CLOSED' ? '正常运行' : s.circuitBreaker.state === 'HALF_OPEN' ? '探测恢复中' : s.circuitBreaker.state === 'OPEN' ? '熔断中(' + Math.ceil(s.circuitBreaker.cooldownRemaining / 1000) + 's 后自动探测' + (s.circuitBreaker.probeFailures > 0 ? '，已连续探测失败 ' + s.circuitBreaker.probeFailures + ' 次，冷却退避至 ' + Math.round((s.circuitBreaker.cooldownMs || 0) / 1000) + 's' : '') + ')' : '等待配置上游'} | 失败 ${s.circuitBreaker.failureCount} | 成功 ${s.circuitBreaker.totalSuccesses} | 失败 ${s.circuitBreaker.totalFailures}</div>
+<div class="note">熔断期间请求自动切换到默认组的下一个方案；冷却结束后会自动放行探测请求，上游恢复即切回本方案，无需手工干预。</div>
 </div>
 
 <h2>模型别名<span class="req">*必填</span></h2>
@@ -5936,7 +5972,7 @@ function render(){
   document.getElementById("cards").innerHTML=c("今日用量",todayTokens,"var(--accent)",1)+c("今日请求",tR,"var(--blue)",1)+c("总用量",allTokens,"var(--green)",1)+c("总请求",tr,"var(--orange)",1)+c("今日错误",(Array.isArray(D.errors)?D.errors:[]).filter(e=>e.time&&e.time.startsWith(td)).length,"var(--red)",1);
   runCountUps(document.getElementById("cards"));
   const psb=document.getElementById("profileSummaryBody"),profiles=Array.isArray(D.profileSummaries)?D.profileSummaries:[];
-  const rowOf=p=>{const st=p.breakerState||"UNKNOWN";const rl=p.rateLimit;let col,led,stateLabel;if(rl){col='var(--red)';led='err';const rm=new Date(rl.resumeAt);stateLabel='限额中 '+String(rm.getHours()).padStart(2,'0')+':'+String(rm.getMinutes()).padStart(2,'0')+'恢复';}else{col=st==="CLOSED"?"var(--green)":st==="HALF_OPEN"?"var(--orange)":"var(--red)";led=st==="CLOSED"?"on":st==="HALF_OPEN"?"warn":"err";stateLabel=st==="CLOSED"?"正常":st==="HALF_OPEN"?"探测中":"熔断";}const current=currentProfile!=="all"&&p.suffix===currentProfile;const gBadge=p.inDefaultGroup?' <span style="color:var(--blue);font-size:10px;font-weight:600">默认组·'+(p.groupOrder+1)+'</span>':'';const rBadge=p.inResponsesGroup?' <span style="color:var(--blue);font-size:10px;font-weight:600">Resp组·'+(p.responsesGroupOrder+1)+'</span>':'';const protoBadge=p.protocol==='responses'?' <span style="color:var(--blue);font-size:10px">Codex</span>':'';const bLabel=p.billingType==='coding_plan'?' <span style="color:var(--dim);font-size:10px">CP</span>':p.billingType==='token_plan'?' <span style="color:var(--dim);font-size:10px">TP</span>':'';const pk=(p.peakHours&&p.peakHours.length)?(function(rs){const now=new Date(),cur=((now.getTime()+8*3600000)%86400000)/60000;const tm=function(t){if(!t)return null;const a=t.split(':');return (+a[0])*60+(+a[1])};const inPk=rs.some(function(r){const s=tm(r.start),e=tm(r.end);return s!==null&&e!==null&&s!==e&&(s<e?(cur>=s&&cur<e):(cur>=s||cur<e))});return ' <span style="color:'+(inPk?'var(--orange)':'var(--dim)')+';font-size:10px" title="高峰时段(北京时间) '+rs.map(function(r){return r.start+'-'+r.end}).join(', ')+'">'+(inPk?'高峰中':rs.map(function(r){return r.start+'-'+r.end}).join(','))+'</span>'})(p.peakHours):'';const rt2=(function(){if(p.peakQuotaRate==null&&p.offPeakQuotaRate==null)return'';const pr=p.peakQuotaRate==null?1:p.peakQuotaRate,orr=p.offPeakQuotaRate==null?1:p.offPeakQuotaRate;if(pr===1&&orr===1)return'';var now=new Date(),cur=((now.getTime()+8*3600000)%86400000)/60000;var tm=function(t){if(!t)return null;var a=t.split(':');return (+a[0])*60+(+a[1])};var ip=(p.peakHours||[]).some(function(r){var s=tm(r.start),e=tm(r.end);return s!==null&&e!==null&&s!==e&&(s<e?(cur>=s&&cur<e):(cur>=s||cur<e))});return ' <span style="color:var(--accent);font-size:10px" title="配额倍率：高峰 ×'+pr+' / 低谷 ×'+orr+'（当前'+(ip?'高峰':'低谷')+'）">×'+(ip?pr:orr)+'</span>'})();const restricted=(p.inDefaultGroup&&profiles.filter(x=>x.inDefaultGroup).length>=2)||(p.inResponsesGroup&&profiles.filter(x=>x.inResponsesGroup).length>=2);const entryCode=p.protocol==='responses'?'/v1/responses':'/v1';const defBadge=(p.isDefault||p.isResponsesDefault)?' <span style="color:var(--green);font-size:11px;font-weight:600;vertical-align:middle">默认</span>':'';return'<tr'+(current?' class="profile-current" aria-current="true"':'')+'><td>'+escH(p.name)+defBadge+gBadge+rBadge+protoBadge+bLabel+pk+rt2+(current?' <span class="current-mark">当前</span>':'')+'</td><td>'+(restricted?'<code>'+entryCode+'</code> <span style="color:var(--dim);font-size:10px">仅 '+entryCode+'</span>':'<code>/'+escH(p.suffix)+'</code>'+((p.isDefault||p.isResponsesDefault)?' <span style="color:var(--dim)">/ <code>'+entryCode+'</code></span>':''))+'</td><td style="font-size:12px;color:var(--dim);max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+escH((p.upstream||'').replace('https://','').replace('http://',''))+'</td><td class="n">'+fmtT(p.todayRequests||0)+'</td><td class="n hl">'+fmtT(p.todayTokens||0)+'</td><td><span class="led '+led+'"></span><span style="color:'+col+';font-size:12px">'+stateLabel+'</span></td></tr>'};
+  const rowOf=p=>{const st=p.breakerState||"UNKNOWN";const rl=p.rateLimit;let col,led,stateLabel;if(rl){col='var(--red)';led='err';const rm=new Date(rl.resumeAt);stateLabel='限额中 '+String(rm.getHours()).padStart(2,'0')+':'+String(rm.getMinutes()).padStart(2,'0')+'恢复';}else{col=st==="CLOSED"?"var(--green)":st==="HALF_OPEN"?"var(--orange)":"var(--red)";led=st==="CLOSED"?"on":st==="HALF_OPEN"?"warn":"err";stateLabel=st==="CLOSED"?"正常":st==="HALF_OPEN"?"探测中":"熔断"+(p.breakerCooldownRemaining>0?' '+Math.ceil(p.breakerCooldownRemaining/1000)+'s后探测':'');}const current=currentProfile!=="all"&&p.suffix===currentProfile;const gBadge=p.inDefaultGroup?' <span style="color:var(--blue);font-size:10px;font-weight:600">默认组·'+(p.groupOrder+1)+'</span>':'';const rBadge=p.inResponsesGroup?' <span style="color:var(--blue);font-size:10px;font-weight:600">Resp组·'+(p.responsesGroupOrder+1)+'</span>':'';const protoBadge=p.protocol==='responses'?' <span style="color:var(--blue);font-size:10px">Codex</span>':'';const bLabel=p.billingType==='coding_plan'?' <span style="color:var(--dim);font-size:10px">CP</span>':p.billingType==='token_plan'?' <span style="color:var(--dim);font-size:10px">TP</span>':'';const pk=(p.peakHours&&p.peakHours.length)?(function(rs){const now=new Date(),cur=((now.getTime()+8*3600000)%86400000)/60000;const tm=function(t){if(!t)return null;const a=t.split(':');return (+a[0])*60+(+a[1])};const inPk=rs.some(function(r){const s=tm(r.start),e=tm(r.end);return s!==null&&e!==null&&s!==e&&(s<e?(cur>=s&&cur<e):(cur>=s||cur<e))});return ' <span style="color:'+(inPk?'var(--orange)':'var(--dim)')+';font-size:10px" title="高峰时段(北京时间) '+rs.map(function(r){return r.start+'-'+r.end}).join(', ')+'">'+(inPk?'高峰中':rs.map(function(r){return r.start+'-'+r.end}).join(','))+'</span>'})(p.peakHours):'';const rt2=(function(){if(p.peakQuotaRate==null&&p.offPeakQuotaRate==null)return'';const pr=p.peakQuotaRate==null?1:p.peakQuotaRate,orr=p.offPeakQuotaRate==null?1:p.offPeakQuotaRate;if(pr===1&&orr===1)return'';var now=new Date(),cur=((now.getTime()+8*3600000)%86400000)/60000;var tm=function(t){if(!t)return null;var a=t.split(':');return (+a[0])*60+(+a[1])};var ip=(p.peakHours||[]).some(function(r){var s=tm(r.start),e=tm(r.end);return s!==null&&e!==null&&s!==e&&(s<e?(cur>=s&&cur<e):(cur>=s||cur<e))});return ' <span style="color:var(--accent);font-size:10px" title="配额倍率：高峰 ×'+pr+' / 低谷 ×'+orr+'（当前'+(ip?'高峰':'低谷')+'）">×'+(ip?pr:orr)+'</span>'})();const restricted=(p.inDefaultGroup&&profiles.filter(x=>x.inDefaultGroup).length>=2)||(p.inResponsesGroup&&profiles.filter(x=>x.inResponsesGroup).length>=2);const entryCode=p.protocol==='responses'?'/v1/responses':'/v1';const defBadge=(p.isDefault||p.isResponsesDefault)?' <span style="color:var(--green);font-size:11px;font-weight:600;vertical-align:middle">默认</span>':'';return'<tr'+(current?' class="profile-current" aria-current="true"':'')+'><td>'+escH(p.name)+defBadge+gBadge+rBadge+protoBadge+bLabel+pk+rt2+(current?' <span class="current-mark">当前</span>':'')+'</td><td>'+(restricted?'<code>'+entryCode+'</code> <span style="color:var(--dim);font-size:10px">仅 '+entryCode+'</span>':'<code>/'+escH(p.suffix)+'</code>'+((p.isDefault||p.isResponsesDefault)?' <span style="color:var(--dim)">/ <code>'+entryCode+'</code></span>':''))+'</td><td style="font-size:12px;color:var(--dim);max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+escH((p.upstream||'').replace('https://','').replace('http://',''))+'</td><td class="n">'+fmtT(p.todayRequests||0)+'</td><td class="n hl">'+fmtT(p.todayTokens||0)+'</td><td><span class="led '+led+'"></span><span style="color:'+col+';font-size:12px">'+stateLabel+'</span></td></tr>'};
   const anthProfiles=profiles.filter(p=>p.protocol!=="responses"),respProfiles=profiles.filter(p=>p.protocol==="responses");
   const protoRow=(label,entry,count)=>'<tr class="proto-row"><td colspan="6">'+label+' · 入口 '+entry+' · '+count+' 个方案</td></tr>';
   let psbHtml="";

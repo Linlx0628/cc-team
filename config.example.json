@@ -13,6 +13,12 @@
         "jx-haiku": "glm-5.1"
       },
       "dailyTokenLimit": 2000000,
+      "peakHours": [
+        { "start": "09:00", "end": "12:00" },
+        { "start": "14:00", "end": "18:00" }
+      ],
+      "peakQuotaRate": 1,
+      "offPeakQuotaRate": 1,
       "users": {
         "jx-example-user": {
           "key": "replace-with-real-upstream-key",

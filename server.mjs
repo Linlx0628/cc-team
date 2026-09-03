@@ -352,6 +352,10 @@ const removedOpenAIUserKeys = new Set();
     const p = config.profiles[pname];
     if (p.dailyTokenLimit === undefined) { p.dailyTokenLimit = null; migrated = true; }
     if (p.peakHours === undefined) { p.peakHours = []; migrated = true; }
+    // Quota rates default to 1.0/1.0 so an upgrade is byte-for-byte equivalent to
+    // the previous behaviour; discounts are opted into per profile from the UI.
+    if (p.peakQuotaRate === undefined) { p.peakQuotaRate = 1; migrated = true; }
+    if (p.offPeakQuotaRate === undefined) { p.offPeakQuotaRate = 1; migrated = true; }
     if (p.users) {
       for (const [vk, u] of Object.entries(p.users)) {
         if (typeof u === "object" && u.dailyTokenLimit === undefined) { u.dailyTokenLimit = null; migrated = true; }
@@ -361,9 +365,9 @@ const removedOpenAIUserKeys = new Set();
   if (migrated) { saveConfig(config); console.log("[MIGRATE] Added dailyTokenLimit fields"); }
 })();
 
-// Peak hours: per-profile recurring daily time ranges, display-only (does not
-// affect proxying/quota). Format: [{start:"HH:mm", end:"HH:mm"}]; end < start
-// means the range crosses midnight (e.g. 22:00-02:00).
+// Peak hours: per-profile recurring daily time ranges. Format: [{start:"HH:mm",
+// end:"HH:mm"}]; end < start means the range crosses midnight (e.g. 22:00-02:00).
+// Drives two things: the peak model aliases, and the peak/off-peak quota rate.
 const PEAK_TIME_RE = /^([01]\d|2[0-3]):([0-5]\d)$/;
 
 function parsePeakTimeMinutes(t) {
@@ -409,6 +413,61 @@ function isInPeakHours(ranges, date = new Date()) {
 function formatPeakHoursSummary(ranges) {
   if (!Array.isArray(ranges) || ranges.length === 0) return "";
   return ranges.map(r => `${r.start}-${r.end}`).join(", ");
+}
+
+// ─── Quota Rate (peak / off-peak weighting) ──────────────────────────────────
+// A request's quota cost is (input+output) × the rate of the slot it lands in.
+// Rates are per-profile so a Coding-Plan upstream and a pay-per-token upstream
+// can price the same tokens differently. Anchor convention: 1.0 = "one peak-hour
+// token on the baseline plan" — keeping one slot at 1.0 is what gives the
+// nominal dailyTokenLimit a meaning.
+const QUOTA_RATE_MAX = 10;
+
+function normalizeQuotaRate(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return 1;
+  return Math.round(Math.min(QUOTA_RATE_MAX, Math.max(0, n)) * 100) / 100;
+}
+
+// `peakHours` empty ⇒ isInPeakHours is always false ⇒ the off-peak rate applies
+// all day. Deliberate ("no peak defined = everything is off-peak"), and the
+// settings page warns when that combination would silently discount 24h.
+function currentQuotaRate(runtime, date = new Date()) {
+  if (!runtime) return 1;
+  return isInPeakHours(runtime.peakHours, date)
+    ? normalizeQuotaRate(runtime.peakQuotaRate)
+    : normalizeQuotaRate(runtime.offPeakQuotaRate);
+}
+
+// Next moment the rate changes, so a quota-exceeded message can tell the user
+// when relief arrives ("20:00 后转入低谷 ×0.5"). Returns null when there is no
+// boundary worth mentioning (no peak hours, or both rates identical).
+function nextRateChangeHint(runtime, date = new Date()) {
+  if (!runtime) return null;
+  const peakRate = normalizeQuotaRate(runtime.peakQuotaRate);
+  const offRate = normalizeQuotaRate(runtime.offPeakQuotaRate);
+  if (peakRate === offRate) return null;
+  const ranges = normalizePeakHours(runtime.peakHours);
+  if (ranges.length === 0) return null;
+
+  const nowMin = Math.floor(((date.getTime() + 8 * 3600000) % 86400000) / 60000);
+  const inPeak = isInPeakHours(ranges, date);
+  // Every range start/end is a potential switch point; the next one in Beijing
+  // minutes-of-day (wrapping past midnight) that flips the current state wins.
+  let bestDelta = Infinity, bestMin = null;
+  for (const r of ranges) {
+    for (const t of [parsePeakTimeMinutes(r.start), parsePeakTimeMinutes(r.end)]) {
+      if (t === null) continue;
+      const delta = (t - nowMin + 1440) % 1440;
+      if (delta === 0) continue;
+      const stateAfter = isInPeakHours(ranges, new Date(date.getTime() + delta * 60000));
+      if (stateAfter === inPeak) continue;
+      if (delta < bestDelta) { bestDelta = delta; bestMin = t; }
+    }
+  }
+  if (bestMin === null) return null;
+  const at = `${String(Math.floor(bestMin / 60)).padStart(2, "0")}:${String(bestMin % 60).padStart(2, "0")}`;
+  return { at, rate: inPeak ? offRate : peakRate, toPeak: !inPeak };
 }
 
 // Auto-migrate: ensure autoQuotaAdjust config exists
@@ -600,6 +659,8 @@ function listProfiles() {
     contextWindow: config.profiles[name].contextWindow || 128000,
     dailyTokenLimit: config.profiles[name].dailyTokenLimit || 0,
     peakHours: normalizePeakHours(config.profiles[name].peakHours),
+    peakQuotaRate: normalizeQuotaRate(config.profiles[name].peakQuotaRate),
+    offPeakQuotaRate: normalizeQuotaRate(config.profiles[name].offPeakQuotaRate),
     configured: !!config.profiles[name].upstream,
     inDefaultGroup: group.includes(name),
     groupOrder: group.indexOf(name),
@@ -717,6 +778,8 @@ function createProfileRuntime(profileName, profile) {
     allowedModels: profile.allowedModels || [],
     modelAliases: getProfileModelAliases(profile),
     peakHours: normalizePeakHours(profile.peakHours),
+    peakQuotaRate: normalizeQuotaRate(profile.peakQuotaRate),
+    offPeakQuotaRate: normalizeQuotaRate(profile.offPeakQuotaRate),
     peakModelAliases: normalizeModelAliases(profile.peakModelAliases || {}),
     globalUsers: { ...(config.users || {}) },
     breaker: new CircuitBreaker({
@@ -1060,6 +1123,7 @@ function initDb() {
       profile TEXT NOT NULL, date TEXT NOT NULL, user_key TEXT NOT NULL,
       input_tokens INTEGER DEFAULT 0, output_tokens INTEGER DEFAULT 0,
       requests INTEGER DEFAULT 0, cache_creation INTEGER DEFAULT 0, cache_read INTEGER DEFAULT 0,
+      weighted_tokens INTEGER DEFAULT 0,
       PRIMARY KEY (profile, date, user_key)
     );
     CREATE TABLE IF NOT EXISTS usage_daily_model (
@@ -1071,6 +1135,7 @@ function initDb() {
       profile TEXT NOT NULL, date TEXT NOT NULL, user_key TEXT NOT NULL, hour TEXT NOT NULL,
       requests INTEGER DEFAULT 0, input_tokens INTEGER DEFAULT 0, output_tokens INTEGER DEFAULT 0,
       cache_creation INTEGER DEFAULT 0, cache_read INTEGER DEFAULT 0,
+      weighted_tokens INTEGER DEFAULT 0,
       PRIMARY KEY (profile, date, user_key, hour)
     );
     CREATE TABLE IF NOT EXISTS usage_model (
@@ -1124,17 +1189,48 @@ function initDb() {
     CREATE INDEX IF NOT EXISTS idx_audit_time ON audit_log(time);
   `);
 
+  // ── Column migration: weighted_tokens (peak/off-peak quota weighting) ──
+  // SQLite has no "ADD COLUMN IF NOT EXISTS", and this project has no versioned
+  // migration framework — so probe table_info and add idempotently. MUST run
+  // before db.prepare() below, since those statements reference the new column.
+  //
+  // Backfilling is not optional: an un-backfilled column reads as 0, which would
+  // wipe every user's "used" figure the moment this ships and make quotas
+  // unenforceable. rate 1.0 is the correct historical value — past usage was
+  // never discounted.
+  const weightedTargets = ["usage_daily", "usage_daily_hourly"].filter(table => {
+    const cols = db.prepare(`PRAGMA table_info(${table})`).all();
+    return cols.length > 0 && !cols.some(c => c.name === "weighted_tokens");
+  });
+  if (weightedTargets.length > 0) {
+    // One-way schema change on live data: keep a pre-migration copy around.
+    const backup = backupDatabaseSync("weighted-tokens-migration");
+    if (backup) console.log(`[MIGRATE] Pre-migration backup: ${path.basename(backup)}`);
+    const tx = db.transaction(() => {
+      for (const table of weightedTargets) {
+        db.exec(`ALTER TABLE ${table} ADD COLUMN weighted_tokens INTEGER DEFAULT 0`);
+        db.exec(`UPDATE ${table} SET weighted_tokens = input_tokens + output_tokens`);
+      }
+    });
+    tx();
+    console.log(`[MIGRATE] weighted_tokens added + backfilled: ${weightedTargets.join(", ")}`);
+  }
+
   // ── Write statements (UPSERT / INSERT) ──
   stmts.upsertUser = db.prepare(`INSERT INTO users (profile,user_key,name,total_input,total_output,total_requests,cache_creation,cache_read,last_active)
     VALUES (@profile,@key,@name,@inp,@out,1,@cacheC,@cacheR,@now)
     ON CONFLICT(profile,user_key) DO UPDATE SET
       total_input=total_input+@inp, total_output=total_output+@out, total_requests=total_requests+1,
       cache_creation=cache_creation+@cacheC, cache_read=cache_read+@cacheR, name=@name, last_active=@now`);
-  stmts.upsertDaily = db.prepare(`INSERT INTO usage_daily (profile,date,user_key,input_tokens,output_tokens,requests,cache_creation,cache_read)
-    VALUES (@profile,@today,@key,@inp,@out,1,@cacheC,@cacheR)
+  // usage_daily / usage_daily_hourly also carry weighted_tokens — the quota
+  // currency ((input+output) × the slot's rate). The other five tables stay
+  // raw-token only: statistics and charts must never show discounted figures.
+  stmts.upsertDaily = db.prepare(`INSERT INTO usage_daily (profile,date,user_key,input_tokens,output_tokens,requests,cache_creation,cache_read,weighted_tokens)
+    VALUES (@profile,@today,@key,@inp,@out,1,@cacheC,@cacheR,@weighted)
     ON CONFLICT(profile,date,user_key) DO UPDATE SET
       input_tokens=input_tokens+@inp, output_tokens=output_tokens+@out, requests=requests+1,
-      cache_creation=cache_creation+@cacheC, cache_read=cache_read+@cacheR`);
+      cache_creation=cache_creation+@cacheC, cache_read=cache_read+@cacheR,
+      weighted_tokens=weighted_tokens+@weighted`);
   stmts.upsertModel = db.prepare(`INSERT INTO usage_model (profile,model,tokens,requests)
     VALUES (@profile,@m,@tokenTotal,1)
     ON CONFLICT(profile,model) DO UPDATE SET tokens=tokens+@tokenTotal, requests=requests+1`);
@@ -1147,11 +1243,12 @@ function initDb() {
     VALUES (@profile,@today,@key,@m,@inp,@out,1)
     ON CONFLICT(profile,date,user_key,model) DO UPDATE SET
       input_tokens=input_tokens+@inp, output_tokens=output_tokens+@out, requests=requests+1`);
-  stmts.upsertDailyHourly = db.prepare(`INSERT INTO usage_daily_hourly (profile,date,user_key,hour,requests,input_tokens,output_tokens,cache_creation,cache_read)
-    VALUES (@profile,@today,@key,@hour,1,@inp,@out,@cacheC,@cacheR)
+  stmts.upsertDailyHourly = db.prepare(`INSERT INTO usage_daily_hourly (profile,date,user_key,hour,requests,input_tokens,output_tokens,cache_creation,cache_read,weighted_tokens)
+    VALUES (@profile,@today,@key,@hour,1,@inp,@out,@cacheC,@cacheR,@weighted)
     ON CONFLICT(profile,date,user_key,hour) DO UPDATE SET
       requests=requests+1, input_tokens=input_tokens+@inp, output_tokens=output_tokens+@out,
-      cache_creation=cache_creation+@cacheC, cache_read=cache_read+@cacheR`);
+      cache_creation=cache_creation+@cacheC, cache_read=cache_read+@cacheR,
+      weighted_tokens=weighted_tokens+@weighted`);
   stmts.upsertHourlyModel = db.prepare(`INSERT INTO usage_hourly_model (profile,date,user_key,hour,model,requests,input_tokens,output_tokens)
     VALUES (@profile,@today,@key,@hour,@m,1,@inp,@out)
     ON CONFLICT(profile,date,user_key,hour,model) DO UPDATE SET
@@ -1180,7 +1277,9 @@ function initDb() {
   stmts.trimAudit = db.prepare(`DELETE FROM audit_log WHERE id NOT IN (SELECT id FROM audit_log ORDER BY id DESC LIMIT 1000)`);
 
   // ── Read statements ──
-  stmts.todayUsageForQuota = db.prepare(`SELECT COALESCE(SUM(input_tokens+output_tokens),0) AS used FROM usage_daily WHERE profile=? AND date=? AND user_key=?`);
+  // Quota enforcement reads the weighted column; `raw` comes along for display so
+  // the UI can show both "扣了多少额度" and "实际用了多少 token" from one query.
+  stmts.todayWeightedForQuota = db.prepare(`SELECT COALESCE(SUM(weighted_tokens),0) AS used, COALESCE(SUM(input_tokens+output_tokens),0) AS raw FROM usage_daily WHERE profile=? AND date=? AND user_key=?`);
   stmts.profileDailyRow = db.prepare(`SELECT * FROM usage_daily WHERE profile=? AND date=? AND user_key=?`);
   stmts.profileDailyModelRows = db.prepare(`SELECT model,input_tokens,output_tokens,requests FROM usage_daily_model WHERE profile=? AND date=? AND user_key=?`);
   stmts.profileDailyHourlyRows = db.prepare(`SELECT hour,requests,input_tokens,output_tokens,cache_creation,cache_read FROM usage_daily_hourly WHERE profile=? AND date=? AND user_key=?`);
@@ -1200,7 +1299,7 @@ function initDb() {
   stmts.auditTotalAdmin = db.prepare(`SELECT COUNT(*) AS c FROM audit_log WHERE actor='admin' AND action NOT LIKE 'auth.%'`);
   stmts.auditTotalSystem = db.prepare(`SELECT COUNT(*) AS c FROM audit_log WHERE actor='system'`);
   stmts.auditTotalAuth = db.prepare(`SELECT COUNT(*) AS c FROM audit_log WHERE action LIKE 'auth.%'`);
-  stmts.defaultDailyForUser = db.prepare(`SELECT date,input_tokens,output_tokens,cache_creation,cache_read FROM usage_daily WHERE profile=? AND user_key=? AND date>=?`);
+  stmts.defaultDailyForUser = db.prepare(`SELECT date,input_tokens,output_tokens,cache_creation,cache_read,weighted_tokens FROM usage_daily WHERE profile=? AND user_key=? AND date>=?`);
 }
 
 // ── Pruning (called once a day via a lazy check) ──
@@ -1257,9 +1356,10 @@ function migrateFromJsonIfNeeded() {
       }
       for (const [date, ud] of Object.entries(ps.daily || {})) {
         for (const [k, v] of Object.entries(ud)) {
-          db.prepare(`INSERT INTO usage_daily (profile,date,user_key,input_tokens,output_tokens,requests,cache_creation,cache_read) VALUES (?,?,?,?,?,?,?,?)
-            ON CONFLICT(profile,date,user_key) DO UPDATE SET input_tokens=input_tokens+excluded.input_tokens, output_tokens=output_tokens+excluded.output_tokens, requests=requests+excluded.requests, cache_creation=cache_creation+excluded.cache_creation, cache_read=cache_read+excluded.cache_read`)
-            .run(suffix, date, k, v.inputTokens||0, v.outputTokens||0, v.requests||0, v.cacheCreationTokens||0, v.cacheReadTokens||0);
+          // Imported history predates weighting → rate 1.0 (weighted = raw).
+          db.prepare(`INSERT INTO usage_daily (profile,date,user_key,input_tokens,output_tokens,requests,cache_creation,cache_read,weighted_tokens) VALUES (?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(profile,date,user_key) DO UPDATE SET input_tokens=input_tokens+excluded.input_tokens, output_tokens=output_tokens+excluded.output_tokens, requests=requests+excluded.requests, cache_creation=cache_creation+excluded.cache_creation, cache_read=cache_read+excluded.cache_read, weighted_tokens=weighted_tokens+excluded.weighted_tokens`)
+            .run(suffix, date, k, v.inputTokens||0, v.outputTokens||0, v.requests||0, v.cacheCreationTokens||0, v.cacheReadTokens||0, (v.inputTokens||0)+(v.outputTokens||0));
         }
       }
       for (const [m, v] of Object.entries(ps.models || {})) {
@@ -1286,9 +1386,9 @@ function migrateFromJsonIfNeeded() {
       for (const [date, dh] of Object.entries(ps.dailyHourly || {})) {
         for (const [k, hours] of Object.entries(dh)) {
           for (const [h, v] of Object.entries(hours)) {
-            db.prepare(`INSERT INTO usage_daily_hourly (profile,date,user_key,hour,requests,input_tokens,output_tokens,cache_creation,cache_read) VALUES (?,?,?,?,?,?,?,?,?)
-              ON CONFLICT(profile,date,user_key,hour) DO UPDATE SET requests=requests+excluded.requests, input_tokens=input_tokens+excluded.input_tokens, output_tokens=output_tokens+excluded.output_tokens, cache_creation=cache_creation+excluded.cache_creation, cache_read=cache_read+excluded.cache_read`)
-              .run(suffix, date, k, h, v.requests||0, v.inputTokens||0, v.outputTokens||0, v.cacheCreationTokens||0, v.cacheReadTokens||0);
+            db.prepare(`INSERT INTO usage_daily_hourly (profile,date,user_key,hour,requests,input_tokens,output_tokens,cache_creation,cache_read,weighted_tokens) VALUES (?,?,?,?,?,?,?,?,?,?)
+              ON CONFLICT(profile,date,user_key,hour) DO UPDATE SET requests=requests+excluded.requests, input_tokens=input_tokens+excluded.input_tokens, output_tokens=output_tokens+excluded.output_tokens, cache_creation=cache_creation+excluded.cache_creation, cache_read=cache_read+excluded.cache_read, weighted_tokens=weighted_tokens+excluded.weighted_tokens`)
+              .run(suffix, date, k, h, v.requests||0, v.inputTokens||0, v.outputTokens||0, v.cacheCreationTokens||0, v.cacheReadTokens||0, (v.inputTokens||0)+(v.outputTokens||0));
           }
         }
       }
@@ -1407,10 +1507,12 @@ function writeLegacyData(normalized, profileMap) {
     }
     for (const [date, rows] of Object.entries(ps.daily || {})) {
       for (const [key, row] of Object.entries(rows || {})) {
-        db.prepare(`INSERT INTO usage_daily (profile,date,user_key,input_tokens,output_tokens,requests,cache_creation,cache_read) VALUES (?,?,?,?,?,?,?,?)
+        // Imported history predates weighting → rate 1.0 (weighted = raw).
+        db.prepare(`INSERT INTO usage_daily (profile,date,user_key,input_tokens,output_tokens,requests,cache_creation,cache_read,weighted_tokens) VALUES (?,?,?,?,?,?,?,?,?)
           ON CONFLICT(profile,date,user_key) DO UPDATE SET input_tokens=input_tokens+excluded.input_tokens, output_tokens=output_tokens+excluded.output_tokens,
-          requests=requests+excluded.requests, cache_creation=cache_creation+excluded.cache_creation, cache_read=cache_read+excluded.cache_read`)
-          .run(suffix, date, key, row.inputTokens || 0, row.outputTokens || 0, row.requests || 0, row.cacheCreationTokens || 0, row.cacheReadTokens || 0);
+          requests=requests+excluded.requests, cache_creation=cache_creation+excluded.cache_creation, cache_read=cache_read+excluded.cache_read,
+          weighted_tokens=weighted_tokens+excluded.weighted_tokens`)
+          .run(suffix, date, key, row.inputTokens || 0, row.outputTokens || 0, row.requests || 0, row.cacheCreationTokens || 0, row.cacheReadTokens || 0, (row.inputTokens || 0) + (row.outputTokens || 0));
       }
     }
     for (const [model, row] of Object.entries(ps.models || {})) {
@@ -1439,10 +1541,11 @@ function writeLegacyData(normalized, profileMap) {
     for (const [date, users] of Object.entries(ps.dailyHourly || {})) {
       for (const [key, hours] of Object.entries(users || {})) {
         for (const [hour, row] of Object.entries(hours || {})) {
-          db.prepare(`INSERT INTO usage_daily_hourly (profile,date,user_key,hour,requests,input_tokens,output_tokens,cache_creation,cache_read) VALUES (?,?,?,?,?,?,?,?,?)
+          db.prepare(`INSERT INTO usage_daily_hourly (profile,date,user_key,hour,requests,input_tokens,output_tokens,cache_creation,cache_read,weighted_tokens) VALUES (?,?,?,?,?,?,?,?,?,?)
             ON CONFLICT(profile,date,user_key,hour) DO UPDATE SET requests=requests+excluded.requests, input_tokens=input_tokens+excluded.input_tokens,
-            output_tokens=output_tokens+excluded.output_tokens, cache_creation=cache_creation+excluded.cache_creation, cache_read=cache_read+excluded.cache_read`)
-            .run(suffix, date, key, hour, row.requests || 0, row.inputTokens || 0, row.outputTokens || 0, row.cacheCreationTokens || 0, row.cacheReadTokens || 0);
+            output_tokens=output_tokens+excluded.output_tokens, cache_creation=cache_creation+excluded.cache_creation, cache_read=cache_read+excluded.cache_read,
+            weighted_tokens=weighted_tokens+excluded.weighted_tokens`)
+            .run(suffix, date, key, hour, row.requests || 0, row.inputTokens || 0, row.outputTokens || 0, row.cacheCreationTokens || 0, row.cacheReadTokens || 0, (row.inputTokens || 0) + (row.outputTokens || 0));
         }
       }
     }
@@ -1992,6 +2095,8 @@ function getProfileSummaries() {
       isResponsesDefault: !!profile.inResponsesGroup && profile.responsesGroupOrder === 0,
       billingType: profile.billingType,
       peakHours: normalizePeakHours(profile.peakHours),
+      peakQuotaRate: profile.peakQuotaRate,
+      offPeakQuotaRate: profile.offPeakQuotaRate,
       upstream: profile.upstream,
       userCount: profile.userCount,
       todayTokens: row.tokens || 0,
@@ -2325,7 +2430,15 @@ function recordUsage(apiKey, usage, model, suffix, _rt) {
 
   pruneOldDataIfNewDay();
 
-  const p = { profile: sfx, key, name: getUserName(key, runtime), inp, out, cacheC, cacheR, m, tokenTotal: inp + out, today, hour, now: new Date().toISOString() };
+  // Weight the request at the rate in force right now. This is settled at write
+  // time on purpose: the row's cost is frozen, so changing a profile's rate later
+  // only affects future requests and never silently re-prices history. Note the
+  // rate comes from the completion instant (same convention as cnHour() above),
+  // so a request spanning a peak boundary is priced by where it finished.
+  const rate = currentQuotaRate(runtime);
+  const weighted = Math.round((inp + out) * rate);
+
+  const p = { profile: sfx, key, name: getUserName(key, runtime), inp, out, cacheC, cacheR, m, tokenTotal: inp + out, weighted, today, hour, now: new Date().toISOString() };
   const tx = db.transaction(() => {
     stmts.upsertUser.run(p);
     stmts.upsertDaily.run(p);
@@ -2361,11 +2474,23 @@ function checkTokenQuota(apiKey, suffix, _rt) {
   const key = resolveUserKey(apiKey, runtime);
   const sfx = normalizeProfileSuffix(suffix) || runtime?.suffix || "";
   const today = cnDate();
-  const rawUsed = stmts.todayUsageForQuota.get(sfx, today, key).used;
+  // `used` is the quota currency (weighted); `raw` is the real token count shown
+  // alongside it so users can reconcile "扣了 1.2M 额度" with "实际用了 2.1M token".
+  const row = stmts.todayWeightedForQuota.get(sfx, today, key);
+  const weightedUsed = row.used, rawTotal = row.raw;
   // Manual daily ops (bonus / reset baseline) are keyed by Beijing date, so
   // yesterday's row stops matching automatically — no cleanup job needed.
+  // reset_baseline is stored in the same weighted currency as `used`.
   const op = stmts.getQuotaDailyOp.get(sfx, key, today) || {};
-  const used = Math.max(0, rawUsed - (op.reset_baseline || 0));
+  const baseline = op.reset_baseline || 0;
+  const used = Math.max(0, weightedUsed - baseline);
+  // Scale the baseline into raw terms by the day's effective ratio so rawUsed and
+  // used stay comparable after a reset (both measure "since the reset point").
+  const dayRatio = weightedUsed > 0 ? rawTotal / weightedUsed : 1;
+  const rawUsed = Math.max(0, Math.round(rawTotal - baseline * dayRatio));
+  const rate = currentQuotaRate(runtime);
+  const inPeak = isInPeakHours(runtime?.peakHours);
+  const discounted = Math.max(0, rawUsed - used);
 
   // User quota overrides profile quota
   const userQuota = getUserQuota(apiKey, runtime);
@@ -2373,7 +2498,9 @@ function checkTokenQuota(apiKey, suffix, _rt) {
   const baseLimit = userQuota > 0 ? userQuota : profileQuota;
   const bonus = op.bonus > 0 ? op.bonus : 0;
 
-  if (baseLimit <= 0) return { allowed: true, limit: 0, used, remaining: Infinity, source: "无限制", bonus: 0, resetApplied: !!op.reset_baseline };
+  if (baseLimit <= 0) {
+    return { allowed: true, limit: 0, used, remaining: Infinity, source: "无限制", bonus: 0, resetApplied: !!baseline, rawUsed, discounted, rate, inPeak };
+  }
 
   const limit = baseLimit + bonus;
   return {
@@ -2383,8 +2510,43 @@ function checkTokenQuota(apiKey, suffix, _rt) {
     remaining: Math.max(0, limit - used),
     source: userQuota > 0 ? "个人配额" : "方案配额",
     bonus,
-    resetApplied: !!op.reset_baseline,
+    resetApplied: !!baseline,
+    rawUsed,
+    discounted,
+    rate,
+    inPeak,
   };
+}
+
+// Quota-exceeded text shared by both protocol branches. With no weighting in play
+// (rate 1.0, weighted == raw) it degrades to the original one-liner; otherwise it
+// also reports the real token count, the delta written off (or added), and — most
+// usefully — when the rate next changes, so the user knows when relief arrives
+// instead of only that they are blocked.
+function quotaExceededMessage(quota, runtime, usageUrl) {
+  const skew = quota.rawUsed != null ? quota.rawUsed - quota.used : 0;
+  const weighted = skew !== 0 || (quota.rate !== undefined && quota.rate !== 1);
+  const lines = [weighted
+    ? `今日配额已用尽：${quota.used.toLocaleString()} / ${quota.limit.toLocaleString()}（计权）`
+    : `今日Token额度已用完。已用: ${quota.used.toLocaleString()}, 限额: ${quota.limit.toLocaleString()}。`];
+  if (skew !== 0) {
+    lines.push(`实际 token ${quota.rawUsed.toLocaleString()}，` +
+      (skew > 0 ? `已抵扣 ${skew.toLocaleString()}` : `已加收 ${(-skew).toLocaleString()}`));
+  }
+  if (weighted) {
+    const slot = quota.inPeak ? "高峰" : "低谷";
+    const hint = nextRateChangeHint(runtime);
+    lines.push(`当前${runtime?.profileName ? ` ${runtime.profileName}` : ""} ${slot} ×${quota.rate}` +
+      (hint ? ` · ${hint.at} 后转入${hint.toPeak ? "高峰" : "低谷"} ×${hint.rate}` : ""));
+  }
+  lines.push(`额度将于北京时间次日凌晨重置。查看用量详情: ${usageUrl}`);
+  return lines.join("\n");
+}
+
+function quotaErrorDetail(quota) {
+  const skew = quota.rawUsed != null ? quota.rawUsed - quota.used : 0;
+  const extra = skew !== 0 ? `, raw ${quota.rawUsed} (${skew > 0 ? "-" : "+"}${Math.abs(skew)} @×${quota.rate})` : "";
+  return `quota_exceeded: ${quota.used}/${quota.limit}${extra}`;
 }
 
 // ─── Auto Quota Adjustment ─────────────────────────────────────────────────
@@ -2430,13 +2592,17 @@ function evaluateAutoQuotaAdjustments() {
     }
 
     // Count hit days and calculate average usage (one SQL query per user)
+    // Uses the weighted column — the same currency dailyTokenLimit is expressed
+    // in. Reading raw tokens here would double-count off-peak discounts: a user
+    // at exactly 100% of a ×0.5 quota looks like 200% in raw terms, and the
+    // auto-raise would compound the discount instead of respecting it.
     const earliest = dates[dates.length - 1];
     const dayRows = stmts.defaultDailyForUser.all(defaultSuffix, vk, earliest).filter(r => dates.includes(r.date));
     let hitCount = 0;
     let totalUsage = 0;
     let usageDays = 0;
     for (const r of dayRows) {
-      const dayUsage = (r.input_tokens||0)+(r.output_tokens||0);
+      const dayUsage = r.weighted_tokens || 0;
       if (dayUsage > 0) {
         usageDays++;
         totalUsage += dayUsage;
@@ -2789,7 +2955,7 @@ function getProfilePersonalUsage(apiKey, suffix, runtime) {
   return {
     profile: runtime.profileName,
     profileSuffix: suffix,
-    quota: { type: quota.source, limit: quota.limit, used: quota.used, remaining: quota.remaining, autoAdjusted: quotaAutoAdjusted, bonus: quota.bonus || 0, resetApplied: !!quota.resetApplied },
+    quota: { type: quota.source, limit: quota.limit, used: quota.used, remaining: quota.remaining, autoAdjusted: quotaAutoAdjusted, bonus: quota.bonus || 0, resetApplied: !!quota.resetApplied, rawUsed: quota.rawUsed, discounted: quota.discounted, rate: quota.rate, inPeak: quota.inPeak, nextRateChange: nextRateChangeHint(runtime) },
     today: { input: todayUsage.inputTokens||0, output: todayUsage.outputTokens||0, requests: todayUsage.requests||0, cacheWrite: todayUsage.cacheCreationTokens||0, cacheRead: todayUsage.cacheReadTokens||0, total: totalUsageTokens(todayUsage) },
     models: todayModels,
     hourly: todayHourly,
@@ -2806,6 +2972,8 @@ function getAggregatedPersonalUsage(apiKey, availableProfiles) {
   let totalQuotaLimit = 0;
   let totalQuotaUsed = 0;
   let totalQuotaBonus = 0;
+  let totalRawUsed = 0;
+  let totalDiscounted = 0;
   let hasQuotaReset = false;
   let hasUnlimitedQuota = false;
 
@@ -2864,6 +3032,11 @@ function getAggregatedPersonalUsage(apiKey, availableProfiles) {
     else hasUnlimitedQuota = true;
     totalQuotaBonus += quota.bonus || 0;
     if (quota.resetApplied) hasQuotaReset = true;
+    // Weighted/raw totals are additive across profiles; the rate itself is not
+    // (each profile has its own), so the aggregate view reports rate: null and
+    // the UI shows only the combined discount.
+    totalRawUsed += quota.rawUsed || 0;
+    totalDiscounted += quota.discounted || 0;
   }
 
   const limit = hasUnlimitedQuota ? 0 : totalQuotaLimit;
@@ -2878,6 +3051,11 @@ function getAggregatedPersonalUsage(apiKey, availableProfiles) {
       autoAdjusted: false,
       bonus: totalQuotaBonus,
       resetApplied: hasQuotaReset,
+      rawUsed: totalRawUsed,
+      discounted: totalDiscounted,
+      rate: null,       // mixed across profiles — meaningless as a single number
+      inPeak: null,
+      nextRateChange: null,
     },
     today: { input: todayUsage.inputTokens, output: todayUsage.outputTokens, requests: todayUsage.requests, cacheWrite: todayUsage.cacheCreationTokens || 0, cacheRead: todayUsage.cacheReadTokens || 0, total: totalUsageTokens(todayUsage) },
     models: todayModels,
@@ -3579,9 +3757,9 @@ function proxyRequest(req, res) {
             const usageUrl = `http://${reqHost}/usage/${apiKey}`;
             const retryAfter = secondsUntilNextCnMidnight();
             sendOpenAiError(res, 429, "quota_exceeded",
-              `今日Token额度已用完。已用: ${q.used.toLocaleString()}, 限额: ${q.limit.toLocaleString()}。额度将于北京时间次日凌晨重置。查看用量详情: ${usageUrl}`,
+              quotaExceededMessage(q, lastFailure.runtime, usageUrl),
               { "Retry-After": String(retryAfter) });
-            recordError(apiKey, 429, `quota_exceeded: ${q.used}/${q.limit}, retry in ${retryAfter}s`, req.url, reqModel, lastFailure.suffix, lastFailure.runtime);
+            recordError(apiKey, 429, `${quotaErrorDetail(q)}, retry in ${retryAfter}s`, req.url, reqModel, lastFailure.suffix, lastFailure.runtime);
           } else if (lastFailure.kind === "rate-limit") {
             const retryAfter = Math.max(1, Math.ceil((lastFailure.err.resumeAt - Date.now()) / 1000));
             sendOpenAiError(res, 429, "rate_limit_exceeded",
@@ -3610,12 +3788,12 @@ function proxyRequest(req, res) {
           const retryAfter = secondsUntilNextCnMidnight();
           res.writeHead(429, { "Content-Type": "application/json", "Retry-After": String(retryAfter) });
           res.end(JSON.stringify({
-            error: `今日Token额度已用完。已用: ${q.used.toLocaleString()}, 限额: ${q.limit.toLocaleString()}。额度将于北京时间次日凌晨重置。查看用量详情: ${usageUrl}`,
+            error: quotaExceededMessage(q, lastFailure.runtime, usageUrl),
             type: "quota_exceeded",
-            quota: { used: q.used, limit: q.limit, remaining: q.remaining, source: q.source },
+            quota: { used: q.used, limit: q.limit, remaining: q.remaining, source: q.source, rawUsed: q.rawUsed, discounted: q.discounted, rate: q.rate },
             usageUrl,
           }));
-          recordError(apiKey, 429, `quota_exceeded: ${q.used}/${q.limit}, retry in ${retryAfter}s`, req.url, reqModel, lastFailure.suffix, lastFailure.runtime);
+          recordError(apiKey, 429, `${quotaErrorDetail(q)}, retry in ${retryAfter}s`, req.url, reqModel, lastFailure.suffix, lastFailure.runtime);
         } else if (lastFailure.kind === "rate-limit") {
           const retryAfter = Math.max(1, Math.ceil((lastFailure.err.resumeAt - Date.now()) / 1000));
           res.writeHead(429, { "Content-Type": "application/json", "Retry-After": String(retryAfter) });
@@ -4139,14 +4317,21 @@ function settingsHtml(errorMsg) {
     const isHead = p.isDefault || isRespDefault;
     const suffixLabel = '<span style="color:var(--accent);font-size:10px">/'+ escHtml(p.suffix)+'</span>' + (isHead ? ' <span style="color:var(--green);font-size:10px">默认入口</span>' : '') + (isResponses ? ' <span style="color:var(--blue);font-size:10px">Responses</span>' : '');
     const peakList = normalizePeakHours(p.peakHours);
+    const inPeakNow = isInPeakHours(peakList);
     const peakLabel = peakList.length > 0
-      ? `<div class="pl-users" style="${isInPeakHours(peakList) ? "color:var(--orange);font-weight:600" : ""}">${escHtml(formatPeakHoursSummary(peakList))}${isInPeakHours(peakList) ? " · 高峰中" : ""}</div>`
+      ? `<div class="pl-users" style="${inPeakNow ? "color:var(--orange);font-weight:600" : ""}">${escHtml(formatPeakHoursSummary(peakList))}${inPeakNow ? " · 高峰中" : ""}</div>`
+      : "";
+    // Only surface the rate when weighting is actually in effect for this profile.
+    const effRate = inPeakNow ? p.peakQuotaRate : p.offPeakQuotaRate;
+    const rateLabel = (p.peakQuotaRate !== 1 || p.offPeakQuotaRate !== 1)
+      ? `<div class="pl-users" style="color:var(--accent)">配额 ×${effRate}<span style="color:var(--dim)"> （峰 ×${p.peakQuotaRate} / 谷 ×${p.offPeakQuotaRate}）</span></div>`
       : "";
     return `<div class="pl-item${p.suffix === initialSuffix ? " active" : ""}" id="pl-${escHtml(p.name)}" onclick="editProfile('${escJs(p.name)}')">
 <div class="pl-name">${escHtml(p.name)} ${suffixLabel}</div>
 <div class="pl-host">${escHtml(host)}</div>
 <div class="pl-users">${p.userCount}位用户</div>
 ${peakLabel}
+${rateLabel}
 <div class="pl-actions">
   ${!isHead ? '<button class="pl-activate" onclick="event.stopPropagation();setDefaultProfile(\'' + escJs(p.name) + '\',\'' + (isResponses ? "responses" : "anthropic") + '\')">设为默认入口</button>' : ''}
   ${!p.isDefault ? '<button class="pl-delete" onclick="event.stopPropagation();deleteProfile(\'' + escJs(p.name) + '\')">删除</button>' : ''}
@@ -4429,7 +4614,19 @@ ${(() => { const mm = initialProfile.modelMultimodal || {}; const aliases = init
 <div class="note">方案配额适用于该方案下所有用户。每个用户可以在用户管理弹窗中单独设置。</div>
 </div>
 
-<h2>高峰时段 <span style="font-size:11px;color:var(--dim);font-weight:400">每日重复的时间段（按北京时间判断，与部署服务器时区无关），命中时启用上方的「高峰期模型别名」</span></h2>
+<h2>配额倍率 <span style="font-size:11px;color:var(--dim);font-weight:400">按时段折算配额消耗，只影响配额计算，统计报表始终显示真实 token</span></h2>
+<div class="section">
+<div style="display:flex;gap:18px;flex-wrap:wrap;align-items:flex-end">
+<div><label>高峰时段倍率</label>
+<input type="number" name="peakQuotaRate" id="peakQuotaRateInput" value="${initialProfile.peakQuotaRate ?? 1}" min="0" max="${QUOTA_RATE_MAX}" step="0.05" style="width:120px"></div>
+<div><label>低谷时段倍率</label>
+<input type="number" name="offPeakQuotaRate" id="offPeakQuotaRateInput" value="${initialProfile.offPeakQuotaRate ?? 1}" min="0" max="${QUOTA_RATE_MAX}" step="0.05" style="width:120px"></div>
+</div>
+<div class="note" id="quotaRateHint" style="margin-top:8px"></div>
+<div class="note" style="margin-top:6px">1.0 = 按实际 token 计入配额；0.5 = 该时段消耗只扣一半额度。建议以「高峰期 Coding Plan 方案 = 1.0」为基准：套餐方案低谷可设 0.5，按量计费方案设 1.5~2.0 反映真实成本。<b>修改只影响之后的请求，已产生的消耗不会重算。</b></div>
+</div>
+
+<h2>高峰时段 <span style="font-size:11px;color:var(--dim);font-weight:400">每日重复的时间段（按北京时间判断，与部署服务器时区无关），命中时启用上方的「高峰期模型别名」与「高峰时段倍率」</span></h2>
 <div class="section">
 <input type="hidden" name="peakStart" value="">
 <input type="hidden" name="peakEnd" value="">
@@ -4880,10 +5077,39 @@ function updatePeakHoursStatus(){
   const el=document.getElementById('peakHoursStatus');
   if(!el)return;
   const ranges=collectPeakHours();
-  if(!ranges.length){el.textContent='未设置时段';el.style.color='var(--dim)';return}
-  if(nowInPeakHours(ranges)){el.textContent='当前处于高峰';el.style.color='var(--orange)'}
+  if(!ranges.length){el.textContent='未设置时段';el.style.color='var(--dim)';}
+  else if(nowInPeakHours(ranges)){el.textContent='当前处于高峰';el.style.color='var(--orange)'}
   else{el.textContent='当前不在高峰';el.style.color='var(--green)'}
+  updateQuotaRateHint();
 }
+// Quota-rate hint: the traps here matter more than the inputs themselves —
+// an off-peak rate with no peak hours defined discounts the whole day, and
+// every-slot-below-1.0 quietly inflates the nominal limit for everyone.
+function updateQuotaRateHint(){
+  const el=document.getElementById('quotaRateHint');
+  if(!el)return;
+  const peakEl=document.getElementById('peakQuotaRateInput'),offEl=document.getElementById('offPeakQuotaRateInput');
+  if(!peakEl||!offEl){el.textContent='';return}
+  const peak=Number(peakEl.value),off=Number(offEl.value);
+  const ranges=collectPeakHours();
+  const warn=function(t){el.innerHTML='<b style="color:var(--orange)">注意：'+t+'</b>';el.style.color='var(--orange)'};
+  if(!Number.isFinite(peak)||!Number.isFinite(off)){warn('倍率必须是数字，非法值保存时会归一为 1.0');return}
+  if(!ranges.length&&off!==1){warn('未设置高峰时段 — 低谷倍率 ×'+off+' 将全天生效');return}
+  if(peak===0||off===0){warn('倍率为 0 的时段消耗完全不计入配额');return}
+  if(peak<1&&off<1){warn('所有时段倍率均小于 1，名义限额将失去参照意义，建议保留一档为 1.0');return}
+  const inPeak=ranges.length?nowInPeakHours(ranges):false;
+  const cur=inPeak?peak:off;
+  const limit=Number((document.forms.settingsForm&&document.forms.settingsForm.profileQuota||{}).value)||0;
+  const equiv=(cur>0&&limit>0)?' · '+fmtRateTk(limit)+' 额度 ≈ '+fmtRateTk(Math.round(limit/cur))+' 实际 token':'';
+  el.innerHTML='当前处于'+(inPeak?'高峰':'低谷')+' <b>×'+cur+'</b>（高峰 ×'+peak+' / 低谷 ×'+off+'）'+equiv;
+  el.style.color='var(--dim)';
+}
+function fmtRateTk(n){n=Number(n)||0;if(n>=1e6)return(n/1e6).toFixed(2)+'M';if(n>=1e3)return(n/1e3).toFixed(1)+'k';return String(n)}
+['peakQuotaRateInput','offPeakQuotaRateInput'].forEach(function(id){
+  var el=document.getElementById(id);
+  if(el)el.addEventListener('input',updateQuotaRateHint);
+});
+(function(){var q=document.forms.settingsForm&&document.forms.settingsForm.profileQuota;if(q)q.addEventListener('input',updateQuotaRateHint)})();
 setInterval(updatePeakHoursStatus,30000);
 // Initial render: fill rows for the profile the page was opened with.
 (function(){
@@ -5099,6 +5325,8 @@ async function editProfile(n){
   document.getElementById('profileNameInput').value=p.name||'';
   renderAliasRows(p);
   if(fm.profileQuota)fm.profileQuota.value=p.dailyTokenLimit||0;
+  const pqr=document.getElementById('peakQuotaRateInput');if(pqr)pqr.value=(p.peakQuotaRate??1);
+  const oqr=document.getElementById('offPeakQuotaRateInput');if(oqr)oqr.value=(p.offPeakQuotaRate??1);
   const bt=fm.querySelector('select[name="billingType"]');if(bt)bt.value=p.billingType||'on_demand';
   renderPeakHoursRows(p.peakHours||[]);
   refreshBridgeSelect(p);
@@ -5225,8 +5453,11 @@ function openQuotaOp(key){
   const pu=((SETTINGS.profileAssignments||{})[suffix]||{})[key];
   const profile=(SETTINGS.profiles||[]).find(p=>p.suffix===suffix)||{};
   const base=(pu&&pu.dailyTokenLimit>0)?pu.dailyTokenLimit:(profile.dailyTokenLimit||0);
+  // Note the unit when weighting is on: bonus/reset amounts are weighted tokens,
+  // not raw ones, so an admin typing "1,000,000" is granting 1M of quota currency.
+  const weighted=(profile.peakQuotaRate!==undefined&&(profile.peakQuotaRate!==1||profile.offPeakQuotaRate!==1));
   document.getElementById('qoTitle').textContent='临时额度 · '+username;
-  document.getElementById('qoInfo').innerHTML='方案：'+h(profile.name||suffix)+' /'+h(suffix)+' · 基础每日配额：'+(base>0?(base.toLocaleString('zh-CN')+(pu&&pu.dailyTokenLimit>0?'（个人）':'（方案级）')):'<span style="color:var(--orange)">未设置（当前无限制）</span>');
+  document.getElementById('qoInfo').innerHTML='方案：'+h(profile.name||suffix)+' /'+h(suffix)+' · 基础每日配额：'+(base>0?(base.toLocaleString('zh-CN')+(pu&&pu.dailyTokenLimit>0?'（个人）':'（方案级）')+(weighted?' <span style="color:var(--accent)">· 计权口径（峰 ×'+profile.peakQuotaRate+' / 谷 ×'+profile.offPeakQuotaRate+'）</span>':'')):'<span style="color:var(--orange)">未设置（当前无限制）</span>');
   document.getElementById('qoBonusInput').value='';
   const noBase=!(base>0);
   document.getElementById('qoSetBtn').disabled=noBase;
@@ -5243,6 +5474,7 @@ function qoRenderStatus(q){
   if(op&&op.bonus>0)parts.push('<span style="font-size:11px;color:var(--green);border:1px solid var(--green);border-radius:3px;padding:1px 5px">今日临时 +'+qFmt(op.bonus)+'</span>');
   if(op&&op.reset_baseline>0)parts.push('<span style="font-size:11px;color:var(--accent);border:1px solid var(--accent);border-radius:3px;padding:1px 5px">今日已重置</span>');
   if(q&&q.limit>0)parts.push('<span style="font-size:11px;color:var(--dim)">生效额度 '+q.limit.toLocaleString('zh-CN')+' · 已用 '+q.used.toLocaleString('zh-CN')+' · 剩余 '+q.remaining.toLocaleString('zh-CN')+'</span>');
+  if(q&&q.rawUsed!=null&&q.rawUsed!==q.used){const d=q.rawUsed-q.used;parts.push('<span style="font-size:11px;color:var(--accent)">实际 '+q.rawUsed.toLocaleString('zh-CN')+'（'+(q.inPeak?'高峰':'低谷')+' ×'+q.rate+(d>0?' 已抵扣 '+qFmt(d):' 已加收 '+qFmt(-d))+'）</span>')}
   if(!op&&!q)parts.push('<span style="font-size:12px;color:var(--dim)">今日暂无手工操作</span>');
   document.getElementById('qoStatus').innerHTML=parts.join(' ');
   document.getElementById('qoClearBtn').style.display=op?'':'none';
@@ -5704,7 +5936,7 @@ function render(){
   document.getElementById("cards").innerHTML=c("今日用量",todayTokens,"var(--accent)",1)+c("今日请求",tR,"var(--blue)",1)+c("总用量",allTokens,"var(--green)",1)+c("总请求",tr,"var(--orange)",1)+c("今日错误",(Array.isArray(D.errors)?D.errors:[]).filter(e=>e.time&&e.time.startsWith(td)).length,"var(--red)",1);
   runCountUps(document.getElementById("cards"));
   const psb=document.getElementById("profileSummaryBody"),profiles=Array.isArray(D.profileSummaries)?D.profileSummaries:[];
-  const rowOf=p=>{const st=p.breakerState||"UNKNOWN";const rl=p.rateLimit;let col,led,stateLabel;if(rl){col='var(--red)';led='err';const rm=new Date(rl.resumeAt);stateLabel='限额中 '+String(rm.getHours()).padStart(2,'0')+':'+String(rm.getMinutes()).padStart(2,'0')+'恢复';}else{col=st==="CLOSED"?"var(--green)":st==="HALF_OPEN"?"var(--orange)":"var(--red)";led=st==="CLOSED"?"on":st==="HALF_OPEN"?"warn":"err";stateLabel=st==="CLOSED"?"正常":st==="HALF_OPEN"?"探测中":"熔断";}const current=currentProfile!=="all"&&p.suffix===currentProfile;const gBadge=p.inDefaultGroup?' <span style="color:var(--blue);font-size:10px;font-weight:600">默认组·'+(p.groupOrder+1)+'</span>':'';const rBadge=p.inResponsesGroup?' <span style="color:var(--blue);font-size:10px;font-weight:600">Resp组·'+(p.responsesGroupOrder+1)+'</span>':'';const protoBadge=p.protocol==='responses'?' <span style="color:var(--blue);font-size:10px">Codex</span>':'';const bLabel=p.billingType==='coding_plan'?' <span style="color:var(--dim);font-size:10px">CP</span>':p.billingType==='token_plan'?' <span style="color:var(--dim);font-size:10px">TP</span>':'';const pk=(p.peakHours&&p.peakHours.length)?(function(rs){const now=new Date(),cur=((now.getTime()+8*3600000)%86400000)/60000;const tm=function(t){if(!t)return null;const a=t.split(':');return (+a[0])*60+(+a[1])};const inPk=rs.some(function(r){const s=tm(r.start),e=tm(r.end);return s!==null&&e!==null&&s!==e&&(s<e?(cur>=s&&cur<e):(cur>=s||cur<e))});return ' <span style="color:'+(inPk?'var(--orange)':'var(--dim)')+';font-size:10px" title="高峰时段(北京时间) '+rs.map(function(r){return r.start+'-'+r.end}).join(', ')+'">'+(inPk?'高峰中':rs.map(function(r){return r.start+'-'+r.end}).join(','))+'</span>'})(p.peakHours):'';const restricted=(p.inDefaultGroup&&profiles.filter(x=>x.inDefaultGroup).length>=2)||(p.inResponsesGroup&&profiles.filter(x=>x.inResponsesGroup).length>=2);const entryCode=p.protocol==='responses'?'/v1/responses':'/v1';const defBadge=(p.isDefault||p.isResponsesDefault)?' <span style="color:var(--green);font-size:11px;font-weight:600;vertical-align:middle">默认</span>':'';return'<tr'+(current?' class="profile-current" aria-current="true"':'')+'><td>'+escH(p.name)+defBadge+gBadge+rBadge+protoBadge+bLabel+pk+(current?' <span class="current-mark">当前</span>':'')+'</td><td>'+(restricted?'<code>'+entryCode+'</code> <span style="color:var(--dim);font-size:10px">仅 '+entryCode+'</span>':'<code>/'+escH(p.suffix)+'</code>'+((p.isDefault||p.isResponsesDefault)?' <span style="color:var(--dim)">/ <code>'+entryCode+'</code></span>':''))+'</td><td style="font-size:12px;color:var(--dim);max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+escH((p.upstream||'').replace('https://','').replace('http://',''))+'</td><td class="n">'+fmtT(p.todayRequests||0)+'</td><td class="n hl">'+fmtT(p.todayTokens||0)+'</td><td><span class="led '+led+'"></span><span style="color:'+col+';font-size:12px">'+stateLabel+'</span></td></tr>'};
+  const rowOf=p=>{const st=p.breakerState||"UNKNOWN";const rl=p.rateLimit;let col,led,stateLabel;if(rl){col='var(--red)';led='err';const rm=new Date(rl.resumeAt);stateLabel='限额中 '+String(rm.getHours()).padStart(2,'0')+':'+String(rm.getMinutes()).padStart(2,'0')+'恢复';}else{col=st==="CLOSED"?"var(--green)":st==="HALF_OPEN"?"var(--orange)":"var(--red)";led=st==="CLOSED"?"on":st==="HALF_OPEN"?"warn":"err";stateLabel=st==="CLOSED"?"正常":st==="HALF_OPEN"?"探测中":"熔断";}const current=currentProfile!=="all"&&p.suffix===currentProfile;const gBadge=p.inDefaultGroup?' <span style="color:var(--blue);font-size:10px;font-weight:600">默认组·'+(p.groupOrder+1)+'</span>':'';const rBadge=p.inResponsesGroup?' <span style="color:var(--blue);font-size:10px;font-weight:600">Resp组·'+(p.responsesGroupOrder+1)+'</span>':'';const protoBadge=p.protocol==='responses'?' <span style="color:var(--blue);font-size:10px">Codex</span>':'';const bLabel=p.billingType==='coding_plan'?' <span style="color:var(--dim);font-size:10px">CP</span>':p.billingType==='token_plan'?' <span style="color:var(--dim);font-size:10px">TP</span>':'';const pk=(p.peakHours&&p.peakHours.length)?(function(rs){const now=new Date(),cur=((now.getTime()+8*3600000)%86400000)/60000;const tm=function(t){if(!t)return null;const a=t.split(':');return (+a[0])*60+(+a[1])};const inPk=rs.some(function(r){const s=tm(r.start),e=tm(r.end);return s!==null&&e!==null&&s!==e&&(s<e?(cur>=s&&cur<e):(cur>=s||cur<e))});return ' <span style="color:'+(inPk?'var(--orange)':'var(--dim)')+';font-size:10px" title="高峰时段(北京时间) '+rs.map(function(r){return r.start+'-'+r.end}).join(', ')+'">'+(inPk?'高峰中':rs.map(function(r){return r.start+'-'+r.end}).join(','))+'</span>'})(p.peakHours):'';const rt2=(function(){if(p.peakQuotaRate==null&&p.offPeakQuotaRate==null)return'';const pr=p.peakQuotaRate==null?1:p.peakQuotaRate,orr=p.offPeakQuotaRate==null?1:p.offPeakQuotaRate;if(pr===1&&orr===1)return'';var now=new Date(),cur=((now.getTime()+8*3600000)%86400000)/60000;var tm=function(t){if(!t)return null;var a=t.split(':');return (+a[0])*60+(+a[1])};var ip=(p.peakHours||[]).some(function(r){var s=tm(r.start),e=tm(r.end);return s!==null&&e!==null&&s!==e&&(s<e?(cur>=s&&cur<e):(cur>=s||cur<e))});return ' <span style="color:var(--accent);font-size:10px" title="配额倍率：高峰 ×'+pr+' / 低谷 ×'+orr+'（当前'+(ip?'高峰':'低谷')+'）">×'+(ip?pr:orr)+'</span>'})();const restricted=(p.inDefaultGroup&&profiles.filter(x=>x.inDefaultGroup).length>=2)||(p.inResponsesGroup&&profiles.filter(x=>x.inResponsesGroup).length>=2);const entryCode=p.protocol==='responses'?'/v1/responses':'/v1';const defBadge=(p.isDefault||p.isResponsesDefault)?' <span style="color:var(--green);font-size:11px;font-weight:600;vertical-align:middle">默认</span>':'';return'<tr'+(current?' class="profile-current" aria-current="true"':'')+'><td>'+escH(p.name)+defBadge+gBadge+rBadge+protoBadge+bLabel+pk+rt2+(current?' <span class="current-mark">当前</span>':'')+'</td><td>'+(restricted?'<code>'+entryCode+'</code> <span style="color:var(--dim);font-size:10px">仅 '+entryCode+'</span>':'<code>/'+escH(p.suffix)+'</code>'+((p.isDefault||p.isResponsesDefault)?' <span style="color:var(--dim)">/ <code>'+entryCode+'</code></span>':''))+'</td><td style="font-size:12px;color:var(--dim);max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+escH((p.upstream||'').replace('https://','').replace('http://',''))+'</td><td class="n">'+fmtT(p.todayRequests||0)+'</td><td class="n hl">'+fmtT(p.todayTokens||0)+'</td><td><span class="led '+led+'"></span><span style="color:'+col+';font-size:12px">'+stateLabel+'</span></td></tr>'};
   const anthProfiles=profiles.filter(p=>p.protocol!=="responses"),respProfiles=profiles.filter(p=>p.protocol==="responses");
   const protoRow=(label,entry,count)=>'<tr class="proto-row"><td colspan="6">'+label+' · 入口 '+entry+' · '+count+' 个方案</td></tr>';
   let psbHtml="";
@@ -5818,7 +6050,7 @@ function render(){
   // User table
   const ut=document.querySelector("#uTable tbody");
   const ul=Object.entries(D.users).sort((a,b)=>totalTokens(b[1])-totalTokens(a[1]));
-  if(!ul.length){ut.innerHTML='<tr><td colspan="11" class="empty">暂无数据</td></tr>'}else{ut.innerHTML=ul.map(([uk,u],idx)=>{const on=u.lastActive&&Date.now()-new Date(u.lastActive).getTime()<36e5;const effQ=(D.userQuotaEff||{})[uk];const uq=effQ?effQ.limit:((D.userQuotas||{})[uk]||D.profileQuota||0);const td2=(D.daily||{})[td]||{};const tdu=td2[uk]||{};const used=effQ?effQ.used:ioTokens(tdu);const qPct=uq>0?Math.min(100,Math.round(used/uq*100)):0;const rank='<span class="rank">'+(idx+1)+'.</span>';const qTag=effQ&&effQ.bonus>0?' <span style="font-size:10px;color:var(--green);border:1px solid var(--green);border-radius:3px;padding:0 3px;white-space:nowrap" title="今日临时加量，明日自动失效">+'+fmtTk(effQ.bonus)+'</span>':(effQ&&effQ.resetApplied?' <span style="font-size:10px;color:var(--accent);border:1px solid var(--accent);border-radius:3px;padding:0 3px;white-space:nowrap" title="今日用量已重置（统计保留）">已重置</span>':'');const qCell=uq>0?'<span style="color:var(--accent);font-size:12px">'+qPct+'%</span> '+quotaBar(qPct)+qTag:'<span style="color:var(--dim)">-</span>';return'<tr><td>'+rank+escH(u.name)+'</td><td><span class="led '+(on?'on':'')+'"></span><span style="color:'+(on?'var(--green)':'var(--dim)')+';font-size:12px">'+(on?'在线':'离线')+'</span></td><td class="n">'+fmtT(u.totalRequests)+'</td><td class="n">'+fmtT(u.totalInputTokens)+'</td><td class="n">'+fmtT(u.totalOutputTokens)+'</td><td class="n">'+fmtT(u.cacheCreationTokens || 0)+'</td><td class="n">'+fmtT(u.cacheReadTokens || 0)+'</td><td class="n hl">'+fmtT(ioTokens(u))+'</td><td class="n">'+fmtT(ioTokens(tdu))+'</td><td class="n" style="white-space:nowrap">'+qCell+'</td><td style="font-size:12px;color:var(--dim)">'+ago(u.lastActive)+'</td></tr>'}).join("")}
+  if(!ul.length){ut.innerHTML='<tr><td colspan="11" class="empty">暂无数据</td></tr>'}else{ut.innerHTML=ul.map(([uk,u],idx)=>{const on=u.lastActive&&Date.now()-new Date(u.lastActive).getTime()<36e5;const effQ=(D.userQuotaEff||{})[uk];const uq=effQ?effQ.limit:((D.userQuotas||{})[uk]||D.profileQuota||0);const td2=(D.daily||{})[td]||{};const tdu=td2[uk]||{};const used=effQ?effQ.used:ioTokens(tdu);const qPct=uq>0?Math.min(100,Math.round(used/uq*100)):0;const rank='<span class="rank">'+(idx+1)+'.</span>';const qTag=effQ&&effQ.bonus>0?' <span style="font-size:10px;color:var(--green);border:1px solid var(--green);border-radius:3px;padding:0 3px;white-space:nowrap" title="今日临时加量，明日自动失效">+'+fmtTk(effQ.bonus)+'</span>':(effQ&&effQ.resetApplied?' <span style="font-size:10px;color:var(--accent);border:1px solid var(--accent);border-radius:3px;padding:0 3px;white-space:nowrap" title="今日用量已重置（统计保留）">已重置</span>':'');const rTag=(effQ&&effQ.rate!=null&&effQ.rate!==1)?' <span style="font-size:10px;color:var(--dim);border:1px solid var(--border);border-radius:3px;padding:0 3px;white-space:nowrap" title="配额倍率 ×'+effQ.rate+'（当前时段）· 实际 '+fmtT(effQ.rawUsed||0)+'，计入配额 '+fmtT(effQ.used||0)+'">×'+effQ.rate+'</span>':'';const qCell=uq>0?'<span style="color:var(--accent);font-size:12px">'+qPct+'%</span> '+quotaBar(qPct)+qTag+rTag:'<span style="color:var(--dim)">-</span>';return'<tr><td>'+rank+escH(u.name)+'</td><td><span class="led '+(on?'on':'')+'"></span><span style="color:'+(on?'var(--green)':'var(--dim)')+';font-size:12px">'+(on?'在线':'离线')+'</span></td><td class="n">'+fmtT(u.totalRequests)+'</td><td class="n">'+fmtT(u.totalInputTokens)+'</td><td class="n">'+fmtT(u.totalOutputTokens)+'</td><td class="n">'+fmtT(u.cacheCreationTokens || 0)+'</td><td class="n">'+fmtT(u.cacheReadTokens || 0)+'</td><td class="n hl">'+fmtT(ioTokens(u))+'</td><td class="n">'+fmtT(ioTokens(tdu))+'</td><td class="n" style="white-space:nowrap">'+qCell+'</td><td style="font-size:12px;color:var(--dim)">'+ago(u.lastActive)+'</td></tr>'}).join("")}
 
   renderDetail();
 
@@ -6383,12 +6615,37 @@ function switchProtocolView(proto){
   if(D)load();
 }
 document.querySelectorAll('#protoSeg button').forEach(b=>b.addEventListener('click',()=>switchProtocolView(b.dataset.proto)));
+// Quota-rate helpers. rate===null means the aggregate view (rates differ per
+// profile), so only the combined discount is shown, never a single multiplier.
+function rateTag(q){
+  if(q.rate===null||q.rate===undefined||q.rate===1)return'';
+  const col=q.inPeak?'var(--orange)':'var(--green)';
+  const t=(q.inPeak?'高峰':'低谷')+'倍率 ×'+q.rate+'，消耗按此比例计入配额';
+  return ' <span class="tag" style="background:rgba(0,0,0,.04);color:'+col+'" title="'+t+'">'+(q.inPeak?'高峰':'低谷')+' ×'+q.rate+'</span>';
+}
+function rateFootnote(q){
+  if(q.rawUsed==null||q.rawUsed===q.used)return'';
+  const delta=q.rawUsed-q.used;
+  return '<div style="margin-top:6px;font-size:10px;color:var(--dim)">实际 '+fmtTk(q.rawUsed)+' · '+(delta>0?'已抵扣 '+fmtTk(delta):'已加收 '+fmtTk(-delta))+'</div>';
+}
 function renderQNotice(q){
   const el=document.getElementById('qNotice');
   let html='';
   if(q.limit>0&&q.bonus>0){
     const base=q.limit-q.bonus;
     html+='<div class="qnotice bonus show"><span class="qi">加</span><div><b>今日临时加量已生效</b> — 管理员为你追加 <span class="hl">+'+fmtTk(q.bonus)+'</span> 临时额度（'+fmtT(q.bonus)+' tokens）。今日总额度 <b>'+fmtT(q.limit)+'</b>（基础 '+fmtT(base)+' + 临时 '+fmtTk(q.bonus)+'），将于<b>明日零点自动恢复</b>为基础额度，无需任何操作。</div></div>';
+  }
+  if(q.rawUsed!=null&&q.rawUsed!==q.used){
+    const slot=q.rate===null?'':(q.inPeak?'高峰':'低谷');
+    const delta=q.rawUsed-q.used;
+    const nx=q.nextRateChange;
+    html+='<div class="qnotice bonus show"><span class="qi">率</span><div><b>配额倍率生效中</b> — '
+      +(q.rate!==null&&q.rate!==undefined?'当前'+slot+'时段，消耗按 <span class="hl">×'+q.rate+'</span> 计入配额。':'当前各方案倍率不同，下列为合计值。')
+      +'今日实际使用 <b>'+fmtT(q.rawUsed)+'</b> tokens，'
+      +(delta>0?'已为你抵扣 <span class="hl">'+fmtTk(delta)+'</span> 额度':'额外加收 <span class="hl">'+fmtTk(-delta)+'</span> 额度')
+      +'（计入配额 '+fmtT(q.used)+'）。'
+      +(nx?'<b>'+nx.at+'</b> 后转入'+(nx.toPeak?'高峰':'低谷')+' ×'+nx.rate+'。':'')
+      +'</div></div>';
   }
   if(q.resetApplied){
     html+='<div class="qnotice reset show"><span class="qi">重</span><div><b>今日用量已被管理员重置</b> — 配额已恢复满额，可立即继续使用。下方「今日用量」等统计数字仍为今日实际消耗（统计报表保留），配额判定已从重置时刻重新计算。</div></div>';
@@ -6407,13 +6664,16 @@ function render(){
   const q=D.quota,t=D.today;
   const pct=q.limit>0?Math.min(100,Math.round(q.used/q.limit*100)):0;
   const color=pct>90?'var(--red)':pct>70?'var(--orange)':'var(--green)';
-  document.getElementById('meta').innerHTML=D.username+' · 方案: '+D.profile+linkTag+(q.limit>0?' · <span style="color:'+color+'">'+pct+'% 已用</span> '+hpBar(pct,16)+(q.autoAdjusted?' <span class="tag">AUTO</span>':'')+(q.bonus>0?' <span class="tag" style="background:rgba(46,164,79,.12);color:var(--green)" title="管理员今日临时加量，明日自动失效">临时+'+fmtTk(q.bonus)+'</span>':'')+(q.resetApplied?' <span class="tag" title="管理员已重置今日用量，统计数据保留">已重置</span>':''):' · 无配额限制');
+  document.getElementById('meta').innerHTML=D.username+' · 方案: '+D.profile+linkTag+(q.limit>0?' · <span style="color:'+color+'">'+pct+'% 已用</span> '+hpBar(pct,16)+rateTag(q)+(q.autoAdjusted?' <span class="tag">AUTO</span>':'')+(q.bonus>0?' <span class="tag" style="background:rgba(46,164,79,.12);color:var(--green)" title="管理员今日临时加量，明日自动失效">临时+'+fmtTk(q.bonus)+'</span>':'')+(q.resetApplied?' <span class="tag" title="管理员已重置今日用量，统计数据保留">已重置</span>':''):' · 无配额限制'+rateTag(q));
   renderQNotice(q);
   document.getElementById('cards').innerHTML=
     '<div class="card"><div class="l">今日用量 <span style="font-size:9px;color:var(--dim);font-weight:400">输入+输出</span></div><div class="v" data-cu="'+ioTokens(t)+'" data-cu-k style="color:var(--accent)">0</div></div>'+
     '<div class="card"><div class="l">今日请求</div><div class="v" data-cu="'+t.requests+'" data-cu-k style="color:var(--blue)">0</div></div>'+
-    (q.limit>0?'<div class="card"'+(q.bonus>0?' style="border-top:2px solid var(--green)"':'')+'><div class="l">剩余额度'+(q.bonus>0?' <span class="tag" style="background:rgba(47,110,80,.1);color:var(--green)">含临时加量</span>':'')+'</div><div class="v" data-cu="'+q.remaining+'" data-cu-k style="color:'+color+'">0</div><div style="margin-top:8px">'+hpBar(pct,16)+'</div></div>'+
-    '<div class="card"><div class="l">每日限额</div><div class="v" data-cu="'+q.limit+'" data-cu-k style="color:var(--dim)">0</div>'+(q.bonus>0?'<div style="margin-top:6px;font-size:10px;color:var(--green);font-weight:550">基础 '+fmtTk(q.limit-q.bonus)+' + 临时 '+fmtTk(q.bonus)+'</div>':'')+'</div>':'')+
+    // Weighted card only appears when weighting is live — otherwise it would just
+    // duplicate 今日用量 and add noise.
+    (((q.rawUsed!=null&&q.rawUsed!==q.used)||(q.rate!==null&&q.rate!==undefined&&q.rate!==1))?'<div class="card" style="border-top:2px solid var(--accent)"><div class="l">计权用量 <span style="font-size:9px;color:var(--dim);font-weight:400">计入配额</span></div><div class="v" data-cu="'+q.used+'" data-cu-k style="color:var(--accent)">0</div>'+rateFootnote(q)+'</div>':'')+
+    (q.limit>0?'<div class="card"'+(q.bonus>0?' style="border-top:2px solid var(--green)"':'')+'><div class="l">剩余额度'+(q.bonus>0?' <span class="tag" style="background:rgba(47,110,80,.1);color:var(--green)">含临时加量</span>':'')+'</div><div class="v" data-cu="'+q.remaining+'" data-cu-k style="color:'+color+'">0</div><div style="margin-top:8px">'+hpBar(pct,16)+'</div>'+rateFootnote(q)+'</div>'+
+    '<div class="card"><div class="l">每日限额'+((q.rate!==null&&q.rate!==undefined&&q.rate!==1)?' <span style="font-size:9px;color:var(--dim);font-weight:400">计权口径</span>':'')+'</div><div class="v" data-cu="'+q.limit+'" data-cu-k style="color:var(--dim)">0</div>'+(q.bonus>0?'<div style="margin-top:6px;font-size:10px;color:var(--green);font-weight:550">基础 '+fmtTk(q.limit-q.bonus)+' + 临时 '+fmtTk(q.bonus)+'</div>':'')+'</div>':'')+
     '<div class="card"><div class="l">今日输入</div><div class="v" data-cu="'+t.input+'" data-cu-k style="color:var(--green)">0</div></div>'+
     '<div class="card"><div class="l">今日输出</div><div class="v" data-cu="'+t.output+'" data-cu-k style="color:var(--orange)">0</div></div>'+
     '<div class="card"><div class="l">今日缓存写入</div><div class="v" data-cu="'+t.cacheWrite+'" data-cu-k>0</div></div>'+
@@ -6484,6 +6744,10 @@ function settingsAuditDiff(snap, now) {
     if (a === b) continue;
     const changed = jsonChangedKeys(a, b);
     parts.push(`方案 "${name}"${changed.length ? `(${changed.join(", ")})` : ""}`);
+    // Quota rates silently re-price everyone's effective allowance, so spell the
+    // old→new values out instead of leaving just a field name in the log.
+    const rateText = quotaRateChangeText(a, b);
+    if (rateText) parts.push(`方案 "${name}" 配额倍率：${rateText}`);
     if (!target) target = name;
   }
   const proxyChanged = jsonChangedKeys(snap.proxy, now.proxy);
@@ -6492,6 +6756,18 @@ function settingsAuditDiff(snap, now) {
   if (quotaChanged.length) parts.push(`自动配额(${quotaChanged.join(", ")})`);
   if (snap.users !== now.users) parts.push("全局用户配置");
   return { target, text: parts.join("；") };
+}
+
+function quotaRateChangeText(beforeJson, afterJson) {
+  let before, after;
+  try { before = JSON.parse(beforeJson || "{}"); after = JSON.parse(afterJson || "{}"); }
+  catch { return ""; }
+  const bits = [];
+  for (const [field, label] of [["peakQuotaRate", "峰"], ["offPeakQuotaRate", "谷"]]) {
+    const b = normalizeQuotaRate(before[field]), a = normalizeQuotaRate(after[field]);
+    if (b !== a) bits.push(`${label} ${b}→${a}`);
+  }
+  return bits.join(" / ");
 }
 
 function applySettings(formData) {
@@ -6539,11 +6815,19 @@ function applySettings(formData) {
     editingProfile.billingType = formData.billingType;
   }
 
-  // Update peak hours (display-only recurring daily time ranges)
+  // Update peak hours (recurring daily ranges; drive peak aliases + quota rates)
   if (!isGlobalOnlySave && formData.peakStart !== undefined) {
     const starts = [].concat(formData.peakStart);
     const ends = [].concat(formData.peakEnd);
     editingProfile.peakHours = normalizePeakHours(starts.map((s, i) => ({ start: s, end: ends[i] })));
+  }
+
+  // Update quota rates (weighting applied to future requests only)
+  if (!isGlobalOnlySave && formData.peakQuotaRate !== undefined) {
+    editingProfile.peakQuotaRate = normalizeQuotaRate(formData.peakQuotaRate);
+  }
+  if (!isGlobalOnlySave && formData.offPeakQuotaRate !== undefined) {
+    editingProfile.offPeakQuotaRate = normalizeQuotaRate(formData.offPeakQuotaRate);
   }
 
   // Update auto quota adjustment settings
@@ -7144,6 +7428,8 @@ const server = http.createServer((req, res) => {
           isDefault: false,
           billingType: validBilling,
           peakHours: [],
+          peakQuotaRate: 1,
+          offPeakQuotaRate: 1,
         };
         saveConfig(config);
         reloadAllRuntimes();
@@ -7357,7 +7643,7 @@ const server = http.createServer((req, res) => {
           const q = getUserQuota(k, targetRt);
           if (q > 0) data.userQuotas[k.slice(0, 8) + "****"] = q;
           const eff = checkTokenQuota(k, targetSuffix, targetRt);
-          if (eff.limit > 0) data.userQuotaEff[k.slice(0, 8) + "****"] = { limit: eff.limit, used: eff.used, bonus: eff.bonus || 0, resetApplied: !!eff.resetApplied };
+          if (eff.limit > 0) data.userQuotaEff[k.slice(0, 8) + "****"] = { limit: eff.limit, used: eff.used, bonus: eff.bonus || 0, resetApplied: !!eff.resetApplied, rawUsed: eff.rawUsed, discounted: eff.discounted, rate: eff.rate };
         }
       } else {
         res.writeHead(404, { "Content-Type": "application/json" });
@@ -7439,7 +7725,11 @@ const server = http.createServer((req, res) => {
 
         const today = cnDate();
         const op = stmts.getQuotaDailyOp.get(sfx, key, today) || { bonus: 0, reset_baseline: 0 };
-        const rawUsed = stmts.todayUsageForQuota.get(sfx, today, key).used;
+        // The baseline must be stored in the weighted currency that
+        // checkTokenQuota subtracts it from; `todayRaw` is only for the log/audit
+        // text so the admin sees both figures.
+        const todayRow = stmts.todayWeightedForQuota.get(sfx, today, key);
+        const weightedUsed = todayRow.used, todayRaw = todayRow.raw;
         const now = new Date().toISOString();
         let bonus = op.bonus || 0, baseline = op.reset_baseline || 0, resetTime = op.reset_time || null;
         const userName = getUserName(key, runtime);
@@ -7455,9 +7745,9 @@ const server = http.createServer((req, res) => {
           stmts.trimQuotaAdjust.run();
           console.log(`[临时额度] ${userName} /${sfx} 当日加量 ${(op.bonus || 0).toLocaleString()} → ${bonus.toLocaleString()}（明日自动失效）`);
         } else if (action === "reset") {
-          baseline = rawUsed;
+          baseline = weightedUsed;
           resetTime = now;
-          console.log(`[临时额度] ${userName} /${sfx} 今日用量已重置（基线 ${rawUsed.toLocaleString()}，统计数据保留）`);
+          console.log(`[临时额度] ${userName} /${sfx} 今日用量已重置（计权基线 ${weightedUsed.toLocaleString()} / 实际 ${todayRaw.toLocaleString()}，统计数据保留）`);
         } else {
           console.log(`[临时额度] ${userName} /${sfx} 已撤销今日全部手工额度操作`);
         }
@@ -7472,7 +7762,7 @@ const server = http.createServer((req, res) => {
             `设置 ${userName} 当日临时加量：${(op.bonus || 0).toLocaleString()} → ${bonus.toLocaleString()}（基础 ${baseLimit.toLocaleString()}，明日自动失效）`);
         } else if (action === "reset") {
           recordAdminAudit(req, "quota.reset", `/${sfx} · ${maskAuditKey(key)}`,
-            `重置 ${userName} 今日用量（基线 ${rawUsed.toLocaleString()}，配额恢复满额，统计保留）`);
+            `重置 ${userName} 今日用量（计权基线 ${weightedUsed.toLocaleString()}${todayRaw !== weightedUsed ? ` / 实际 ${todayRaw.toLocaleString()}` : ""}，配额恢复满额，统计保留）`);
         } else {
           recordAdminAudit(req, "quota.clear", `/${sfx} · ${maskAuditKey(key)}`, `撤销 ${userName} 今日全部手工额度操作`);
         }

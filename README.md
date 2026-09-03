@@ -14,6 +14,7 @@ Claude Code 走 Anthropic Messages 协议（`/v1/messages`），Codex 走 OpenAI
 - 每位成员使用独立的 `jx-` 虚拟 Key，真实上游 Key 不暴露
 - 按成员、方案、模型、日期和小时统计 Token 用量（含缓存 token）
 - 方案级与成员级每日配额，北京时间零点重置
+- 配额倍率：高峰/低谷时段按倍率计权扣额，低谷折扣让同样的限额更耐用
 - 统一的 `alias=实际模型` 模型别名配置，对 Claude Code 与 Codex 同样生效
 - 模型准入、并发限制、速率限制、重试和熔断保护
 - 桌面单屏 Dashboard、设置页与成员个人用量页
@@ -80,6 +81,9 @@ node server.mjs
       "isDefault": true,
       "upstream": "https://open.bigmodel.cn/api/anthropic",
       "dailyTokenLimit": 2000000,
+      "peakHours": [{ "start": "09:00", "end": "12:00" }],
+      "peakQuotaRate": 1,
+      "offPeakQuotaRate": 0.5,
       "allowedModels": ["glm-5.1"],
       "modelAliases": {
         "jx-sonnet": "glm-5.1",
@@ -230,6 +234,29 @@ experimental_bearer_token = "jx-your-virtual-key"
 
 达到限额时返回 429、`type: "quota_exceeded"` 和距北京时间下一个零点的 `Retry-After`。配额、并发和速率限制产生的 429 都会进入错误记录。
 
+### 配额倍率（峰谷计权）
+
+每个方案可以配一对配额倍率，把「消耗多少 token」和「扣多少额度」解耦：
+
+```text
+扣除额度 = (输入 + 输出) × 当前时段倍率
+```
+
+- 命中「高峰时段」用 `peakQuotaRate`，其余时间用 `offPeakQuotaRate`（**不设高峰时段 = 全天按低谷倍率**，设置页会就此告警）
+- 默认均为 `1.0`，即与不启用倍率时的行为完全一致
+- 倍率在请求落库时结算并写入 `weighted_tokens`，**改倍率只影响之后的请求，已产生的消耗不会重算**。需要追溯补偿请用上面的手工临时额度
+- 统计报表、图表、导出始终显示真实 token，倍率只作用于配额判定
+- 自动配额调整同样读取计权用量，不会把折扣二次放大
+
+建议以「高峰期 Coding Plan 方案 = 1.0」为基准，让名义限额有确切含义（1 额度 = 1 个高峰期基准 token）：
+
+| 方案类型 | 高峰 | 低谷 | 说明 |
+| --- | --- | --- | --- |
+| Coding Plan（如 GLM） | 1.0 | 0.5 | 低谷期上游闲置，同样的额度更耐用 |
+| 按量计费（如 DeepSeek） | 2.0 | 1.5 | 真实成本更高，用倍率显式定价 |
+
+倍率变更会写入操作审计日志（含旧值→新值）。个人用量页会同时显示真实用量、计权用量和已抵扣额度；超额 429 的文案也会带上实际 token、抵扣数额与下一次倍率切换时刻。
+
 ### 手工临时额度
 
 在设置页「用户管理」弹窗中，每个方案内用户可以使用「临时额度」按钮进行当日手工干预（接口 `POST /api/quota/daily-op`）：
@@ -361,6 +388,8 @@ Anthropic Messages 代理使用虚拟 Key 鉴权。管理类写入接口除登�
 - `backups/`：破坏性迁移、替换导入和数据清空前的本地备份
 
 运行中的旧版 `data.json` 可通过设置页导入。首次启动且 SQLite 为空时，服务也会自动迁移同目录下的旧文件并将其重命名为 `data.json.migrated`。
+
+数据库结构变更（如为配额倍率新增的 `weighted_tokens` 列）在启动时幂等执行：先把整库备份到 `backups/`，再加列并按倍率 1.0 回填历史数据，重启不会重复执行。**升级后不建议回滚到旧版本**——旧版写入不含该列，会导致配额少算。
 
 ## 技术栈
 

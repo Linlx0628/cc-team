@@ -19,6 +19,7 @@
       ],
       "peakQuotaRate": 1,
       "offPeakQuotaRate": 1,
+      "modelQuotaRates": {},
       "users": {
         "jx-example-user": {
           "key": "replace-with-real-upstream-key",

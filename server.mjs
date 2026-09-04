@@ -356,6 +356,7 @@ const removedOpenAIUserKeys = new Set();
     // the previous behaviour; discounts are opted into per profile from the UI.
     if (p.peakQuotaRate === undefined) { p.peakQuotaRate = 1; migrated = true; }
     if (p.offPeakQuotaRate === undefined) { p.offPeakQuotaRate = 1; migrated = true; }
+    if (p.modelQuotaRates === undefined) { p.modelQuotaRates = {}; migrated = true; }
     if (p.users) {
       for (const [vk, u] of Object.entries(p.users)) {
         if (typeof u === "object" && u.dailyTokenLimit === undefined) { u.dailyTokenLimit = null; migrated = true; }
@@ -418,9 +419,10 @@ function formatPeakHoursSummary(ranges) {
 // ─── Quota Rate (peak / off-peak weighting) ──────────────────────────────────
 // A request's quota cost is (input+output) × the rate of the slot it lands in.
 // Rates are per-profile so a Coding-Plan upstream and a pay-per-token upstream
-// can price the same tokens differently. Anchor convention: 1.0 = "one peak-hour
-// token on the baseline plan" — keeping one slot at 1.0 is what gives the
-// nominal dailyTokenLimit a meaning.
+// can price the same tokens differently, and optionally per-model on top of that
+// (a "flash" tier costs a fraction of a flagship on the same upstream).
+// Anchor convention: 1.0 = "one peak-hour token at the profile's default rate" —
+// keeping one slot at 1.0 is what gives the nominal dailyTokenLimit a meaning.
 const QUOTA_RATE_MAX = 10;
 
 function normalizeQuotaRate(value) {
@@ -429,23 +431,62 @@ function normalizeQuotaRate(value) {
   return Math.round(Math.min(QUOTA_RATE_MAX, Math.max(0, n)) * 100) / 100;
 }
 
+// Per-model overrides, keyed by the REAL upstream model name (not the alias):
+// { "glm-5.3-flash": { peak: 0.3, offPeak: 0.15 } }
+// Real model names are what recordUsage receives from the upstream response and
+// what the usage_*_model tables store, so this key survives peak-alias overrides
+// that make two aliases resolve to the same model.
+function normalizeModelQuotaRates(raw) {
+  if (!raw || typeof raw !== "object") return {};
+  const out = {};
+  for (const [model, entry] of Object.entries(raw)) {
+    const name = String(model || "").trim();
+    if (!name || !entry || typeof entry !== "object") continue;
+    out[name] = {
+      peak: normalizeQuotaRate(entry.peak),
+      offPeak: normalizeQuotaRate(entry.offPeak),
+    };
+  }
+  return out;
+}
+
+// Model lookup mirrors resolveModel's tolerance: exact match first, then a
+// case-insensitive sweep, so a rate configured as "GLM-5.3" still applies when
+// the upstream echoes "glm-5.3".
+function lookupModelQuotaRate(rates, model) {
+  if (!rates || !model) return null;
+  if (rates[model]) return rates[model];
+  const lower = String(model).toLowerCase();
+  for (const [name, entry] of Object.entries(rates)) {
+    if (name.toLowerCase() === lower) return entry;
+  }
+  return null;
+}
+
 // `peakHours` empty ⇒ isInPeakHours is always false ⇒ the off-peak rate applies
 // all day. Deliberate ("no peak defined = everything is off-peak"), and the
 // settings page warns when that combination would silently discount 24h.
-function currentQuotaRate(runtime, date = new Date()) {
+// `model` is optional: pass the real upstream model to honour its per-model
+// override, omit it to get the profile's default rate for the current slot.
+function currentQuotaRate(runtime, date = new Date(), model = null) {
   if (!runtime) return 1;
-  return isInPeakHours(runtime.peakHours, date)
+  const inPeak = isInPeakHours(runtime.peakHours, date);
+  const override = lookupModelQuotaRate(runtime.modelQuotaRates, model);
+  if (override) return inPeak ? override.peak : override.offPeak;
+  return inPeak
     ? normalizeQuotaRate(runtime.peakQuotaRate)
     : normalizeQuotaRate(runtime.offPeakQuotaRate);
 }
 
 // Next moment the rate changes, so a quota-exceeded message can tell the user
 // when relief arrives ("20:00 后转入低谷 ×0.5"). Returns null when there is no
-// boundary worth mentioning (no peak hours, or both rates identical).
-function nextRateChangeHint(runtime, date = new Date()) {
+// boundary worth mentioning (no peak hours, or both rates identical for the
+// model in question).
+function nextRateChangeHint(runtime, date = new Date(), model = null) {
   if (!runtime) return null;
-  const peakRate = normalizeQuotaRate(runtime.peakQuotaRate);
-  const offRate = normalizeQuotaRate(runtime.offPeakQuotaRate);
+  const override = lookupModelQuotaRate(runtime.modelQuotaRates, model);
+  const peakRate = override ? override.peak : normalizeQuotaRate(runtime.peakQuotaRate);
+  const offRate = override ? override.offPeak : normalizeQuotaRate(runtime.offPeakQuotaRate);
   if (peakRate === offRate) return null;
   const ranges = normalizePeakHours(runtime.peakHours);
   if (ranges.length === 0) return null;
@@ -661,6 +702,7 @@ function listProfiles() {
     peakHours: normalizePeakHours(config.profiles[name].peakHours),
     peakQuotaRate: normalizeQuotaRate(config.profiles[name].peakQuotaRate),
     offPeakQuotaRate: normalizeQuotaRate(config.profiles[name].offPeakQuotaRate),
+    modelQuotaRates: normalizeModelQuotaRates(config.profiles[name].modelQuotaRates),
     configured: !!config.profiles[name].upstream,
     inDefaultGroup: group.includes(name),
     groupOrder: group.indexOf(name),
@@ -810,6 +852,7 @@ function createProfileRuntime(profileName, profile) {
     peakHours: normalizePeakHours(profile.peakHours),
     peakQuotaRate: normalizeQuotaRate(profile.peakQuotaRate),
     offPeakQuotaRate: normalizeQuotaRate(profile.offPeakQuotaRate),
+    modelQuotaRates: normalizeModelQuotaRates(profile.modelQuotaRates),
     peakModelAliases: normalizeModelAliases(profile.peakModelAliases || {}),
     globalUsers: { ...(config.users || {}) },
     breaker: new CircuitBreaker({
@@ -1159,6 +1202,7 @@ function initDb() {
     CREATE TABLE IF NOT EXISTS usage_daily_model (
       profile TEXT NOT NULL, date TEXT NOT NULL, user_key TEXT NOT NULL, model TEXT NOT NULL,
       input_tokens INTEGER DEFAULT 0, output_tokens INTEGER DEFAULT 0, requests INTEGER DEFAULT 0,
+      weighted_tokens INTEGER DEFAULT 0,
       PRIMARY KEY (profile, date, user_key, model)
     );
     CREATE TABLE IF NOT EXISTS usage_daily_hourly (
@@ -1228,7 +1272,7 @@ function initDb() {
   // wipe every user's "used" figure the moment this ships and make quotas
   // unenforceable. rate 1.0 is the correct historical value — past usage was
   // never discounted.
-  const weightedTargets = ["usage_daily", "usage_daily_hourly"].filter(table => {
+  const weightedTargets = ["usage_daily", "usage_daily_hourly", "usage_daily_model"].filter(table => {
     const cols = db.prepare(`PRAGMA table_info(${table})`).all();
     return cols.length > 0 && !cols.some(c => c.name === "weighted_tokens");
   });
@@ -1252,9 +1296,10 @@ function initDb() {
     ON CONFLICT(profile,user_key) DO UPDATE SET
       total_input=total_input+@inp, total_output=total_output+@out, total_requests=total_requests+1,
       cache_creation=cache_creation+@cacheC, cache_read=cache_read+@cacheR, name=@name, last_active=@now`);
-  // usage_daily / usage_daily_hourly also carry weighted_tokens — the quota
-  // currency ((input+output) × the slot's rate). The other five tables stay
-  // raw-token only: statistics and charts must never show discounted figures.
+  // usage_daily / usage_daily_hourly / usage_daily_model also carry
+  // weighted_tokens — the quota currency ((input+output) × the effective rate for
+  // that slot and model). The other four tables stay raw-token only: statistics
+  // and charts must never show discounted figures.
   stmts.upsertDaily = db.prepare(`INSERT INTO usage_daily (profile,date,user_key,input_tokens,output_tokens,requests,cache_creation,cache_read,weighted_tokens)
     VALUES (@profile,@today,@key,@inp,@out,1,@cacheC,@cacheR,@weighted)
     ON CONFLICT(profile,date,user_key) DO UPDATE SET
@@ -1269,10 +1314,11 @@ function initDb() {
     ON CONFLICT(profile,date,hour) DO UPDATE SET
       requests=requests+1, input_tokens=input_tokens+@inp, output_tokens=output_tokens+@out,
       cache_creation=cache_creation+@cacheC, cache_read=cache_read+@cacheR`);
-  stmts.upsertDailyModel = db.prepare(`INSERT INTO usage_daily_model (profile,date,user_key,model,input_tokens,output_tokens,requests)
-    VALUES (@profile,@today,@key,@m,@inp,@out,1)
+  stmts.upsertDailyModel = db.prepare(`INSERT INTO usage_daily_model (profile,date,user_key,model,input_tokens,output_tokens,requests,weighted_tokens)
+    VALUES (@profile,@today,@key,@m,@inp,@out,1,@weighted)
     ON CONFLICT(profile,date,user_key,model) DO UPDATE SET
-      input_tokens=input_tokens+@inp, output_tokens=output_tokens+@out, requests=requests+1`);
+      input_tokens=input_tokens+@inp, output_tokens=output_tokens+@out, requests=requests+1,
+      weighted_tokens=weighted_tokens+@weighted`);
   stmts.upsertDailyHourly = db.prepare(`INSERT INTO usage_daily_hourly (profile,date,user_key,hour,requests,input_tokens,output_tokens,cache_creation,cache_read,weighted_tokens)
     VALUES (@profile,@today,@key,@hour,1,@inp,@out,@cacheC,@cacheR,@weighted)
     ON CONFLICT(profile,date,user_key,hour) DO UPDATE SET
@@ -1311,7 +1357,7 @@ function initDb() {
   // the UI can show both "扣了多少额度" and "实际用了多少 token" from one query.
   stmts.todayWeightedForQuota = db.prepare(`SELECT COALESCE(SUM(weighted_tokens),0) AS used, COALESCE(SUM(input_tokens+output_tokens),0) AS raw FROM usage_daily WHERE profile=? AND date=? AND user_key=?`);
   stmts.profileDailyRow = db.prepare(`SELECT * FROM usage_daily WHERE profile=? AND date=? AND user_key=?`);
-  stmts.profileDailyModelRows = db.prepare(`SELECT model,input_tokens,output_tokens,requests FROM usage_daily_model WHERE profile=? AND date=? AND user_key=?`);
+  stmts.profileDailyModelRows = db.prepare(`SELECT model,input_tokens,output_tokens,requests,weighted_tokens FROM usage_daily_model WHERE profile=? AND date=? AND user_key=?`);
   stmts.profileDailyHourlyRows = db.prepare(`SELECT hour,requests,input_tokens,output_tokens,cache_creation,cache_read FROM usage_daily_hourly WHERE profile=? AND date=? AND user_key=?`);
   stmts.profileDailyTrend = db.prepare(`SELECT date,input_tokens,output_tokens,requests,cache_creation,cache_read FROM usage_daily WHERE profile=? AND user_key=? AND date>=? ORDER BY date`);
   stmts.profileSummaryToday = db.prepare(`SELECT COALESCE(SUM(input_tokens+output_tokens+cache_creation+cache_read),0) AS tokens, COALESCE(SUM(requests),0) AS requests FROM usage_daily WHERE profile=? AND date=?`);
@@ -1407,9 +1453,9 @@ function migrateFromJsonIfNeeded() {
       for (const [date, dm] of Object.entries(ps.dailyModels || {})) {
         for (const [k, models] of Object.entries(dm)) {
           for (const [m, v] of Object.entries(models)) {
-            db.prepare(`INSERT INTO usage_daily_model (profile,date,user_key,model,input_tokens,output_tokens,requests) VALUES (?,?,?,?,?,?,?)
-              ON CONFLICT(profile,date,user_key,model) DO UPDATE SET input_tokens=input_tokens+excluded.input_tokens, output_tokens=output_tokens+excluded.output_tokens, requests=requests+excluded.requests`)
-              .run(suffix, date, k, m, v.inputTokens||0, v.outputTokens||0, v.requests||0);
+            db.prepare(`INSERT INTO usage_daily_model (profile,date,user_key,model,input_tokens,output_tokens,requests,weighted_tokens) VALUES (?,?,?,?,?,?,?,?)
+              ON CONFLICT(profile,date,user_key,model) DO UPDATE SET input_tokens=input_tokens+excluded.input_tokens, output_tokens=output_tokens+excluded.output_tokens, requests=requests+excluded.requests, weighted_tokens=weighted_tokens+excluded.weighted_tokens`)
+              .run(suffix, date, k, m, v.inputTokens||0, v.outputTokens||0, v.requests||0, (v.inputTokens||0)+(v.outputTokens||0));
           }
         }
       }
@@ -1561,10 +1607,11 @@ function writeLegacyData(normalized, profileMap) {
     for (const [date, users] of Object.entries(ps.dailyModels || {})) {
       for (const [key, models] of Object.entries(users || {})) {
         for (const [model, row] of Object.entries(models || {})) {
-          db.prepare(`INSERT INTO usage_daily_model (profile,date,user_key,model,input_tokens,output_tokens,requests) VALUES (?,?,?,?,?,?,?)
+          db.prepare(`INSERT INTO usage_daily_model (profile,date,user_key,model,input_tokens,output_tokens,requests,weighted_tokens) VALUES (?,?,?,?,?,?,?,?)
             ON CONFLICT(profile,date,user_key,model) DO UPDATE SET input_tokens=input_tokens+excluded.input_tokens,
-            output_tokens=output_tokens+excluded.output_tokens, requests=requests+excluded.requests`)
-            .run(suffix, date, key, model, row.inputTokens || 0, row.outputTokens || 0, row.requests || 0);
+            output_tokens=output_tokens+excluded.output_tokens, requests=requests+excluded.requests,
+            weighted_tokens=weighted_tokens+excluded.weighted_tokens`)
+            .run(suffix, date, key, model, row.inputTokens || 0, row.outputTokens || 0, row.requests || 0, (row.inputTokens || 0) + (row.outputTokens || 0));
         }
       }
     }
@@ -2041,6 +2088,75 @@ function getAggregatedStore(suffixFilter) {
   return agg;
 }
 
+// One row per profile×model, pairing the configured rates with today's realised
+// cost. The dashboard's model chart can only plot one number per model, so the
+// rate story needs a table: without it an admin cannot answer "which model is
+// draining quota fastest" — the expensive model is not necessarily the busiest.
+function getModelRateBoard(suffixFilter) {
+  const today = cnDate();
+  const usage = {};   // suffix → model → { raw, weighted, requests }
+  const hasFilter = Array.isArray(suffixFilter);
+  const binds = hasFilter ? (suffixFilter.length ? suffixFilter : [" none"]) : [];
+  const where = hasFilter ? `AND profile IN (${binds.map(() => "?").join(",")})` : "";
+  const rows = db.prepare(
+    `SELECT profile, model, SUM(requests) AS r, SUM(input_tokens+output_tokens) AS raw, SUM(weighted_tokens) AS w
+     FROM usage_daily_model WHERE date=? ${where} GROUP BY profile, model`
+  ).all(today, ...binds);
+  for (const r of rows) {
+    if (!usage[r.profile]) usage[r.profile] = {};
+    usage[r.profile][r.model] = { raw: r.raw || 0, weighted: r.w || 0, requests: r.r || 0 };
+  }
+
+  const out = [];
+  for (const [name, profile] of Object.entries(config.profiles || {})) {
+    const suffix = normalizeProfileSuffix(profile.suffix);
+    const runtime = runtimes[suffix];
+    if (!runtime) continue;
+    if (hasFilter && !suffixFilter.includes(suffix)) continue;
+    const inPeak = isInPeakHours(runtime.peakHours);
+    const rates = runtime.modelQuotaRates || {};
+    const aliases = getProfileModelAliases(profile);
+    const peakAliases = normalizeModelAliases(profile.peakModelAliases || {});
+    // Union of: models any alias points at (default or peak), models with an
+    // explicit rate, and models that actually served traffic today. The last one
+    // matters — a model retired from the alias list can still be in today's rows.
+    const byModel = new Map();
+    const note = (model, alias, isPeakAlias) => {
+      if (!model) return;
+      if (!byModel.has(model)) byModel.set(model, { aliases: [], peakOnly: [] });
+      const entry = byModel.get(model);
+      if (alias) (isPeakAlias ? entry.peakOnly : entry.aliases).push(alias);
+    };
+    for (const [alias, model] of Object.entries(aliases)) note(model, alias, false);
+    for (const [alias, model] of Object.entries(peakAliases)) note(model, alias, true);
+    for (const model of Object.keys(rates)) note(model, null, false);
+    for (const model of Object.keys(usage[suffix] || {})) note(model, null, false);
+
+    for (const [model, meta] of byModel) {
+      const override = lookupModelQuotaRate(rates, model);
+      const used = (usage[suffix] || {})[model] || { raw: 0, weighted: 0, requests: 0 };
+      out.push({
+        profile: name,
+        suffix,
+        model,
+        aliases: meta.aliases,
+        peakAliases: meta.peakOnly,
+        custom: !!override,
+        peak: override ? override.peak : normalizeQuotaRate(runtime.peakQuotaRate),
+        offPeak: override ? override.offPeak : normalizeQuotaRate(runtime.offPeakQuotaRate),
+        rate: currentQuotaRate(runtime, new Date(), model),
+        inPeak,
+        todayRaw: used.raw,
+        todayWeighted: used.weighted,
+        todayRequests: used.requests,
+      });
+    }
+  }
+  // Costliest-right-now first: that is the row an admin needs to see.
+  out.sort((a, b) => b.rate - a.rate || b.todayWeighted - a.todayWeighted || a.model.localeCompare(b.model));
+  return out;
+}
+
 // Load hourly-per-model usage for the 24h model trend chart. `suffix` null =
 // all profiles; `suffixFilter` (array) narrows to a protocol when no single
 // suffix is given. Shape: { date: { hour: { model: { requests, inputTokens, outputTokens } } } }
@@ -2129,6 +2245,7 @@ function getProfileSummaries() {
       peakHours: normalizePeakHours(profile.peakHours),
       peakQuotaRate: profile.peakQuotaRate,
       offPeakQuotaRate: profile.offPeakQuotaRate,
+      modelQuotaRates: profile.modelQuotaRates || {},
       upstream: profile.upstream,
       userCount: profile.userCount,
       todayTokens: row.tokens || 0,
@@ -2465,12 +2582,12 @@ function recordUsage(apiKey, usage, model, suffix, _rt) {
 
   pruneOldDataIfNewDay();
 
-  // Weight the request at the rate in force right now. This is settled at write
-  // time on purpose: the row's cost is frozen, so changing a profile's rate later
-  // only affects future requests and never silently re-prices history. Note the
-  // rate comes from the completion instant (same convention as cnHour() above),
-  // so a request spanning a peak boundary is priced by where it finished.
-  const rate = currentQuotaRate(runtime);
+  // Weight the request at the rate in force right now, for THIS model. This is
+  // settled at write time on purpose: the row's cost is frozen, so changing a rate
+  // later only affects future requests and never silently re-prices history. Note
+  // the rate comes from the completion instant (same convention as cnHour()
+  // above), so a request spanning a peak boundary is priced by where it finished.
+  const rate = currentQuotaRate(runtime, new Date(), m);
   const weighted = Math.round((inp + out) * rate);
 
   const p = { profile: sfx, key, name: getUserName(key, runtime), inp, out, cacheC, cacheR, m, tokenTotal: inp + out, weighted, today, hour, now: new Date().toISOString() };
@@ -2504,7 +2621,7 @@ function getUserQuota(apiKey, _rt) {
   return pu.dailyTokenLimit;
 }
 
-function checkTokenQuota(apiKey, suffix, _rt) {
+function checkTokenQuota(apiKey, suffix, _rt, model = null) {
   const runtime = _rt || rt;
   const key = resolveUserKey(apiKey, runtime);
   const sfx = normalizeProfileSuffix(suffix) || runtime?.suffix || "";
@@ -2523,7 +2640,12 @@ function checkTokenQuota(apiKey, suffix, _rt) {
   // used stay comparable after a reset (both measure "since the reset point").
   const dayRatio = weightedUsed > 0 ? rawTotal / weightedUsed : 1;
   const rawUsed = Math.max(0, Math.round(rawTotal - baseline * dayRatio));
-  const rate = currentQuotaRate(runtime);
+  // `rate` is the price the NEXT request would pay. With a model given (the proxy
+  // pre-flight path) it is that model's rate; without one (dashboard / personal
+  // page, which span many models) it is the profile default, labelled as such in
+  // the UI so a mixed day is never presented as a single multiplier.
+  const rate = currentQuotaRate(runtime, new Date(), model);
+  const rateIsDefault = !lookupModelQuotaRate(runtime?.modelQuotaRates, model);
   const inPeak = isInPeakHours(runtime?.peakHours);
   const discounted = Math.max(0, rawUsed - used);
 
@@ -2534,7 +2656,7 @@ function checkTokenQuota(apiKey, suffix, _rt) {
   const bonus = op.bonus > 0 ? op.bonus : 0;
 
   if (baseLimit <= 0) {
-    return { allowed: true, limit: 0, used, remaining: Infinity, source: "无限制", bonus: 0, resetApplied: !!baseline, rawUsed, discounted, rate, inPeak };
+    return { allowed: true, limit: 0, used, remaining: Infinity, source: "无限制", bonus: 0, resetApplied: !!baseline, rawUsed, discounted, rate, rateIsDefault, inPeak, model };
   }
 
   const limit = baseLimit + bonus;
@@ -2549,7 +2671,9 @@ function checkTokenQuota(apiKey, suffix, _rt) {
     rawUsed,
     discounted,
     rate,
+    rateIsDefault,
     inPeak,
+    model,
   };
 }
 
@@ -2570,8 +2694,9 @@ function quotaExceededMessage(quota, runtime, usageUrl) {
   }
   if (weighted) {
     const slot = quota.inPeak ? "高峰" : "低谷";
-    const hint = nextRateChangeHint(runtime);
+    const hint = nextRateChangeHint(runtime, new Date(), quota.model);
     lines.push(`当前${runtime?.profileName ? ` ${runtime.profileName}` : ""} ${slot} ×${quota.rate}` +
+      (quota.model && !quota.rateIsDefault ? `（${quota.model} 单独定价）` : "") +
       (hint ? ` · ${hint.at} 后转入${hint.toPeak ? "高峰" : "低谷"} ×${hint.rate}` : ""));
   }
   lines.push(`额度将于北京时间次日凌晨重置。查看用量详情: ${usageUrl}`);
@@ -2953,10 +3078,18 @@ function getProfilePersonalUsage(apiKey, suffix, runtime) {
   const todayRow = stmts.profileDailyRow.get(suffix, today, key) || emptyUsageBucket();
   const todayUsage = todayRow.inputTokens != null ? todayRow : { inputTokens: todayRow.input_tokens||0, outputTokens: todayRow.output_tokens||0, requests: todayRow.requests||0, cacheCreationTokens: todayRow.cache_creation||0, cacheReadTokens: todayRow.cache_read||0 };
 
-  // Per-model breakdown for today
+  // Per-model breakdown for today. `weighted` is what each model actually cost
+  // against the quota, and `rate` the price it would pay right now — together they
+  // let the page explain a mixed day without inventing a single blended figure.
   const todayModels = {};
   for (const r of stmts.profileDailyModelRows.all(suffix, today, key)) {
-    todayModels[r.model] = { inputTokens: r.input_tokens, outputTokens: r.output_tokens, requests: r.requests, total: r.input_tokens + r.output_tokens };
+    todayModels[r.model] = {
+      inputTokens: r.input_tokens, outputTokens: r.output_tokens, requests: r.requests,
+      total: r.input_tokens + r.output_tokens,
+      weighted: r.weighted_tokens || 0,
+      rate: currentQuotaRate(runtime, new Date(), r.model),
+      rateIsDefault: !lookupModelQuotaRate(runtime?.modelQuotaRates, r.model),
+    };
   }
 
   // Per-hour breakdown for today
@@ -2990,11 +3123,44 @@ function getProfilePersonalUsage(apiKey, suffix, runtime) {
   return {
     profile: runtime.profileName,
     profileSuffix: suffix,
-    quota: { type: quota.source, limit: quota.limit, used: quota.used, remaining: quota.remaining, autoAdjusted: quotaAutoAdjusted, bonus: quota.bonus || 0, resetApplied: !!quota.resetApplied, rawUsed: quota.rawUsed, discounted: quota.discounted, rate: quota.rate, inPeak: quota.inPeak, nextRateChange: nextRateChangeHint(runtime) },
+    quota: { type: quota.source, limit: quota.limit, used: quota.used, remaining: quota.remaining, autoAdjusted: quotaAutoAdjusted, bonus: quota.bonus || 0, resetApplied: !!quota.resetApplied, rawUsed: quota.rawUsed, discounted: quota.discounted, rate: quota.rate, rateIsDefault: true, inPeak: quota.inPeak, nextRateChange: nextRateChangeHint(runtime) },
+    // Price list for the current slot: every alias the user can call, with the
+    // rate it costs right now. This is the answer to "为什么我的额度掉得这么快" —
+    // the user can see which model is expensive BEFORE spending on it.
+    rateCard: buildRateCard(runtime),
     today: { input: todayUsage.inputTokens||0, output: todayUsage.outputTokens||0, requests: todayUsage.requests||0, cacheWrite: todayUsage.cacheCreationTokens||0, cacheRead: todayUsage.cacheReadTokens||0, total: totalUsageTokens(todayUsage) },
     models: todayModels,
     hourly: todayHourly,
     trend,
+  };
+}
+
+// One row per alias→model pair the profile exposes, priced for the current slot.
+// Aliases are what users type, so the card is keyed on them; several aliases may
+// share a model (and therefore a rate), which is fine and worth showing.
+function buildRateCard(runtime) {
+  if (!runtime) return null;
+  const now = new Date();
+  const inPeak = isInPeakHours(runtime.peakHours, now);
+  const aliases = effectiveModelAliases(runtime);
+  const rows = [];
+  for (const [alias, model] of Object.entries(aliases)) {
+    const override = lookupModelQuotaRate(runtime.modelQuotaRates, model);
+    rows.push({
+      alias, model,
+      rate: currentQuotaRate(runtime, now, model),
+      custom: !!override,
+      peak: override ? override.peak : normalizeQuotaRate(runtime.peakQuotaRate),
+      offPeak: override ? override.offPeak : normalizeQuotaRate(runtime.offPeakQuotaRate),
+    });
+  }
+  rows.sort((a, b) => a.rate - b.rate || a.alias.localeCompare(b.alias));
+  return {
+    profile: runtime.profileName,
+    inPeak,
+    defaultPeak: normalizeQuotaRate(runtime.peakQuotaRate),
+    defaultOffPeak: normalizeQuotaRate(runtime.offPeakQuotaRate),
+    rows,
   };
 }
 
@@ -3038,11 +3204,16 @@ function getAggregatedPersonalUsage(apiKey, availableProfiles) {
     }
 
     for (const r of stmts.profileDailyModelRows.all(suffix, today, key)) {
-      if (!todayModels[r.model]) todayModels[r.model] = { inputTokens: 0, outputTokens: 0, requests: 0, total: 0 };
+      // Same model name can appear under several profiles with different rates, so
+      // the aggregate view sums weighted/raw but leaves `rate` null — a single
+      // multiplier would be a fiction. The implied ratio (weighted/total) is still
+      // meaningful and is what the UI shows here.
+      if (!todayModels[r.model]) todayModels[r.model] = { inputTokens: 0, outputTokens: 0, requests: 0, total: 0, weighted: 0, rate: null, rateIsDefault: true };
       todayModels[r.model].inputTokens += r.input_tokens || 0;
       todayModels[r.model].outputTokens += r.output_tokens || 0;
       todayModels[r.model].requests += r.requests || 0;
       todayModels[r.model].total += (r.input_tokens||0) + (r.output_tokens||0);
+      todayModels[r.model].weighted += r.weighted_tokens || 0;
     }
 
     for (const r of stmts.profileDailyHourlyRows.all(suffix, today, key)) {
@@ -3089,9 +3260,15 @@ function getAggregatedPersonalUsage(apiKey, availableProfiles) {
       rawUsed: totalRawUsed,
       discounted: totalDiscounted,
       rate: null,       // mixed across profiles — meaningless as a single number
+      rateIsDefault: true,
       inPeak: null,
       nextRateChange: null,
     },
+    // Per-profile price lists, so the aggregate view can still answer "which model
+    // is cheap where" without pretending the profiles share one rate.
+    rateCards: availableProfiles
+      .map(p => buildRateCard(runtimes[p.suffix]))
+      .filter(card => card && card.rows.length > 0),
     today: { input: todayUsage.inputTokens, output: todayUsage.outputTokens, requests: todayUsage.requests, cacheWrite: todayUsage.cacheCreationTokens || 0, cacheRead: todayUsage.cacheReadTokens || 0, total: totalUsageTokens(todayUsage) },
     models: todayModels,
     hourly: todayHourly,
@@ -3709,7 +3886,10 @@ function proxyRequest(req, res) {
           break;
         }
 
-        const quota = checkTokenQuota(apiKey, csuffix, cruntime);
+        // creqModel is already resolved through this candidate's aliases, so the
+        // quota figures (and any 429 copy) reflect the model that would actually
+        // be billed — not the profile default.
+        const quota = checkTokenQuota(apiKey, csuffix, cruntime, creqModel);
         if (!quota.allowed) {
           lastFailure = { kind: "quota", status: 429, quota, runtime: cruntime, suffix: csuffix };
           if (!isLastCandidate) continue;
@@ -4358,8 +4538,9 @@ function settingsHtml(errorMsg) {
       : "";
     // Only surface the rate when weighting is actually in effect for this profile.
     const effRate = inPeakNow ? p.peakQuotaRate : p.offPeakQuotaRate;
-    const rateLabel = (p.peakQuotaRate !== 1 || p.offPeakQuotaRate !== 1)
-      ? `<div class="pl-users" style="color:var(--accent)">配额 ×${effRate}<span style="color:var(--dim)"> （峰 ×${p.peakQuotaRate} / 谷 ×${p.offPeakQuotaRate}）</span></div>`
+    const customCount = Object.keys(p.modelQuotaRates || {}).length;
+    const rateLabel = (p.peakQuotaRate !== 1 || p.offPeakQuotaRate !== 1 || customCount > 0)
+      ? `<div class="pl-users" style="color:var(--accent)">配额 ×${effRate}<span style="color:var(--dim)"> （峰 ×${p.peakQuotaRate} / 谷 ×${p.offPeakQuotaRate}${customCount > 0 ? ` · ${customCount} 个模型单独定价` : ""}）</span></div>`
       : "";
     return `<div class="pl-item${p.suffix === initialSuffix ? " active" : ""}" id="pl-${escHtml(p.name)}" onclick="editProfile('${escJs(p.name)}')">
 <div class="pl-name">${escHtml(p.name)} ${suffixLabel}</div>
@@ -4512,6 +4693,9 @@ td{padding:8px;border-bottom:1px solid #ecece8;font-size:12px}
 .alias-toolbar{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin-bottom:8px}
 .alias-head{display:grid;grid-template-columns:1fr 1.25fr 118px 56px 30px;gap:8px;font-size:10px;font-weight:600;color:var(--dim);margin-bottom:4px}
 .alias-head.peak{grid-template-columns:1fr 1.4fr 30px}
+.alias-head.rate{grid-template-columns:1.6fr 100px 100px 1fr 30px}
+.alias-row.rate{grid-template-columns:1.6fr 100px 100px 1fr 30px}
+.alias-row.rate .rate-eff{font-size:11px;color:var(--dim);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .alias-row{display:grid;grid-template-columns:1fr 1.25fr 118px 56px 30px;gap:8px;margin-bottom:8px;align-items:center}
 .alias-row.peak{grid-template-columns:1fr 1.4fr 30px}
 .alias-row .mm-cell{display:flex;align-items:center;gap:4px;font-size:10px;color:var(--dim);cursor:pointer;white-space:nowrap}
@@ -4652,6 +4836,7 @@ ${(() => { const mm = initialProfile.modelMultimodal || {}; const aliases = init
 
 <h2>配额倍率 <span style="font-size:11px;color:var(--dim);font-weight:400">按时段折算配额消耗，只影响配额计算，统计报表始终显示真实 token</span></h2>
 <div class="section">
+<label>方案默认倍率 — 未单独定价的模型都走这一档</label>
 <div style="display:flex;gap:18px;flex-wrap:wrap;align-items:flex-end">
 <div><label>高峰时段倍率</label>
 <input type="number" name="peakQuotaRate" id="peakQuotaRateInput" value="${initialProfile.peakQuotaRate ?? 1}" min="0" max="${QUOTA_RATE_MAX}" step="0.05" style="width:120px"></div>
@@ -4660,6 +4845,17 @@ ${(() => { const mm = initialProfile.modelMultimodal || {}; const aliases = init
 </div>
 <div class="note" id="quotaRateHint" style="margin-top:8px"></div>
 <div class="note" style="margin-top:6px">1.0 = 按实际 token 计入配额；0.5 = 该时段消耗只扣一半额度。建议以「高峰期 Coding Plan 方案 = 1.0」为基准：套餐方案低谷可设 0.5，按量计费方案设 1.5~2.0 反映真实成本。<b>修改只影响之后的请求，已产生的消耗不会重算。</b></div>
+
+<label style="margin-top:16px">按模型单独定价（可选，覆盖上方默认倍率）</label>
+<div class="alias-toolbar">
+  <button type="button" class="preset" onclick="addRateRow()">＋添加模型倍率</button>
+  <button type="button" class="preset" onclick="fillAllRateRows()">按全部模型铺开</button>
+</div>
+<div class="alias-head rate"><span>实际模型</span><span>高峰倍率</span><span>低谷倍率</span><span>当前生效</span><span></span></div>
+<input type="hidden" name="mrPresent" value="1">
+<div id="rateRows"></div>
+<div class="note" id="rateRowsHint"></div>
+<div class="note">模型下拉来自上方别名的实际模型（含高峰期覆盖），避免手打错名字导致静默回落默认倍率。同一实际模型被多个别名指向时只需配一次。适合给便宜的 flash / mini 档位设更低倍率，或给昂贵模型设更高倍率。</div>
 </div>
 
 <h2>高峰时段 <span style="font-size:11px;color:var(--dim);font-weight:400">每日重复的时间段（按北京时间判断，与部署服务器时区无关），命中时启用上方的「高峰期模型别名」与「高峰时段倍率」</span></h2>
@@ -5117,6 +5313,8 @@ function updatePeakHoursStatus(){
   else if(nowInPeakHours(ranges)){el.textContent='当前处于高峰';el.style.color='var(--orange)'}
   else{el.textContent='当前不在高峰';el.style.color='var(--green)'}
   updateQuotaRateHint();
+  // Peak/off-peak flip changes which column of every model rate is "current".
+  try{updateRateRowsHint()}catch(e){}
 }
 // Quota-rate hint: the traps here matter more than the inputs themselves —
 // an off-peak rate with no peak hours defined discounts the whole day, and
@@ -5143,7 +5341,7 @@ function updateQuotaRateHint(){
 function fmtRateTk(n){n=Number(n)||0;if(n>=1e6)return(n/1e6).toFixed(2)+'M';if(n>=1e3)return(n/1e3).toFixed(1)+'k';return String(n)}
 ['peakQuotaRateInput','offPeakQuotaRateInput'].forEach(function(id){
   var el=document.getElementById(id);
-  if(el)el.addEventListener('input',updateQuotaRateHint);
+  if(el)el.addEventListener('input',function(){updateQuotaRateHint();try{updateRateRowsHint()}catch(e){}});
 });
 (function(){var q=document.forms.settingsForm&&document.forms.settingsForm.profileQuota;if(q)q.addEventListener('input',updateQuotaRateHint)})();
 setInterval(updatePeakHoursStatus,30000);
@@ -5570,7 +5768,7 @@ function fillUpstream(url){
 const CW_OPTIONS=[[32768,'32K（32,768）'],[65536,'64K（65,536）'],[128000,'128K（128,000）'],[200000,'200K（200,000）'],[262144,'256K（262,144）'],[400000,'400K（400,000）'],[1048576,'1M（1,048,576）']];
 function cwSelectHtml(name,val){return '<select name="'+name+'">'+CW_OPTIONS.map(o=>'<option value="'+o[0]+'"'+(String(o[0])===String(val||128000)?' selected':'')+'>'+o[1]+'</option>').join('')+'</select>'}
 function renumberRows(prefix){
-  const wrap=prefix==='ma'?document.getElementById('aliasRows'):document.getElementById('peakRows');
+  const wrap=prefix==='ma'?document.getElementById('aliasRows'):prefix==='mr'?document.getElementById('rateRows'):document.getElementById('peakRows');
   const rows=[...wrap.querySelectorAll('.alias-row')];
   rows.forEach((row,i)=>{row.querySelectorAll('[name^="'+prefix+'_"]').forEach(el=>{
     const parts=el.name.split('_');el.name=prefix+'_'+parts[1]+'_'+i;});});
@@ -5619,6 +5817,89 @@ function addAliasRow(presetName){
   (presetName?row.querySelector('[name^="ma_model_"]'):row.querySelector('[name^="ma_alias_"]')).focus();
 }
 function addPeakRow(){document.getElementById('peakRows').appendChild(peakRowEl('',''));renumberRows('pa');refreshPeakSelects();updateAllowedTags()}
+// ── Per-model quota rates ────────────────────────────────────────────────────
+// Keyed on the REAL model name (what the upstream echoes and what the usage
+// tables store), picked from a dropdown of the profile's alias targets so a typo
+// cannot silently fall back to the default rate.
+function allRateModels(){
+  return [...new Set([...document.querySelectorAll('#aliasRows [name^="ma_model_"], #peakRows [name^="pa_model_"]')]
+    .map(el=>el.value.trim()).filter(Boolean))].sort();
+}
+function rateRowEl(model,peak,off){
+  const div=document.createElement('div');div.className='alias-row rate';
+  div.innerHTML='<select name="mr_model_0"></select>'
+    +'<input type="number" name="mr_peak_0" min="0" max="${QUOTA_RATE_MAX}" step="0.05" value="'+(peak==null?'':peak)+'" placeholder="高峰">'
+    +'<input type="number" name="mr_off_0" min="0" max="${QUOTA_RATE_MAX}" step="0.05" value="'+(off==null?'':off)+'" placeholder="低谷">'
+    +'<span class="rate-eff"></span>'
+    +'<button type="button" class="row-del" title="删除该行">×</button>';
+  div.querySelector('.row-del').onclick=()=>{div.remove();renumberRows('mr');updateRateRowsHint()};
+  div.addEventListener('input',updateRateRowsHint);
+  refreshRateSelect(div.querySelector('select[name^="mr_model_"]'),model);
+  return div;
+}
+function refreshRateSelect(sel,want){
+  if(!sel)return;
+  const keep=want!==undefined?want:sel.value;
+  const models=allRateModels();
+  sel.innerHTML='<option value="">选择模型…</option>'+models.map(m=>'<option value="'+m.replace(/"/g,'&quot;')+'"'+(m===keep?' selected':'')+'>'+m.replace(/</g,'&lt;')+'</option>').join('');
+  // A rate configured for a model no longer referenced by any alias would vanish
+  // silently on save; keep it visible and explicitly flagged instead.
+  if(keep&&!models.includes(keep)){
+    sel.insertAdjacentHTML('beforeend','<option value="'+keep.replace(/"/g,'&quot;')+'">'+keep.replace(/</g,'&lt;')+'（未在别名中引用）</option>');
+  }
+  sel.value=keep||'';
+}
+function refreshAllRateSelects(){
+  document.querySelectorAll('#rateRows select[name^="mr_model_"]').forEach(sel=>refreshRateSelect(sel));
+  updateRateRowsHint();
+}
+function addRateRow(model,peak,off){
+  document.getElementById('rateRows').appendChild(rateRowEl(model||'',peak,off));
+  renumberRows('mr');updateRateRowsHint();
+}
+// Convenience: one row per model still lacking an explicit rate, prefilled with
+// the profile default so the admin edits numbers instead of hunting model names.
+function fillAllRateRows(){
+  const have=new Set([...document.querySelectorAll('#rateRows select[name^="mr_model_"]')].map(s=>s.value).filter(Boolean));
+  const dp=Number(document.getElementById('peakQuotaRateInput').value),
+        dof=Number(document.getElementById('offPeakQuotaRateInput').value);
+  allRateModels().filter(m=>!have.has(m)).forEach(m=>addRateRow(m,Number.isFinite(dp)?dp:1,Number.isFinite(dof)?dof:1));
+}
+function renderRateRows(profile){
+  const wrap=document.getElementById('rateRows');
+  if(!wrap)return;
+  wrap.innerHTML='';
+  Object.entries(profile.modelQuotaRates||{}).forEach(([m,r])=>wrap.appendChild(rateRowEl(m,r.peak,r.offPeak)));
+  renumberRows('mr');updateRateRowsHint();
+}
+function updateRateRowsHint(){
+  const el=document.getElementById('rateRowsHint');
+  if(!el)return;
+  const rows=[...document.querySelectorAll('#rateRows .alias-row')];
+  const peakEl=document.getElementById('peakQuotaRateInput'),offEl=document.getElementById('offPeakQuotaRateInput');
+  const dp=peakEl?Number(peakEl.value):1,dof=offEl?Number(offEl.value):1;
+  const inPeak=nowInPeakHours(collectPeakHours());
+  // Per-row "current" cell: what a request for that model would cost right now.
+  const priced=new Set();
+  rows.forEach(row=>{
+    const m=row.querySelector('select[name^="mr_model_"]').value;
+    const p=Number(row.querySelector('[name^="mr_peak_"]').value),o=Number(row.querySelector('[name^="mr_off_"]').value);
+    const cell=row.querySelector('.rate-eff');
+    if(m)priced.add(m);
+    if(!m){cell.textContent='未选择模型';cell.style.color='var(--orange)';return}
+    const eff=inPeak?p:o;
+    if(!Number.isFinite(eff)){cell.textContent='倍率无效 → 归一为 1.0';cell.style.color='var(--orange)';return}
+    cell.textContent='×'+eff+(inPeak?'（高峰）':'（低谷）');
+    cell.style.color='var(--dim)';
+  });
+  const dupes=rows.map(r=>r.querySelector('select[name^="mr_model_"]').value).filter(Boolean)
+    .filter((m,i,arr)=>arr.indexOf(m)!==i);
+  if(dupes.length){el.innerHTML='<b style="color:var(--orange)">注意：模型 "'+h(dupes[0])+'" 配置了多行，保存时以最后一行为准</b>';el.style.color='var(--orange)';return}
+  const uncovered=allRateModels().filter(m=>!priced.has(m));
+  el.innerHTML=(rows.length?'已单独定价 '+priced.size+' 个模型。':'')
+    +(uncovered.length?'其余 '+uncovered.length+' 个模型走默认倍率（'+(inPeak?'高峰 ×'+dp:'低谷 ×'+dof)+'）：'+uncovered.map(m=>h(m)).join('、'):'全部模型均已单独定价。');
+  el.style.color='var(--dim)';
+}
 function renderAliasRows(profile){
   const wrap=document.getElementById('aliasRows');wrap.innerHTML='';
   const aliases=profile.modelAliases||{},ctxs=profile.modelContextWindows||{},mms=profile.modelMultimodal||{};
@@ -5645,6 +5926,7 @@ function renderAliasRows(profile){
     }
   });
   refreshBridgeSelect(profile);
+  renderRateRows(profile);
   updateAllowedTags();
 }
 // Rebuild the image-bridge helper-model dropdown from the profile's multimodal
@@ -5659,8 +5941,10 @@ function refreshBridgeSelect(profile){
   if(keep&&![...sel.options].some(o=>o.value===keep))sel.value='';
   else sel.value=keep;
 }
-document.getElementById('aliasRows').addEventListener('input',()=>{refreshPeakSelects();updateAllowedTags()});
-document.getElementById('peakRows').addEventListener('input',updateAllowedTags);
+// Editing an alias's target model changes the set of models the rate rows can
+// point at, so keep those dropdowns in sync with every keystroke.
+document.getElementById('aliasRows').addEventListener('input',()=>{refreshPeakSelects();updateAllowedTags();refreshAllRateSelects()});
+document.getElementById('peakRows').addEventListener('input',()=>{updateAllowedTags();refreshAllRateSelects()});
 // Init LAST: editProfile/switchProtoTab assign let-declared module state
 // (editingProfileName), so running this any earlier throws a TDZ ReferenceError
 // and leaves the alias rows unrendered.
@@ -5788,6 +6072,7 @@ td{padding:8px 12px;font-size:11px;border-bottom:1px solid #ecece8;white-space:n
     <button id="workspace-tab-users" role="tab" aria-controls="workspace-panel-users" aria-selected="true" tabindex="0" class="workspace-tab">用户用量<span class="workspace-tab-count" id="workspaceCountUsers">0</span></button>
     <button id="workspace-tab-detail" role="tab" aria-controls="workspace-panel-detail" aria-selected="false" tabindex="-1" class="workspace-tab">明细记录<span class="workspace-tab-count" id="workspaceCountDetail">0</span></button>
     <button id="workspace-tab-profiles" role="tab" aria-controls="workspace-panel-profiles" aria-selected="false" tabindex="-1" class="workspace-tab">方案中心<span class="workspace-tab-count" id="workspaceCountProfiles">0</span></button>
+    <button id="workspace-tab-rates" role="tab" aria-controls="workspace-panel-rates" aria-selected="false" tabindex="-1" class="workspace-tab">配额倍率<span class="workspace-tab-count" id="workspaceCountRates">0</span></button>
     <button id="workspace-tab-errors" role="tab" aria-controls="workspace-panel-errors" aria-selected="false" tabindex="-1" class="workspace-tab">错误记录<span class="workspace-tab-count" id="workspaceCountErrors">0</span></button>
   </div>
   <div class="workspace-content">
@@ -5807,6 +6092,10 @@ td{padding:8px 12px;font-size:11px;border-bottom:1px solid #ecece8;white-space:n
     </section>
     <section id="workspace-panel-profiles" role="tabpanel" aria-labelledby="workspace-tab-profiles" class="workspace-panel" hidden><div id="profileSummarySec" class="workspace-panel-inner">
       <div class="workspace-panel-head"><strong>方案中心</strong><span class="workspace-panel-summary" id="profileContext">当前查看：全部方案</span></div><div class="workspace-panel-scroll"><table><thead><tr><th>方案</th><th>入口</th><th>上游</th><th class="n">今日请求</th><th class="n">今日用量</th><th>状态</th></tr></thead><tbody id="profileSummaryBody"></tbody></table></div>
+    </div></section>
+    <section id="workspace-panel-rates" role="tabpanel" aria-labelledby="workspace-tab-rates" class="workspace-panel" hidden><div class="workspace-panel-inner">
+      <div class="workspace-panel-head"><strong>配额倍率</strong><span class="workspace-panel-summary" id="rateBoardContext"></span></div>
+      <div class="workspace-panel-scroll"><table id="rateBoardTable"><thead><tr><th>模型</th><th>方案</th><th>别名</th><th class="n">当前倍率</th><th class="n">高峰</th><th class="n">低谷</th><th class="n">今日实际</th><th class="n">今日计入</th><th class="n">今日请求</th></tr></thead><tbody id="rateBoardBody"></tbody></table></div>
     </div></section>
     <section id="workspace-panel-errors" role="tabpanel" aria-labelledby="workspace-tab-errors" class="workspace-panel" hidden><div id="errorSec">
       <div class="workspace-panel-head"><span class="sec-toggle" id="errorSecIcon"></span><strong>错误记录</strong><span id="errorCount" style="font-size:10px;color:var(--red)"></span><span class="workspace-panel-summary" id="errorHint">暂无错误</span><button id="clearErrors" class="clear-btn">清除</button></div>
@@ -5892,6 +6181,49 @@ function renderWorkspaceSummaries(){
   document.getElementById("workspaceCountUsers").textContent=Object.keys(D.users||{}).length;
   document.getElementById("workspaceCountProfiles").textContent=Array.isArray(D.profileSummaries)?D.profileSummaries.length:0;
   document.getElementById("workspaceCountErrors").textContent=Array.isArray(D.errors)?D.errors.length:0;
+  // Tab count = models priced individually, not total rows: that is the number an
+  // admin is checking ("did my overrides take effect?").
+  const board=Array.isArray(D.modelRateBoard)?D.modelRateBoard:[];
+  document.getElementById("workspaceCountRates").textContent=board.filter(r=>r.custom).length;
+}
+// Model rate board. The chart above can only plot one number per model, so the
+// answer to "which model is draining quota" lives here: configured peak/off-peak
+// side by side with what today actually cost.
+function renderRateBoard(){
+  const body=document.getElementById("rateBoardBody"),ctx=document.getElementById("rateBoardContext");
+  if(!body)return;
+  const rows=Array.isArray(D.modelRateBoard)?D.modelRateBoard:[];
+  if(!rows.length){body.innerHTML='<tr><td colspan="9" class="empty">暂无模型 — 先在设置页配置模型别名</td></tr>';if(ctx)ctx.textContent="";return}
+  const inPeak=rows[0].inPeak;
+  const customCount=rows.filter(r=>r.custom).length;
+  const totalRaw=rows.reduce((s,r)=>s+r.todayRaw,0),totalW=rows.reduce((s,r)=>s+r.todayWeighted,0);
+  if(ctx){
+    const blended=totalRaw>0?Math.round(totalW/totalRaw*100)/100:null;
+    ctx.innerHTML='当前 <b style="color:'+(inPeak?'var(--orange)':'var(--green)')+'">'+(inPeak?'高峰时段':'低谷时段')+'</b>'
+      +' · '+customCount+'/'+rows.length+' 个模型单独定价'
+      +(blended!=null?' · 今日综合 ×'+blended+'（实际 '+fmtTk(totalRaw)+' → 计入 '+fmtTk(totalW)+'）':'');
+  }
+  body.innerHTML=rows.map(r=>{
+    // Realised ratio can differ from the configured rate: the day may straddle a
+    // peak boundary, or a rate may have been changed mid-day. Flag it rather than
+    // hiding it — a mismatch is information, not an error.
+    const realised=r.todayRaw>0?Math.round(r.todayWeighted/r.todayRaw*100)/100:null;
+    const drift=realised!=null&&realised!==r.rate;
+    const rateCol=r.rate>1?'var(--orange)':r.rate<1?'var(--green)':'var(--text)';
+    const aliasText=[...r.aliases,...r.peakAliases.map(a=>a+'(峰)')].join(', ')||'<span style="color:var(--dim)">未被别名引用</span>';
+    return '<tr'+(r.custom?' style="background:rgba(47,110,80,.035)"':'')+'>'
+      +'<td><b>'+escH(r.model)+'</b>'+(r.custom?' <span style="font-size:9px;color:var(--accent);border:1px solid var(--accent);border-radius:3px;padding:0 3px">单独定价</span>':' <span style="font-size:9px;color:var(--dim)">默认</span>')+'</td>'
+      +'<td style="font-size:11px;color:var(--dim)">'+escH(r.profile)+'</td>'
+      +'<td style="font-size:11px;color:var(--blue)">'+aliasText+'</td>'
+      +'<td class="n"><b style="color:'+rateCol+'">×'+r.rate+'</b>'
+        +(drift?' <span style="font-size:10px;color:var(--dim)" title="今日实际计权比例与当前倍率不同：跨了高峰边界或期间调整过倍率">实收 ×'+realised+'</span>':'')+'</td>'
+      +'<td class="n"'+(inPeak?' style="font-weight:600"':' style="color:var(--dim)"')+'>×'+r.peak+'</td>'
+      +'<td class="n"'+(!inPeak?' style="font-weight:600"':' style="color:var(--dim)"')+'>×'+r.offPeak+'</td>'
+      +'<td class="n">'+(r.todayRaw?fmtTk(r.todayRaw):'-')+'</td>'
+      +'<td class="n hl">'+(r.todayWeighted?fmtTk(r.todayWeighted):'-')+'</td>'
+      +'<td class="n">'+(r.todayRequests||'-')+'</td>'
+      +'</tr>';
+  }).join("");
 }
 function maskDetailKey(key){const value=String(key||"");return value.length<=12?value:value.slice(0,8)+"****"+value.slice(-4)}
 function detailTokens(row){return ioTokens(row)}
@@ -5972,7 +6304,7 @@ function render(){
   document.getElementById("cards").innerHTML=c("今日用量",todayTokens,"var(--accent)",1)+c("今日请求",tR,"var(--blue)",1)+c("总用量",allTokens,"var(--green)",1)+c("总请求",tr,"var(--orange)",1)+c("今日错误",(Array.isArray(D.errors)?D.errors:[]).filter(e=>e.time&&e.time.startsWith(td)).length,"var(--red)",1);
   runCountUps(document.getElementById("cards"));
   const psb=document.getElementById("profileSummaryBody"),profiles=Array.isArray(D.profileSummaries)?D.profileSummaries:[];
-  const rowOf=p=>{const st=p.breakerState||"UNKNOWN";const rl=p.rateLimit;let col,led,stateLabel;if(rl){col='var(--red)';led='err';const rm=new Date(rl.resumeAt);stateLabel='限额中 '+String(rm.getHours()).padStart(2,'0')+':'+String(rm.getMinutes()).padStart(2,'0')+'恢复';}else{col=st==="CLOSED"?"var(--green)":st==="HALF_OPEN"?"var(--orange)":"var(--red)";led=st==="CLOSED"?"on":st==="HALF_OPEN"?"warn":"err";stateLabel=st==="CLOSED"?"正常":st==="HALF_OPEN"?"探测中":"熔断"+(p.breakerCooldownRemaining>0?' '+Math.ceil(p.breakerCooldownRemaining/1000)+'s后探测':'');}const current=currentProfile!=="all"&&p.suffix===currentProfile;const gBadge=p.inDefaultGroup?' <span style="color:var(--blue);font-size:10px;font-weight:600">默认组·'+(p.groupOrder+1)+'</span>':'';const rBadge=p.inResponsesGroup?' <span style="color:var(--blue);font-size:10px;font-weight:600">Resp组·'+(p.responsesGroupOrder+1)+'</span>':'';const protoBadge=p.protocol==='responses'?' <span style="color:var(--blue);font-size:10px">Codex</span>':'';const bLabel=p.billingType==='coding_plan'?' <span style="color:var(--dim);font-size:10px">CP</span>':p.billingType==='token_plan'?' <span style="color:var(--dim);font-size:10px">TP</span>':'';const pk=(p.peakHours&&p.peakHours.length)?(function(rs){const now=new Date(),cur=((now.getTime()+8*3600000)%86400000)/60000;const tm=function(t){if(!t)return null;const a=t.split(':');return (+a[0])*60+(+a[1])};const inPk=rs.some(function(r){const s=tm(r.start),e=tm(r.end);return s!==null&&e!==null&&s!==e&&(s<e?(cur>=s&&cur<e):(cur>=s||cur<e))});return ' <span style="color:'+(inPk?'var(--orange)':'var(--dim)')+';font-size:10px" title="高峰时段(北京时间) '+rs.map(function(r){return r.start+'-'+r.end}).join(', ')+'">'+(inPk?'高峰中':rs.map(function(r){return r.start+'-'+r.end}).join(','))+'</span>'})(p.peakHours):'';const rt2=(function(){if(p.peakQuotaRate==null&&p.offPeakQuotaRate==null)return'';const pr=p.peakQuotaRate==null?1:p.peakQuotaRate,orr=p.offPeakQuotaRate==null?1:p.offPeakQuotaRate;if(pr===1&&orr===1)return'';var now=new Date(),cur=((now.getTime()+8*3600000)%86400000)/60000;var tm=function(t){if(!t)return null;var a=t.split(':');return (+a[0])*60+(+a[1])};var ip=(p.peakHours||[]).some(function(r){var s=tm(r.start),e=tm(r.end);return s!==null&&e!==null&&s!==e&&(s<e?(cur>=s&&cur<e):(cur>=s||cur<e))});return ' <span style="color:var(--accent);font-size:10px" title="配额倍率：高峰 ×'+pr+' / 低谷 ×'+orr+'（当前'+(ip?'高峰':'低谷')+'）">×'+(ip?pr:orr)+'</span>'})();const restricted=(p.inDefaultGroup&&profiles.filter(x=>x.inDefaultGroup).length>=2)||(p.inResponsesGroup&&profiles.filter(x=>x.inResponsesGroup).length>=2);const entryCode=p.protocol==='responses'?'/v1/responses':'/v1';const defBadge=(p.isDefault||p.isResponsesDefault)?' <span style="color:var(--green);font-size:11px;font-weight:600;vertical-align:middle">默认</span>':'';return'<tr'+(current?' class="profile-current" aria-current="true"':'')+'><td>'+escH(p.name)+defBadge+gBadge+rBadge+protoBadge+bLabel+pk+rt2+(current?' <span class="current-mark">当前</span>':'')+'</td><td>'+(restricted?'<code>'+entryCode+'</code> <span style="color:var(--dim);font-size:10px">仅 '+entryCode+'</span>':'<code>/'+escH(p.suffix)+'</code>'+((p.isDefault||p.isResponsesDefault)?' <span style="color:var(--dim)">/ <code>'+entryCode+'</code></span>':''))+'</td><td style="font-size:12px;color:var(--dim);max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+escH((p.upstream||'').replace('https://','').replace('http://',''))+'</td><td class="n">'+fmtT(p.todayRequests||0)+'</td><td class="n hl">'+fmtT(p.todayTokens||0)+'</td><td><span class="led '+led+'"></span><span style="color:'+col+';font-size:12px">'+stateLabel+'</span></td></tr>'};
+  const rowOf=p=>{const st=p.breakerState||"UNKNOWN";const rl=p.rateLimit;let col,led,stateLabel;if(rl){col='var(--red)';led='err';const rm=new Date(rl.resumeAt);stateLabel='限额中 '+String(rm.getHours()).padStart(2,'0')+':'+String(rm.getMinutes()).padStart(2,'0')+'恢复';}else{col=st==="CLOSED"?"var(--green)":st==="HALF_OPEN"?"var(--orange)":"var(--red)";led=st==="CLOSED"?"on":st==="HALF_OPEN"?"warn":"err";stateLabel=st==="CLOSED"?"正常":st==="HALF_OPEN"?"探测中":"熔断"+(p.breakerCooldownRemaining>0?' '+Math.ceil(p.breakerCooldownRemaining/1000)+'s后探测':'');}const current=currentProfile!=="all"&&p.suffix===currentProfile;const gBadge=p.inDefaultGroup?' <span style="color:var(--blue);font-size:10px;font-weight:600">默认组·'+(p.groupOrder+1)+'</span>':'';const rBadge=p.inResponsesGroup?' <span style="color:var(--blue);font-size:10px;font-weight:600">Resp组·'+(p.responsesGroupOrder+1)+'</span>':'';const protoBadge=p.protocol==='responses'?' <span style="color:var(--blue);font-size:10px">Codex</span>':'';const bLabel=p.billingType==='coding_plan'?' <span style="color:var(--dim);font-size:10px">CP</span>':p.billingType==='token_plan'?' <span style="color:var(--dim);font-size:10px">TP</span>':'';const pk=(p.peakHours&&p.peakHours.length)?(function(rs){const now=new Date(),cur=((now.getTime()+8*3600000)%86400000)/60000;const tm=function(t){if(!t)return null;const a=t.split(':');return (+a[0])*60+(+a[1])};const inPk=rs.some(function(r){const s=tm(r.start),e=tm(r.end);return s!==null&&e!==null&&s!==e&&(s<e?(cur>=s&&cur<e):(cur>=s||cur<e))});return ' <span style="color:'+(inPk?'var(--orange)':'var(--dim)')+';font-size:10px" title="高峰时段(北京时间) '+rs.map(function(r){return r.start+'-'+r.end}).join(', ')+'">'+(inPk?'高峰中':rs.map(function(r){return r.start+'-'+r.end}).join(','))+'</span>'})(p.peakHours):'';const rt2=(function(){if(p.peakQuotaRate==null&&p.offPeakQuotaRate==null)return'';const pr=p.peakQuotaRate==null?1:p.peakQuotaRate,orr=p.offPeakQuotaRate==null?1:p.offPeakQuotaRate;const nCustom=Object.keys(p.modelQuotaRates||{}).length;if(pr===1&&orr===1&&nCustom===0)return'';var now=new Date(),cur=((now.getTime()+8*3600000)%86400000)/60000;var tm=function(t){if(!t)return null;var a=t.split(':');return (+a[0])*60+(+a[1])};var ip=(p.peakHours||[]).some(function(r){var s=tm(r.start),e=tm(r.end);return s!==null&&e!==null&&s!==e&&(s<e?(cur>=s&&cur<e):(cur>=s||cur<e))});return ' <span style="color:var(--accent);font-size:10px" title="默认配额倍率：高峰 ×'+pr+' / 低谷 ×'+orr+'（当前'+(ip?'高峰':'低谷')+'）'+(nCustom?'；另有 '+nCustom+' 个模型单独定价':'')+'">×'+(ip?pr:orr)+(nCustom?'+'+nCustom:'')+'</span>'})();const restricted=(p.inDefaultGroup&&profiles.filter(x=>x.inDefaultGroup).length>=2)||(p.inResponsesGroup&&profiles.filter(x=>x.inResponsesGroup).length>=2);const entryCode=p.protocol==='responses'?'/v1/responses':'/v1';const defBadge=(p.isDefault||p.isResponsesDefault)?' <span style="color:var(--green);font-size:11px;font-weight:600;vertical-align:middle">默认</span>':'';return'<tr'+(current?' class="profile-current" aria-current="true"':'')+'><td>'+escH(p.name)+defBadge+gBadge+rBadge+protoBadge+bLabel+pk+rt2+(current?' <span class="current-mark">当前</span>':'')+'</td><td>'+(restricted?'<code>'+entryCode+'</code> <span style="color:var(--dim);font-size:10px">仅 '+entryCode+'</span>':'<code>/'+escH(p.suffix)+'</code>'+((p.isDefault||p.isResponsesDefault)?' <span style="color:var(--dim)">/ <code>'+entryCode+'</code></span>':''))+'</td><td style="font-size:12px;color:var(--dim);max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+escH((p.upstream||'').replace('https://','').replace('http://',''))+'</td><td class="n">'+fmtT(p.todayRequests||0)+'</td><td class="n hl">'+fmtT(p.todayTokens||0)+'</td><td><span class="led '+led+'"></span><span style="color:'+col+';font-size:12px">'+stateLabel+'</span></td></tr>'};
   const anthProfiles=profiles.filter(p=>p.protocol!=="responses"),respProfiles=profiles.filter(p=>p.protocol==="responses");
   const protoRow=(label,entry,count)=>'<tr class="proto-row"><td colspan="6">'+label+' · 入口 '+entry+' · '+count+' 个方案</td></tr>';
   let psbHtml="";
@@ -6102,6 +6434,7 @@ function render(){
   document.getElementById("errorCount").textContent=allErrs.length>0?'('+allErrs.length+')':'';
   document.getElementById("errorHint").textContent=allErrs.length>0?(allErrs.length+'条错误'):'暂无错误';
   renderWorkspaceSummaries();
+  renderRateBoard();
 }
 async function load(){try{const profile=currentProfile==="all"?"all":currentProfile;const qs=[];if(profile!=="all")qs.push("profile="+encodeURIComponent(profile));else if(PROTO)qs.push("protocol="+PROTO);const r=await fetch("/api/stats"+(qs.length?"?"+qs.join("&"):""));D=await r.json();render()}catch(e){document.getElementById("meta").textContent="Error: "+e.message}}
 function toggleSec(id){const body=document.getElementById(id+"Body");const icon=document.getElementById(id+"Icon");const open=body.classList.toggle("open");icon.classList.toggle("open",open)}
@@ -6616,7 +6949,8 @@ table{width:100%;border-collapse:collapse;min-width:560px}th{text-align:left;pad
 <div class="cards" id="cards"></div>
 <div class="box"><h3>今日24小时趋势</h3><canvas id="hourChart"></canvas></div>
 <div class="box"><h3>近7天趋势</h3><canvas id="trendChart"></canvas></div>
-<div class="box"><h3>今日模型请求</h3><table id="modelTable"><thead><tr><th>模型</th><th class="n">请求数</th><th class="n">Token</th></tr></thead><tbody></tbody></table></div>
+<div class="box"><h3>今日模型请求</h3><table id="modelTable"><thead><tr><th>模型</th><th class="n">请求数</th><th class="n">实际 Token</th><th class="n">倍率</th><th class="n">计入配额</th></tr></thead><tbody></tbody></table><div class="note" id="modelTableNote" style="font-size:11px;color:var(--dim);margin-top:8px"></div></div>
+<div class="box" id="rateCardBox" style="display:none"><h3>配额价目表 <span style="font-size:11px;color:var(--dim);font-weight:400">当前时段每个模型消耗 1 token 扣多少额度</span></h3><div id="rateCardBody"></div></div>
 <script>
 ${UI_HELPERS}
 ${TOAST_JS}
@@ -6653,11 +6987,13 @@ function switchProtocolView(proto){
 document.querySelectorAll('#protoSeg button').forEach(b=>b.addEventListener('click',()=>switchProtocolView(b.dataset.proto)));
 // Quota-rate helpers. rate===null means the aggregate view (rates differ per
 // profile), so only the combined discount is shown, never a single multiplier.
+// The profile-level rate is explicitly labelled 默认 because per-model overrides
+// mean a mixed day has no single "the" rate — the model table carries the detail.
 function rateTag(q){
   if(q.rate===null||q.rate===undefined||q.rate===1)return'';
   const col=q.inPeak?'var(--orange)':'var(--green)';
-  const t=(q.inPeak?'高峰':'低谷')+'倍率 ×'+q.rate+'，消耗按此比例计入配额';
-  return ' <span class="tag" style="background:rgba(0,0,0,.04);color:'+col+'" title="'+t+'">'+(q.inPeak?'高峰':'低谷')+' ×'+q.rate+'</span>';
+  const t=(q.inPeak?'高峰':'低谷')+'时段默认倍率 ×'+q.rate+'；单独定价的模型见下方价目表';
+  return ' <span class="tag" style="background:rgba(0,0,0,.04);color:'+col+'" title="'+t+'">'+(q.inPeak?'高峰':'低谷')+'默认 ×'+q.rate+'</span>';
 }
 function rateFootnote(q){
   if(q.rawUsed==null||q.rawUsed===q.used)return'';
@@ -6675,12 +7011,16 @@ function renderQNotice(q){
     const slot=q.rate===null?'':(q.inPeak?'高峰':'低谷');
     const delta=q.rawUsed-q.used;
     const nx=q.nextRateChange;
+    // Lead with the realised effect (how much was written off), not the nominal
+    // rate: with per-model rates the day is a blend and the single default rate
+    // would not reconcile with the numbers below it.
+    const realised=q.rawUsed>0?Math.round(q.used/q.rawUsed*100)/100:null;
     html+='<div class="qnotice bonus show"><span class="qi">率</span><div><b>配额倍率生效中</b> — '
-      +(q.rate!==null&&q.rate!==undefined?'当前'+slot+'时段，消耗按 <span class="hl">×'+q.rate+'</span> 计入配额。':'当前各方案倍率不同，下列为合计值。')
       +'今日实际使用 <b>'+fmtT(q.rawUsed)+'</b> tokens，'
       +(delta>0?'已为你抵扣 <span class="hl">'+fmtTk(delta)+'</span> 额度':'额外加收 <span class="hl">'+fmtTk(-delta)+'</span> 额度')
-      +'（计入配额 '+fmtT(q.used)+'）。'
-      +(nx?'<b>'+nx.at+'</b> 后转入'+(nx.toPeak?'高峰':'低谷')+' ×'+nx.rate+'。':'')
+      +'（计入配额 '+fmtT(q.used)+(realised!=null?'，综合 ×'+realised:'')+'）。'
+      +(q.rate!==null&&q.rate!==undefined?'当前'+slot+'时段默认 ×'+q.rate+'，各模型倍率见下方价目表。':'当前各方案倍率不同，上列为合计值。')
+      +(nx?'<b>'+nx.at+'</b> 后转入'+(nx.toPeak?'高峰':'低谷')+'。':'')
       +'</div></div>';
   }
   if(q.resetApplied){
@@ -6723,12 +7063,58 @@ function render(){
   // Trend chart
   if(C.t)C.t.destroy();
   C.t=new Chart(document.getElementById("trendChart"),{type:"line",data:{labels:D.trend.map(d=>d.date.slice(5)),datasets:[{label:"总Token(含缓存)",data:D.trend.map(d=>d.total),borderColor:COL[0],backgroundColor:"rgba(47,110,80,.12)",fill:true,tension:.28,pointRadius:2,borderWidth:2}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{labels:{color:"#686863",font:{size:10}}}},scales:{x:{ticks:{color:"#686863"},grid:{display:false}},y:{ticks:{color:"#686863",callback:v=>fmtTk(v)},grid:{color:"rgba(24,24,22,.08)"}}}}});
-  // Model table
+  // Model table. Two token columns side by side is the whole point: "实际" is what
+  // the user spent, "计入配额" is what it cost them. The per-row multiplier is the
+  // realised ratio (weighted/raw) — for a row that straddled a peak boundary or a
+  // rate change that lands between the two configured values, which is correct.
   const mt=document.querySelector("#modelTable tbody");
   const models=Object.entries(D.models||{}).sort((a,b)=>b[1].requests-a[1].requests);
-  if(!models.length){mt.innerHTML='<tr><td colspan="3" style="text-align:center;color:var(--dim)">暂无数据</td></tr>'}else{
-    mt.innerHTML=models.map(([m,d])=>'<tr><td style="color:var(--blue)">'+m+'</td><td class="n">'+fmtT(d.requests)+'</td><td class="n" title="输入 '+fmtT(d.inputTokens||0)+' / 输出 '+fmtT(d.outputTokens||0)+'">'+fmtTk(d.total||0)+'</td></tr>').join("");
+  const anyWeighted=models.some(([,d])=>d.weighted!=null&&d.weighted!==d.total);
+  if(!models.length){mt.innerHTML='<tr><td colspan="5" style="text-align:center;color:var(--dim)">暂无数据</td></tr>'}else{
+    mt.innerHTML=models.map(([m,d])=>{
+      const raw=d.total||0,w=d.weighted!=null?d.weighted:raw;
+      const realised=raw>0?Math.round(w/raw*100)/100:null;
+      const now=d.rate;
+      // Show the realised ratio, and flag when the live rate differs from it (rate
+      // changed today, or the day spanned a peak boundary).
+      const rateCell=realised==null?'<span style="color:var(--dim)">-</span>'
+        :'<span'+(realised!==1?' style="color:var(--accent)"':'')+' title="今日实际计权比例'+(now!=null&&now!==realised?'；当前时段该模型为 ×'+now:'')+'">×'+realised+(now!=null&&now!==realised?' <span style="color:var(--dim);font-size:10px">(现 ×'+now+')</span>':'')+'</span>';
+      return '<tr><td style="color:var(--blue)">'+m+(d.rateIsDefault===false?' <span class="tag" style="font-size:9px">单独定价</span>':'')+'</td>'
+        +'<td class="n">'+fmtT(d.requests)+'</td>'
+        +'<td class="n" title="输入 '+fmtT(d.inputTokens||0)+' / 输出 '+fmtT(d.outputTokens||0)+'">'+fmtTk(raw)+'</td>'
+        +'<td class="n">'+rateCell+'</td>'
+        +'<td class="n hl">'+fmtTk(w)+'</td></tr>';
+    }).join("");
   }
+  const note=document.getElementById('modelTableNote');
+  note.innerHTML=anyWeighted
+    ?'「实际 Token」是真实消耗，「计入配额」是按倍率折算后从每日额度里扣掉的数额。倍率列为今日实际计权比例，跨高峰边界或期间调整过倍率时会落在两档之间。'
+    :'当前所有模型倍率均为 1.0，实际消耗与计入配额相同。';
+  renderRateCard();
+}
+// Price list: what each alias costs right now. Answers "为什么额度掉这么快" before
+// the user spends, not after. Cheapest first — the cheap option should be the one
+// that catches the eye.
+function renderRateCard(){
+  const box=document.getElementById('rateCardBox'),body=document.getElementById('rateCardBody');
+  if(!box||!body)return;
+  const cards=D.rateCard?[D.rateCard]:(D.rateCards||[]);
+  const meaningful=cards.filter(c=>c&&c.rows.length&&(c.rows.some(r=>r.custom)||c.defaultPeak!==1||c.defaultOffPeak!==1));
+  if(!meaningful.length){box.style.display='none';return}
+  box.style.display='';
+  body.innerHTML=meaningful.map(c=>{
+    const rows=c.rows.map(r=>'<tr><td style="color:var(--blue)">'+r.alias+'</td>'
+      +'<td style="color:var(--dim);font-size:11px">'+r.model+'</td>'
+      +'<td class="n"'+(r.rate<1?' style="color:var(--green);font-weight:600"':r.rate>1?' style="color:var(--orange);font-weight:600"':'')+'>×'+r.rate+'</td>'
+      +'<td class="n" style="color:var(--dim);font-size:11px">'+(r.custom?'峰 ×'+r.peak+' / 谷 ×'+r.offPeak:'跟随默认')+'</td></tr>').join('');
+    return '<div style="margin-bottom:14px">'
+      +'<div style="font-size:12px;font-weight:600;margin-bottom:6px">'+c.profile
+      +' <span class="tag" style="background:rgba(0,0,0,.04);color:'+(c.inPeak?'var(--orange)':'var(--green)')+'">'+(c.inPeak?'高峰时段':'低谷时段')+'</span>'
+      +' <span style="font-size:10px;color:var(--dim);font-weight:400">默认 ×'+(c.inPeak?c.defaultPeak:c.defaultOffPeak)+'</span></div>'
+      +'<table style="min-width:auto"><thead><tr><th>别名</th><th>实际模型</th><th class="n">当前倍率</th><th class="n">峰/谷</th></tr></thead><tbody>'+rows+'</tbody></table>'
+      +'</div>';
+  }).join('')
+    +'<div class="note" style="font-size:11px;color:var(--dim)">倍率越低越省额度：×0.5 表示消耗 1000 token 只扣 500 额度。倍率随时段自动切换，调整只影响之后的请求。</div>';
 }
 load();setInterval(load,30000);
 <\/script></body></html>`;
@@ -6803,6 +7189,17 @@ function quotaRateChangeText(beforeJson, afterJson) {
     const b = normalizeQuotaRate(before[field]), a = normalizeQuotaRate(after[field]);
     if (b !== a) bits.push(`${label} ${b}→${a}`);
   }
+  // Per-model overrides: report added / removed / changed models by name, since a
+  // bare "modelQuotaRates" field name tells the reader nothing about the impact.
+  const mb = normalizeModelQuotaRates(before.modelQuotaRates), ma = normalizeModelQuotaRates(after.modelQuotaRates);
+  for (const model of new Set([...Object.keys(mb), ...Object.keys(ma)])) {
+    const x = mb[model], y = ma[model];
+    if (!x && y) bits.push(`${model} 新增 峰 ${y.peak}/谷 ${y.offPeak}`);
+    else if (x && !y) bits.push(`${model} 取消单独定价（回落默认）`);
+    else if (x && y && (x.peak !== y.peak || x.offPeak !== y.offPeak)) {
+      bits.push(`${model} 峰 ${x.peak}→${y.peak}/谷 ${x.offPeak}→${y.offPeak}`);
+    }
+  }
   return bits.join(" / ");
 }
 
@@ -6864,6 +7261,21 @@ function applySettings(formData) {
   }
   if (!isGlobalOnlySave && formData.offPeakQuotaRate !== undefined) {
     editingProfile.offPeakQuotaRate = normalizeQuotaRate(formData.offPeakQuotaRate);
+  }
+  // Per-model rate rows: mr_model_N / mr_peak_N / mr_off_N, gated on the hidden
+  // mrPresent marker so a submit that deleted every row still clears the overrides
+  // (row keys alone would be absent and the old map would survive).
+  if (!isGlobalOnlySave && formData.mrPresent !== undefined) {
+    const rates = {};
+    for (let i = 0; formData["mr_model_" + i] !== undefined; i++) {
+      const model = String(formData["mr_model_" + i] || "").trim();
+      if (!model) continue;   // unselected row — silently skipped
+      rates[model] = {
+        peak: normalizeQuotaRate(formData["mr_peak_" + i]),
+        offPeak: normalizeQuotaRate(formData["mr_off_" + i]),
+      };
+    }
+    editingProfile.modelQuotaRates = rates;
   }
 
   // Update auto quota adjustment settings
@@ -7466,6 +7878,7 @@ const server = http.createServer((req, res) => {
           peakHours: [],
           peakQuotaRate: 1,
           offPeakQuotaRate: 1,
+          modelQuotaRates: {},
         };
         saveConfig(config);
         reloadAllRuntimes();
@@ -7697,6 +8110,10 @@ const server = http.createServer((req, res) => {
     data.hourlyModels = loadHourlyModels(scopedSuffix, protoFilter);
     data.profileDaily = loadProfileDaily(protoFilter);
     data.profileDailyModels = loadProfileDailyModels(protoFilter);
+    // Model rate board: config rates + today's realised cost per profile×model.
+    data.modelRateBoard = getModelRateBoard(
+      profileSuffix === "all" ? protoFilter : [normalizeProfileSuffix(profileSuffix)]
+    );
     sendJson(res, data, req);
     return;
   }

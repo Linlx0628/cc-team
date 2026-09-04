@@ -4943,10 +4943,21 @@ body{padding:0;overflow:hidden;height:100vh}
 .sidebar-hd a:hover{color:var(--text)}.sidebar-brand{display:flex;align-items:center;gap:10px}
 .sidebar-list{flex:1;overflow-y:auto;padding:12px}
 .sidebar-global{padding:10px 12px;border-top:1px solid var(--border);background:var(--surface)}
-.sidebar-tool{display:block;width:100%;margin:0;text-align:left;font-family:var(--font-body)}
-.sidebar-tool .pl-name,.sidebar-tool .pl-users{display:block}.sidebar-tool .pl-name{padding-right:0}
+.sidebar-nav{display:grid;grid-template-columns:1fr 1fr 1fr;gap:4px;padding:8px 12px;border-top:1px solid var(--border);background:var(--surface)}
+.sidebar-nav .nav-btn{font-size:11px;font-weight:600;padding:7px 4px;border:1px solid var(--border);border-radius:6px;background:var(--surface);color:var(--dim);cursor:pointer;text-align:center;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.sidebar-nav .nav-btn:hover{border-color:var(--border-strong);background:var(--surface-subtle);color:var(--text)}
+.sidebar-nav .nav-btn.active{border-color:var(--accent);background:var(--accent-soft);color:var(--accent)}
+/* Popover listing not-yet-grouped profiles, anchored right of a failover group.
+   position:fixed is deliberate: the group dock is a scrollable (overflow) box,
+   an absolutely-positioned child would be clipped. A fixed child of a
+   display:none tab pane still doesn't render, so switching protocol tabs
+   closes it for free. */
+.group-add-pop{position:fixed;z-index:60;display:none;flex-direction:column;gap:6px;background:var(--surface);border:1px solid var(--border-strong);border-radius:8px;box-shadow:0 12px 32px rgba(24,24,22,.14);padding:10px 12px;min-width:200px;max-width:280px}
+.group-add-pop .preset{text-align:left}
+.gap-hd{font-size:10px;font-weight:650;color:var(--dim)}
+.gap-empty{font-size:11px;color:var(--dim);padding:4px 2px}
 .sidebar-ft{padding:12px;border-top:1px solid var(--border);background:var(--surface)}
-.pl-item{background:transparent;border:1px solid transparent;border-radius:6px;padding:11px 12px;margin-bottom:4px;position:relative;cursor:pointer}
+.pl-item{background:transparent;border:1px solid transparent;border-radius:6px;padding:9px 11px;margin-bottom:3px;position:relative;cursor:pointer}
 .pl-item:hover{background:var(--surface-subtle)}
 .pl-item.active{border-color:var(--border);background:var(--accent-soft)}
 .pl-name{font-size:13px;font-weight:600;margin-bottom:3px;padding-right:74px}
@@ -5011,10 +5022,10 @@ td{padding:8px;border-bottom:1px solid #ecece8;font-size:12px}
 .proto-tab.on{border-color:var(--accent);background:var(--accent-soft);color:var(--accent)}
 .proto-pane{flex:1;min-height:0;display:flex;flex-direction:column;overflow:hidden}
 .sidebar-dock{flex-shrink:0}
-.sidebar-dock .sidebar-global{max-height:38vh;overflow-y:auto}
+.sidebar-dock .sidebar-global{max-height:32vh;overflow-y:auto}
 .proto-pane-hd{font-size:11px;font-weight:650;padding:2px 12px 4px;display:flex;align-items:center;justify-content:space-between;gap:8px}
 .proto-pane-hd .proto-entry{font-size:10px;font-weight:400;color:var(--accent)}
-.proto-pane-hint{font-size:10px;color:var(--dim);padding:0 12px 8px;line-height:1.5}
+.proto-pane-hint{font-size:10px;color:var(--dim);padding:0 12px 5px;line-height:1.5;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .alias-toolbar{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin-bottom:8px}
 .alias-head{display:grid;grid-template-columns:1fr 1.25fr 118px 56px 30px;gap:8px;font-size:10px;font-weight:600;color:var(--dim);margin-bottom:4px}
 .alias-head.peak{grid-template-columns:1fr 1.4fr 30px}
@@ -5032,7 +5043,7 @@ td{padding:8px;border-bottom:1px solid #ecece8;font-size:12px}
 .tag-row{display:flex;flex-wrap:wrap;gap:6px;min-height:30px;align-items:center;background:var(--bg);border:1px dashed var(--border);border-radius:6px;padding:8px 10px}
 .tag-row .m-tag{font-size:11px;font-family:var(--font-mono);background:var(--accent-soft);color:var(--accent);padding:3px 10px;border-radius:10px}
 .tag-row .m-empty{font-size:11px;color:var(--dim)}
-@media(max-width:680px){body{overflow:auto;height:auto}.layout{flex-direction:column;height:auto;min-height:100vh}.sidebar{width:100%;min-width:0;max-height:none;border-right:0;border-bottom:1px solid var(--border)}.sidebar-list{display:flex;gap:6px;overflow-x:auto}.sidebar-dock .sidebar-global{max-height:none;overflow-y:visible}.sidebar-global{padding:8px 12px}.sidebar-tool{min-width:0}.pl-item{min-width:210px;margin:0}.main{overflow:visible;padding:22px 16px}.actions{left:0;padding-left:16px;padding-right:16px}.row,.row3{grid-template-columns:1fr}.modal{width:100%;max-height:90vh}.section{padding:15px;overflow-x:auto}.import-summary{grid-template-columns:1fr 1fr}.mapping-row{grid-template-columns:1fr}.mapping-arrow{display:none}.danger-copy{align-items:flex-start;flex-direction:column}}
+@media(max-width:680px){body{overflow:auto;height:auto}.layout{flex-direction:column;height:auto;min-height:100vh}.sidebar{width:100%;min-width:0;max-height:none;border-right:0;border-bottom:1px solid var(--border)}.sidebar-list{display:flex;gap:6px;overflow-x:auto}.sidebar-dock .sidebar-global{max-height:none;overflow-y:visible}.sidebar-global{padding:8px 12px}.pl-item{min-width:210px;margin:0}.main{overflow:visible;padding:22px 16px}.actions{left:0;padding-left:16px;padding-right:16px}.row,.row3{grid-template-columns:1fr}.modal{width:100%;max-height:90vh}.section{padding:15px;overflow-x:auto}.import-summary{grid-template-columns:1fr 1fr}.mapping-row{grid-template-columns:1fr}.mapping-arrow{display:none}.danger-copy{align-items:flex-start;flex-direction:column}}
 </style></head><body data-theme="editorial-light">
 <div class="layout">
 <div class="sidebar">
@@ -5043,34 +5054,48 @@ td{padding:8px;border-bottom:1px solid #ecece8;font-size:12px}
 </div>
 <div class="proto-pane" data-proto="anthropic">
   <div class="proto-pane-hd"><span>Anthropic 方案 <span class="proto-entry">入口 /v1</span></span><button type="button" class="btn btn-outline btn-sm" onclick="openProfileModal('anthropic')">+ 新建</button></div>
-  <div class="proto-pane-hint">Claude Code 走这里。本协议的默认入口和方案组只影响 /v1 请求，与 Codex 的 /v1/responses 完全互不影响。</div>
+  <div class="proto-pane-hint">Claude Code 走这里；默认入口与 failover 仅影响 /v1</div>
   <div class="sidebar-list">${anthProfiles.map(profileCard).join("") || '<div style="padding:0 12px 8px;font-size:11px;color:var(--dim)">暂无 Anthropic 方案</div>'}</div>
 </div>
 <div class="proto-pane" data-proto="responses" style="display:none">
   <div class="proto-pane-hd"><span>OpenAI 方案 <span class="proto-entry">入口 /v1/responses</span></span><button type="button" class="btn btn-outline btn-sm" onclick="openProfileModal('responses')">+ 新建</button></div>
-  <div class="proto-pane-hint">Codex 走这里（base_url 指向 http://&lt;host&gt;:端口/v1）。本协议的默认入口和方案组只影响 /v1/responses 请求，与 Claude Code 的 /v1 完全互不影响。</div>
+  <div class="proto-pane-hint">Codex 走 /v1/responses；与 Claude Code 完全隔离</div>
   <div class="sidebar-list">${respProfiles.map(profileCard).join("") || '<div style="padding:0 12px 8px;font-size:11px;color:var(--dim)">暂无 OpenAI 方案 — Codex 请求将返回 503</div>'}</div>
 </div>
 <div class="sidebar-dock">
-  <div class="sidebar-global" data-proto="anthropic" style="padding:10px 12px">
+  <div class="sidebar-global" data-proto="anthropic" style="padding:8px 12px">
     <div style="font-size:11px;font-weight:650;margin-bottom:8px;display:flex;align-items:center;justify-content:space-between">
       <span>默认方案组 <span style="color:var(--dim);font-weight:400;font-size:10px">/v1 failover</span></span>
-      <label style="display:flex;align-items:center;gap:4px;cursor:pointer;font-size:10px;font-weight:400;white-space:nowrap" title="全局设置：同时作用于两个协议的方案组"><input type="checkbox" id="restrictGroupSuffixCb" ${config.restrictGroupSuffix !== false ? "checked" : ""} onchange="setRestrictGroupSuffix(this.checked)" style="width:auto;accent-color:var(--accent)"> 限制直连</label>
+      <div style="display:flex;align-items:center;gap:6px">
+        <button type="button" class="btn btn-outline btn-sm" data-grouppop-btn onclick="toggleGroupAddPop('defaultGroupAddPop',this)" style="font-size:10px;padding:3px 8px">＋ 加入</button>
+        <label style="display:flex;align-items:center;gap:4px;cursor:pointer;font-size:10px;font-weight:400;white-space:nowrap" title="全局设置：同时作用于两个协议的方案组"><input type="checkbox" id="restrictGroupSuffixCb" ${config.restrictGroupSuffix !== false ? "checked" : ""} onchange="setRestrictGroupSuffix(this.checked)" style="width:auto;accent-color:var(--accent)"> 限制直连</label>
+      </div>
     </div>
     <div id="defaultGroupList" style="margin-bottom:6px">${groupItemsHtml || '<span style="font-size:11px;color:var(--dim)">组为空 — 至少加入 2 个方案以启用 failover</span>'}</div>
-    ${nonMembersHtml ? `<div style="margin-top:6px;display:flex;align-items:center;gap:6px;flex-wrap:wrap"><span style="color:var(--dim);font-size:10px">加入：</span>${nonMembersHtml}</div>` : ''}
+    <div class="group-add-pop" id="defaultGroupAddPop">
+      <div class="gap-hd">未加入的 Anthropic 方案</div>
+      ${nonMembersHtml || '<div class="gap-empty">没有可加入的方案</div>'}
+    </div>
   </div>
-  <div class="sidebar-global" data-proto="responses" style="padding:10px 12px;display:none">
+  <div class="sidebar-global" data-proto="responses" style="padding:8px 12px;display:none">
     <div style="font-size:11px;font-weight:650;margin-bottom:8px;display:flex;align-items:center;justify-content:space-between">
       <span>OpenAI 方案组 <span style="color:var(--dim);font-weight:400;font-size:10px">/v1/responses failover · Codex</span></span>
-      <label style="display:flex;align-items:center;gap:4px;cursor:pointer;font-size:10px;font-weight:400;white-space:nowrap" title="全局设置：同时作用于两个协议的方案组"><input type="checkbox" id="restrictGroupSuffixCb2" ${config.restrictGroupSuffix !== false ? "checked" : ""} onchange="setRestrictGroupSuffix(this.checked)" style="width:auto;accent-color:var(--accent)"> 限制直连</label>
+      <div style="display:flex;align-items:center;gap:6px">
+        <button type="button" class="btn btn-outline btn-sm" data-grouppop-btn onclick="toggleGroupAddPop('responsesGroupAddPop',this)" style="font-size:10px;padding:3px 8px">＋ 加入</button>
+        <label style="display:flex;align-items:center;gap:4px;cursor:pointer;font-size:10px;font-weight:400;white-space:nowrap" title="全局设置：同时作用于两个协议的方案组"><input type="checkbox" id="restrictGroupSuffixCb2" ${config.restrictGroupSuffix !== false ? "checked" : ""} onchange="setRestrictGroupSuffix(this.checked)" style="width:auto;accent-color:var(--accent)"> 限制直连</label>
+      </div>
     </div>
     <div id="responsesGroupList" style="margin-bottom:6px">${responsesGroupItemsHtml || '<span style="font-size:11px;color:var(--dim)">组为空 — Codex 请求将返回 503</span>'}</div>
-    ${responsesNonMembersHtml ? `<div style="margin-top:6px;display:flex;align-items:center;gap:6px;flex-wrap:wrap"><span style="color:var(--dim);font-size:10px">加入：</span>${responsesNonMembersHtml}</div>` : ''}
+    <div class="group-add-pop" id="responsesGroupAddPop">
+      <div class="gap-hd">未加入的 OpenAI 方案</div>
+      ${responsesNonMembersHtml || '<div class="gap-empty">没有可加入的方案</div>'}
+    </div>
   </div>
-<div class="sidebar-global"><button type="button" class="pl-item sidebar-tool" id="quotaPoolNav" onclick="openQuotaPoolView()"><span class="pl-name">额度池</span><span class="pl-users">${quotaPoolCount} 个池 · 共享额度与定价</span></button></div>
-<div class="sidebar-global"><button type="button" class="pl-item sidebar-tool" id="dataManagementNav" onclick="openDataManagementView()"><span class="pl-name">全局数据管理</span><span class="pl-users">导入、备份与清空</span></button></div>
-<div class="sidebar-global"><button type="button" class="pl-item sidebar-tool" id="auditLogNav" onclick="openAuditLogView()"><span class="pl-name">操作日志</span><span class="pl-users">谁在何时改了什么</span></button></div>
+<div class="sidebar-nav">
+  <button type="button" class="nav-btn" id="quotaPoolNav" onclick="openQuotaPoolView()" title="额度池（${quotaPoolCount} 个池）——共享额度与定价">额度池</button>
+  <button type="button" class="nav-btn" id="dataManagementNav" onclick="openDataManagementView()" title="全局数据管理——导入、备份与清空">数据管理</button>
+  <button type="button" class="nav-btn" id="auditLogNav" onclick="openAuditLogView()" title="操作日志——谁在何时改了什么">操作日志</button>
+</div>
 <div class="sidebar-ft" style="display:flex;gap:6px"><button class="btn btn-outline btn-sm" onclick="openUserModal()" style="flex:1">用户管理</button><button class="btn btn-outline btn-sm" onclick="openProfileModal()" style="flex:1">新增方案</button></div>
 </div>
 </div>
@@ -5503,15 +5528,13 @@ ${s.profiles.map(p => `<option value="${escHtml(p.suffix)}" ${p.suffix === initi
 </select>
 <div class="note" id="newProfileProtocolNote">Claude Code 走 /v1/messages；Codex 走 /v1/responses。两种协议的方案完全隔离。</div>
 <label>上游 API 地址<span class="req">*</span></label><input type="text" id="newProfileUpstream" value="${escHtml(initialProfile.upstream || s.upstream || "")}" placeholder="https://open.bigmodel.cn/api/anthropic">
-<label>允许模型</label><input type="text" id="newProfileModels" value="${escHtml((initialProfile.allowedModels || s.allowedModels || []).join(","))}" placeholder="glm-5.1,qwen-max">
-<label>模型别名（每行 alias=实际模型，建议直接填 jx-fable / jx-opus / jx-haiku / jx-sonnet）</label><textarea id="newProfileAliases" rows="3" placeholder="jx-fable=glm-5.3&#10;jx-opus=glm-5.3&#10;jx-haiku=glm-5.3-flash&#10;jx-sonnet=glm-5.3-flash"></textarea>
 <label>所属额度池</label>
 <select id="newProfilePool">
   <option value="">＋ 新建额度池（与方案同名，独立额度）</option>
   ${(s.quotaPools || []).map(p => `<option value="${escHtml(p.name)}">${escHtml(p.label)}（${p.profiles.length} 个方案共用额度）</option>`).join("")}
 </select>
 <div class="note">同一上游套餐的多个方案（如 Claude Code 与 Codex 各一个）应选同一个池，用量合并计入同一份额度。</div>
-<div class="note">创建后会出现在左侧方案列表；进入编辑页后可用行编辑器逐行完善（含每别名上下文）。</div>
+<div class="note">模型别名在创建后进入方案编辑页配置（允许模型由别名目标自动生成，无需手填）。未配置别名的方案会拒绝所有请求。</div>
 <div style="margin-top:16px;display:flex;justify-content:flex-end;gap:8px">
 <button type="button" class="btn btn-outline btn-sm" onclick="closeProfileModal()">取消</button>
 <button type="button" class="btn btn-primary btn-sm" onclick="createProfile()">创建方案</button>
@@ -5783,6 +5806,11 @@ function hideAllSecondaryViews(){
   audit.hidden=true;audit.setAttribute('aria-hidden','true');
   if(pool){pool.hidden=true;pool.setAttribute('aria-hidden','true')}
   document.querySelectorAll('.pl-item').forEach(function(el){el.classList.remove('active')});
+  // Nav buttons live outside .pl-item now, so clear their highlight explicitly.
+  ['quotaPoolNav','dataManagementNav','auditLogNav'].forEach(function(id){
+    const el=document.getElementById(id);
+    if(el)el.classList.remove('active');
+  });
 }
 function openQuotaPoolView(){
   const form=document.getElementById('settingsForm');
@@ -6067,16 +6095,13 @@ async function createProfile(){
   const name=document.getElementById('newProfileName').value.trim();
   const suffix=document.getElementById('newProfileSuffix').value.trim();
   const upstream=document.getElementById('newProfileUpstream').value.trim();
-  const models=document.getElementById('newProfileModels').value.trim();
-  const modelAliases=document.getElementById('newProfileAliases').value.trim();
   const protocol=document.getElementById('newProfileProtocol').value;
   if(!name||!suffix||!upstream){alert('方案名称、URL 后缀和上游 API 地址必填');return}
-  const fm=document.forms.settingsForm;
   const r=await fetch('/api/profile/save',{method:'POST',headers:csrfHeaders({'Content-Type':'application/json'}),body:JSON.stringify({
-    profile:name,suffix:suffix,upstream:upstream,allowedModels:models,
-    modelAliases:modelAliases,protocol:protocol,quotaPool:document.getElementById('newProfilePool')?.value||''
+    profile:name,suffix:suffix,upstream:upstream,
+    protocol:protocol,quotaPool:document.getElementById('newProfilePool')?.value||''
   })});
-  if(r.ok)toastThen('方案已创建',()=>location.reload());else{const e=await r.json();alert('创建失败: '+e.error)}
+  if(r.ok)toastThen('方案已创建 — 点击左侧方案配置模型别名',()=>location.reload());else{const e=await r.json();alert('创建失败: '+e.error)}
 }
 async function setDefaultProfile(n,protocol){
   const r=await fetch('/api/profile/default',{method:'POST',headers:csrfHeaders({'Content-Type':'application/json'}),body:JSON.stringify({profile:n,protocol:protocol||'anthropic'})});
@@ -6103,6 +6128,27 @@ function currentResponsesGroupFromDom(){return Array.prototype.map.call(document
 async function addToResponsesGroup(n){const g=currentResponsesGroupFromDom();if(!g.includes(n))g.push(n);saveResponsesGroup(g)}
 async function removeFromResponsesGroup(n){saveResponsesGroup(currentResponsesGroupFromDom().filter(function(x){return x!==n}))}
 async function moveResponsesGroup(n,d){const g=currentResponsesGroupFromDom();const i=g.indexOf(n);if(i<0)return;const j=i+d;if(j<0||j>=g.length)return;g.splice(i,1);g.splice(j,0,n);saveResponsesGroup(g)}
+// ── 方案组「加入」弹卡：贴组区右侧，点选即加（reload 后自然关闭）──
+let _groupPopId=null;
+function toggleGroupAddPop(id,btn){
+  const pop=document.getElementById(id);
+  if(!pop)return;
+  if(_groupPopId===id){closeGroupAddPop();return}
+  closeGroupAddPop();
+  pop.style.display='flex';
+  const r=btn.getBoundingClientRect(),w=pop.offsetWidth;
+  let left=r.right+8;
+  if(left+w>innerWidth-8)left=Math.max(8,r.right-w);
+  pop.style.left=left+'px';
+  pop.style.top=Math.min(r.top,innerHeight-pop.offsetHeight-8)+'px';
+  _groupPopId=id;
+}
+function closeGroupAddPop(){document.querySelectorAll('.group-add-pop').forEach(function(p){p.style.display='none'});_groupPopId=null}
+document.addEventListener('click',function(e){
+  if(!_groupPopId)return;
+  if(e.target.closest('.group-add-pop')||e.target.closest('[data-grouppop-btn]'))return;
+  closeGroupAddPop();
+},true);
 async function deleteGlobalUser(k){
   if(!confirm('确定删除用户？该用户将从所有方案中移除。'))return;
   const r=await fetch('/api/global-user/delete',{method:'POST',headers:csrfHeaders({'Content-Type':'application/json'}),body:JSON.stringify({key:k})});
@@ -6790,12 +6836,15 @@ function renderUserQuotaContext(qm,userList){
 // this profile (not authorized, or the profile is unlimited). The tooltip carries
 // the exact numbers so the cell itself can stay narrow.
 function quotaMatrixCell(q,userName,pool){
+  const NL='&#10;';   // tooltip line break (title attribute) — must be declared
+                      // before first use: it's referenced in memberNote below,
+                      // and a const used before its declaration is a TDZ crash
+                      // that only fires for shared pools (memberCount > 1).
   const poolLabel=pool?(pool.label||pool.name):'';
   const memberNote=pool&&pool.memberCount>1?NL+'含 '+pool.memberCount+' 个方案（'+pool.memberNames.join('、')+'）':'';
   if(!q)return '<td class="n"><span class="q-none" title="'+escH(userName)+' 在额度池 '+escH(poolLabel)+' 无配额限制或无访问权限">-</span></td>';
   const col=q.pct>=100?'var(--red)':q.pct>90?'var(--red)':q.pct>70?'var(--orange)':'var(--green)';
   const tags=(q.bonus>0?' +'+fmtTk(q.bonus):'')+(q.resetApplied?' 已重置':'');
-  const NL='&#10;';   // tooltip line break (title attribute)
   const rateNote=(q.rate!=null&&q.rate!==1)?NL+'倍率 ×'+q.rate+'（实际 '+fmtT(q.rawUsed||0)+'）':'';
   const title=escH(userName)+' @ '+escH(poolLabel)+NL+'已用 '+fmtT(q.used)+' / '+fmtT(q.limit)
     +'（'+q.source+'）'+NL+'剩余 '+fmtT(q.remaining)+rateNote+memberNote
@@ -8538,7 +8587,12 @@ const server = http.createServer((req, res) => {
         const sfx = validateProfileSuffix(suffix, name);
         const aliases = parseModelAliasesInput(modelAliases);
         const proto = normalizeProfileProtocol(protocol);
-        const models = allowedModels ? allowedModels.split(",").map(s => s.trim()).filter(Boolean) : [...(rt?.allowedModels || [])];
+        // Models come ONLY from explicit input (API callers) or alias targets —
+        // never inherited from the default profile: a new profile usually points
+        // at a different upstream, and silently copying the default's model list
+        // would 403-or-worse. A bare profile with no aliases serves nothing until
+        // the admin configures them, which is the intended create-then-configure flow.
+        const models = allowedModels ? allowedModels.split(",").map(s => s.trim()).filter(Boolean) : [];
         for (const m of Object.values(aliases)) {
           if (m && !models.includes(m)) models.push(m);
         }
@@ -8571,7 +8625,7 @@ const server = http.createServer((req, res) => {
         saveConfig(config);
         reloadAllRuntimes();
         console.log(`[PROFILE] Created new profile "${name}" (suffix: ${JSON.stringify(sfx)}, protocol: ${proto})`);
-        recordAdminAudit(req, "profile.create", name, `新建方案 "${name}"（后缀 /${sfx}，协议 ${proto === "responses" ? "OpenAI Responses" : "Anthropic"}，上游 ${upstream || "继承默认"}）`);
+        recordAdminAudit(req, "profile.create", name, `新建方案 "${name}"（后缀 /${sfx}，协议 ${proto === "responses" ? "OpenAI Responses" : "Anthropic"}，上游 ${upstream || "继承默认"}${Object.keys(aliases).length ? "" : "，待配置模型别名"}）`);
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ ok: true, profile: name, suffix: sfx, protocol: proto }));
       } catch (err) {

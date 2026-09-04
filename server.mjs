@@ -3219,6 +3219,7 @@ function getAggregatedPersonalUsage(apiKey, availableProfiles) {
   let totalQuotaBonus = 0;
   let totalRawUsed = 0;
   let totalDiscounted = 0;
+  const profileQuotas = [];
   let hasQuotaReset = false;
   let hasUnlimitedQuota = false;
 
@@ -3287,6 +3288,29 @@ function getAggregatedPersonalUsage(apiKey, availableProfiles) {
     // the UI shows only the combined discount.
     totalRawUsed += quota.rawUsed || 0;
     totalDiscounted += quota.discounted || 0;
+    // Per-profile breakdown. The aggregate limit collapses to 0 (= "unlimited")
+    // as soon as ANY profile is unlimited, which hides every other profile's very
+    // real limit — and even when it does add up, one summed bar cannot say which
+    // profile is about to run out. This list is what the page actually shows.
+    profileQuotas.push({
+      profile: profile.name,
+      suffix: profile.suffix,
+      protocol: profile.protocol,
+      billingType: runtime.billingType,
+      isDefault: !!profile.isDefault,
+      type: quota.source,
+      limit: quota.limit,
+      used: quota.used,
+      remaining: quota.limit > 0 ? quota.remaining : null,
+      pct: quota.limit > 0 ? Math.min(100, Math.round((quota.used / quota.limit) * 100)) : null,
+      bonus: quota.bonus || 0,
+      resetApplied: !!quota.resetApplied,
+      rawUsed: quota.rawUsed,
+      discounted: quota.discounted,
+      rate: quota.rate,
+      inPeak: quota.inPeak,
+      nextRateChange: nextRateChangeHint(runtime),
+    });
   }
 
   const limit = hasUnlimitedQuota ? 0 : totalQuotaLimit;
@@ -3313,6 +3337,10 @@ function getAggregatedPersonalUsage(apiKey, availableProfiles) {
     rateCards: availableProfiles
       .map(p => buildRateCard(runtimes[p.suffix]))
       .filter(card => card && card.rows.length > 0),
+    // Per-profile quota rows: the honest answer to "how much do I have left",
+    // which a single aggregate bar cannot give. Tightest first — the limit about
+    // to bite is the one worth seeing.
+    profileQuotas: profileQuotas.sort((a, b) => (b.pct ?? -1) - (a.pct ?? -1) || a.profile.localeCompare(b.profile)),
     today: { input: todayUsage.inputTokens, output: todayUsage.outputTokens, requests: todayUsage.requests, cacheWrite: todayUsage.cacheCreationTokens || 0, cacheRead: todayUsage.cacheReadTokens || 0, total: totalUsageTokens(todayUsage) },
     models: todayModels,
     hourly: todayHourly,
@@ -7063,7 +7091,9 @@ function personalUsageHtml(virtualKey) {
 ${UI_THEME}
 ${TOAST_CSS}
 body{padding:28px clamp(18px,3vw,44px) 48px}
-body>div{max-width:1120px;margin-left:auto;margin-right:auto}
+/* Wider than the old 1120px: with 5+ profiles the quota cards were squeezed to
+   their 215px floor, wrapping every number onto two lines. */
+body>div{max-width:1400px;margin-left:auto;margin-right:auto}
 .proto-seg{display:inline-flex;border:1px solid var(--border);border-radius:6px;overflow:hidden;background:var(--surface)}
 .proto-seg button{font-size:11px;font-weight:600;padding:6px 12px;border:none;background:transparent;color:var(--dim);cursor:pointer}
 .proto-seg button+button{border-left:1px solid var(--border)}
@@ -7083,16 +7113,35 @@ select{font-size:12px;background:var(--surface);color:var(--text);border:1px sol
 .qnotice.reset b{color:var(--orange)}
 .qnotice.reset .qi{background:var(--orange)}
 .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin-bottom:20px}
+/* Per-profile quota cards for the "all profiles" view. One card per profile
+   beats one summed bar: the aggregate limit collapses to "unlimited" the moment
+   any single profile is unlimited, and even when it sums it cannot say WHICH
+   profile is about to run out. */
+.pq-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(255px,1fr));gap:11px;margin-bottom:20px}
+.pq{background:var(--surface);border:1px solid var(--border);border-left:3px solid var(--border-strong);border-radius:6px;padding:13px 15px}
+.pq.warn{border-left-color:var(--orange)}.pq.crit{border-left-color:var(--red)}.pq.ok{border-left-color:var(--green)}.pq.free{border-left-color:var(--dim2)}
+.pq-hd{display:flex;align-items:baseline;justify-content:space-between;gap:8px;margin-bottom:9px}
+.pq-name{font-size:12.5px;font-weight:650;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.pq-sfx{font-size:10px;color:var(--dim);font-family:var(--font-mono)}
+.pq-pct{font-size:17px;font-weight:700;font-variant-numeric:tabular-nums;line-height:1}
+.pq-nums{font-size:11px;color:var(--dim);margin-top:7px;font-variant-numeric:tabular-nums;line-height:1.6}
+.pq-nums b{color:var(--text);font-weight:600}
+/* Keep "已用 X / Y（个人配额）" on one line — wrapping mid-figure was what made
+   the cards look cramped. Each fragment breaks as a unit instead. */
+.pq-nums span{white-space:nowrap}
+.pq .quota-progress{width:100%;margin-left:0;height:7px}
+.pq-tags{display:flex;gap:4px;flex-wrap:wrap;margin-top:7px}
 .card{background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:15px 16px;min-height:88px}.card:first-child{border-top:2px solid var(--accent)}
 .card .l{font-size:11px;font-weight:550;color:var(--dim);margin-bottom:12px}.card .v{font-size:22px;line-height:1;font-weight:650;font-variant-numeric:tabular-nums;color:var(--text)!important}
 .box{background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:17px;margin-bottom:14px;overflow-x:auto}.box h3{font-size:13px;font-weight:650;color:var(--text);margin-bottom:12px}.box canvas{max-height:220px}
 table{width:100%;border-collapse:collapse;min-width:560px}th{text-align:left;padding:9px 12px;font-size:11px;font-weight:550;color:var(--dim);border-bottom:1px solid var(--border);white-space:nowrap}td{padding:9px 12px;font-size:12px;border-bottom:1px solid #ecece8;white-space:nowrap}.n{text-align:right;font-variant-numeric:tabular-nums}tbody tr:hover td{background:#fafaf7}.tag{font-size:10px;background:var(--accent-soft);color:var(--accent);padding:2px 6px;border-radius:4px}
-@media(max-width:560px){body{padding:20px 14px 36px}.top h1{font-size:24px}.cards{grid-template-columns:1fr 1fr}.card .v{font-size:20px}.box{padding:14px}}
+@media(max-width:560px){body{padding:20px 14px 36px}.top h1{font-size:24px}.cards{grid-template-columns:1fr 1fr}.card .v{font-size:20px}.box{padding:14px}.pq-grid{grid-template-columns:1fr}}
 </style></head><body data-theme="editorial-light">
 <div class="top"><div><h1>我的用量</h1><div class="sub">查看个人配额、趋势和模型明细 · <a href="/setup/${escJs(virtualKey)}" style="color:var(--accent)">配置 Codex 接入 →</a></div></div><div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap"><div class="proto-seg" id="protoSeg" role="group" aria-label="协议分类"><button type="button" class="on" data-proto="">全部</button><button type="button" data-proto="anthropic">Anthropic</button><button type="button" data-proto="responses">OpenAI</button></div><select id="profileSel" onchange="switchProfile(this.value)"><option value="all">全部可用方案</option></select></div></div>
 <div class="meta" id="meta">加载中...</div>
 <div id="qNotice"></div>
 <div class="cards" id="cards"></div>
+<div id="pqSection" style="display:none"><h3 style="font-size:13px;font-weight:650;margin:0 0 10px">各方案配额 <span style="font-size:11px;color:var(--dim);font-weight:400" id="pqHint"></span></h3><div class="pq-grid" id="pqGrid"></div></div>
 <div class="box"><h3>今日24小时趋势</h3><canvas id="hourChart"></canvas></div>
 <div class="box"><h3>近7天趋势</h3><canvas id="trendChart"></canvas></div>
 <div class="box"><h3>今日模型请求</h3><table id="modelTable"><thead><tr><th>模型</th><th class="n">请求数</th><th class="n">实际 Token</th><th class="n">倍率</th><th class="n">计入配额</th></tr></thead><tbody></tbody></table><div class="note" id="modelTableNote" style="font-size:11px;color:var(--dim);margin-top:8px"></div></div>
@@ -7104,6 +7153,9 @@ Chart.defaults.color='#686863';Chart.defaults.font.family='-apple-system,BlinkMa
 const VK='${escJs(virtualKey)}';
 let D=null,C={h:null,t:null},currentProfile='all',PROTO='';
 const fmtT=n=>n.toLocaleString("zh-CN");
+// Profile names come from admin-authored config; this page renders them into
+// markup, so escape here rather than trusting them.
+const esc=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const fmtTk=n=>{if(n>=1e6)return(n/1e6).toFixed(1)+"M";if(n>=1e3)return(n/1e3).toFixed(1)+"k";return n.toString()};
 const COL=["#2f6e50","#4a6fa5","#c2604f","#c4a23a","#7a6bb0","#d4824a","#4a9ba8","#c47a99","#6ba368","#5a6bc4","#8a6db5","#5a9b8e"];
 async function load(){
@@ -7174,6 +7226,48 @@ function renderQNotice(q){
   }
   el.innerHTML=html;
 }
+// Per-profile quota cards, shown only in the aggregate view. The aggregate bar
+// above cannot answer "how much do I have left" — it reads 无配额限制 as soon as
+// any one profile is unlimited, and even a summed limit cannot say WHICH profile
+// is nearly exhausted. These cards can.
+function renderProfileQuotas(){
+  const box=document.getElementById('pqSection'),grid=document.getElementById('pqGrid'),hint=document.getElementById('pqHint');
+  if(!box||!grid)return;
+  const rows=Array.isArray(D.profileQuotas)?D.profileQuotas:[];
+  if(!rows.length){box.style.display='none';return}
+  box.style.display='';
+  const limited=rows.filter(r=>r.limit>0);
+  const tight=limited.filter(r=>r.pct>=80);
+  if(hint){
+    hint.innerHTML='共 '+rows.length+' 个可用方案'
+      +(limited.length?'，'+limited.length+' 个有配额':'，均无配额限制')
+      +(tight.length?' · <b style="color:'+(tight.some(r=>r.pct>=100)?'var(--red)':'var(--orange)')+'">'+tight.length+' 个已超 80%</b>':'');
+  }
+  grid.innerHTML=rows.map(r=>{
+    const free=!(r.limit>0);
+    const cls=free?'free':r.pct>=90?'crit':r.pct>=80?'warn':'ok';
+    const col=free?'var(--dim)':r.pct>=90?'var(--red)':r.pct>=80?'var(--orange)':'var(--green)';
+    const tags=[];
+    if(r.isDefault)tags.push('<span class="tag" style="background:rgba(47,110,80,.1);color:var(--green)">默认入口</span>');
+    tags.push('<span class="tag" style="background:rgba(0,0,0,.04);color:var(--dim)">'+(r.protocol==='responses'?'Codex':'Claude Code')+'</span>');
+    if(r.rate!=null&&r.rate!==1)tags.push('<span class="tag" style="background:rgba(0,0,0,.04);color:'+(r.inPeak?'var(--orange)':'var(--green)')+'" title="'+(r.inPeak?'高峰':'低谷')+'时段默认倍率 ×'+r.rate+'">'+(r.inPeak?'高峰':'低谷')+' ×'+r.rate+'</span>');
+    if(r.bonus>0)tags.push('<span class="tag" style="background:rgba(46,164,79,.12);color:var(--green)" title="管理员今日临时加量，明日自动失效">临时+'+fmtTk(r.bonus)+'</span>');
+    if(r.resetApplied)tags.push('<span class="tag" title="管理员已重置今日用量，统计数据保留">已重置</span>');
+    const nums=free
+      ? '<div class="pq-nums"><span>今日已用 <b>'+fmtT(r.used)+'</b> tokens</span> · <span>该方案无每日上限</span></div>'
+      : '<div class="pq-nums"><span>已用 <b>'+fmtT(r.used)+'</b> / '+fmtT(r.limit)+'</span> <span>（'+r.type+'）</span><br><span>剩余 <b>'+fmtT(r.remaining)+'</b></span>'
+        +((r.rawUsed!=null&&r.rawUsed!==r.used)?' · <span>实际 '+fmtTk(r.rawUsed)+'</span> <span>'+(r.rawUsed>r.used?'已抵扣 '+fmtTk(r.rawUsed-r.used):'已加收 '+fmtTk(r.used-r.rawUsed))+'</span>':'')
+        +(r.nextRateChange?'<br><span>'+r.nextRateChange.at+' 后转入'+(r.nextRateChange.toPeak?'高峰':'低谷')+' ×'+r.nextRateChange.rate+'</span>':'')
+        +'</div>';
+    return '<div class="pq '+cls+'">'
+      +'<div class="pq-hd"><div style="min-width:0"><div class="pq-name">'+esc(r.profile)+'</div><div class="pq-sfx">/'+esc(r.suffix)+'</div></div>'
+      +'<div class="pq-pct" style="color:'+col+'">'+(free?'不限':r.pct+'%')+'</div></div>'
+      +(free?'':hpBar(r.pct,16))
+      +nums
+      +'<div class="pq-tags">'+tags.join('')+'</div>'
+      +'</div>';
+  }).join('');
+}
 function render(){
   if(!D)return;
   const sel=document.getElementById('profileSel');
@@ -7201,6 +7295,7 @@ function render(){
     '<div class="card"><div class="l">今日缓存写入</div><div class="v" data-cu="'+t.cacheWrite+'" data-cu-k>0</div></div>'+
     '<div class="card"><div class="l">今日缓存命中</div><div class="v" data-cu="'+t.cacheRead+'" data-cu-k>0</div></div>';
   runCountUps(document.getElementById('cards'));
+  renderProfileQuotas();
   // Hourly chart
   const hrs=[];for(let i=0;i<24;i++)hrs.push(i.toString().padStart(2,"0")+":00");
   const hData=hrs.map((_,i)=>{const h=D.hourly[i.toString().padStart(2,"0")]||{};return{req:h.requests||0,tokens:ioTokens(h)}});

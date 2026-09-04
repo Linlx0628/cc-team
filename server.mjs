@@ -345,25 +345,83 @@ const removedOpenAIUserKeys = new Set();
   }
 })();
 
-// Auto-migrate: ensure quota fields exist
+// Auto-migrate: ensure per-profile config fields exist. NOTE: dailyTokenLimit is
+// deliberately absent here — it now lives on the quota pool and is migrated (and
+// removed from profiles) by migrateQuotaPools below. Re-adding it here would make
+// the two migrations fight on every boot.
 (function migrateQuotaConfig() {
   let migrated = false;
   for (const pname of Object.keys(config.profiles)) {
     const p = config.profiles[pname];
-    if (p.dailyTokenLimit === undefined) { p.dailyTokenLimit = null; migrated = true; }
     if (p.peakHours === undefined) { p.peakHours = []; migrated = true; }
     // Quota rates default to 1.0/1.0 so an upgrade is byte-for-byte equivalent to
     // the previous behaviour; discounts are opted into per profile from the UI.
     if (p.peakQuotaRate === undefined) { p.peakQuotaRate = 1; migrated = true; }
     if (p.offPeakQuotaRate === undefined) { p.offPeakQuotaRate = 1; migrated = true; }
     if (p.modelQuotaRates === undefined) { p.modelQuotaRates = {}; migrated = true; }
-    if (p.users) {
-      for (const [vk, u] of Object.entries(p.users)) {
-        if (typeof u === "object" && u.dailyTokenLimit === undefined) { u.dailyTokenLimit = null; migrated = true; }
-      }
+  }
+  if (migrated) { saveConfig(config); console.log("[MIGRATE] Added profile config fields"); }
+})();
+
+// ─── Quota Pools ─────────────────────────────────────────────────────────────
+// A quota pool is the billing boundary: the profiles inside it draw from ONE
+// allowance. This exists because several profiles routinely share a single
+// upstream subscription (an Anthropic profile for Claude Code plus a Responses
+// profile for Codex, same plan, same account) — with quota scoped per profile,
+// one plan's allowance was silently multiplied by the number of profiles, and a
+// single member could drain the team's plan while both meters read half full.
+//
+// Deliberately NOT in the pool: quota rates, peak hours and billingType stay on
+// the profile. Keeping rates per profile is what lets two profiles share one
+// allowance while still pricing their traffic differently (Codex can cost 1.5×
+// while drawing from the same pool), and peakHours has to stay because it also
+// drives peakModelAliases, which is routing, not billing.
+const QUOTA_POOL_NAME_MAX = 40;
+
+function normalizeQuotaPoolName(value) {
+  return String(value || "").trim().slice(0, QUOTA_POOL_NAME_MAX);
+}
+
+// Migration is strictly 1:1 — every profile gets its own pool carrying exactly
+// the limits it had. Behaviour after the upgrade is byte-for-byte identical;
+// merging profiles into a shared pool is a deliberate admin action afterwards.
+// Anything else (e.g. dropping every profile into one pool) would silently
+// collapse unrelated allowances on upgrade.
+(function migrateQuotaPools() {
+  let migrated = false;
+  if (!config.quotaPools || typeof config.quotaPools !== "object") { config.quotaPools = {}; migrated = true; }
+  const used = new Set(Object.keys(config.quotaPools));
+  for (const [pname, p] of Object.entries(config.profiles || {})) {
+    const existing = normalizeQuotaPoolName(p.quotaPool);
+    if (existing && config.quotaPools[existing]) continue;   // already assigned
+    // Name the pool after the profile, de-duplicating if that name is taken.
+    let name = normalizeQuotaPoolName(pname) || "pool";
+    for (let i = 2; used.has(name); i++) name = `${normalizeQuotaPoolName(pname)}-${i}`.slice(0, QUOTA_POOL_NAME_MAX);
+    used.add(name);
+    const users = {};
+    for (const [vk, u] of Object.entries(p.users || {})) {
+      if (u && typeof u === "object" && u.dailyTokenLimit != null) users[vk] = { dailyTokenLimit: u.dailyTokenLimit };
+    }
+    config.quotaPools[name] = {
+      label: pname,
+      dailyTokenLimit: p.dailyTokenLimit ?? null,
+      users,
+    };
+    p.quotaPool = name;
+    migrated = true;
+  }
+  // The limits now live in the pool; leaving copies on the profile would give
+  // two sources of truth and a stale one would eventually be believed.
+  for (const p of Object.values(config.profiles || {})) {
+    if ("dailyTokenLimit" in p) { delete p.dailyTokenLimit; migrated = true; }
+    for (const u of Object.values(p.users || {})) {
+      if (u && typeof u === "object" && "dailyTokenLimit" in u) { delete u.dailyTokenLimit; migrated = true; }
     }
   }
-  if (migrated) { saveConfig(config); console.log("[MIGRATE] Added dailyTokenLimit fields"); }
+  if (migrated) {
+    saveConfig(config);
+    console.log(`[MIGRATE] Quota pools: ${Object.keys(config.quotaPools).length} pool(s) — ${Object.entries(config.profiles).map(([n, p]) => `${n}→${p.quotaPool}`).join(", ")}`);
+  }
 })();
 
 // Peak hours: per-profile recurring daily time ranges. Format: [{start:"HH:mm",
@@ -680,6 +738,90 @@ function getProfileNameBySuffix(suffix) {
   return null;
 }
 
+// ── Quota pool resolution ────────────────────────────────────────────────────
+// A profile always belongs to exactly one pool. A dangling reference (hand-edited
+// config, deleted pool) must not silently become "unlimited" — that would remove
+// every limit without a word — so it is repaired into an empty pool and logged.
+function resolvePoolName(profileName) {
+  const profile = config.profiles?.[profileName];
+  if (!profile) return "";
+  const name = normalizeQuotaPoolName(profile.quotaPool);
+  if (name && config.quotaPools?.[name]) return name;
+  const fallback = normalizeQuotaPoolName(profileName) || "pool";
+  if (!config.quotaPools) config.quotaPools = {};
+  if (!config.quotaPools[fallback]) {
+    config.quotaPools[fallback] = { label: profileName, dailyTokenLimit: null, users: {} };
+    console.warn(`[QuotaPool] 方案 "${profileName}" 指向不存在的额度池 "${name}"，已自动重建空池 "${fallback}"（不限额）`);
+  }
+  profile.quotaPool = fallback;
+  return fallback;
+}
+
+function getPoolByName(name) {
+  const pool = config.quotaPools?.[normalizeQuotaPoolName(name)];
+  if (!pool) return null;
+  if (!pool.users || typeof pool.users !== "object") pool.users = {};
+  return pool;
+}
+
+// Pool that a profile suffix draws from, plus its name — the pair every quota
+// lookup needs.
+function getPoolForSuffix(suffix) {
+  const sfx = normalizeProfileSuffix(suffix);
+  const profileName = getProfileNameBySuffix(sfx);
+  if (!profileName) return { name: "", pool: null };
+  const name = resolvePoolName(profileName);
+  return { name, pool: getPoolByName(name) };
+}
+
+// Every profile suffix drawing from a pool. This is what turns a per-profile
+// usage table into a pooled total.
+function getPoolSuffixes(poolName) {
+  const name = normalizeQuotaPoolName(poolName);
+  const out = [];
+  for (const profileName of Object.keys(config.profiles || {})) {
+    if (resolvePoolName(profileName) !== name) continue;
+    const sfx = normalizeProfileSuffix(config.profiles[profileName].suffix);
+    if (sfx) out.push(sfx);
+  }
+  return out;
+}
+
+function listQuotaPools() {
+  return Object.entries(config.quotaPools || {}).map(([name, pool]) => {
+    const members = Object.keys(config.profiles || {}).filter(p => resolvePoolName(p) === name);
+    // Every user who has a real key on ANY member profile — the editable pool
+    // view lists these (including ones with no limit yet), not just the ones who
+    // already have a limit.
+    const memberUsers = {};
+    for (const memberName of members) {
+      for (const [uk, u] of Object.entries(config.profiles[memberName]?.users || {})) {
+        const hasKey = typeof u === "string" ? !!u : !!(u && u.key);
+        if (!hasKey) continue;
+        if (!memberUsers[uk]) memberUsers[uk] = {
+          username: (config.users?.[uk]?.username) || uk.slice(0, 8),
+          dailyTokenLimit: (pool.users?.[uk]?.dailyTokenLimit) ?? null,
+        };
+      }
+    }
+    return {
+      name,
+      label: pool.label || name,
+      dailyTokenLimit: pool.dailyTokenLimit ?? null,
+      userLimits: Object.fromEntries(Object.entries(pool.users || {})
+        .filter(([, v]) => v && v.dailyTokenLimit != null)
+        .map(([k, v]) => [k, v.dailyTokenLimit])),
+      memberUsers,
+      profiles: members.map(name2 => ({
+        name: name2,
+        suffix: normalizeProfileSuffix(config.profiles[name2].suffix),
+        protocol: normalizeProfileProtocol(config.profiles[name2].protocol),
+        billingType: config.profiles[name2].billingType || "on_demand",
+      })),
+    };
+  });
+}
+
 function listProfiles() {
   const group = Array.isArray(config.defaultProfileGroup) ? config.defaultProfileGroup : [];
   const responsesGroup = Array.isArray(config.responsesProfileGroup) ? config.responsesProfileGroup : [];
@@ -698,7 +840,7 @@ function listProfiles() {
     modelMultimodal: config.profiles[name].modelMultimodal || {},
     imageBridge: config.profiles[name].imageBridge || { enabled: false, model: "" },
     contextWindow: config.profiles[name].contextWindow || 128000,
-    dailyTokenLimit: config.profiles[name].dailyTokenLimit || 0,
+    quotaPool: resolvePoolName(name),
     peakHours: normalizePeakHours(config.profiles[name].peakHours),
     peakQuotaRate: normalizeQuotaRate(config.profiles[name].peakQuotaRate),
     offPeakQuotaRate: normalizeQuotaRate(config.profiles[name].offPeakQuotaRate),
@@ -844,6 +986,7 @@ function createProfileRuntime(profileName, profile) {
     protocol: normalizeProfileProtocol(profile.protocol),
     isDefault: !!profile.isDefault,
     billingType: profile.billingType || "on_demand",
+    quotaPool: resolvePoolName(profileName),
     upstream: profile.upstream,
     upstreamUrl,
     users: { ...(profile.users || {}) },
@@ -1244,12 +1387,12 @@ function initDb() {
     );
     CREATE TABLE IF NOT EXISTS kv_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS quota_daily_ops (
-      profile TEXT NOT NULL, user_key TEXT NOT NULL, date TEXT NOT NULL,
+      pool TEXT NOT NULL, user_key TEXT NOT NULL, date TEXT NOT NULL,
       bonus INTEGER NOT NULL DEFAULT 0,
       reset_baseline INTEGER NOT NULL DEFAULT 0,
       reset_time TEXT,
       updated_at TEXT,
-      PRIMARY KEY (profile, user_key, date)
+      PRIMARY KEY (pool, user_key, date)
     );
     CREATE TABLE IF NOT EXISTS audit_log (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1288,6 +1431,53 @@ function initDb() {
     });
     tx();
     console.log(`[MIGRATE] weighted_tokens added + backfilled: ${weightedTargets.join(", ")}`);
+  }
+
+  // ── Table migration: quota_daily_ops keyed by pool instead of profile ──
+  // Manual daily ops (bonus / reset baseline) have to follow the allowance, which
+  // now belongs to the pool: a bonus granted on one profile would otherwise leave
+  // the user blocked on every other profile drawing from the same plan. SQLite
+  // cannot change a primary key, so rebuild the table. Rows are folded by pool
+  // with SUM on both counters — bonus is "extra allowance granted today" and
+  // reset_baseline is "usage to ignore", and both are additive across the members
+  // whose usage the pool now sums.
+  const opCols = db.prepare("PRAGMA table_info(quota_daily_ops)").all().map(c => c.name);
+  if (opCols.length > 0 && !opCols.includes("pool")) {
+    const backup = backupDatabaseSync("quota-pool-migration");
+    if (backup) console.log(`[MIGRATE] Pre-migration backup: ${path.basename(backup)}`);
+    // profile suffix → pool name, from the config that was already migrated above.
+    const suffixToPool = {};
+    for (const [pname, p] of Object.entries(config.profiles || {})) {
+      const sfx = normalizeProfileSuffix(p.suffix);
+      if (sfx) suffixToPool[sfx] = resolvePoolName(pname);
+    }
+    const legacy = db.prepare("SELECT * FROM quota_daily_ops").all();
+    const tx = db.transaction(() => {
+      db.exec("DROP TABLE IF EXISTS quota_daily_ops_legacy");
+      db.exec("ALTER TABLE quota_daily_ops RENAME TO quota_daily_ops_legacy");
+      db.exec(`CREATE TABLE quota_daily_ops (
+        pool TEXT NOT NULL, user_key TEXT NOT NULL, date TEXT NOT NULL,
+        bonus INTEGER NOT NULL DEFAULT 0,
+        reset_baseline INTEGER NOT NULL DEFAULT 0,
+        reset_time TEXT,
+        updated_at TEXT,
+        PRIMARY KEY (pool, user_key, date)
+      )`);
+      const ins = db.prepare(`INSERT INTO quota_daily_ops (pool,user_key,date,bonus,reset_baseline,reset_time,updated_at)
+        VALUES (?,?,?,?,?,?,?)
+        ON CONFLICT(pool,user_key,date) DO UPDATE SET
+          bonus=bonus+excluded.bonus, reset_baseline=reset_baseline+excluded.reset_baseline,
+          reset_time=COALESCE(excluded.reset_time,reset_time), updated_at=excluded.updated_at`);
+      for (const r of legacy) {
+        // A row whose profile no longer exists keeps its old key as the pool name
+        // rather than being dropped — it expires by date on its own.
+        const pool = suffixToPool[r.profile] || r.profile;
+        ins.run(pool, r.user_key, r.date, r.bonus || 0, r.reset_baseline || 0, r.reset_time || null, r.updated_at || null);
+      }
+      db.exec("DROP TABLE quota_daily_ops_legacy");
+    });
+    tx();
+    console.log(`[MIGRATE] quota_daily_ops rekeyed to pool (${legacy.length} row(s) folded)`);
   }
 
   // ── Write statements (UPSERT / INSERT) ──
@@ -1341,11 +1531,11 @@ function initDb() {
   stmts.insertQuotaAdjustManual = db.prepare(`INSERT INTO quota_adjust_history (user_key,user_name,date,old_quota,new_quota,hit_rate,avg_daily_usage,auto,time)
     VALUES (@user,@username,@date,@oldQuota,@newQuota,NULL,NULL,0,@time)`);
   stmts.trimQuotaAdjust = db.prepare(`DELETE FROM quota_adjust_history WHERE id NOT IN (SELECT id FROM quota_adjust_history ORDER BY id DESC LIMIT 100)`);
-  stmts.upsertQuotaDailyOp = db.prepare(`INSERT INTO quota_daily_ops (profile,user_key,date,bonus,reset_baseline,reset_time,updated_at)
-    VALUES (@profile,@key,@date,@bonus,@baseline,@resetTime,@updatedAt)
-    ON CONFLICT(profile,user_key,date) DO UPDATE SET
+  stmts.upsertQuotaDailyOp = db.prepare(`INSERT INTO quota_daily_ops (pool,user_key,date,bonus,reset_baseline,reset_time,updated_at)
+    VALUES (@pool,@key,@date,@bonus,@baseline,@resetTime,@updatedAt)
+    ON CONFLICT(pool,user_key,date) DO UPDATE SET
       bonus=@bonus, reset_baseline=@baseline, reset_time=@resetTime, updated_at=@updatedAt`);
-  stmts.deleteQuotaDailyOp = db.prepare(`DELETE FROM quota_daily_ops WHERE profile=? AND user_key=? AND date=?`);
+  stmts.deleteQuotaDailyOp = db.prepare(`DELETE FROM quota_daily_ops WHERE pool=? AND user_key=? AND date=?`);
   stmts.pruneQuotaDailyOps = db.prepare(`DELETE FROM quota_daily_ops WHERE date < ?`);
   stmts.upsertMeta = db.prepare(`INSERT INTO kv_meta (key,value) VALUES (@k,@v) ON CONFLICT(key) DO UPDATE SET value=excluded.value`);
   stmts.insertAudit = db.prepare(`INSERT INTO audit_log (time,actor,action,target,detail,ip)
@@ -1353,8 +1543,8 @@ function initDb() {
   stmts.trimAudit = db.prepare(`DELETE FROM audit_log WHERE id NOT IN (SELECT id FROM audit_log ORDER BY id DESC LIMIT 1000)`);
 
   // ── Read statements ──
-  // Quota enforcement reads the weighted column; `raw` comes along for display so
-  // the UI can show both "扣了多少额度" and "实际用了多少 token" from one query.
+  // Single-profile variant of the pooled usage query above; still used where the
+  // scope is genuinely one profile (per-profile stats, not quota enforcement).
   stmts.todayWeightedForQuota = db.prepare(`SELECT COALESCE(SUM(weighted_tokens),0) AS used, COALESCE(SUM(input_tokens+output_tokens),0) AS raw FROM usage_daily WHERE profile=? AND date=? AND user_key=?`);
   stmts.profileDailyRow = db.prepare(`SELECT * FROM usage_daily WHERE profile=? AND date=? AND user_key=?`);
   stmts.profileDailyModelRows = db.prepare(`SELECT model,input_tokens,output_tokens,requests,weighted_tokens FROM usage_daily_model WHERE profile=? AND date=? AND user_key=?`);
@@ -1363,7 +1553,7 @@ function initDb() {
   stmts.profileSummaryToday = db.prepare(`SELECT COALESCE(SUM(input_tokens+output_tokens+cache_creation+cache_read),0) AS tokens, COALESCE(SUM(requests),0) AS requests FROM usage_daily WHERE profile=? AND date=?`);
   stmts.lastQuotaAdjust = db.prepare(`SELECT * FROM quota_adjust_history WHERE user_key=? AND auto=1 ORDER BY id DESC LIMIT 1`);
   stmts.quotaAdjustRecent = db.prepare(`SELECT * FROM quota_adjust_history ORDER BY id DESC LIMIT 20`);
-  stmts.getQuotaDailyOp = db.prepare(`SELECT * FROM quota_daily_ops WHERE profile=? AND user_key=? AND date=?`);
+  stmts.getQuotaDailyOp = db.prepare(`SELECT * FROM quota_daily_ops WHERE pool=? AND user_key=? AND date=?`);
   stmts.todayQuotaOps = db.prepare(`SELECT * FROM quota_daily_ops WHERE date=?`);
   stmts.auditPage = db.prepare(`SELECT * FROM audit_log ORDER BY id DESC LIMIT ? OFFSET ?`);
   stmts.auditPageForActor = db.prepare(`SELECT * FROM audit_log WHERE actor=? ORDER BY id DESC LIMIT ? OFFSET ?`);
@@ -1375,7 +1565,6 @@ function initDb() {
   stmts.auditTotalAdmin = db.prepare(`SELECT COUNT(*) AS c FROM audit_log WHERE actor='admin' AND action NOT LIKE 'auth.%'`);
   stmts.auditTotalSystem = db.prepare(`SELECT COUNT(*) AS c FROM audit_log WHERE actor='system'`);
   stmts.auditTotalAuth = db.prepare(`SELECT COUNT(*) AS c FROM audit_log WHERE action LIKE 'auth.%'`);
-  stmts.defaultDailyForUser = db.prepare(`SELECT date,input_tokens,output_tokens,cache_creation,cache_read,weighted_tokens FROM usage_daily WHERE profile=? AND user_key=? AND date>=?`);
 }
 
 // ── Pruning (called once a day via a lazy check) ──
@@ -2098,24 +2287,29 @@ function getAggregatedStore(suffixFilter) {
 // profile once instead of repeating it under every user), and `matrix` is keyed
 // by MASKED user key to line up with sanitizeStore's users map.
 function getUserQuotaMatrix(suffixFilter) {
+  // Columns are now POOLS, not profiles — a pool is the billing boundary, and two
+  // profiles in one pool would otherwise produce two columns that always read
+  // identically. One column per pool also solves the crowding from profile sprawl.
   const matrix = {};
-  const profiles = [];
+  const pools = [];
   const hasFilter = Array.isArray(suffixFilter);
-  for (const profile of listProfiles()) {
-    const runtime = runtimes[profile.suffix];
+  for (const pool of listQuotaPools()) {
+    // Filter by protocol: a pool is shown if ANY member passes the filter.
+    if (hasFilter && !pool.profiles.some(m => suffixFilter.includes(m.suffix))) continue;
+    // Use the first member profile as the representative runtime for quota math;
+    // checkTokenQuota already aggregates across the whole pool.
+    const rep = pool.profiles.find(m => runtimes[m.suffix]) || pool.profiles[0];
+    const runtime = runtimes[rep.suffix];
     if (!runtime) continue;
-    if (hasFilter && !suffixFilter.includes(profile.suffix)) continue;
     let anyQuota = false;
     for (const key of Object.keys(runtime.users || {})) {
-      // Skip users who cannot actually use the profile (disabled / expired / no
-      // real key) — a quota bar for an unusable profile is noise.
       if (!canUseProfile(key, runtime).allowed) continue;
-      const eff = checkTokenQuota(key, profile.suffix, runtime);
+      const eff = checkTokenQuota(key, rep.suffix, runtime);
       if (!(eff.limit > 0)) continue;   // unlimited: nothing to show
       anyQuota = true;
       const masked = key.slice(0, 8) + "****";
       if (!matrix[masked]) matrix[masked] = {};
-      matrix[masked][profile.suffix] = {
+      matrix[masked][pool.name] = {
         limit: eff.limit,
         used: eff.used,
         remaining: eff.remaining,
@@ -2125,11 +2319,23 @@ function getUserQuotaMatrix(suffixFilter) {
         rawUsed: eff.rawUsed,
         rate: eff.rate,
         source: eff.source,
+        poolLabel: eff.poolLabel,
+        poolProfiles: (eff.poolProfiles || []).length,
       };
     }
-    if (anyQuota) profiles.push({ suffix: profile.suffix, name: profile.name, billingType: profile.billingType, protocol: profile.protocol });
+    if (anyQuota) {
+      pools.push({
+        key: pool.name,
+        name: pool.name,
+        label: pool.label,
+        billingType: pool.profiles[0]?.billingType || "on_demand",
+        protocol: pool.profiles[0]?.protocol,
+        memberNames: pool.profiles.map(m => m.name),
+        memberCount: pool.profiles.length,
+      });
+    }
   }
-  return { profiles, matrix };
+  return { pools, matrix };
 }
 
 // One row per profile×model, pairing the configured rates with today's realised
@@ -2648,19 +2854,31 @@ function recordUsage(apiKey, usage, model, suffix, _rt) {
 }
 
 // ─── Token Quota ──────────────────────────────────────────────────────────────
-function getProfileQuota(suffix) {
-  const sfx = normalizeProfileSuffix(suffix) || getDefaultProfileSuffix();
-  const rt0 = runtimes[sfx] || rt;
-  if (!rt0) return 0;
-  const profile = config.profiles[rt0.profileName];
-  if (!profile || !profile.dailyTokenLimit) return 0;
-  return profile.dailyTokenLimit;
+// Pooled usage. Membership changes at runtime (config edits), so the IN clause
+// is built per member count and the prepared statement cached — one statement per
+// distinct pool size, not one per call.
+const pooledUsageStmts = new Map();
+function pooledUsageForQuota(suffixes, date, key) {
+  if (!suffixes.length) return { used: 0, raw: 0 };
+  let stmt = pooledUsageStmts.get(suffixes.length);
+  if (!stmt) {
+    const holes = suffixes.map(() => "?").join(",");
+    stmt = db.prepare(`SELECT COALESCE(SUM(weighted_tokens),0) AS used, COALESCE(SUM(input_tokens+output_tokens),0) AS raw
+      FROM usage_daily WHERE date=? AND user_key=? AND profile IN (${holes})`);
+    pooledUsageStmts.set(suffixes.length, stmt);
+  }
+  return stmt.get(date, key, ...suffixes);
 }
 
-function getUserQuota(apiKey, _rt) {
-  const runtime = _rt || rt;
-  const key = resolveUserKey(apiKey, runtime);
-  const pu = runtime.users[key];
+function getPoolQuota(poolName) {
+  const pool = getPoolByName(poolName);
+  if (!pool || !pool.dailyTokenLimit) return 0;
+  return pool.dailyTokenLimit;
+}
+
+function getUserPoolQuota(poolName, userKey) {
+  const pool = getPoolByName(poolName);
+  const pu = pool?.users?.[userKey];
   if (!pu || typeof pu !== "object" || !pu.dailyTokenLimit) return 0;
   return pu.dailyTokenLimit;
 }
@@ -2670,37 +2888,49 @@ function checkTokenQuota(apiKey, suffix, _rt, model = null) {
   const key = resolveUserKey(apiKey, runtime);
   const sfx = normalizeProfileSuffix(suffix) || runtime?.suffix || "";
   const today = cnDate();
+  // Usage is summed over every profile in the pool: the allowance belongs to the
+  // upstream subscription, not to one route into it. Each member contributed rows
+  // already weighted at its own rate, so a pool can price Codex traffic higher
+  // than Claude Code traffic while both draw from the same allowance.
+  const poolName = runtime?.quotaPool || getPoolForSuffix(sfx).name;
+  const members = getPoolSuffixes(poolName);
+  const suffixes = members.length ? members : (sfx ? [sfx] : []);
   // `used` is the quota currency (weighted); `raw` is the real token count shown
   // alongside it so users can reconcile "扣了 1.2M 额度" with "实际用了 2.1M token".
-  const row = stmts.todayWeightedForQuota.get(sfx, today, key);
+  const row = pooledUsageForQuota(suffixes, today, key);
   const weightedUsed = row.used, rawTotal = row.raw;
   // Manual daily ops (bonus / reset baseline) are keyed by Beijing date, so
-  // yesterday's row stops matching automatically — no cleanup job needed.
-  // reset_baseline is stored in the same weighted currency as `used`.
-  const op = stmts.getQuotaDailyOp.get(sfx, key, today) || {};
+  // yesterday's row stops matching automatically — no cleanup job needed. They are
+  // keyed by POOL: a bonus granted for the plan has to count in every profile that
+  // draws from it, otherwise the user stays blocked on the other route.
+  const op = stmts.getQuotaDailyOp.get(poolName, key, today) || {};
   const baseline = op.reset_baseline || 0;
   const used = Math.max(0, weightedUsed - baseline);
   // Scale the baseline into raw terms by the day's effective ratio so rawUsed and
   // used stay comparable after a reset (both measure "since the reset point").
   const dayRatio = weightedUsed > 0 ? rawTotal / weightedUsed : 1;
   const rawUsed = Math.max(0, Math.round(rawTotal - baseline * dayRatio));
-  // `rate` is the price the NEXT request would pay. With a model given (the proxy
-  // pre-flight path) it is that model's rate; without one (dashboard / personal
-  // page, which span many models) it is the profile default, labelled as such in
-  // the UI so a mixed day is never presented as a single multiplier.
+  // `rate` is the price the NEXT request would pay ON THIS PROFILE — rates stay
+  // per profile even though the allowance is shared. With a model given (the proxy
+  // pre-flight path) it is that model's rate; without one it is the profile
+  // default, labelled as such so a mixed day is never shown as one multiplier.
   const rate = currentQuotaRate(runtime, new Date(), model);
   const rateIsDefault = !lookupModelQuotaRate(runtime?.modelQuotaRates, model);
   const inPeak = isInPeakHours(runtime?.peakHours);
   const discounted = Math.max(0, rawUsed - used);
+  const pool = getPoolByName(poolName);
+  const poolLabel = pool?.label || poolName;
 
-  // User quota overrides profile quota
-  const userQuota = getUserQuota(apiKey, runtime);
-  const profileQuota = getProfileQuota(suffix);
-  const baseLimit = userQuota > 0 ? userQuota : profileQuota;
+  // Per-user pool quota overrides the pool-wide quota
+  const userQuota = getUserPoolQuota(poolName, key);
+  const poolQuota = getPoolQuota(poolName);
+  const baseLimit = userQuota > 0 ? userQuota : poolQuota;
   const bonus = op.bonus > 0 ? op.bonus : 0;
+  const shared = suffixes.length > 1;
+  const meta = { rawUsed, discounted, rate, rateIsDefault, inPeak, model, pool: poolName, poolLabel, poolProfiles: suffixes, poolShared: shared };
 
   if (baseLimit <= 0) {
-    return { allowed: true, limit: 0, used, remaining: Infinity, source: "无限制", bonus: 0, resetApplied: !!baseline, rawUsed, discounted, rate, rateIsDefault, inPeak, model };
+    return { allowed: true, limit: 0, used, remaining: Infinity, source: "无限制", bonus: 0, resetApplied: !!baseline, ...meta };
   }
 
   const limit = baseLimit + bonus;
@@ -2709,15 +2939,10 @@ function checkTokenQuota(apiKey, suffix, _rt, model = null) {
     limit,
     used,
     remaining: Math.max(0, limit - used),
-    source: userQuota > 0 ? "个人配额" : "方案配额",
+    source: userQuota > 0 ? "个人配额" : "额度池配额",
     bonus,
     resetApplied: !!baseline,
-    rawUsed,
-    discounted,
-    rate,
-    rateIsDefault,
-    inPeak,
-    model,
+    ...meta,
   };
 }
 
@@ -2729,9 +2954,13 @@ function checkTokenQuota(apiKey, suffix, _rt, model = null) {
 function quotaExceededMessage(quota, runtime, usageUrl) {
   const skew = quota.rawUsed != null ? quota.rawUsed - quota.used : 0;
   const weighted = skew !== 0 || (quota.rate !== undefined && quota.rate !== 1);
+  // Naming the pool matters when it is shared: a user blocked in Codex needs to
+  // learn that Claude Code traffic is drawing from the same allowance.
+  const poolNote = quota.poolShared && quota.poolLabel
+    ? `（额度池「${quota.poolLabel}」，${quota.poolProfiles.length} 个方案共用）` : "";
   const lines = [weighted
-    ? `今日配额已用尽：${quota.used.toLocaleString()} / ${quota.limit.toLocaleString()}（计权）`
-    : `今日Token额度已用完。已用: ${quota.used.toLocaleString()}, 限额: ${quota.limit.toLocaleString()}。`];
+    ? `今日配额已用尽：${quota.used.toLocaleString()} / ${quota.limit.toLocaleString()}（计权）${poolNote}`
+    : `今日Token额度已用完。已用: ${quota.used.toLocaleString()}, 限额: ${quota.limit.toLocaleString()}。${poolNote}`];
   if (skew !== 0) {
     lines.push(`实际 token ${quota.rawUsed.toLocaleString()}，` +
       (skew > 0 ? `已抵扣 ${skew.toLocaleString()}` : `已加收 ${(-skew).toLocaleString()}`));
@@ -2749,8 +2978,9 @@ function quotaExceededMessage(quota, runtime, usageUrl) {
 
 function quotaErrorDetail(quota) {
   const skew = quota.rawUsed != null ? quota.rawUsed - quota.used : 0;
+  const poolNote = quota.poolShared ? ` pool=${quota.pool}(${quota.poolProfiles.join("+")})` : "";
   const extra = skew !== 0 ? `, raw ${quota.rawUsed} (${skew > 0 ? "-" : "+"}${Math.abs(skew)} @×${quota.rate})` : "";
-  return `quota_exceeded: ${quota.used}/${quota.limit}${extra}`;
+  return `quota_exceeded: ${quota.used}/${quota.limit}${extra}${poolNote}`;
 }
 
 // ─── Auto Quota Adjustment ─────────────────────────────────────────────────
@@ -2779,12 +3009,20 @@ function evaluateAutoQuotaAdjustments() {
 
   const profile = config.profiles[getDefaultProfileName()];
   if (!profile || !profile.users) return;
-  const defaultSuffix = profile.suffix;
+  // Evaluation follows the ALLOWANCE, which lives in the default profile's pool:
+  // usage is summed over every member profile and the raise is written to the
+  // pool. Per-profile evaluation would compound with pooling the same way it
+  // compounded with discounts — a user at exactly 100% of the pooled quota would
+  // look over-limit through any single member's lens.
+  const poolName = resolvePoolName(getDefaultProfileName());
+  const pool = getPoolByName(poolName);
+  if (!pool) return;
+  const members = getPoolSuffixes(poolName);
 
-  for (const [vk, pu] of Object.entries(profile.users)) {
-    if (typeof pu !== "object") continue;
-    const userQuota = pu.dailyTokenLimit;
+  for (const vk of Object.keys(pool.users || {})) {
+    const userQuota = getUserPoolQuota(poolName, vk);
     if (!userQuota || userQuota <= 0) continue; // skip users without quota
+    if (!getGlobalUser(vk)) continue;   // key no longer exists globally
 
     // Check cooldown
     const lastAdjust = stmts.lastQuotaAdjust.get(vk);
@@ -2795,13 +3033,17 @@ function evaluateAutoQuotaAdjustments() {
       if (diffDays < cooldownDays) continue;
     }
 
-    // Count hit days and calculate average usage (one SQL query per user)
-    // Uses the weighted column — the same currency dailyTokenLimit is expressed
-    // in. Reading raw tokens here would double-count off-peak discounts: a user
-    // at exactly 100% of a ×0.5 quota looks like 200% in raw terms, and the
-    // auto-raise would compound the discount instead of respecting it.
+    // Count hit days and calculate average usage (one SQL query per user).
+    // Uses the weighted column — the same currency the quota is expressed in —
+    // summed across every profile in the pool. Reading raw tokens here would
+    // double-count off-peak discounts: a user at exactly 100% of a ×0.5 quota
+    // looks like 200% in raw terms, and the auto-raise would compound the
+    // discount instead of respecting it.
     const earliest = dates[dates.length - 1];
-    const dayRows = stmts.defaultDailyForUser.all(defaultSuffix, vk, earliest).filter(r => dates.includes(r.date));
+    const holes = members.map(() => "?").join(",");
+    const dayRows = db.prepare(`SELECT date, SUM(weighted_tokens) AS weighted_tokens FROM usage_daily
+      WHERE user_key=? AND date>=? AND profile IN (${holes}) GROUP BY date`).all(vk, earliest, ...members)
+      .filter(r => dates.includes(r.date));
     let hitCount = 0;
     let totalUsage = 0;
     let usageDays = 0;
@@ -2830,8 +3072,8 @@ function evaluateAutoQuotaAdjustments() {
 
     if (newQuota <= userQuota) continue;
 
-    // Execute adjustment
-    pu.dailyTokenLimit = newQuota;
+    // Execute adjustment — in the pool
+    pool.users[vk].dailyTokenLimit = newQuota;
 
     stmts.insertQuotaAdjust.run({
       user: vk, username: getUserName(vk), date: today, oldQuota: userQuota, newQuota,
@@ -2842,8 +3084,8 @@ function evaluateAutoQuotaAdjustments() {
 
     saveConfig(config);
     console.log(`[配额调整] ${getUserName(vk)} ${userQuota.toLocaleString()} → ${newQuota.toLocaleString()} (命中率${Math.round(actualHitRate * 100)}%, 均值${Math.round(avgDaily).toLocaleString()})`);
-    recordAudit("system", "quota.auto_adjust", `${defaultSuffix} · ${maskAuditKey(vk)}`,
-      `自动配额调整：${getUserName(vk)} 每日配额 ${userQuota.toLocaleString()} → ${newQuota.toLocaleString()}（近${period}天命中率 ${Math.round(actualHitRate * 100)}%，日均 ${Math.round(avgDaily).toLocaleString()}）`);
+    recordAudit("system", "quota.auto_adjust", `${pool.label || poolName} · ${maskAuditKey(vk)}`,
+      `自动配额调整：${getUserName(vk)} 额度池「${pool.label || poolName}」每日配额 ${userQuota.toLocaleString()} → ${newQuota.toLocaleString()}（近${period}天命中率 ${Math.round(actualHitRate * 100)}%，日均 ${Math.round(avgDaily).toLocaleString()}）`);
   }
 }
 
@@ -3167,7 +3409,7 @@ function getProfilePersonalUsage(apiKey, suffix, runtime) {
   return {
     profile: runtime.profileName,
     profileSuffix: suffix,
-    quota: { type: quota.source, limit: quota.limit, used: quota.used, remaining: quota.remaining, autoAdjusted: quotaAutoAdjusted, bonus: quota.bonus || 0, resetApplied: !!quota.resetApplied, rawUsed: quota.rawUsed, discounted: quota.discounted, rate: quota.rate, rateIsDefault: true, inPeak: quota.inPeak, nextRateChange: nextRateChangeHint(runtime) },
+    quota: { type: quota.source, limit: quota.limit, used: quota.used, remaining: quota.remaining, autoAdjusted: quotaAutoAdjusted, bonus: quota.bonus || 0, resetApplied: !!quota.resetApplied, rawUsed: quota.rawUsed, discounted: quota.discounted, rate: quota.rate, rateIsDefault: true, inPeak: quota.inPeak, nextRateChange: nextRateChangeHint(runtime), pool: quota.pool, poolLabel: quota.poolLabel, poolProfiles: quota.poolProfiles || [], poolShared: !!quota.poolShared },
     // Price list for the current slot: every alias the user can call, with the
     // rate it costs right now. This is the answer to "为什么我的额度掉得这么快" —
     // the user can see which model is expensive BEFORE spending on it.
@@ -3220,6 +3462,7 @@ function getAggregatedPersonalUsage(apiKey, availableProfiles) {
   let totalRawUsed = 0;
   let totalDiscounted = 0;
   const profileQuotas = [];
+  const seenPools = new Set();
   let hasQuotaReset = false;
   let hasUnlimitedQuota = false;
 
@@ -3278,26 +3521,37 @@ function getAggregatedPersonalUsage(apiKey, availableProfiles) {
     }
 
     const quota = checkTokenQuota(apiKey, profile.suffix, runtime);
+    // The quota is pooled — two profiles in one pool report the SAME numbers, so
+    // the per-pool card and the aggregate totals must be added exactly once per
+    // pool, while the usage accumulations above legitimately loop every profile.
+    const poolName = runtime.quotaPool || getPoolForSuffix(suffix).name;
+    if (seenPools.has(poolName)) continue;
+    seenPools.add(poolName);
     totalQuotaUsed += quota.used || 0;
     if (quota.limit > 0) totalQuotaLimit += quota.limit;
     else hasUnlimitedQuota = true;
     totalQuotaBonus += quota.bonus || 0;
     if (quota.resetApplied) hasQuotaReset = true;
-    // Weighted/raw totals are additive across profiles; the rate itself is not
+    // Weighted/raw totals are additive across pools; the rate itself is not
     // (each profile has its own), so the aggregate view reports rate: null and
     // the UI shows only the combined discount.
     totalRawUsed += quota.rawUsed || 0;
     totalDiscounted += quota.discounted || 0;
-    // Per-profile breakdown. The aggregate limit collapses to 0 (= "unlimited")
-    // as soon as ANY profile is unlimited, which hides every other profile's very
-    // real limit — and even when it does add up, one summed bar cannot say which
-    // profile is about to run out. This list is what the page actually shows.
+    // Per-pool breakdown. The aggregate limit collapses to 0 (= "unlimited") as
+    // soon as ANY pool is unlimited, which hides every other pool's very real
+    // limit — and even when it does add up, one summed bar cannot say which pool
+    // is about to run out. This list is what the page actually shows.
     profileQuotas.push({
-      profile: profile.name,
-      suffix: profile.suffix,
+      profile: quota.poolLabel || poolName,
+      suffix: poolName,
       protocol: profile.protocol,
       billingType: runtime.billingType,
       isDefault: !!profile.isDefault,
+      isPool: true,
+      poolProfiles: (quota.poolProfiles || []).map(s => {
+        const m = runtimes[s];
+        return m ? m.profileName : s;
+      }),
       type: quota.source,
       limit: quota.limit,
       used: quota.used,
@@ -4537,12 +4791,12 @@ function getPublicSettings() {
       profileAssignments[profile.suffix][k] = {
         key: isObj ? (v.key || "") : (typeof v === "string" ? v : ""),
         disabled: isObj ? !!v.disabled : false,
-        dailyTokenLimit: isObj ? (v.dailyTokenLimit || 0) : 0,
       };
     }
   }
   const defaultSuffix = getDefaultProfileSuffix();
   const defaultProfile = config.profiles[getDefaultProfileName()];
+  const defaultPool = getPoolForSuffix(defaultSuffix);
   return {
     upstream: defaultProfile?.upstream || "",
     proxy: { ...gProxy },
@@ -4554,13 +4808,14 @@ function getPublicSettings() {
     globalUsers,
     activeProfile: getDefaultProfileName(),
     profiles: listProfiles(),
+    quotaPools: listQuotaPools(),
     defaultProfileGroup: Array.isArray(config.defaultProfileGroup) ? config.defaultProfileGroup : [],
     responsesProfileGroup: Array.isArray(config.responsesProfileGroup) ? config.responsesProfileGroup : [],
     selectedProfileSuffix: defaultSuffix,
     circuitBreaker: rt?.breaker?.status() || { state: "UNKNOWN", failureCount: 0, totalSuccesses: 0, totalFailures: 0, cooldownRemaining: 0 },
     port: port,
     hasPassword: !!dashboardPassword,
-    profileQuota: getProfileQuota(defaultSuffix),
+    profileQuota: getPoolQuota(defaultPool.name),
     autoQuotaAdjust: config.autoQuotaAdjust || {},
   };
 }
@@ -4628,13 +4883,16 @@ ${rateLabel}
   const anthProfiles = s.profiles.filter(p => p.protocol !== "responses");
   const respProfiles = s.profiles.filter(p => p.protocol === "responses");
 
-  // Today's manual quota ops (bonus / reset) keyed by "profile<TAB>userKey" so
-  // the user modal can badge rows and stay in sync without a reload.
-  const quotaOpsMap = {};
+  // Today's manual quota ops (bonus / reset), now keyed by POOL. The badge needs
+  // to appear under every member profile of the pool (the op affects them all),
+  // so the map is suffix → set of user keys.
+  const quotaOpsByPool = {};
   for (const r of stmts.todayQuotaOps.all(cnDate())) {
-    quotaOpsMap[`${r.profile}\t${r.user_key}`] = { bonus: r.bonus || 0, reset_baseline: r.reset_baseline || 0 };
+    quotaOpsByPool[r.pool] = quotaOpsByPool[r.pool] || {};
+    quotaOpsByPool[r.pool][r.user_key] = { bonus: r.bonus || 0, reset_baseline: r.reset_baseline || 0 };
   }
-  const quotaOpsJson = JSON.stringify(quotaOpsMap).replace(/</g, "\\x3c");
+  const quotaOpsJson = JSON.stringify(quotaOpsByPool).replace(/</g, "\\x3c");
+  const quotaPoolCount = (s.quotaPools || []).length;
 
   const globalUserRows = Object.entries(s.globalUsers).map(([k, v]) => {
     const isObj = typeof v === "object" && v !== null;
@@ -4649,7 +4907,9 @@ ${rateLabel}
 <td><button type="button" onclick="deleteGlobalUser('${escJs(k)}')" style="background:#fff2f0;color:var(--red);border:1px solid #f1c8c2;padding:2px 8px;border-radius:4px;cursor:pointer;font-size:11px">删除</button></td></tr>`;
   }).join("");
 
-  // Profile user rows (key assignment)
+  // Profile user rows (key assignment): real key + disable only. Quota lives in
+  // the pool and is edited on the 额度池 page — keeping it here would present the
+  // same allowance under every member profile, reading as "one user, many limits".
   const profileUserRows = Object.entries(s.globalUsers).map(([k, v]) => {
     const isObj = typeof v === "object" && v !== null;
     const username = isObj ? (v.username || "") : (typeof v === "string" ? v : "");
@@ -4657,18 +4917,11 @@ ${rateLabel}
     const pu = initialAssignments[k];
     const realKey = pu ? (typeof pu === "string" ? pu : (pu.key || "")) : "";
     const profileDisabled = pu ? (typeof pu === "object" ? !!pu.disabled : false) : false;
-    const userQuota = (pu && typeof pu === "object") ? (pu.dailyTokenLimit || 0) : 0;
     const rowStyle = globalDisabled ? "opacity:0.4" : "";
-    const qop = quotaOpsMap[`${initialSuffix}\t${k}`];
-    const qCompact = n => n >= 1e6 ? (n / 1e6).toFixed(1) + "M" : n >= 1e3 ? (n / 1e3).toFixed(1) + "k" : String(n);
-    const qBadges = qop ? ((qop.bonus > 0 ? `<span style="font-size:10px;color:var(--green);border:1px solid var(--green);border-radius:3px;padding:0 3px;white-space:nowrap" title="今日临时加量，明日自动失效">+${qCompact(qop.bonus)}</span>` : "") + (qop.reset_baseline > 0 ? `<span style="font-size:10px;color:var(--accent);border:1px solid var(--accent);border-radius:3px;padding:0 3px;white-space:nowrap" title="今日用量已重置（统计保留）">已重置</span>` : "")) : "";
-    const qCell = pu ? `<div style="display:flex;align-items:center;gap:3px;flex-wrap:wrap">${qBadges}<button type="button" class="btn btn-outline btn-sm" data-k="${escHtml(k)}" onclick="openQuotaOp(this.dataset.k)" style="font-size:11px;padding:2px 8px;white-space:nowrap">临时额度</button></div>` : '<span style="color:var(--dim);font-size:11px">—</span>';
     return `<tr style="${rowStyle}">
 <td><code style="font-size:11px;color:var(--accent)">${escHtml(k)}</code></td>
 <td>${escHtml(username)}</td>
 <td><input type="text" name="pu_rk_${escHtml(k)}" value="${escHtml(realKey)}" style="width:100%;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:4px 8px;border-radius:4px;font-size:12px;font-family:monospace" placeholder="真实Key (必填)"></td>
-<td><input type="number" name="pu_quota_${escHtml(k)}" value="${userQuota}" style="width:100%;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:4px 8px;border-radius:4px;font-size:12px" min="0" step="100000" placeholder="0=不限"></td>
-<td>${qCell}</td>
 <td><label style="display:inline-flex;align-items:center;gap:4px;margin:0;cursor:pointer"><input type="checkbox" name="pu_dis_${escHtml(k)}" ${profileDisabled ? "checked" : ""} style="width:auto;accent-color:var(--orange)"><span style="font-size:11px;color:${profileDisabled ? "var(--orange)" : "var(--dim)"}">${profileDisabled ? "已禁用" : "正常"}</span></label></td></tr>`;
   }).join("");
 
@@ -4815,6 +5068,7 @@ td{padding:8px;border-bottom:1px solid #ecece8;font-size:12px}
     <div id="responsesGroupList" style="margin-bottom:6px">${responsesGroupItemsHtml || '<span style="font-size:11px;color:var(--dim)">组为空 — Codex 请求将返回 503</span>'}</div>
     ${responsesNonMembersHtml ? `<div style="margin-top:6px;display:flex;align-items:center;gap:6px;flex-wrap:wrap"><span style="color:var(--dim);font-size:10px">加入：</span>${responsesNonMembersHtml}</div>` : ''}
   </div>
+<div class="sidebar-global"><button type="button" class="pl-item sidebar-tool" id="quotaPoolNav" onclick="openQuotaPoolView()"><span class="pl-name">额度池</span><span class="pl-users">${quotaPoolCount} 个池 · 共享额度与定价</span></button></div>
 <div class="sidebar-global"><button type="button" class="pl-item sidebar-tool" id="dataManagementNav" onclick="openDataManagementView()"><span class="pl-name">全局数据管理</span><span class="pl-users">导入、备份与清空</span></button></div>
 <div class="sidebar-global"><button type="button" class="pl-item sidebar-tool" id="auditLogNav" onclick="openAuditLogView()"><span class="pl-name">操作日志</span><span class="pl-users">谁在何时改了什么</span></button></div>
 <div class="sidebar-ft" style="display:flex;gap:6px"><button class="btn btn-outline btn-sm" onclick="openUserModal()" style="flex:1">用户管理</button><button class="btn btn-outline btn-sm" onclick="openProfileModal()" style="flex:1">新增方案</button></div>
@@ -4899,11 +5153,25 @@ ${(() => { const mm = initialProfile.modelMultimodal || {}; const aliases = init
 </select>
 </div>
 
-<h2>每日Token配额 <span style="font-size:11px;color:var(--dim);font-weight:400">配额只计输入+输出（不含缓存），0=不限制，北京时间每日0点重置</span></h2>
+<h2>额度池 <span style="font-size:11px;color:var(--dim);font-weight:400">同一上游套餐的方案应放进同一个池，共享额度判定；配额只计输入+输出，北京时间每日0点重置</span></h2>
 <div class="section">
-<label>方案每日总Token上限 (0=不限制)</label>
-<input type="number" name="profileQuota" value="${s.profileQuota || 0}" min="0" step="100000" placeholder="0 = 不限制">
-<div class="note">方案配额适用于该方案下所有用户。每个用户可以在用户管理弹窗中单独设置。</div>
+<label>所属额度池 — 该方案及同池所有方案的用量合并计入同一份每日额度</label>
+${(() => {
+  const pools = s.quotaPools || [];
+  const current = initialProfile.quotaPool || "";
+  const pool = pools.find(p => p.name === current);
+  const memberNames = pool ? pool.profiles.map(m => m.name).join("、") : "";
+  const limitSummary = pool
+    ? (pool.dailyTokenLimit ? `池级上限 ${(pool.dailyTokenLimit).toLocaleString("zh-CN")}` : "池级不限制")
+      + ` · ${Object.keys(pool.userLimits).length} 人有个人配额`
+    : "";
+  return `<select name="quotaPool" id="quotaPoolSelect" onchange="updatePoolSummary()">
+    ${pools.map(p => `<option value="${escHtml(p.name)}" ${p.name === current ? "selected" : ""}>${escHtml(p.label)}（${p.profiles.length} 个方案）</option>`).join("")}
+    <option value="__new__" ${!current ? "selected" : ""}>＋ 新建额度池（与方案同名）</option>
+  </select>
+  <div class="note" id="poolSummary">${pool ? `本池成员：${escHtml(memberNames)} · ${escHtml(limitSummary)}${pool.profiles.length > 1 ? '<br><b style="color:var(--orange)">注意：改入此池后，该方案的用量与额度立即与上述方案合并计算</b>' : ""}` : "未关联额度池"}</div>
+  <div class="note">同一上游套餐的 Anthropic 与 Responses 两个方案放进同一个池后，成员在两端的消耗从同一份额度中扣减，不会再翻倍。每人配额在用户管理弹窗中设置（写入所属池，同池方案共享）。倍率仍按方案独立配置。</div>`;
+})()}
 </div>
 
 <h2>配额倍率 <span style="font-size:11px;color:var(--dim);font-weight:400">按时段折算配额消耗，只影响配额计算，统计报表始终显示真实 token</span></h2>
@@ -5090,8 +5358,60 @@ ${((() => { const qa = stmts.quotaAdjustRecent.all(); return qa.length > 0 ? `<h
 </div>
 </div>
 
+<div id="quotaPoolView" hidden aria-hidden="true">
+<h2>额度池 <span style="font-size:12px;color:var(--dim);font-weight:400">同一上游套餐的多个方案放进同一个池，用量从同一份额度扣；在此处维护池级限额与每人配额</span></h2>
+<div class="section" id="quotaPoolSection">
+<div style="display:flex;gap:8px;align-items:center;margin-bottom:14px;flex-wrap:wrap">
+  <button type="button" class="btn btn-outline btn-sm" onclick="togglePoolCreate()">＋ 新建额度池</button>
+  <span id="poolCreateRow" style="display:none;gap:6px;align-items:center">
+    <input type="text" id="newPoolName" placeholder="池名称，如：GLM 套餐池" style="width:220px;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:6px 10px;border-radius:5px;font-size:12px">
+    <button type="button" class="btn btn-primary btn-sm" onclick="createPool()">创建</button>
+  </span>
+  <span class="note" style="margin:0">先建空池，再到各方案编辑页把方案并入。同一上游套餐的方案应放进同一个池。</span>
+</div>
+${(() => {
+  const pools = s.quotaPools || [];
+  if (!pools.length) return '<div class="note">暂无额度池。</div>';
+  return pools.map(p => {
+    const shared = p.profiles.length > 1;
+    const empty = p.profiles.length === 0;
+    const memberChips = p.profiles.map(m => `<span class="tag" style="background:rgba(0,0,0,.04);color:${m.protocol === "responses" ? "var(--blue)" : "var(--accent)"}">${escHtml(m.name)}${m.protocol === "responses" ? " · Codex" : " · Claude Code"}</span>`).join(" ");
+    const memberKeys = Object.keys(p.memberUsers || {});
+    const repSuffix = p.profiles[0]?.suffix || "";
+    const rows = memberKeys.map(k => {
+      const mu = p.memberUsers[k];
+      const lim = mu.dailyTokenLimit ?? null;
+      return `<tr>
+<td><code style="font-size:11px;color:var(--accent)">${escHtml(k)}</code></td>
+<td>${escHtml(mu.username)}</td>
+<td style="width:160px"><input type="number" data-pool="${escHtml(p.name)}" data-user="${escHtml(k)}" value="${lim ?? ""}" min="0" step="100000" placeholder="跟随池级" style="width:100%;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:5px 8px;border-radius:4px;font-size:12px" title="留空=跟随池级限额"></td>
+<td><button type="button" class="btn btn-outline btn-sm" onclick="openQuotaOpFromPool('${escJs(repSuffix)}','${escJs(k)}')" style="font-size:11px;padding:2px 8px;white-space:nowrap">临时额度</button></td>
+</tr>`;
+    }).join("");
+    return `<div data-poolcard="${escHtml(p.name)}" style="border:1px solid ${shared ? "#e5b8b2" : empty ? "#eadfc3" : "var(--border)"};border-radius:6px;padding:14px 16px;margin-bottom:12px;background:${shared ? "#fffdfc" : "var(--surface)"}${empty ? ";opacity:.85" : ""}">
+  <div style="display:flex;align-items:baseline;justify-content:space-between;gap:10px;flex-wrap:wrap;margin-bottom:8px">
+    <div><b style="font-size:14px">${escHtml(p.label)}</b> <span style="color:var(--dim);font-size:11px">（池 key: ${escHtml(p.name)}）</span>
+    ${shared ? `<span class="tag" style="background:rgba(180,35,24,.08);color:var(--red)">${p.profiles.length} 个方案共用</span>` : ''}
+    ${empty ? `<span class="tag" style="background:#faf5e6;color:var(--orange)">无成员方案</span>` : ''}</div>
+    <div style="display:flex;align-items:center;gap:8px">
+      <label style="font-size:12px;color:var(--dim);margin:0">池级每日限额</label>
+      <input type="number" data-poollimit="${escHtml(p.name)}" value="${p.dailyTokenLimit ?? ""}" min="0" step="100000" placeholder="不限制" style="width:150px;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:5px 8px;border-radius:4px;font-size:12px">
+      ${empty ? `<button type="button" class="btn btn-danger btn-sm" onclick="deletePool('${escJs(p.name)}')" title="删除此空池及其配额配置">删除</button>` : `<button type="button" class="btn btn-outline btn-sm" disabled title="先在方案编辑页把成员移到其他池，空池才能删除">删除</button>`}
+    </div>
+  </div>
+  ${empty
+    ? '<div class="note" style="margin-bottom:0">尚无成员方案 —— 到各方案的编辑页，在「额度池」下拉中选择本池即可将其并入。</div>'
+    : `<div style="margin-bottom:10px;display:flex;gap:6px;flex-wrap:wrap">${memberChips}</div>
+  ${rows ? `<table style="min-width:auto;margin:0"><thead><tr><th>虚拟 Key</th><th>成员</th><th>每日配额（留空=跟随池级）</th><th></th></tr></thead><tbody>${rows}</tbody></table>` : '<div class="note">本池还没有成员用户——成员用户是在各方案里分配了真实 Key 的用户。</div>'}`}
+  <div style="margin-top:10px;display:flex;justify-content:flex-end"><button type="button" class="btn btn-primary btn-sm" onclick="savePoolQuota('${escJs(p.name)}')">保存「${escHtml(p.label)}」</button></div>
+</div>`;
+  }).join("");
+})()}
+<div class="note">池级限额对所有未单独设限的成员生效；每人配额优先于池级限额。留空 = 跟随池级（或池级也不限则不限）。池的归属在方案编辑页「额度池」下拉中调整，方案移出后若池变空会自动清理；倍率仍在方案里配置。</div>
+</div>
+</div>
+
 <div id="auditLogView" hidden aria-hidden="true">
-<h2>操作日志</h2>
 <div class="note" style="margin-bottom:12px">记录全部管理操作与系统自动事件（failover 切换/恢复、熔断、限流、自动配额调整）。最多保留最近 1000 条；「清空全部数据」不会删除审计记录。</div>
 <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:12px">
   <select id="auditFilter" onchange="switchAuditFilter()" style="background:var(--bg);border:1px solid var(--border);color:var(--text);padding:5px 8px;border-radius:4px;font-size:12px">
@@ -5135,7 +5455,7 @@ ${s.profiles.map(p => `<option value="${escHtml(p.suffix)}" ${p.suffix === initi
 </select>
 </h4>
 <table id="profileUsersTable">
-<thead><tr><th>虚拟 Key</th><th>用户名称</th><th>真实 Key</th><th style="width:120px">每日配额</th><th style="width:170px">今日临时额度</th><th style="width:80px">方案禁用</th></tr></thead>
+<thead><tr><th>虚拟 Key</th><th>用户名称</th><th>真实 Key</th><th style="width:80px">方案禁用</th></tr></thead>
 <tbody>${profileUserRows}</tbody>
 </table>
 <div class="note" style="margin-top:6px">全局禁用的用户灰色显示。真实Key必填才能使用此方案。</div>
@@ -5185,6 +5505,12 @@ ${s.profiles.map(p => `<option value="${escHtml(p.suffix)}" ${p.suffix === initi
 <label>上游 API 地址<span class="req">*</span></label><input type="text" id="newProfileUpstream" value="${escHtml(initialProfile.upstream || s.upstream || "")}" placeholder="https://open.bigmodel.cn/api/anthropic">
 <label>允许模型</label><input type="text" id="newProfileModels" value="${escHtml((initialProfile.allowedModels || s.allowedModels || []).join(","))}" placeholder="glm-5.1,qwen-max">
 <label>模型别名（每行 alias=实际模型，建议直接填 jx-fable / jx-opus / jx-haiku / jx-sonnet）</label><textarea id="newProfileAliases" rows="3" placeholder="jx-fable=glm-5.3&#10;jx-opus=glm-5.3&#10;jx-haiku=glm-5.3-flash&#10;jx-sonnet=glm-5.3-flash"></textarea>
+<label>所属额度池</label>
+<select id="newProfilePool">
+  <option value="">＋ 新建额度池（与方案同名，独立额度）</option>
+  ${(s.quotaPools || []).map(p => `<option value="${escHtml(p.name)}">${escHtml(p.label)}（${p.profiles.length} 个方案共用额度）</option>`).join("")}
+</select>
+<div class="note">同一上游套餐的多个方案（如 Claude Code 与 Codex 各一个）应选同一个池，用量合并计入同一份额度。</div>
 <div class="note">创建后会出现在左侧方案列表；进入编辑页后可用行编辑器逐行完善（含每别名上下文）。</div>
 <div style="margin-top:16px;display:flex;justify-content:flex-end;gap:8px">
 <button type="button" class="btn btn-outline btn-sm" onclick="closeProfileModal()">取消</button>
@@ -5208,7 +5534,10 @@ ${s.profiles.map(p => `<option value="${escHtml(p.suffix)}" ${p.suffix === initi
 <script>
 ${TOAST_JS}
 const SETTINGS=${settingsJson};
-const QUOTA_OPS=${quotaOpsJson};
+// Manual ops keyed by pool → user key (an op on the pool affects every member
+// profile, so the badge lookup must follow the pool, not the profile).
+const QUOTA_OPS_BY_POOL=${quotaOpsJson};
+function qoKey(suffix,key){const p=(SETTINGS.quotaPools||[]).find(x=>x.profiles.some(m=>m.suffix===suffix));return p?p.name:suffix}
 const NOTIFIER_CFG=${JSON.stringify(config.notifier || {}).replace(/</g, "\\x3c")};
 const PAGE_CSRF="${CSRF_TOKEN}";
 function getCsrf(){return PAGE_CSRF||(document.cookie.match(/tm_csrf=([^;]+)/)||[])[1]||''}
@@ -5426,38 +5755,107 @@ setInterval(updatePeakHoursStatus,30000);
 })();
 function openDataManagementView(){
   const form=document.getElementById('settingsForm');
-  document.getElementById('auditLogView').hidden=true;
-  document.getElementById('auditLogNav').classList.remove('active');
+  hideAllSecondaryViews();
   const view=document.getElementById('dataManagementView');
   form.hidden=true;
   view.hidden=false;
   view.setAttribute('aria-hidden','false');
-  document.querySelectorAll('.pl-item').forEach(function(el){el.classList.remove('active')});
   document.getElementById('dataManagementNav').classList.add('active');
 }
 function showProfileSettings(){
   const form=document.getElementById('settingsForm');
   const view=document.getElementById('dataManagementView');
   const audit=document.getElementById('auditLogView');
+  const pool=document.getElementById('quotaPoolView');
   form.hidden=false;
   view.hidden=true;
   view.setAttribute('aria-hidden','true');
   audit.hidden=true;
   audit.setAttribute('aria-hidden','true');
+  if(pool){pool.hidden=true;pool.setAttribute('aria-hidden','true')}
   document.getElementById('dataManagementNav').classList.remove('active');
   document.getElementById('auditLogNav').classList.remove('active');
+  const pn=document.getElementById('quotaPoolNav');if(pn)pn.classList.remove('active');
+}
+function hideAllSecondaryViews(){
+  const dm=document.getElementById('dataManagementView'),audit=document.getElementById('auditLogView'),pool=document.getElementById('quotaPoolView');
+  dm.hidden=true;dm.setAttribute('aria-hidden','true');
+  audit.hidden=true;audit.setAttribute('aria-hidden','true');
+  if(pool){pool.hidden=true;pool.setAttribute('aria-hidden','true')}
+  document.querySelectorAll('.pl-item').forEach(function(el){el.classList.remove('active')});
+}
+function openQuotaPoolView(){
+  const form=document.getElementById('settingsForm');
+  hideAllSecondaryViews();
+  form.hidden=true;
+  const view=document.getElementById('quotaPoolView');
+  view.hidden=false;view.setAttribute('aria-hidden','false');
+  document.getElementById('quotaPoolNav').classList.add('active');
+}
+// Collect a pool card's pool-level limit + per-user limits and POST to the single
+// write path. The temporary-quota modal (bonus/reset) is separate and reaches the
+// same pool via its representative profile suffix.
+async function savePoolQuota(poolName){
+  const card=document.querySelector('[data-poolcard="'+poolName+'"]');
+  if(!card)return;
+  const limitInput=card.querySelector('[data-poollimit="'+poolName+'"]');
+  const users={};
+  card.querySelectorAll('input[data-user]').forEach(inp=>{
+    users[inp.dataset.user]=inp.value.trim()?parseInt(inp.value,10):null;
+  });
+  let r,data;
+  try{
+    r=await fetch('/api/quota-pool/save',{method:'POST',headers:csrfHeaders({'Content-Type':'application/json'}),
+      body:JSON.stringify({pool:poolName,dailyTokenLimit:limitInput?limitInput.value.trim()||null:null,users})});
+    data=await r.json();
+  }catch(err){alert('保存失败: '+err.message);return}
+  if(!r.ok){alert('保存失败: '+(data&&data.error?data.error:r.status));return}
+  toastThen('额度池「'+(data.pool?data.pool.label:poolName)+'」已保存',()=>location.reload());
+}
+// Open the temporary-quota modal for a user from the pool view, using the pool's
+// representative profile suffix so /api/quota/daily-op resolves the same pool.
+function openQuotaOpFromPool(suffix,key){
+  const sel=document.getElementById('userProfileSel');
+  if(sel)sel.value=suffix;
+  openQuotaOp(key);
+}
+function togglePoolCreate(){
+  const row=document.getElementById('poolCreateRow');
+  if(!row)return;
+  row.style.display=row.style.display==='none'?'inline-flex':'none';
+  if(row.style.display!=='none'){const inp=document.getElementById('newPoolName');if(inp)inp.focus()}
+}
+async function createPool(){
+  const inp=document.getElementById('newPoolName');
+  const name=inp?inp.value.trim():'';
+  if(!name){alert('请填写额度池名称');return}
+  let r,data;
+  try{
+    r=await fetch('/api/quota-pool/create',{method:'POST',headers:csrfHeaders({'Content-Type':'application/json'}),body:JSON.stringify({label:name})});
+    data=await r.json().catch(()=>({}));
+  }catch(err){alert('创建失败: '+err.message);return}
+  if(!r.ok){alert('创建失败: '+(data.error||r.status));return}
+  toastThen('额度池「'+name+'」已创建',()=>location.reload());
+}
+async function deletePool(name){
+  if(!confirm('确定删除额度池「'+name+'」？该池当前没有成员方案，其池级限额与每人配额配置将一并删除。'))return;
+  let r,data;
+  try{
+    r=await fetch('/api/quota-pool/delete',{method:'POST',headers:csrfHeaders({'Content-Type':'application/json'}),body:JSON.stringify({pool:name})});
+    data=await r.json().catch(()=>({}));
+  }catch(err){alert('删除失败: '+err.message);return}
+  if(!r.ok){alert('删除失败: '+(data.error||r.status));return}
+  toastThen('额度池已删除',()=>location.reload());
 }
 // ─── 操作日志（audit_log）───
 let auditRows=[],auditOffset=0,auditCategory='',auditLoaded=false,auditTotal=0;
 const AUDIT_PAGE=100;
 function openAuditLogView(){
   const form=document.getElementById('settingsForm');
-  const dm=document.getElementById('dataManagementView');
-  dm.hidden=true;dm.setAttribute('aria-hidden','true');
+  hideAllSecondaryViews();
   form.hidden=true;
   const view=document.getElementById('auditLogView');
   view.hidden=false;view.setAttribute('aria-hidden','false');
-  document.querySelectorAll('.pl-item').forEach(function(el){el.classList.remove('active')});
   document.getElementById('auditLogNav').classList.add('active');
   if(!auditLoaded)loadAuditLog(true);
 }
@@ -5625,12 +6023,28 @@ async function editProfile(n){
   if(!p)return;
   showProfileSettings();
   editingProfileName=n;
+  // Pool summary follows the select; declared before use inside the fn body.
+  ;
+  window.updatePoolSummary=function(){
+    const sel=document.getElementById('quotaPoolSelect'),el=document.getElementById('poolSummary');
+    if(!sel||!el)return;
+    const name=sel.value;
+    if(name==='__new__'){el.innerHTML='将在保存时新建一个与方案同名的额度池';return}
+    const pool=(SETTINGS.quotaPools||[]).find(x=>x.name===name);
+    if(!pool){el.innerHTML='未关联额度池';return}
+    const memberNames=pool.profiles.map(m=>m.name).join('、');
+    const limit=pool.dailyTokenLimit?('池级上限 '+pool.dailyTokenLimit.toLocaleString('zh-CN')):'池级不限制';
+    const nUsers=Object.keys(pool.userLimits||{}).length;
+    el.innerHTML='本池成员：'+h(memberNames)+' · '+h(limit)+' · '+nUsers+' 人有个人配额'
+      +(pool.profiles.length>1?'<br><b style="color:var(--orange)">注意：此方案保存后，其用量与额度立即与上述方案合并计算</b>':'');
+  };
   const fm=document.forms.settingsForm;
   fm.upstream.value=p.upstream||'';
   document.getElementById('suffixInput').value=p.suffix||'';
   document.getElementById('profileNameInput').value=p.name||'';
   renderAliasRows(p);
-  if(fm.profileQuota)fm.profileQuota.value=p.dailyTokenLimit||0;
+  const poolSel=document.getElementById('quotaPoolSelect');if(poolSel)poolSel.value=p.quotaPool||'__new__';
+  updatePoolSummary();
   const pqr=document.getElementById('peakQuotaRateInput');if(pqr)pqr.value=(p.peakQuotaRate??1);
   const oqr=document.getElementById('offPeakQuotaRateInput');if(oqr)oqr.value=(p.offPeakQuotaRate??1);
   const bt=fm.querySelector('select[name="billingType"]');if(bt)bt.value=p.billingType||'on_demand';
@@ -5660,7 +6074,7 @@ async function createProfile(){
   const fm=document.forms.settingsForm;
   const r=await fetch('/api/profile/save',{method:'POST',headers:csrfHeaders({'Content-Type':'application/json'}),body:JSON.stringify({
     profile:name,suffix:suffix,upstream:upstream,allowedModels:models,
-    modelAliases:modelAliases,protocol:protocol
+    modelAliases:modelAliases,protocol:protocol,quotaPool:document.getElementById('newProfilePool')?.value||''
   })});
   if(r.ok)toastThen('方案已创建',()=>location.reload());else{const e=await r.json();alert('创建失败: '+e.error)}
 }
@@ -5703,17 +6117,11 @@ function renderProfileUsers(suffix){
     const pu=assignments[k]||null;
     const realKey=(pu&&pu.key)||'';
     const profileDisabled=!!(pu&&pu.disabled);
-    const userQuota=(pu&&pu.dailyTokenLimit)||0;
     const rowStyle=globalDisabled?'opacity:0.4':'';
-    const qop=QUOTA_OPS[suffix+'	'+k];
-    const qBadges=(qop?((qop.bonus>0?'<span style="font-size:10px;color:var(--green);border:1px solid var(--green);border-radius:3px;padding:0 3px;white-space:nowrap" title="今日临时加量，明日自动失效">+'+qFmt(qop.bonus)+'</span>':'')+(qop.reset_baseline>0?'<span style="font-size:10px;color:var(--accent);border:1px solid var(--accent);border-radius:3px;padding:0 3px;white-space:nowrap" title="今日用量已重置（统计保留）">已重置</span>':'')):'');
-    const qCell=pu?'<div style="display:flex;align-items:center;gap:3px;flex-wrap:wrap">'+qBadges+'<button type="button" class="btn btn-outline btn-sm" data-k="'+h(k)+'" onclick="openQuotaOp(this.dataset.k)" style="font-size:11px;padding:2px 8px;white-space:nowrap">临时额度</button></div>':'<span style="color:var(--dim);font-size:11px">—</span>';
     return '<tr style="'+rowStyle+'">'
       +'<td><code style="font-size:11px;color:var(--accent)">'+h(k)+'</code></td>'
       +'<td>'+h(username)+'</td>'
       +'<td><input type="text" name="pu_rk_'+h(k)+'" value="'+h(realKey)+'" style="width:100%;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:4px 8px;border-radius:4px;font-size:12px;font-family:monospace" placeholder="真实Key (留空=不可用此方案)"></td>'
-      +'<td><input type="number" name="pu_quota_'+h(k)+'" value="'+h(userQuota)+'" style="width:100%;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:4px 8px;border-radius:4px;font-size:12px" min="0" step="100000" placeholder="0=不限"></td>'
-      +'<td>'+qCell+'</td>'
       +'<td><label style="display:inline-flex;align-items:center;gap:4px;margin:0;cursor:pointer"><input type="checkbox" name="pu_dis_'+h(k)+'" '+(profileDisabled?'checked':'')+' style="width:auto;accent-color:var(--orange)"><span style="font-size:11px;color:'+(profileDisabled?'var(--orange)':'var(--dim)')+'">'+(profileDisabled?'已禁用':'正常')+'</span></label></td></tr>';
   }).join('');
 }
@@ -5739,9 +6147,7 @@ async function saveUsers(){
     const rkInput=tr.querySelector('input[name^="pu_rk_"]');
     const disInput=tr.querySelector('input[name^="pu_dis_"]');
     if(!vk)return;
-    const qInput=tr.querySelector('input[name^="pu_quota_"]');
-    const qv=parseInt(qInput?qInput.value:'0',10)||0;
-    profileUsers.push({key:vk,realKey:rkInput?rkInput.value.trim():'',disabled:disInput?disInput.checked:false,dailyTokenLimit:qv>0?qv:null});
+    profileUsers.push({key:vk,realKey:rkInput?rkInput.value.trim():'',disabled:disInput?disInput.checked:false});
   });
   const profileSuffix=document.getElementById('userProfileSel').value;
   const r=await fetch('/api/global-user/save',{method:'POST',headers:csrfHeaders({'Content-Type':'application/json'}),body:JSON.stringify({users,profileUsers,profileSuffix})});
@@ -5750,25 +6156,27 @@ async function saveUsers(){
 // ── 今日临时额度（bonus / reset）弹窗 ──────────────────────────────────────
 function qFmt(n){n=Number(n)||0;if(n>=1e6)return(n/1e6).toFixed(1)+'M';if(n>=1e3)return(n/1e3).toFixed(1)+'k';return String(n)}
 const QUOTA_OP_CTX={suffix:'',key:''};
-function qoKey(suffix,key){return suffix+'	'+key}
-function qoOp(){return QUOTA_OPS[qoKey(QUOTA_OP_CTX.suffix,QUOTA_OP_CTX.key)]}
+function qoOp(){const pool=QUOTA_OPS_BY_POOL[qoKey(QUOTA_OP_CTX.suffix,'')];return pool?pool[QUOTA_OP_CTX.key]:undefined}
 function openQuotaOp(key){
   const suffix=document.getElementById('userProfileSel').value;
   QUOTA_OP_CTX.suffix=suffix;QUOTA_OP_CTX.key=key;
   const username=((SETTINGS.globalUsers||{})[key]||{}).username||key.slice(0,8);
-  const pu=((SETTINGS.profileAssignments||{})[suffix]||{})[key];
   const profile=(SETTINGS.profiles||[]).find(p=>p.suffix===suffix)||{};
-  const base=(pu&&pu.dailyTokenLimit>0)?pu.dailyTokenLimit:(profile.dailyTokenLimit||0);
+  const pool=(SETTINGS.quotaPools||[]).find(p=>p.profiles.some(m=>m.suffix===suffix));
+  const userLimit=pool?((pool.userLimits||{})[key]||0):0;
+  const poolLimit=pool?(pool.dailyTokenLimit||0):0;
+  const base=userLimit>0?userLimit:poolLimit;
   // Note the unit when weighting is on: bonus/reset amounts are weighted tokens,
   // not raw ones, so an admin typing "1,000,000" is granting 1M of quota currency.
   const weighted=(profile.peakQuotaRate!==undefined&&(profile.peakQuotaRate!==1||profile.offPeakQuotaRate!==1));
+  const poolNote=pool&&pool.profiles.length>1?' · 额度池「'+h(pool.label)+'」'+pool.profiles.length+' 个方案共用':'';
   document.getElementById('qoTitle').textContent='临时额度 · '+username;
-  document.getElementById('qoInfo').innerHTML='方案：'+h(profile.name||suffix)+' /'+h(suffix)+' · 基础每日配额：'+(base>0?(base.toLocaleString('zh-CN')+(pu&&pu.dailyTokenLimit>0?'（个人）':'（方案级）')+(weighted?' <span style="color:var(--accent)">· 计权口径（峰 ×'+profile.peakQuotaRate+' / 谷 ×'+profile.offPeakQuotaRate+'）</span>':'')):'<span style="color:var(--orange)">未设置（当前无限制）</span>');
+  document.getElementById('qoInfo').innerHTML='额度池：'+h(pool?pool.label:'')+' · 基础每日配额：'+(base>0?(base.toLocaleString('zh-CN')+(userLimit>0?'（个人）':'（池级）')+(poolNote)+(weighted?' <span style="color:var(--accent)">· 计权口径（峰 ×'+profile.peakQuotaRate+' / 谷 ×'+profile.offPeakQuotaRate+'）</span>':'')):'<span style="color:var(--orange)">未设置（当前无限制）</span>');
   document.getElementById('qoBonusInput').value='';
   const noBase=!(base>0);
   document.getElementById('qoSetBtn').disabled=noBase;
   document.getElementById('qoResetBtn').disabled=noBase;
-  document.getElementById('qoResetBtn').title=noBase?'方案与用户均未设置每日配额，无限制状态下无需重置':'';
+  document.getElementById('qoResetBtn').title=noBase?'该用户与额度池均未设置每日配额，无限制状态下无需重置':'';
   qoRenderStatus();
   document.getElementById('quotaOpModal').classList.add('open');
 }
@@ -5793,9 +6201,12 @@ async function qoPost(action,amount){
     data=await r.json();
   }catch(err){alert('操作失败: '+err.message);return null}
   if(!r.ok){alert('操作失败: '+(data&&data.error?data.error:r.status));return null}
-  const kk=qoKey(QUOTA_OP_CTX.suffix,QUOTA_OP_CTX.key);
-  if(data.quota&&(data.quota.bonus>0||data.quota.resetApplied))QUOTA_OPS[kk]={bonus:data.quota.bonus||0,reset_baseline:data.quota.resetApplied?1:0};
-  else delete QUOTA_OPS[kk];
+  const poolName=qoKey(QUOTA_OP_CTX.suffix,'');
+  if(data.quota&&(data.quota.bonus>0||data.quota.resetApplied)){
+    (QUOTA_OPS_BY_POOL[poolName]=QUOTA_OPS_BY_POOL[poolName]||{})[QUOTA_OP_CTX.key]={bonus:data.quota.bonus||0,reset_baseline:data.quota.resetApplied?1:0};
+  } else if(QUOTA_OPS_BY_POOL[poolName]) {
+    delete QUOTA_OPS_BY_POOL[poolName][QUOTA_OP_CTX.key];
+  }
   renderProfileUsers(QUOTA_OP_CTX.suffix);
   return data.quota;
 }
@@ -6329,8 +6740,9 @@ function renderUserTableHead(profiles){
   if(!profiles){head.innerHTML=base+'<th class="n">配额</th>'+tail;return}
   const cols=profiles.map(p=>{
     const badge=p.billingType==='coding_plan'?'套餐':p.billingType==='token_plan'?'包月':'按量';
-    return '<th class="n q-col" title="'+escH(p.name)+' /'+escH(p.suffix)+'">'+escH(p.name)
-      +'<span class="q-head-sub">/'+escH(p.suffix)+' · '+badge+'</span></th>';
+    const sub=p.memberCount>1?p.memberCount+' 个方案 · '+badge:badge;
+    return '<th class="n q-col" title="'+escH(p.label)+'：'+escH(p.memberNames.join('、'))+'">'+escH(p.label)
+      +'<span class="q-head-sub">'+escH(sub)+'</span></th>';
   }).join("");
   head.innerHTML=base+cols+tail;
 }
@@ -6365,7 +6777,7 @@ function renderUserQuotaContext(qm,userList){
     }
   }
   const nameOf=uk=>{const hit=(userList||[]).find(([k])=>k===uk);return hit?hit[1].name:uk};
-  const nameFor=sfx=>{const p=(qm.profiles||[]).find(x=>x.suffix===sfx);return p?p.name:sfx};
+  const nameFor=key=>{const p=(qm.pools||[]).find(x=>x.key===key);return p?p.label:key};
   hot.sort((a,b)=>b.pct-a.pct);
   const parts=['共 '+total+' 项配额'];
   if(full)parts.push('<b style="color:var(--red)">'+full+' 项已用尽</b>');
@@ -6377,14 +6789,16 @@ function renderUserQuotaContext(qm,userList){
 // One quota cell: percentage + bar, or a dash when this member has no quota on
 // this profile (not authorized, or the profile is unlimited). The tooltip carries
 // the exact numbers so the cell itself can stay narrow.
-function quotaMatrixCell(q,userName,profile){
-  if(!q)return '<td class="n"><span class="q-none" title="'+escH(userName)+' 在 '+escH(profile.name)+' 无配额限制或无访问权限">-</span></td>';
+function quotaMatrixCell(q,userName,pool){
+  const poolLabel=pool?(pool.label||pool.name):'';
+  const memberNote=pool&&pool.memberCount>1?NL+'含 '+pool.memberCount+' 个方案（'+pool.memberNames.join('、')+'）':'';
+  if(!q)return '<td class="n"><span class="q-none" title="'+escH(userName)+' 在额度池 '+escH(poolLabel)+' 无配额限制或无访问权限">-</span></td>';
   const col=q.pct>=100?'var(--red)':q.pct>90?'var(--red)':q.pct>70?'var(--orange)':'var(--green)';
   const tags=(q.bonus>0?' +'+fmtTk(q.bonus):'')+(q.resetApplied?' 已重置':'');
   const NL='&#10;';   // tooltip line break (title attribute)
   const rateNote=(q.rate!=null&&q.rate!==1)?NL+'倍率 ×'+q.rate+'（实际 '+fmtT(q.rawUsed||0)+'）':'';
-  const title=escH(userName)+' @ '+escH(profile.name)+NL+'已用 '+fmtT(q.used)+' / '+fmtT(q.limit)
-    +'（'+q.source+'）'+NL+'剩余 '+fmtT(q.remaining)+rateNote
+  const title=escH(userName)+' @ '+escH(poolLabel)+NL+'已用 '+fmtT(q.used)+' / '+fmtT(q.limit)
+    +'（'+q.source+'）'+NL+'剩余 '+fmtT(q.remaining)+rateNote+memberNote
     +(q.bonus>0?NL+'含今日临时加量 '+fmtT(q.bonus):'')+(q.resetApplied?NL+'今日已重置':'');
   return '<td class="n q-col"><div class="q-cell" title="'+title+'">'
     +'<span class="q-pct" style="color:'+col+'">'+q.pct+'%'+(tags?'<span style="color:var(--dim);font-weight:400;font-size:9px">'+tags+'</span>':'')+'</span>'
@@ -6586,13 +7000,13 @@ function render(){
   const ut=document.querySelector("#uTable tbody");
   const ul=Object.entries(D.users).sort((a,b)=>totalTokens(b[1])-totalTokens(a[1]));
   const qm=D.userQuotaMatrix||null;
-  const qProfiles=qm&&Array.isArray(qm.profiles)?qm.profiles:[];
-  const multiQuota=!!qm&&qProfiles.length>0;
-  renderUserTableHead(multiQuota?qProfiles:null);
+  const qPools=qm&&Array.isArray(qm.pools)?qm.pools:[];
+  const multiQuota=!!qm&&qPools.length>0;
+  renderUserTableHead(multiQuota?qPools:null);
   renderUserQuotaContext(multiQuota?qm:null,ul);
   applyQuotaFocus();
-  const colSpan=multiQuota?10+qProfiles.length:11;
-  if(!ul.length){ut.innerHTML='<tr><td colspan="'+colSpan+'" class="empty">暂无数据</td></tr>'}else{ut.innerHTML=ul.map(([uk,u],idx)=>{const on=u.lastActive&&Date.now()-new Date(u.lastActive).getTime()<36e5;const effQ=(D.userQuotaEff||{})[uk];const uq=effQ?effQ.limit:((D.userQuotas||{})[uk]||D.profileQuota||0);const td2=(D.daily||{})[td]||{};const tdu=td2[uk]||{};const used=effQ?effQ.used:ioTokens(tdu);const qPct=uq>0?Math.min(100,Math.round(used/uq*100)):0;const rank='<span class="rank">'+(idx+1)+'.</span>';const qTag=effQ&&effQ.bonus>0?' <span style="font-size:10px;color:var(--green);border:1px solid var(--green);border-radius:3px;padding:0 3px;white-space:nowrap" title="今日临时加量，明日自动失效">+'+fmtTk(effQ.bonus)+'</span>':(effQ&&effQ.resetApplied?' <span style="font-size:10px;color:var(--accent);border:1px solid var(--accent);border-radius:3px;padding:0 3px;white-space:nowrap" title="今日用量已重置（统计保留）">已重置</span>':'');const rTag=(effQ&&effQ.rate!=null&&effQ.rate!==1)?' <span style="font-size:10px;color:var(--dim);border:1px solid var(--border);border-radius:3px;padding:0 3px;white-space:nowrap" title="配额倍率 ×'+effQ.rate+'（当前时段）· 实际 '+fmtT(effQ.rawUsed||0)+'，计入配额 '+fmtT(effQ.used||0)+'">×'+effQ.rate+'</span>':'';const qCell=uq>0?'<span style="color:var(--accent);font-size:12px">'+qPct+'%</span> '+quotaBar(qPct)+qTag+rTag:'<span style="color:var(--dim)">-</span>';const quotaCells=multiQuota?qProfiles.map(p=>quotaMatrixCell(((qm.matrix||{})[uk]||{})[p.suffix],u.name,p)).join(""):'<td class="n" style="white-space:nowrap">'+qCell+'</td>';return'<tr><td>'+rank+escH(u.name)+'</td><td><span class="led '+(on?'on':'')+'"></span><span style="color:'+(on?'var(--green)':'var(--dim)')+';font-size:12px">'+(on?'在线':'离线')+'</span></td><td class="n stat-col">'+fmtT(u.totalRequests)+'</td><td class="n stat-col">'+fmtT(u.totalInputTokens)+'</td><td class="n stat-col">'+fmtT(u.totalOutputTokens)+'</td><td class="n stat-col">'+fmtT(u.cacheCreationTokens || 0)+'</td><td class="n stat-col">'+fmtT(u.cacheReadTokens || 0)+'</td><td class="n hl stat-col">'+fmtT(ioTokens(u))+'</td><td class="n">'+fmtT(ioTokens(tdu))+'</td>'+quotaCells+'<td style="font-size:12px;color:var(--dim)">'+ago(u.lastActive)+'</td></tr>'}).join("")}
+  const colSpan=multiQuota?10+qPools.length:11;
+  if(!ul.length){ut.innerHTML='<tr><td colspan="'+colSpan+'" class="empty">暂无数据</td></tr>'}else{ut.innerHTML=ul.map(([uk,u],idx)=>{const on=u.lastActive&&Date.now()-new Date(u.lastActive).getTime()<36e5;const effQ=(D.userQuotaEff||{})[uk];const uq=effQ?effQ.limit:((D.userQuotas||{})[uk]||D.profileQuota||0);const td2=(D.daily||{})[td]||{};const tdu=td2[uk]||{};const used=effQ?effQ.used:ioTokens(tdu);const qPct=uq>0?Math.min(100,Math.round(used/uq*100)):0;const rank='<span class="rank">'+(idx+1)+'.</span>';const qTag=effQ&&effQ.bonus>0?' <span style="font-size:10px;color:var(--green);border:1px solid var(--green);border-radius:3px;padding:0 3px;white-space:nowrap" title="今日临时加量，明日自动失效">+'+fmtTk(effQ.bonus)+'</span>':(effQ&&effQ.resetApplied?' <span style="font-size:10px;color:var(--accent);border:1px solid var(--accent);border-radius:3px;padding:0 3px;white-space:nowrap" title="今日用量已重置（统计保留）">已重置</span>':'');const rTag=(effQ&&effQ.rate!=null&&effQ.rate!==1)?' <span style="font-size:10px;color:var(--dim);border:1px solid var(--border);border-radius:3px;padding:0 3px;white-space:nowrap" title="配额倍率 ×'+effQ.rate+'（当前时段）· 实际 '+fmtT(effQ.rawUsed||0)+'，计入配额 '+fmtT(effQ.used||0)+'">×'+effQ.rate+'</span>':'';const qCell=uq>0?'<span style="color:var(--accent);font-size:12px">'+qPct+'%</span> '+quotaBar(qPct)+qTag+rTag:'<span style="color:var(--dim)">-</span>';const quotaCells=multiQuota?qPools.map(p=>quotaMatrixCell(((qm.matrix||{})[uk]||{})[p.key],u.name,p)).join(""):'<td class="n" style="white-space:nowrap">'+qCell+'</td>';return'<tr><td>'+rank+escH(u.name)+'</td><td><span class="led '+(on?'on':'')+'"></span><span style="color:'+(on?'var(--green)':'var(--dim)')+';font-size:12px">'+(on?'在线':'离线')+'</span></td><td class="n stat-col">'+fmtT(u.totalRequests)+'</td><td class="n stat-col">'+fmtT(u.totalInputTokens)+'</td><td class="n stat-col">'+fmtT(u.totalOutputTokens)+'</td><td class="n stat-col">'+fmtT(u.cacheCreationTokens || 0)+'</td><td class="n stat-col">'+fmtT(u.cacheReadTokens || 0)+'</td><td class="n hl stat-col">'+fmtT(ioTokens(u))+'</td><td class="n">'+fmtT(ioTokens(tdu))+'</td>'+quotaCells+'<td style="font-size:12px;color:var(--dim)">'+ago(u.lastActive)+'</td></tr>'}).join("")}
 
   renderDetail();
 
@@ -7239,7 +7653,7 @@ function renderProfileQuotas(){
   const limited=rows.filter(r=>r.limit>0);
   const tight=limited.filter(r=>r.pct>=80);
   if(hint){
-    hint.innerHTML='共 '+rows.length+' 个可用方案'
+    hint.innerHTML='共 '+rows.length+' 个额度池'
       +(limited.length?'，'+limited.length+' 个有配额':'，均无配额限制')
       +(tight.length?' · <b style="color:'+(tight.some(r=>r.pct>=100)?'var(--red)':'var(--orange)')+'">'+tight.length+' 个已超 80%</b>':'');
   }
@@ -7249,7 +7663,8 @@ function renderProfileQuotas(){
     const col=free?'var(--dim)':r.pct>=90?'var(--red)':r.pct>=80?'var(--orange)':'var(--green)';
     const tags=[];
     if(r.isDefault)tags.push('<span class="tag" style="background:rgba(47,110,80,.1);color:var(--green)">默认入口</span>');
-    tags.push('<span class="tag" style="background:rgba(0,0,0,.04);color:var(--dim)">'+(r.protocol==='responses'?'Codex':'Claude Code')+'</span>');
+    if(r.isPool&&r.poolProfiles&&r.poolProfiles.length>1)tags.push('<span class="tag" style="background:rgba(0,0,0,.04);color:var(--dim)" title="此额度池包含：'+esc((r.poolProfiles||[]).join('、'))+'">'+r.poolProfiles.length+' 个方案</span>');
+    else tags.push('<span class="tag" style="background:rgba(0,0,0,.04);color:var(--dim)">'+(r.protocol==='responses'?'Codex':'Claude Code')+'</span>');
     if(r.rate!=null&&r.rate!==1)tags.push('<span class="tag" style="background:rgba(0,0,0,.04);color:'+(r.inPeak?'var(--orange)':'var(--green)')+'" title="'+(r.inPeak?'高峰':'低谷')+'时段默认倍率 ×'+r.rate+'">'+(r.inPeak?'高峰':'低谷')+' ×'+r.rate+'</span>');
     if(r.bonus>0)tags.push('<span class="tag" style="background:rgba(46,164,79,.12);color:var(--green)" title="管理员今日临时加量，明日自动失效">临时+'+fmtTk(r.bonus)+'</span>');
     if(r.resetApplied)tags.push('<span class="tag" title="管理员已重置今日用量，统计数据保留">已重置</span>');
@@ -7478,10 +7893,30 @@ function applySettings(formData) {
   if (formData.circuitBreakerFailures) gProxy.circuitBreakerFailures = Math.max(1, Math.min(50, parseInt(formData.circuitBreakerFailures, 10) || 5));
   if (formData.circuitBreakerCooldown) gProxy.circuitBreakerCooldown = Math.max(1000, Math.min(300000, parseInt(formData.circuitBreakerCooldown, 10) || 30000));
 
-  // Update profile quota (profile form only — the global form carries no quota)
-  if (!isGlobalOnlySave && formData.profileQuota !== undefined) {
-    const q = parseInt(formData.profileQuota, 10) || 0;
-    editingProfile.dailyTokenLimit = q > 0 ? q : null;
+  // Pool assignment (profile form only). "__new__" creates a same-named pool so a
+  // profile can always be given an independent allowance by splitting it off.
+  if (!isGlobalOnlySave && formData.quotaPool !== undefined) {
+    const chosen = String(formData.quotaPool);
+    const prevPool = normalizeQuotaPoolName(editingProfile.quotaPool);
+    if (chosen === "__new__") {
+      let name = normalizeQuotaPoolName(editingProfileName) || "pool";
+      for (let i = 2; config.quotaPools[name]; i++) name = `${normalizeQuotaPoolName(editingProfileName)}-${i}`.slice(0, QUOTA_POOL_NAME_MAX);
+      config.quotaPools[name] = { label: editingProfileName, dailyTokenLimit: null, users: {} };
+      editingProfile.quotaPool = name;
+    } else if (config.quotaPools[chosen]) {
+      editingProfile.quotaPool = chosen;
+    }
+    // Auto-clean the vacated pool: once no profile draws from it, its limits are
+    // dead config — exactly the leftover a merge leaves behind (GLM-CodeX moved
+    // into the GLM pool, the old same-named pool would linger forever otherwise).
+    const newPool = normalizeQuotaPoolName(editingProfile.quotaPool);
+    if (prevPool && prevPool !== newPool && config.quotaPools[prevPool]) {
+      const stillUsed = Object.keys(config.profiles).some(p => resolvePoolName(p) === prevPool);
+      if (!stillUsed) {
+        delete config.quotaPools[prevPool];
+        console.log(`[QuotaPool] 方案 "${editingProfileName}" 移出后池 "${prevPool}" 已无成员，自动删除`);
+      }
+    }
   }
 
   // Update billing type (display label, drives no logic)
@@ -7645,18 +8080,17 @@ function applySettings(formData) {
     config.users = newGlobalUsers;
   }
 
-  // Update profile users (key assignment + profile disable)
+  // Update profile users (key assignment + profile disable). Quota is NOT written
+  // here — it belongs to the pool and is edited on the 额度池 page.
   const newProfileUsers = {};
   for (const [k, v] of Object.entries(formData)) {
     if (k.startsWith("pu_rk_")) {
       const vk = k.slice(6);
       const realKey = v.trim();
       if (!realKey) continue; // skip users without real key
-      const quotaVal = parseInt(formData["pu_quota_" + vk], 10) || 0;
       newProfileUsers[vk] = {
         key: realKey,
         disabled: formData["pu_dis_" + vk] === "on",
-        dailyTokenLimit: quotaVal > 0 ? quotaVal : null,
       };
     }
   }
@@ -7718,6 +8152,9 @@ function resetConfigToUnconfiguredState() {
   for (const key of Object.keys(config)) delete config[key];
   Object.assign(config, preserved, {
     users: {},
+    quotaPools: {
+      "默认方案": { label: "默认方案", dailyTokenLimit: null, users: {} },
+    },
     profiles: {
       "默认方案": {
         suffix: "default",
@@ -7726,7 +8163,7 @@ function resetConfigToUnconfiguredState() {
         allowedModels: [],
         modelAliases: {},
         peakModelAliases: {},
-        dailyTokenLimit: null,
+        quotaPool: "默认方案",
         users: {},
       },
     },
@@ -8094,7 +8531,7 @@ const server = http.createServer((req, res) => {
     if (!checkCsrf(req)) { res.writeHead(403); res.end("CSRF validation failed"); return; }
     readBody(req).then(buf => {
       try {
-        const { profile, upstream, allowedModels, suffix, modelAliases, billingType, protocol } = JSON.parse(buf.toString());
+        const { profile, upstream, allowedModels, suffix, modelAliases, billingType, protocol, quotaPool } = JSON.parse(buf.toString());
         const name = (profile || "").trim();
         if (!name) throw new Error("Profile name required");
         if (config.profiles[name]) throw new Error(`方案 "${name}" 已存在`);
@@ -8106,6 +8543,15 @@ const server = http.createServer((req, res) => {
           if (m && !models.includes(m)) models.push(m);
         }
         const validBilling = ["coding_plan", "token_plan", "on_demand"].includes(billingType) ? billingType : "on_demand";
+        // Every profile needs a pool; accept an existing one or create a same-named
+        // one so quota enforcement never runs against nothing (= unlimited).
+        const requestedPool = normalizeQuotaPoolName(quotaPool);
+        let poolName = requestedPool && config.quotaPools[requestedPool] ? requestedPool : "";
+        if (!poolName) {
+          poolName = normalizeQuotaPoolName(name) || "pool";
+          for (let i = 2; config.quotaPools[poolName]; i++) poolName = `${normalizeQuotaPoolName(name)}-${i}`.slice(0, QUOTA_POOL_NAME_MAX);
+          config.quotaPools[poolName] = { label: name, dailyTokenLimit: null, users: {} };
+        }
         config.profiles[name] = {
           upstream: upstream || rt?.upstream || "",
           allowedModels: models,
@@ -8116,6 +8562,7 @@ const server = http.createServer((req, res) => {
           protocol: proto,
           isDefault: false,
           billingType: validBilling,
+          quotaPool: poolName,
           peakHours: [],
           peakQuotaRate: 1,
           offPeakQuotaRate: 1,
@@ -8157,6 +8604,13 @@ const server = http.createServer((req, res) => {
         // Drop the profile from the responses failover group as well.
         if (Array.isArray(config.responsesProfileGroup)) {
           config.responsesProfileGroup = config.responsesProfileGroup.filter(n => n !== profile);
+        }
+        // An orphaned pool has no members to draw on it and its limits are dead
+        // weight — drop it. A pool still referenced elsewhere is left alone.
+        const orphanPool = p && p.quotaPool ? normalizeQuotaPoolName(p.quotaPool) : "";
+        if (orphanPool && config.quotaPools[orphanPool]) {
+          const stillUsed = Object.values(config.profiles).some(x => x !== p && resolvePoolName(Object.keys(config.profiles).find(n => config.profiles[n] === x)) === orphanPool);
+          if (!stillUsed) delete config.quotaPools[orphanPool];
         }
         delete config.profiles[profile];
         saveConfig(config);
@@ -8326,14 +8780,16 @@ const server = http.createServer((req, res) => {
         data.profileView = targetRt.profileName;
         data.profileSuffix = targetSuffix;
         data.upstream = targetRt.upstream;
-        data.profileQuota = getProfileQuota(targetSuffix);
+        const poolOf = getPoolForSuffix(targetSuffix);
+        data.profileQuota = getPoolQuota(poolOf.name);
+        data.quotaPool = poolOf.name;
         data.userQuotas = {};
         // Effective quota per user (base + today's manual bonus, usage minus
         // reset baseline) so the dashboard quota bar matches what the proxy
         // actually enforces, while usage columns keep the real statistics.
         data.userQuotaEff = {};
         for (const k of Object.keys(targetRt.users)) {
-          const q = getUserQuota(k, targetRt);
+          const q = getUserPoolQuota(poolOf.name, k);
           if (q > 0) data.userQuotas[k.slice(0, 8) + "****"] = q;
           const eff = checkTokenQuota(k, targetSuffix, targetRt);
           if (eff.limit > 0) data.userQuotaEff[k.slice(0, 8) + "****"] = { limit: eff.limit, used: eff.used, bonus: eff.bonus || 0, resetApplied: !!eff.resetApplied, rawUsed: eff.rawUsed, discounted: eff.discounted, rate: eff.rate };
@@ -8402,6 +8858,126 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+  // Quota pool editing: the single write path for pool-level and per-user limits.
+  // Kept separate from /api/global-user/save so "who can use a profile" (real key
+  // + disable, per profile) and "how much a pool allows" (limits, per pool) each
+  // have exactly one home.
+  if (req.method === "POST" && req.url === "/api/quota-pool/save") {
+    if (!checkAuth(req)) { res.writeHead(401); res.end("Unauthorized"); return; }
+    if (!checkCsrf(req)) { res.writeHead(403); res.end("CSRF validation failed"); return; }
+    readBody(req).then(buf => {
+      try {
+        const { pool: poolNameRaw, dailyTokenLimit, users } = JSON.parse(buf.toString());
+        const poolName = normalizeQuotaPoolName(poolNameRaw);
+        const pool = getPoolByName(poolName);
+        if (!poolName || !pool) throw new Error(`额度池 "${poolNameRaw || ""}" 不存在`);
+        const normLimit = (v) => {
+          if (v === null || v === undefined || v === "") return null;
+          const n = Number(v);
+          return (Number.isFinite(n) && n > 0) ? Math.round(n) : null;
+        };
+
+        const prevPoolLimit = pool.dailyTokenLimit ?? null;
+        const prevUsers = { ...(pool.users || {}) };
+        const nextPoolLimit = normLimit(dailyTokenLimit);
+        pool.dailyTokenLimit = nextPoolLimit;
+
+        const userChanges = [];
+        if (users && typeof users === "object") {
+          const nextUsers = {};
+          for (const [k, v] of Object.entries(users)) {
+            const lim = normLimit(v);
+            nextUsers[k] = { dailyTokenLimit: lim };
+            const prev = prevUsers[k]?.dailyTokenLimit ?? null;
+            if (prev !== lim) {
+              userChanges.push(`${(config.users?.[k]?.username) || k.slice(0, 8)} ${prev ? prev.toLocaleString() : "不限"} → ${lim ? lim.toLocaleString() : "不限"}`);
+            }
+          }
+          pool.users = nextUsers;
+        }
+
+        saveConfig(config);
+        reloadAllRuntimes();
+
+        const parts = [];
+        if (prevPoolLimit !== nextPoolLimit) parts.push(`池级 ${prevPoolLimit ? prevPoolLimit.toLocaleString() : "不限"} → ${nextPoolLimit ? nextPoolLimit.toLocaleString() : "不限"}`);
+        if (userChanges.length) parts.push(userChanges.slice(0, 12).join("；") + (userChanges.length > 12 ? ` 等 ${userChanges.length} 项` : ""));
+        recordAdminAudit(req, "quotaPool.save", pool.label || poolName, `保存额度池「${pool.label || poolName}」${parts.length ? "：" + parts.join("；") : "（无变化）"}`);
+
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: true, pool: listQuotaPools().find(p => p.name === poolName) }));
+      } catch (err) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: err.message }));
+      }
+    }).catch(() => {
+      res.writeHead(413); res.end("Request too large");
+    });
+    return;
+  }
+
+  // Create an empty pool — the independent creation entry the 额度池 page needs.
+  // An empty pool is a TARGET: create "GLM 套餐池" here, then assign profiles to
+  // it from each profile's edit page. Rejected duplicates keep name === label
+  // unambiguous (the name doubles as the config key).
+  if (req.method === "POST" && req.url === "/api/quota-pool/create") {
+    if (!checkAuth(req)) { res.writeHead(401); res.end("Unauthorized"); return; }
+    if (!checkCsrf(req)) { res.writeHead(403); res.end("CSRF validation failed"); return; }
+    readBody(req).then(buf => {
+      try {
+        const { label } = JSON.parse(buf.toString());
+        const name = normalizeQuotaPoolName(label);
+        if (!name) throw new Error("请填写额度池名称");
+        if (config.quotaPools[name]) throw new Error(`额度池 "${name}" 已存在`);
+        config.quotaPools[name] = { label: name, dailyTokenLimit: null, users: {} };
+        saveConfig(config);
+        reloadAllRuntimes();
+        recordAdminAudit(req, "quotaPool.create", name, `新建额度池「${name}」（空池，待在方案编辑页将方案并入）`);
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: true, pool: listQuotaPools().find(p => p.name === name) }));
+      } catch (err) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: err.message }));
+      }
+    }).catch(() => {
+      res.writeHead(413); res.end("Request too large");
+    });
+    return;
+  }
+
+  // Delete a pool no profile draws from. Pools with members must be vacated
+  // first — deleting under live members would silently drop every limit they
+  // rely on (resolvePoolName would then also "repair" a dangling reference into
+  // a fresh unlimited pool, which is the opposite of what the admin asked for).
+  if (req.method === "POST" && req.url === "/api/quota-pool/delete") {
+    if (!checkAuth(req)) { res.writeHead(401); res.end("Unauthorized"); return; }
+    if (!checkCsrf(req)) { res.writeHead(403); res.end("CSRF validation failed"); return; }
+    readBody(req).then(buf => {
+      try {
+        const { pool: poolNameRaw } = JSON.parse(buf.toString());
+        const poolName = normalizeQuotaPoolName(poolNameRaw);
+        const pool = getPoolByName(poolName);
+        if (!poolName || !pool) throw new Error(`额度池 "${poolNameRaw || ""}" 不存在`);
+        const stillUsed = Object.keys(config.profiles).some(p => resolvePoolName(p) === poolName);
+        if (stillUsed) throw new Error("仍有方案使用该额度池，请先在方案编辑页将它们移到其他池");
+        const limitNote = pool.dailyTokenLimit ? `（含池级上限 ${pool.dailyTokenLimit.toLocaleString()}）` : "";
+        const userNote = Object.keys(pool.users || {}).length ? `、${Object.keys(pool.users).length} 人个人配额` : "";
+        delete config.quotaPools[poolName];
+        saveConfig(config);
+        reloadAllRuntimes();
+        recordAdminAudit(req, "quotaPool.delete", poolName, `删除空额度池「${pool.label || poolName}」${limitNote}${userNote}——其配置一并移除`);
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: true }));
+      } catch (err) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: err.message }));
+      }
+    }).catch(() => {
+      res.writeHead(413); res.end("Request too large");
+    });
+    return;
+  }
+
   // Manual daily quota ops (admin): same-day bonus / reset today's usage baseline.
   // Rows are keyed by Beijing date, so they stop matching at midnight and the
   // permanent dailyTokenLimit is never touched — no revert job needed.
@@ -8417,19 +8993,27 @@ const server = http.createServer((req, res) => {
         if (!key || !runtime.users[key]) throw new Error("该方案下不存在此用户 Key");
         if (!["bonus", "reset", "clear"].includes(action)) throw new Error("action 必须为 bonus | reset | clear");
 
-        const baseLimit = getUserQuota(key, runtime) || getProfileQuota(sfx);
-        if (baseLimit <= 0) throw new Error("该用户与方案均未设置每日配额（当前无限制），无需临时加量或重置");
+        // Manual ops act on the POOL the profile draws from — that is where the
+        // allowance and the usage both live now. A per-profile bonus would leave
+        // the user blocked on the other route into the same plan.
+        const poolOf = getPoolForSuffix(sfx);
+        const poolName = poolOf.name;
+        if (!poolName) throw new Error("该方案未关联额度池");
+        const baseLimit = getUserPoolQuota(poolName, key) || getPoolQuota(poolName);
+        if (baseLimit <= 0) throw new Error("该用户与额度池均未设置每日配额（当前无限制），无需临时加量或重置");
 
         const today = cnDate();
-        const op = stmts.getQuotaDailyOp.get(sfx, key, today) || { bonus: 0, reset_baseline: 0 };
+        const op = stmts.getQuotaDailyOp.get(poolName, key, today) || { bonus: 0, reset_baseline: 0 };
         // The baseline must be stored in the weighted currency that
         // checkTokenQuota subtracts it from; `todayRaw` is only for the log/audit
-        // text so the admin sees both figures.
-        const todayRow = stmts.todayWeightedForQuota.get(sfx, today, key);
+        // text so the admin sees both figures. Both are POOLED totals.
+        const members = getPoolSuffixes(poolName);
+        const todayRow = pooledUsageForQuota(members.length ? members : [sfx], today, key);
         const weightedUsed = todayRow.used, todayRaw = todayRow.raw;
         const now = new Date().toISOString();
         let bonus = op.bonus || 0, baseline = op.reset_baseline || 0, resetTime = op.reset_time || null;
         const userName = getUserName(key, runtime);
+        const poolLabel = poolOf.pool?.label || poolName;
 
         if (action === "bonus") {
           const n = Number(amount);
@@ -8440,28 +9024,28 @@ const server = http.createServer((req, res) => {
             oldQuota: baseLimit + (op.bonus || 0), newQuota: baseLimit + bonus, time: now,
           });
           stmts.trimQuotaAdjust.run();
-          console.log(`[临时额度] ${userName} /${sfx} 当日加量 ${(op.bonus || 0).toLocaleString()} → ${bonus.toLocaleString()}（明日自动失效）`);
+          console.log(`[临时额度] ${userName} @${poolLabel} 当日加量 ${(op.bonus || 0).toLocaleString()} → ${bonus.toLocaleString()}（明日自动失效）`);
         } else if (action === "reset") {
           baseline = weightedUsed;
           resetTime = now;
-          console.log(`[临时额度] ${userName} /${sfx} 今日用量已重置（计权基线 ${weightedUsed.toLocaleString()} / 实际 ${todayRaw.toLocaleString()}，统计数据保留）`);
+          console.log(`[临时额度] ${userName} @${poolLabel} 今日用量已重置（计权基线 ${weightedUsed.toLocaleString()} / 实际 ${todayRaw.toLocaleString()}，统计数据保留）`);
         } else {
-          console.log(`[临时额度] ${userName} /${sfx} 已撤销今日全部手工额度操作`);
+          console.log(`[临时额度] ${userName} @${poolLabel} 已撤销今日全部手工额度操作`);
         }
 
         if (action === "clear" || (bonus === 0 && baseline === 0)) {
-          stmts.deleteQuotaDailyOp.run(sfx, key, today);
+          stmts.deleteQuotaDailyOp.run(poolName, key, today);
         } else {
-          stmts.upsertQuotaDailyOp.run({ profile: sfx, key, date: today, bonus, baseline, resetTime, updatedAt: now });
+          stmts.upsertQuotaDailyOp.run({ pool: poolName, key, date: today, bonus, baseline, resetTime, updatedAt: now });
         }
         if (action === "bonus") {
-          recordAdminAudit(req, "quota.bonus", `/${sfx} · ${maskAuditKey(key)}`,
-            `设置 ${userName} 当日临时加量：${(op.bonus || 0).toLocaleString()} → ${bonus.toLocaleString()}（基础 ${baseLimit.toLocaleString()}，明日自动失效）`);
+          recordAdminAudit(req, "quota.bonus", `${poolLabel} · ${maskAuditKey(key)}`,
+            `设置 ${userName} 当日临时加量：${(op.bonus || 0).toLocaleString()} → ${bonus.toLocaleString()}（基础 ${baseLimit.toLocaleString()}，额度池「${poolLabel}」，明日自动失效）`);
         } else if (action === "reset") {
-          recordAdminAudit(req, "quota.reset", `/${sfx} · ${maskAuditKey(key)}`,
-            `重置 ${userName} 今日用量（计权基线 ${weightedUsed.toLocaleString()}${todayRaw !== weightedUsed ? ` / 实际 ${todayRaw.toLocaleString()}` : ""}，配额恢复满额，统计保留）`);
+          recordAdminAudit(req, "quota.reset", `${poolLabel} · ${maskAuditKey(key)}`,
+            `重置 ${userName} 今日用量（计权基线 ${weightedUsed.toLocaleString()}${todayRaw !== weightedUsed ? ` / 实际 ${todayRaw.toLocaleString()}` : ""}，额度池「${poolLabel}」，配额恢复满额，统计保留）`);
         } else {
-          recordAdminAudit(req, "quota.clear", `/${sfx} · ${maskAuditKey(key)}`, `撤销 ${userName} 今日全部手工额度操作`);
+          recordAdminAudit(req, "quota.clear", `${poolLabel} · ${maskAuditKey(key)}`, `撤销 ${userName} 今日全部手工额度操作（额度池「${poolLabel}」）`);
         }
 
         const quota = checkTokenQuota(key, sfx, runtime);
@@ -8700,13 +9284,14 @@ const server = http.createServer((req, res) => {
         if (!targetRt) throw new Error(`Profile suffix "${targetSuffix}" not found`);
         const targetProfileName = targetRt.profileName;
         const prevProfileUsers = { ...((config.profiles[targetProfileName] || {}).users || {}) };
-        // Update profile users (real keys + profile disable)
+        // Update profile users: real key + disable only. Quota is NOT written here
+        // — it belongs to the pool and has its own write path (/api/quota-pool/save).
         let newProfileUsers = null;
         if (Array.isArray(profileUsers)) {
           newProfileUsers = {};
           for (const pu of profileUsers) {
             if (!pu.key) continue;
-            newProfileUsers[pu.key] = { key: pu.realKey || "", disabled: !!pu.disabled, dailyTokenLimit: pu.dailyTokenLimit || null };
+            newProfileUsers[pu.key] = { key: pu.realKey || "", disabled: !!pu.disabled };
           }
           const ap = config.profiles[targetProfileName];
           if (ap) {
@@ -8723,17 +9308,16 @@ const server = http.createServer((req, res) => {
         saveConfig(config);
         reloadAllRuntimes();
         console.log(`[USER] Saved ${Object.keys(newGlobalUsers).length} global users`);
-        // Per-user diff: quota changes, disables and membership moves — the
-        // "who changed whose quota" question the audit log exists to answer.
+        // Per-user diff: membership moves and disables — the "who changed whose
+        // access" question the audit log exists to answer. Quota changes are logged
+        // by /api/quota-pool/save, not here.
         const changes = [];
         if (newProfileUsers) {
           const nameOf = k => (newGlobalUsers[k] || prevGlobalUsers[k] || {}).username || k.slice(0, 8);
           for (const k of new Set([...Object.keys(prevProfileUsers), ...Object.keys(newProfileUsers)])) {
             const a = prevProfileUsers[k] || null, b = newProfileUsers[k] || null;
-            if (!a && b) { changes.push(`新增分配 ${nameOf(k)}${b.dailyTokenLimit ? `（配额 ${b.dailyTokenLimit.toLocaleString()}）` : ""}`); continue; }
+            if (!a && b) { changes.push(`新增分配 ${nameOf(k)}`); continue; }
             if (a && !b) { changes.push(`移除分配 ${nameOf(k)}`); continue; }
-            const aq = a.dailyTokenLimit || 0, bq = b.dailyTokenLimit || 0;
-            if (aq !== bq) changes.push(`${nameOf(k)} 配额 ${aq ? aq.toLocaleString() : "不限"} → ${bq ? bq.toLocaleString() : "不限"}`);
             if (!!a.disabled !== !!b.disabled) changes.push(`${nameOf(k)} 方案内${b.disabled ? "禁用" : "启用"}`);
           }
         }

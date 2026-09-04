@@ -5065,8 +5065,8 @@ td{padding:8px;border-bottom:1px solid #ecece8;font-size:12px}
 <div class="sidebar-dock">
   <div class="sidebar-global" data-proto="anthropic" style="padding:8px 12px">
     <div style="font-size:11px;font-weight:650;margin-bottom:8px;display:flex;align-items:center;justify-content:space-between">
-      <span>默认方案组 <span style="color:var(--dim);font-weight:400;font-size:10px">/v1 failover</span></span>
-      <div style="display:flex;align-items:center;gap:6px">
+      <span style="min-width:0;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">默认方案组</span>
+      <div style="display:flex;align-items:center;gap:6px;flex:none">
         <button type="button" class="btn btn-outline btn-sm" data-grouppop-btn onclick="toggleGroupAddPop('defaultGroupAddPop',this)" style="font-size:10px;padding:3px 8px">＋ 加入</button>
         <label style="display:flex;align-items:center;gap:4px;cursor:pointer;font-size:10px;font-weight:400;white-space:nowrap" title="全局设置：同时作用于两个协议的方案组"><input type="checkbox" id="restrictGroupSuffixCb" ${config.restrictGroupSuffix !== false ? "checked" : ""} onchange="setRestrictGroupSuffix(this.checked)" style="width:auto;accent-color:var(--accent)"> 限制直连</label>
       </div>
@@ -5079,8 +5079,8 @@ td{padding:8px;border-bottom:1px solid #ecece8;font-size:12px}
   </div>
   <div class="sidebar-global" data-proto="responses" style="padding:8px 12px;display:none">
     <div style="font-size:11px;font-weight:650;margin-bottom:8px;display:flex;align-items:center;justify-content:space-between">
-      <span>OpenAI 方案组 <span style="color:var(--dim);font-weight:400;font-size:10px">/v1/responses failover · Codex</span></span>
-      <div style="display:flex;align-items:center;gap:6px">
+      <span style="min-width:0;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">OpenAI 方案组</span>
+      <div style="display:flex;align-items:center;gap:6px;flex:none">
         <button type="button" class="btn btn-outline btn-sm" data-grouppop-btn onclick="toggleGroupAddPop('responsesGroupAddPop',this)" style="font-size:10px;padding:3px 8px">＋ 加入</button>
         <label style="display:flex;align-items:center;gap:4px;cursor:pointer;font-size:10px;font-weight:400;white-space:nowrap" title="全局设置：同时作用于两个协议的方案组"><input type="checkbox" id="restrictGroupSuffixCb2" ${config.restrictGroupSuffix !== false ? "checked" : ""} onchange="setRestrictGroupSuffix(this.checked)" style="width:auto;accent-color:var(--accent)"> 限制直连</label>
       </div>
@@ -5820,6 +5820,11 @@ function openQuotaPoolView(){
   view.hidden=false;view.setAttribute('aria-hidden','false');
   document.getElementById('quotaPoolNav').classList.add('active');
 }
+// Reload should land back HERE, not on the profile form — admins adjusting
+// several pools in a row shouldn't be kicked out of the view each save.
+function rememberPoolViewForReload(){
+  try{sessionStorage.setItem('tm_return_pool_view','1')}catch(e){}
+}
 // Collect a pool card's pool-level limit + per-user limits and POST to the single
 // write path. The temporary-quota modal (bonus/reset) is separate and reaches the
 // same pool via its representative profile suffix.
@@ -5838,6 +5843,7 @@ async function savePoolQuota(poolName){
     data=await r.json();
   }catch(err){alert('保存失败: '+err.message);return}
   if(!r.ok){alert('保存失败: '+(data&&data.error?data.error:r.status));return}
+  rememberPoolViewForReload();
   toastThen('额度池「'+(data.pool?data.pool.label:poolName)+'」已保存',()=>location.reload());
 }
 // Open the temporary-quota modal for a user from the pool view, using the pool's
@@ -5863,6 +5869,7 @@ async function createPool(){
     data=await r.json().catch(()=>({}));
   }catch(err){alert('创建失败: '+err.message);return}
   if(!r.ok){alert('创建失败: '+(data.error||r.status));return}
+  rememberPoolViewForReload();
   toastThen('额度池「'+name+'」已创建',()=>location.reload());
 }
 async function deletePool(name){
@@ -5873,6 +5880,7 @@ async function deletePool(name){
     data=await r.json().catch(()=>({}));
   }catch(err){alert('删除失败: '+err.message);return}
   if(!r.ok){alert('删除失败: '+(data.error||r.status));return}
+  rememberPoolViewForReload();
   toastThen('额度池已删除',()=>location.reload());
 }
 // ─── 操作日志（audit_log）───
@@ -6479,7 +6487,12 @@ document.getElementById('peakRows').addEventListener('input',()=>{updateAllowedT
 // and leaves the alias rows unrendered.
 (function(){var saved=null;try{saved=localStorage.getItem('tm_settings_proto_tab')}catch(e){}
 if(saved==='responses'){try{switchProtoTab('responses')}catch(e){}}
-else{renderAliasRows(SETTINGS.profiles.find(p=>p.suffix===SETTINGS.selectedProfileSuffix)||SETTINGS.profiles[0]||{})}})();
+else{renderAliasRows(SETTINGS.profiles.find(p=>p.suffix===SETTINGS.selectedProfileSuffix)||SETTINGS.profiles[0]||{})}
+// Pool ops (save/create/delete) set a one-shot flag so the reload lands back on
+// the 额度池 view instead of the profile form. sessionStorage = once only, this
+// session; a fresh open of the settings page starts on profiles as usual.
+try{if(sessionStorage.getItem('tm_return_pool_view')==='1'){sessionStorage.removeItem('tm_return_pool_view');openQuotaPoolView()}}catch(e){}
+})();
 document.addEventListener("keydown",e=>{if(e.key==="Enter"&&e.target.tagName!=="TEXTAREA"&&e.target.tagName!=="INPUT")e.preventDefault()});
 </script>
 </body></html>`;

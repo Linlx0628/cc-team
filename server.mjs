@@ -2088,6 +2088,50 @@ function getAggregatedStore(suffixFilter) {
   return agg;
 }
 
+// Per-user × per-profile quota state for the "all profiles" dashboard view.
+// Without this the quota column is empty unless you drill into one profile, so
+// the one question an admin opens the dashboard to answer — "who is close to
+// their limit?" — costs N clicks across N profiles.
+//
+// Returns { profiles, matrix }: `profiles` is the ordered list of profiles that
+// have a quota at all (so the table can render them as COLUMNS, naming each
+// profile once instead of repeating it under every user), and `matrix` is keyed
+// by MASKED user key to line up with sanitizeStore's users map.
+function getUserQuotaMatrix(suffixFilter) {
+  const matrix = {};
+  const profiles = [];
+  const hasFilter = Array.isArray(suffixFilter);
+  for (const profile of listProfiles()) {
+    const runtime = runtimes[profile.suffix];
+    if (!runtime) continue;
+    if (hasFilter && !suffixFilter.includes(profile.suffix)) continue;
+    let anyQuota = false;
+    for (const key of Object.keys(runtime.users || {})) {
+      // Skip users who cannot actually use the profile (disabled / expired / no
+      // real key) — a quota bar for an unusable profile is noise.
+      if (!canUseProfile(key, runtime).allowed) continue;
+      const eff = checkTokenQuota(key, profile.suffix, runtime);
+      if (!(eff.limit > 0)) continue;   // unlimited: nothing to show
+      anyQuota = true;
+      const masked = key.slice(0, 8) + "****";
+      if (!matrix[masked]) matrix[masked] = {};
+      matrix[masked][profile.suffix] = {
+        limit: eff.limit,
+        used: eff.used,
+        remaining: eff.remaining,
+        pct: Math.min(100, Math.round((eff.used / eff.limit) * 100)),
+        bonus: eff.bonus || 0,
+        resetApplied: !!eff.resetApplied,
+        rawUsed: eff.rawUsed,
+        rate: eff.rate,
+        source: eff.source,
+      };
+    }
+    if (anyQuota) profiles.push({ suffix: profile.suffix, name: profile.name, billingType: profile.billingType, protocol: profile.protocol });
+  }
+  return { profiles, matrix };
+}
+
 // One row per profile×model, pairing the configured rates with today's realised
 // cost. The dashboard's model chart can only plot one number per model, so the
 // rate story needs a table: without it an admin cannot answer "which model is
@@ -6012,6 +6056,22 @@ body{padding:16px clamp(14px,2vw,28px) 28px}
 .workspace-panel-head{min-height:36px;padding:7px 12px;display:flex;align-items:center;gap:9px;border-bottom:1px solid var(--border);font-size:12px}.workspace-panel-head strong{font-weight:650}.workspace-panel-summary{font-size:10px;color:var(--dim);margin-left:auto}.workspace-panel-scroll{flex:1;min-height:0;overflow:auto}
 .workspace-panel table{margin:0}.workspace-panel table thead th{position:sticky;top:0;z-index:3;background:#fafaf7}.workspace-panel table th:first-child,.workspace-panel table td:first-child{position:sticky;left:0;z-index:2;background:var(--surface)}.workspace-panel table thead th:first-child{z-index:4;background:#fafaf7}.workspace-panel table tbody tr:hover td:first-child{background:#fafaf7}
 .profile-current td{background:var(--accent-soft)!important}.profile-current td:first-child{background:var(--accent-soft)!important}.current-mark{color:var(--accent);font-size:10px;font-weight:650;margin-left:6px}
+/* Per-profile quota columns in the all-profiles user table. Each profile is a
+   column so its name is written once in the header instead of repeating under
+   every user; the cell is a compact pct + bar so N profiles stay scannable. */
+.q-col{min-width:104px}
+.q-cell{display:flex;flex-direction:column;gap:3px;align-items:flex-end}
+.q-cell .q-pct{font-size:11px;font-variant-numeric:tabular-nums;font-weight:600}
+.q-cell .quota-progress{margin-left:0;width:76px}
+.q-none{color:var(--dim2);font-size:11px}
+.q-head-sub{display:block;font-size:9px;font-weight:400;color:var(--dim2);margin-top:1px}
+/* 只看配额: hide the token statistics columns so N profile columns fit without
+   horizontal scrolling. Marked by class rather than nth-child because the column
+   count is dynamic. */
+#uTable.q-focus .stat-col{display:none}
+.q-focus-btn{font-size:10px;background:var(--surface);color:var(--dim);border:1px solid var(--border);border-radius:4px;padding:3px 8px;cursor:pointer;margin-left:8px}
+.q-focus-btn:hover{border-color:var(--border-strong);background:var(--surface-subtle)}
+.q-focus-btn.on{border-color:#bdd0c3;color:var(--green);background:var(--accent-soft)}
 .sec-toggle{display:none}.sec-hint{font-size:10px;color:var(--dim);font-weight:400}.sec-body{display:block;min-height:0}.sec-body.open{display:block}
 #detailSec,#detailSecBody,#errorSec{height:100%;min-height:0;display:flex;flex-direction:column}#errorSecBody{flex:1;min-height:0;overflow:auto}
 .clear-btn{font-size:11px;background:#fff5f3;color:var(--red);border:1px solid #f1c8c2;border-radius:4px;padding:4px 9px;cursor:pointer;margin-left:8px}
@@ -6076,9 +6136,11 @@ td{padding:8px 12px;font-size:11px;border-bottom:1px solid #ecece8;white-space:n
     <button id="workspace-tab-errors" role="tab" aria-controls="workspace-panel-errors" aria-selected="false" tabindex="-1" class="workspace-tab">错误记录<span class="workspace-tab-count" id="workspaceCountErrors">0</span></button>
   </div>
   <div class="workspace-content">
-    <section id="workspace-panel-users" role="tabpanel" aria-labelledby="workspace-tab-users" class="workspace-panel active"><div class="workspace-panel-scroll"><table id="uTable"><thead>
-      <tr><th>用户</th><th>状态</th><th class="n">请求数</th><th class="n">输入</th><th class="n">输出</th><th class="n">缓存写入</th><th class="n">缓存命中</th><th class="n">合计</th><th class="n">今日</th><th class="n">配额</th><th>最后活跃</th></tr>
-    </thead><tbody></tbody></table></div></section>
+    <section id="workspace-panel-users" role="tabpanel" aria-labelledby="workspace-tab-users" class="workspace-panel active"><div class="workspace-panel-inner">
+      <div class="workspace-panel-head" id="userQuotaHead" hidden><strong>用户用量</strong><button type="button" class="q-focus-btn" id="qFocusBtn" onclick="toggleQuotaFocus()" title="隐藏 Token 统计列，只看各方案配额占用">只看配额</button><span class="workspace-panel-summary" id="userQuotaContext"></span></div>
+      <div class="workspace-panel-scroll"><table id="uTable"><thead>
+      <tr id="uTableHead"><th>用户</th><th>状态</th><th class="n">请求数</th><th class="n">输入</th><th class="n">输出</th><th class="n">缓存写入</th><th class="n">缓存命中</th><th class="n">合计</th><th class="n">今日</th><th class="n">配额</th><th>最后活跃</th></tr>
+    </thead><tbody></tbody></table></div></div></section>
     <section id="workspace-panel-detail" role="tabpanel" aria-labelledby="workspace-tab-detail" class="workspace-panel" hidden><div id="detailSec">
       <div class="workspace-panel-head"><span class="sec-toggle open" id="detailSecIcon"></span><strong>明细记录</strong><span class="sec-hint" id="detailHint"></span></div><div class="sec-body open" id="detailSecBody">
       <div class="detail-tools">
@@ -6112,6 +6174,7 @@ let D=null,P="day",C={t:null,p:null,m:null,h:null,hm:null,pr:null},errPage=1,aut
 let MDL="all",USR="all",MT="tokens";
 let DS="",DE="";
 let activeWorkspaceTab="users";
+let quotaFocus=(function(){try{return localStorage.getItem('tm_quota_focus')==='1'}catch(e){return false}})();
 const ERR_PAGE_SIZE=20;
 const DETAIL_PAGE_SIZE=10;
 let detailPage=1,detailQuery="",detailRange="all",detailSort="time",detailInitialized=false;
@@ -6226,6 +6289,79 @@ function renderRateBoard(){
   }).join("");
 }
 function maskDetailKey(key){const value=String(key||"");return value.length<=12?value:value.slice(0,8)+"****"+value.slice(-4)}
+// ── All-profiles quota columns ───────────────────────────────────────────────
+// Swap the single 配额 header for one column per quota-bearing profile (or back).
+// Rebuilt on every render because the profile set changes with the protocol
+// filter and with config edits.
+function renderUserTableHead(profiles){
+  const head=document.getElementById("uTableHead");
+  if(!head)return;
+  const base='<th>用户</th><th>状态</th><th class="n stat-col">请求数</th><th class="n stat-col">输入</th><th class="n stat-col">输出</th><th class="n stat-col">缓存写入</th><th class="n stat-col">缓存命中</th><th class="n stat-col">合计</th><th class="n">今日</th>';
+  const tail='<th>最后活跃</th>';
+  if(!profiles){head.innerHTML=base+'<th class="n">配额</th>'+tail;return}
+  const cols=profiles.map(p=>{
+    const badge=p.billingType==='coding_plan'?'套餐':p.billingType==='token_plan'?'包月':'按量';
+    return '<th class="n q-col" title="'+escH(p.name)+' /'+escH(p.suffix)+'">'+escH(p.name)
+      +'<span class="q-head-sub">/'+escH(p.suffix)+' · '+badge+'</span></th>';
+  }).join("");
+  head.innerHTML=base+cols+tail;
+}
+// Many profiles + 6 token columns overflows horizontally; this collapses the
+// statistics so the quota columns alone fill the width. Preference is remembered
+// because an admin watching quotas wants it to stay on across refreshes.
+function toggleQuotaFocus(){
+  quotaFocus=!quotaFocus;
+  try{localStorage.setItem('tm_quota_focus',quotaFocus?'1':'0')}catch(e){}
+  applyQuotaFocus();
+}
+function applyQuotaFocus(){
+  const table=document.getElementById("uTable"),btn=document.getElementById("qFocusBtn");
+  if(table)table.classList.toggle("q-focus",quotaFocus);
+  if(btn)btn.classList.toggle("on",quotaFocus);
+}
+// Header summary: how many members are near their limit, and where. This is the
+// line that makes the table actionable without reading every row.
+function renderUserQuotaContext(qm,userList){
+  const head=document.getElementById("userQuotaHead"),ctx=document.getElementById("userQuotaContext");
+  if(!head||!ctx)return;
+  if(!qm){head.hidden=true;return}
+  head.hidden=false;
+  const matrix=qm.matrix||{};
+  let full=0,warn=0,total=0;
+  const hot=[];
+  for(const [uk,byProfile] of Object.entries(matrix)){
+    for(const [sfx,q] of Object.entries(byProfile)){
+      total++;
+      if(q.pct>=100){full++;hot.push({uk,sfx,pct:q.pct})}
+      else if(q.pct>=80){warn++;hot.push({uk,sfx,pct:q.pct})}
+    }
+  }
+  const nameOf=uk=>{const hit=(userList||[]).find(([k])=>k===uk);return hit?hit[1].name:uk};
+  const nameFor=sfx=>{const p=(qm.profiles||[]).find(x=>x.suffix===sfx);return p?p.name:sfx};
+  hot.sort((a,b)=>b.pct-a.pct);
+  const parts=['共 '+total+' 项配额'];
+  if(full)parts.push('<b style="color:var(--red)">'+full+' 项已用尽</b>');
+  if(warn)parts.push('<b style="color:var(--orange)">'+warn+' 项超过 80%</b>');
+  if(!full&&!warn)parts.push('<span style="color:var(--green)">全部低于 80%</span>');
+  const top=hot.slice(0,3).map(h=>escH(nameOf(h.uk))+' @ '+escH(nameFor(h.sfx))+' '+h.pct+'%').join('、');
+  ctx.innerHTML=parts.join(' · ')+(top?' — '+top:'');
+}
+// One quota cell: percentage + bar, or a dash when this member has no quota on
+// this profile (not authorized, or the profile is unlimited). The tooltip carries
+// the exact numbers so the cell itself can stay narrow.
+function quotaMatrixCell(q,userName,profile){
+  if(!q)return '<td class="n"><span class="q-none" title="'+escH(userName)+' 在 '+escH(profile.name)+' 无配额限制或无访问权限">-</span></td>';
+  const col=q.pct>=100?'var(--red)':q.pct>90?'var(--red)':q.pct>70?'var(--orange)':'var(--green)';
+  const tags=(q.bonus>0?' +'+fmtTk(q.bonus):'')+(q.resetApplied?' 已重置':'');
+  const NL='&#10;';   // tooltip line break (title attribute)
+  const rateNote=(q.rate!=null&&q.rate!==1)?NL+'倍率 ×'+q.rate+'（实际 '+fmtT(q.rawUsed||0)+'）':'';
+  const title=escH(userName)+' @ '+escH(profile.name)+NL+'已用 '+fmtT(q.used)+' / '+fmtT(q.limit)
+    +'（'+q.source+'）'+NL+'剩余 '+fmtT(q.remaining)+rateNote
+    +(q.bonus>0?NL+'含今日临时加量 '+fmtT(q.bonus):'')+(q.resetApplied?NL+'今日已重置':'');
+  return '<td class="n q-col"><div class="q-cell" title="'+title+'">'
+    +'<span class="q-pct" style="color:'+col+'">'+q.pct+'%'+(tags?'<span style="color:var(--dim);font-weight:400;font-size:9px">'+tags+'</span>':'')+'</span>'
+    +quotaBar(q.pct)+'</div></td>';
+}
 function detailTokens(row){return ioTokens(row)}
 function detailPeriodLabel(key){if(P==="day")return key;if(P==="week")return key+" 周";if(P==="month")return key;return key+" 年"}
 function detailRangeDaily(daily){if(detailRange==="all")return daily;const days=Number(detailRange)||0;const cutoff=new Date(Date.now()+8*3600000-Math.max(0,days-1)*86400000).toISOString().slice(0,10);return Object.fromEntries(Object.entries(daily).filter(([date])=>date>=cutoff))}
@@ -6415,10 +6551,20 @@ function render(){
   const pSfx=Object.keys(pdBase).sort();
   C.pr=new Chart(document.getElementById("profileChart"),{type:"bar",data:{labels:pSorted.map(k=>lbl(P,k)),datasets:pSfx.map((sfx,i)=>({label:suffixName[sfx]||sfx,data:pSorted.map(k=>{const s=(pBuckets[k]||{})[sfx];return s?(MT==="requests"?s.requests:s.tokens):0}),backgroundColor:COL[i%COL.length]+"cc",borderRadius:3,borderSkipped:false}))},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:trendLegend(),tooltip:{callbacks:{label:ctx=>ctx.dataset.label+": "+fmtT(ctx.raw)+(MT==="requests"?" 次请求":" tokens")}}},scales:{x:{stacked:true,ticks:{color:"#686863",font:{size:10}},grid:{color:"rgba(24,24,22,.08)"}},y:{stacked:true,ticks:{color:"#686863",callback:v=>fmtTk(v)},grid:{color:"rgba(24,24,22,.08)"}}}}});
 
-  // User table
+  // User table. In the all-profiles view the single 配额 column cannot say
+  // anything useful (a user has one quota PER profile), so it is replaced by one
+  // column per quota-bearing profile — the profile name is written once in the
+  // header instead of repeated under every user, which keeps N profiles readable.
   const ut=document.querySelector("#uTable tbody");
   const ul=Object.entries(D.users).sort((a,b)=>totalTokens(b[1])-totalTokens(a[1]));
-  if(!ul.length){ut.innerHTML='<tr><td colspan="11" class="empty">暂无数据</td></tr>'}else{ut.innerHTML=ul.map(([uk,u],idx)=>{const on=u.lastActive&&Date.now()-new Date(u.lastActive).getTime()<36e5;const effQ=(D.userQuotaEff||{})[uk];const uq=effQ?effQ.limit:((D.userQuotas||{})[uk]||D.profileQuota||0);const td2=(D.daily||{})[td]||{};const tdu=td2[uk]||{};const used=effQ?effQ.used:ioTokens(tdu);const qPct=uq>0?Math.min(100,Math.round(used/uq*100)):0;const rank='<span class="rank">'+(idx+1)+'.</span>';const qTag=effQ&&effQ.bonus>0?' <span style="font-size:10px;color:var(--green);border:1px solid var(--green);border-radius:3px;padding:0 3px;white-space:nowrap" title="今日临时加量，明日自动失效">+'+fmtTk(effQ.bonus)+'</span>':(effQ&&effQ.resetApplied?' <span style="font-size:10px;color:var(--accent);border:1px solid var(--accent);border-radius:3px;padding:0 3px;white-space:nowrap" title="今日用量已重置（统计保留）">已重置</span>':'');const rTag=(effQ&&effQ.rate!=null&&effQ.rate!==1)?' <span style="font-size:10px;color:var(--dim);border:1px solid var(--border);border-radius:3px;padding:0 3px;white-space:nowrap" title="配额倍率 ×'+effQ.rate+'（当前时段）· 实际 '+fmtT(effQ.rawUsed||0)+'，计入配额 '+fmtT(effQ.used||0)+'">×'+effQ.rate+'</span>':'';const qCell=uq>0?'<span style="color:var(--accent);font-size:12px">'+qPct+'%</span> '+quotaBar(qPct)+qTag+rTag:'<span style="color:var(--dim)">-</span>';return'<tr><td>'+rank+escH(u.name)+'</td><td><span class="led '+(on?'on':'')+'"></span><span style="color:'+(on?'var(--green)':'var(--dim)')+';font-size:12px">'+(on?'在线':'离线')+'</span></td><td class="n">'+fmtT(u.totalRequests)+'</td><td class="n">'+fmtT(u.totalInputTokens)+'</td><td class="n">'+fmtT(u.totalOutputTokens)+'</td><td class="n">'+fmtT(u.cacheCreationTokens || 0)+'</td><td class="n">'+fmtT(u.cacheReadTokens || 0)+'</td><td class="n hl">'+fmtT(ioTokens(u))+'</td><td class="n">'+fmtT(ioTokens(tdu))+'</td><td class="n" style="white-space:nowrap">'+qCell+'</td><td style="font-size:12px;color:var(--dim)">'+ago(u.lastActive)+'</td></tr>'}).join("")}
+  const qm=D.userQuotaMatrix||null;
+  const qProfiles=qm&&Array.isArray(qm.profiles)?qm.profiles:[];
+  const multiQuota=!!qm&&qProfiles.length>0;
+  renderUserTableHead(multiQuota?qProfiles:null);
+  renderUserQuotaContext(multiQuota?qm:null,ul);
+  applyQuotaFocus();
+  const colSpan=multiQuota?10+qProfiles.length:11;
+  if(!ul.length){ut.innerHTML='<tr><td colspan="'+colSpan+'" class="empty">暂无数据</td></tr>'}else{ut.innerHTML=ul.map(([uk,u],idx)=>{const on=u.lastActive&&Date.now()-new Date(u.lastActive).getTime()<36e5;const effQ=(D.userQuotaEff||{})[uk];const uq=effQ?effQ.limit:((D.userQuotas||{})[uk]||D.profileQuota||0);const td2=(D.daily||{})[td]||{};const tdu=td2[uk]||{};const used=effQ?effQ.used:ioTokens(tdu);const qPct=uq>0?Math.min(100,Math.round(used/uq*100)):0;const rank='<span class="rank">'+(idx+1)+'.</span>';const qTag=effQ&&effQ.bonus>0?' <span style="font-size:10px;color:var(--green);border:1px solid var(--green);border-radius:3px;padding:0 3px;white-space:nowrap" title="今日临时加量，明日自动失效">+'+fmtTk(effQ.bonus)+'</span>':(effQ&&effQ.resetApplied?' <span style="font-size:10px;color:var(--accent);border:1px solid var(--accent);border-radius:3px;padding:0 3px;white-space:nowrap" title="今日用量已重置（统计保留）">已重置</span>':'');const rTag=(effQ&&effQ.rate!=null&&effQ.rate!==1)?' <span style="font-size:10px;color:var(--dim);border:1px solid var(--border);border-radius:3px;padding:0 3px;white-space:nowrap" title="配额倍率 ×'+effQ.rate+'（当前时段）· 实际 '+fmtT(effQ.rawUsed||0)+'，计入配额 '+fmtT(effQ.used||0)+'">×'+effQ.rate+'</span>':'';const qCell=uq>0?'<span style="color:var(--accent);font-size:12px">'+qPct+'%</span> '+quotaBar(qPct)+qTag+rTag:'<span style="color:var(--dim)">-</span>';const quotaCells=multiQuota?qProfiles.map(p=>quotaMatrixCell(((qm.matrix||{})[uk]||{})[p.suffix],u.name,p)).join(""):'<td class="n" style="white-space:nowrap">'+qCell+'</td>';return'<tr><td>'+rank+escH(u.name)+'</td><td><span class="led '+(on?'on':'')+'"></span><span style="color:'+(on?'var(--green)':'var(--dim)')+';font-size:12px">'+(on?'在线':'离线')+'</span></td><td class="n stat-col">'+fmtT(u.totalRequests)+'</td><td class="n stat-col">'+fmtT(u.totalInputTokens)+'</td><td class="n stat-col">'+fmtT(u.totalOutputTokens)+'</td><td class="n stat-col">'+fmtT(u.cacheCreationTokens || 0)+'</td><td class="n stat-col">'+fmtT(u.cacheReadTokens || 0)+'</td><td class="n hl stat-col">'+fmtT(ioTokens(u))+'</td><td class="n">'+fmtT(ioTokens(tdu))+'</td>'+quotaCells+'<td style="font-size:12px;color:var(--dim)">'+ago(u.lastActive)+'</td></tr>'}).join("")}
 
   renderDetail();
 
@@ -8073,6 +8219,9 @@ const server = http.createServer((req, res) => {
       data = sanitizeStore(agg);
       data.profileView = "all";
       data.protocolView = protocolView;
+      // Quota per user across every profile they can use, so the aggregate view
+      // answers "who is near their limit" without drilling into each profile.
+      data.userQuotaMatrix = getUserQuotaMatrix(protoFilter);
     } else {
       const targetSuffix = normalizeProfileSuffix(profileSuffix);
       const targetRt = runtimes[targetSuffix];

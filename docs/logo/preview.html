@@ -1,0 +1,187 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>CC Team · Logo 品牌板</title>
+<style>
+  :root{
+    --canvas:#f7f7f3;--surface:#ffffff;--subtle:#f1f1ec;
+    --text:#181816;--dim:#686863;--border:#deded8;
+    --accent:#2f6e50;--accent-soft:#e7efe9;--paper:#fbfbf8;--danger:#b42318;
+    --sans:-apple-system,BlinkMacSystemFont,"SF Pro Text","PingFang SC","Microsoft YaHei","Segoe UI",sans-serif;
+    --mono:"SFMono-Regular",Consolas,"Liberation Mono",monospace;
+  }
+  *{margin:0;padding:0;box-sizing:border-box}
+  body{background:var(--canvas);color:var(--text);font-family:var(--sans);font-size:14px;line-height:1.6;padding:40px 24px 64px}
+  .sheet{max-width:1060px;margin:0 auto}
+  .sheet-head{display:flex;justify-content:space-between;align-items:baseline;padding:0 4px 14px;color:var(--dim);font-family:var(--mono);font-size:11px;letter-spacing:.14em}
+  .grid{display:grid;grid-template-columns:1fr 1fr;gap:18px}
+  .panel{background:var(--surface);border:1px solid var(--border);border-radius:14px;overflow:hidden}
+  .panel h2{font-size:11px;font-family:var(--mono);font-weight:600;letter-spacing:.18em;color:var(--dim);padding:14px 18px 0}
+  .panel .note{color:var(--dim);font-size:12px;padding:0 18px 14px}
+  .span2{grid-column:1/-1}
+  .cover{display:flex;align-items:center;gap:36px;padding:44px 48px}
+  .cover img,.cover svg{display:block}
+  .cover .word{font-size:34px;font-weight:700;letter-spacing:-0.5px}
+  .cover .tag{color:var(--dim);margin-top:6px;font-size:14px}
+  .canvas{padding:26px 18px 22px;display:flex;justify-content:center}
+  .variants{display:grid;grid-template-columns:1fr 1fr;gap:1px;background:var(--border);margin:14px;border-radius:10px;overflow:hidden;border:1px solid var(--border)}
+  .variants figure{background:var(--surface);padding:26px 18px 18px;display:flex;flex-direction:column;align-items:center;gap:12px}
+  .variants figcaption{font-family:var(--mono);font-size:10px;letter-spacing:.1em;color:var(--dim)}
+  .variants figure.dark{background:#181816}
+  .variants figure.dark figcaption{color:#92928c}
+  .sizes{display:flex;align-items:flex-end;gap:28px;padding:30px 26px 22px}
+  .sizes .s{display:flex;flex-direction:column;align-items:center;gap:10px;color:var(--dim);font-family:var(--mono);font-size:10px}
+  .tabmock{margin:0 26px 24px;background:var(--subtle);border:1px solid var(--border);border-radius:10px 10px 0 0;padding:8px 14px;display:flex;align-items:center;gap:8px;font-size:12px;color:var(--dim);width:fit-content}
+  .tabmock .x{color:#92928c;margin-left:6px}
+  .appbar{display:flex;align-items:center;justify-content:space-between;gap:14px;padding:14px 20px;border-bottom:1px solid var(--border);white-space:nowrap;overflow:hidden}
+  .appbar .brand{display:flex;align-items:center;gap:10px}
+  .appbar .brand .name{font-size:13px;font-weight:700;color:var(--accent)}
+  .appbar .title{font-size:19px;font-weight:700}
+  .appbar .status{display:flex;align-items:center;gap:6px;color:var(--dim);font-size:12px}
+  .appbar .led{width:8px;height:8px;border-radius:50%;background:var(--accent)}
+  .appbar .ctrl{display:flex;gap:8px;color:var(--dim);font-size:12px}
+  .appbar .ctrl span{border:1px solid var(--border);border-radius:7px;padding:4px 10px;background:var(--surface)}
+  .appbody{padding:18px 20px;display:grid;grid-template-columns:repeat(4,1fr);gap:12px}
+  .appbody .card{border:1px solid var(--border);border-radius:10px;padding:12px}
+  .appbody .k{color:var(--dim);font-size:11px}
+  .appbody .v{font-size:18px;font-weight:700;margin-top:2px}
+  .swatches{display:grid;grid-template-columns:repeat(5,1fr);gap:12px;padding:18px}
+  .sw{border:1px solid var(--border);border-radius:10px;overflow:hidden}
+  .sw .chip{height:64px}
+  .sw .m{padding:8px 10px;font-family:var(--mono);font-size:10px;color:var(--dim);line-height:1.5}
+  .sw .m b{display:block;color:var(--text);font-family:var(--sans);font-size:12px}
+  .type{padding:6px 18px 20px}
+  .type .row{display:flex;justify-content:space-between;align-items:baseline;border-top:1px dashed var(--border);padding:10px 0}
+  .type .demo1{font-size:22px;font-weight:700}
+  .type .demo2{font-family:var(--mono);font-size:14px}
+  .type .lab{color:var(--dim);font-size:11px;font-family:var(--mono)}
+  .guides{position:relative}
+  .sheet-foot{display:flex;justify-content:space-between;padding:16px 4px 0;color:#92928c;font-family:var(--mono);font-size:10px;letter-spacing:.12em}
+</style>
+</head>
+<body>
+<div class="sheet">
+  <div class="sheet-head"><span>CC TEAM — LOGO &amp; BRAND SHEET</span><span>2026.09</span></div>
+  <div class="grid">
+
+    <!-- 01 封面 -->
+    <section class="panel span2">
+      <div class="cover">
+        <svg width="120" height="120" viewBox="0 0 96 96" role="img" aria-label="CC Team logo">
+          <rect width="96" height="96" rx="22" fill="#2f6e50"/>
+          <g fill="none" stroke="#fbfbf8" stroke-width="11" stroke-linecap="round" stroke-linejoin="round" transform="translate(48 48) scale(0.9) translate(-48 -48)">
+            <path d="M37 26.5 H31.5 Q20.5 26.5 20.5 37.5 V58.5 Q20.5 69.5 31.5 69.5 H37"/>
+            <path d="M59 26.5 H64.5 Q75.5 26.5 75.5 37.5 V58.5 Q75.5 69.5 64.5 69.5 H59"/>
+          </g>
+          <circle cx="48" cy="48" r="4.95" fill="#fbfbf8"/>
+        </svg>
+        <div>
+          <div class="word">CC Team</div>
+          <div class="tag">团队 AI 编码用量网关 —— 请求经门拱而来，皆被计量。</div>
+        </div>
+      </div>
+    </section>
+
+    <!-- 02 构成 -->
+    <section class="panel">
+      <h2>02 · 构成 CONSTRUCTION</h2>
+      <div class="canvas">
+        <svg width="300" height="300" viewBox="0 0 96 96">
+          <defs>
+            <pattern id="g" width="11" height="11" patternUnits="userSpaceOnUse">
+              <path d="M11 0H0V11" fill="none" stroke="#e7efe9" stroke-width="0.5"/>
+            </pattern>
+          </defs>
+          <rect width="96" height="96" fill="url(#g)"/>
+          <rect x="14.5" y="20.5" width="67" height="55" fill="none" stroke="#c7c7c0" stroke-width="0.5" stroke-dasharray="2 2"/>
+          <line x1="48" y1="8" x2="48" y2="88" stroke="#c7c7c0" stroke-width="0.5" stroke-dasharray="2 2"/>
+          <circle cx="48" cy="48" r="11" fill="none" stroke="#2f6e50" stroke-width="0.6" stroke-dasharray="2 2" opacity="0.7"/>
+          <g fill="none" stroke="#181816" stroke-width="11" stroke-linecap="round" stroke-linejoin="round" opacity="0.92">
+            <path d="M37 26.5 H31.5 Q20.5 26.5 20.5 37.5 V58.5 Q20.5 69.5 31.5 69.5 H37"/>
+            <path d="M59 26.5 H64.5 Q75.5 26.5 75.5 37.5 V58.5 Q75.5 69.5 64.5 69.5 H59"/>
+          </g>
+          <circle cx="48" cy="48" r="5.5" fill="#2f6e50"/>
+        </svg>
+      </div>
+      <p class="note">双 C 括弧相向成门拱，中缝是请求的通道；中央圆点是唯一的彩色——被计量的那一个请求。全标只用一个基本单位 u=11：描边=u，门缝=u，圆点 ⌀=u，圆角边=u。</p>
+    </section>
+
+    <!-- 03 变体 -->
+    <section class="panel">
+      <h2>03 · 变体 VARIANTS</h2>
+      <div class="variants">
+        <figure>
+          <svg width="72" height="72" viewBox="0 0 96 96"><g fill="none" stroke="#181816" stroke-width="11" stroke-linecap="round" stroke-linejoin="round"><path d="M37 26.5 H31.5 Q20.5 26.5 20.5 37.5 V58.5 Q20.5 69.5 31.5 69.5 H37"/><path d="M59 26.5 H64.5 Q75.5 26.5 75.5 37.5 V58.5 Q75.5 69.5 64.5 69.5 H59"/></g><circle cx="48" cy="48" r="5.5" fill="#2f6e50"/></svg>
+          <figcaption>明亮 · 墨点</figcaption>
+        </figure>
+        <figure class="dark">
+          <svg width="72" height="72" viewBox="0 0 96 96"><g fill="none" stroke="#fbfbf8" stroke-width="11" stroke-linecap="round" stroke-linejoin="round"><path d="M37 26.5 H31.5 Q20.5 26.5 20.5 37.5 V58.5 Q20.5 69.5 31.5 69.5 H37"/><path d="M59 26.5 H64.5 Q75.5 26.5 75.5 37.5 V58.5 Q75.5 69.5 64.5 69.5 H59"/></g><circle cx="48" cy="48" r="5.5" fill="#2f6e50"/></svg>
+          <figcaption>暗色 · 绿点亮</figcaption>
+        </figure>
+        <figure>
+          <svg width="72" height="72" viewBox="0 0 96 96"><g fill="none" stroke="#181816" stroke-width="11" stroke-linecap="round" stroke-linejoin="round"><path d="M37 26.5 H31.5 Q20.5 26.5 20.5 37.5 V58.5 Q20.5 69.5 31.5 69.5 H37"/><path d="M59 26.5 H64.5 Q75.5 26.5 75.5 37.5 V58.5 Q75.5 69.5 64.5 69.5 H59"/></g><circle cx="48" cy="48" r="5.5" fill="#181816"/></svg>
+          <figcaption>单色 · 印章/水印</figcaption>
+        </figure>
+        <figure>
+          <svg width="72" height="72" viewBox="0 0 96 96"><rect width="96" height="96" rx="22" fill="#2f6e50"/><g fill="none" stroke="#fbfbf8" stroke-width="11" stroke-linecap="round" stroke-linejoin="round" transform="translate(48 48) scale(0.9) translate(-48 -48)"><path d="M37 26.5 H31.5 Q20.5 26.5 20.5 37.5 V58.5 Q20.5 69.5 31.5 69.5 H37"/><path d="M59 26.5 H64.5 Q75.5 26.5 75.5 37.5 V58.5 Q75.5 69.5 64.5 69.5 H59"/></g><circle cx="48" cy="48" r="4.95" fill="#fbfbf8"/></svg>
+          <figcaption>绿底 Tile · 头像/应用</figcaption>
+        </figure>
+      </div>
+    </section>
+
+    <!-- 04 尺寸 -->
+    <section class="panel span2">
+      <h2>04 · 小尺寸 SMALL SIZES</h2>
+      <div style="display:flex;align-items:flex-end;gap:56px;padding:8px 26px 8px;flex-wrap:wrap">
+      <div class="sizes">
+        <div class="s"><svg width="48" height="48" viewBox="0 0 96 96"><rect width="96" height="96" rx="22" fill="#2f6e50"/><g fill="none" stroke="#fbfbf8" stroke-width="13" stroke-linecap="round" stroke-linejoin="round" transform="translate(48 48) scale(0.88) translate(-48 -48)"><path d="M37 26.5 H31.5 Q20.5 26.5 20.5 37.5 V58.5 Q20.5 69.5 31.5 69.5 H37"/><path d="M59 26.5 H64.5 Q75.5 26.5 75.5 37.5 V58.5 Q75.5 69.5 64.5 69.5 H59"/></g><circle cx="48" cy="48" r="6.2" fill="#fbfbf8"/></svg>48</div>
+        <div class="s"><svg width="32" height="32" viewBox="0 0 96 96"><rect width="96" height="96" rx="22" fill="#2f6e50"/><g fill="none" stroke="#fbfbf8" stroke-width="13" stroke-linecap="round" stroke-linejoin="round" transform="translate(48 48) scale(0.88) translate(-48 -48)"><path d="M37 26.5 H31.5 Q20.5 26.5 20.5 37.5 V58.5 Q20.5 69.5 31.5 69.5 H37"/><path d="M59 26.5 H64.5 Q75.5 26.5 75.5 37.5 V58.5 Q75.5 69.5 64.5 69.5 H59"/></g><circle cx="48" cy="48" r="6.2" fill="#fbfbf8"/></svg>32</div>
+        <div class="s"><svg width="16" height="16" viewBox="0 0 96 96"><rect width="96" height="96" rx="22" fill="#2f6e50"/><g fill="none" stroke="#fbfbf8" stroke-width="13" stroke-linecap="round" stroke-linejoin="round" transform="translate(48 48) scale(0.88) translate(-48 -48)"><path d="M37 26.5 H31.5 Q20.5 26.5 20.5 37.5 V58.5 Q20.5 69.5 31.5 69.5 H37"/><path d="M59 26.5 H64.5 Q75.5 26.5 75.5 37.5 V58.5 Q75.5 69.5 64.5 69.5 H59"/></g><circle cx="48" cy="48" r="6.2" fill="#fbfbf8"/></svg>16</div>
+      </div>
+      <div class="tabmock" style="margin:0 0 20px;align-self:center">CC Team · 团队用量（浏览器标签页预览）<span class="x">✕</span></div>
+      </div>
+    </section>
+
+    <!-- 05 应用 -->
+    <section class="panel span2">
+      <h2>05 · 应用 DASHBOARD HEADER</h2>
+      <div class="appbar">
+        <div class="brand">
+          <svg width="26" height="26" viewBox="0 0 96 96"><rect width="96" height="96" rx="22" fill="#2f6e50"/><g fill="none" stroke="#fbfbf8" stroke-width="11" stroke-linecap="round" stroke-linejoin="round" transform="translate(48 48) scale(0.9) translate(-48 -48)"><path d="M37 26.5 H31.5 Q20.5 26.5 20.5 37.5 V58.5 Q20.5 69.5 31.5 69.5 H37"/><path d="M59 26.5 H64.5 Q75.5 26.5 75.5 37.5 V58.5 Q75.5 69.5 64.5 69.5 H59"/></g><circle cx="48" cy="48" r="4.95" fill="#fbfbf8"/></svg>
+          <span class="name">CC Team</span>
+          <span class="title">团队用量</span>
+          <span class="status"><span class="led"></span>监控服务运行中</span>
+        </div>
+        <div class="ctrl"><span>全部方案</span><span>设置</span><span>自动刷新：开</span></div>
+      </div>
+      <div class="appbody">
+        <div class="card"><div class="k">今日 Token</div><div class="v">1,284,006</div></div>
+        <div class="card"><div class="k">请求数</div><div class="v">3,041</div></div>
+        <div class="card"><div class="k">在线成员</div><div class="v">6</div></div>
+        <div class="card"><div class="k">熔断组</div><div class="v">0</div></div>
+      </div>
+    </section>
+
+    <!-- 06 色彩与字体 -->
+    <section class="panel span2">
+      <h2>06 · 色彩与字体 COLOR &amp; TYPE</h2>
+      <div class="swatches">
+        <div class="sw"><div class="chip" style="background:#2f6e50"></div><div class="m"><b>墨绿 主色</b>#2f6e50<br>品牌底 / 计量点</div></div>
+        <div class="sw"><div class="chip" style="background:#181816"></div><div class="m"><b>近黑 墨</b>#181816<br>标志 / 正文</div></div>
+        <div class="sw"><div class="chip" style="background:#f7f7f3;border-bottom:1px solid #deded8"></div><div class="m"><b>暖白 画布</b>#f7f7f3<br>背景</div></div>
+        <div class="sw"><div class="chip" style="background:#fbfbf8;border-bottom:1px solid #deded8"></div><div class="m"><b>纸白 反白</b>#fbfbf8<br>深底标志</div></div>
+        <div class="sw"><div class="chip" style="background:#b42318"></div><div class="m"><b>告警红</b>#b42318<br>错误 / 熔断</div></div>
+      </div>
+      <div class="type">
+        <div class="row"><span class="demo1">CC Team 团队用量 0123456789</span><span class="lab">SANS · 系统字体栈</span></div>
+        <div class="row"><span class="demo2">jx-virtual-key · /v1/messages · 200 OK</span><span class="lab">MONO · 等宽点缀</span></div>
+      </div>
+    </section>
+
+  </div>
+  <div class="sheet-foot"><span>CC TEAM BRAND</span><span>SHEET 01 / 01</span></div>
+</div>
+</body>
+</html>

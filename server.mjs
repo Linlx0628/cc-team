@@ -4676,7 +4676,7 @@ ${rateLabel}
   const settingsJson = JSON.stringify(s).replace(/</g, "\\x3c");
 
   return `<!DOCTYPE html>
-<html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
+<html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%2096%2096%22%3E%3Crect%20width%3D%2296%22%20height%3D%2296%22%20rx%3D%2222%22%20fill%3D%22%232f6e50%22%2F%3E%3Cg%20fill%3D%22none%22%20stroke%3D%22%23fbfbf8%22%20stroke-width%3D%2213%22%20stroke-linecap%3D%22round%22%20stroke-linejoin%3D%22round%22%20transform%3D%22translate(48%2048)%20scale(0.88)%20translate(-48%20-48)%22%3E%3Cpath%20d%3D%22M37%2026.5H31.5Q20.5%2026.5%2020.5%2037.5V58.5Q20.5%2069.5%2031.5%2069.5H37%22%2F%3E%3Cpath%20d%3D%22M59%2026.5H64.5Q75.5%2026.5%2075.5%2037.5V58.5Q75.5%2069.5%2064.5%2069.5H59%22%2F%3E%3C%2Fg%3E%3Ccircle%20cx%3D%2248%22%20cy%3D%2248%22%20r%3D%226.2%22%20fill%3D%22%23fbfbf8%22%2F%3E%3C%2Fsvg%3E">
 <title>设置 - CC Team</title>
 <style>
 ${UI_THEME}
@@ -4687,7 +4687,7 @@ body{padding:0;overflow:hidden;height:100vh}
 .sidebar-hd{min-height:64px;padding:16px 18px;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between;gap:12px}
 .sidebar-hd h1{font-size:17px;font-weight:650;white-space:nowrap}
 .sidebar-hd a{color:var(--dim);font-size:12px;text-decoration:none;white-space:nowrap}
-.sidebar-hd a:hover{color:var(--text)}
+.sidebar-hd a:hover{color:var(--text)}.sidebar-brand{display:flex;align-items:center;gap:10px}
 .sidebar-list{flex:1;overflow-y:auto;padding:12px}
 .sidebar-global{padding:10px 12px;border-top:1px solid var(--border);background:var(--surface)}
 .sidebar-tool{display:block;width:100%;margin:0;text-align:left;font-family:var(--font-body)}
@@ -4783,7 +4783,7 @@ td{padding:8px;border-bottom:1px solid #ecece8;font-size:12px}
 </style></head><body data-theme="editorial-light">
 <div class="layout">
 <div class="sidebar">
-<div class="sidebar-hd"><h1>配置方案</h1><a href="/dashboard">返回面板</a></div>
+<div class="sidebar-hd"><div class="sidebar-brand"><svg class="brand-logo" width="24" height="24" viewBox="0 0 96 96" aria-hidden="true"><rect width="96" height="96" rx="22" fill="#2f6e50"/><g fill="none" stroke="#fbfbf8" stroke-width="11" stroke-linecap="round" stroke-linejoin="round" transform="translate(48 48) scale(0.9) translate(-48 -48)"><path d="M37 26.5H31.5Q20.5 26.5 20.5 37.5V58.5Q20.5 69.5 31.5 69.5H37"/><path d="M59 26.5H64.5Q75.5 26.5 75.5 37.5V58.5Q75.5 69.5 64.5 69.5H59"/></g><circle cx="48" cy="48" r="4.95" fill="#fbfbf8"/></svg><h1>配置方案</h1></div><a href="/dashboard">返回面板</a></div>
 <div class="proto-tabs" id="protoTabs">
   <button type="button" class="proto-tab on" data-tab="anthropic" onclick="switchProtoTab('anthropic')">Anthropic<small>Claude Code · /v1</small></button>
   <button type="button" class="proto-tab" data-tab="responses" onclick="switchProtoTab('responses')">OpenAI<small>Codex · /v1/responses</small></button>
@@ -6031,7 +6031,7 @@ document.addEventListener("keydown",e=>{if(e.key==="Enter"&&e.target.tagName!=="
 // ─── Dashboard HTML ──────────────────────────────────────────────────────────
 function dashboardHtml() {
   return `<!DOCTYPE html>
-<html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
+<html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%2096%2096%22%3E%3Crect%20width%3D%2296%22%20height%3D%2296%22%20rx%3D%2222%22%20fill%3D%22%232f6e50%22%2F%3E%3Cg%20fill%3D%22none%22%20stroke%3D%22%23fbfbf8%22%20stroke-width%3D%2213%22%20stroke-linecap%3D%22round%22%20stroke-linejoin%3D%22round%22%20transform%3D%22translate(48%2048)%20scale(0.88)%20translate(-48%20-48)%22%3E%3Cpath%20d%3D%22M37%2026.5H31.5Q20.5%2026.5%2020.5%2037.5V58.5Q20.5%2069.5%2031.5%2069.5H37%22%2F%3E%3Cpath%20d%3D%22M59%2026.5H64.5Q75.5%2026.5%2075.5%2037.5V58.5Q75.5%2069.5%2064.5%2069.5H59%22%2F%3E%3C%2Fg%3E%3Ccircle%20cx%3D%2248%22%20cy%3D%2248%22%20r%3D%226.2%22%20fill%3D%22%23fbfbf8%22%2F%3E%3C%2Fsvg%3E">
 <title>团队AI Coding监控</title>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js"><\/script>
 <style>
@@ -6041,7 +6041,7 @@ body{padding:16px clamp(14px,2vw,28px) 28px}
 .dashboard-shell{width:100%;max-width:1560px;margin:0 auto;display:grid;gap:10px;min-width:0}
 .command-bar{min-height:46px;display:flex;align-items:center;justify-content:space-between;gap:18px;padding-bottom:9px;border-bottom:1px solid var(--border);min-width:0;position:sticky;top:0;z-index:20;background:var(--canvas);padding-top:4px}
 .command-brand{display:flex;align-items:center;gap:14px;min-width:0;white-space:nowrap}
-.brand-mark{font-size:13px;font-weight:700;color:var(--accent)}
+.brand-mark{font-size:13px;font-weight:700;color:var(--accent)}.brand-logo{width:26px;height:26px;flex:none;display:block}
 .command-title{font-size:16px;font-weight:650;line-height:1.2;padding-right:14px;border-right:1px solid var(--border)}
 .command-status{font-size:11px;color:var(--dim);display:flex;align-items:center;flex-shrink:0}
 .meta{font-size:11px;color:var(--dim);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0}.meta b{color:var(--text);font-weight:550}
@@ -6128,7 +6128,7 @@ td{padding:8px 12px;font-size:11px;border-bottom:1px solid #ecece8;white-space:n
 </style></head><body data-theme="editorial-light">
 <main class="dashboard-shell">
 <header class="command-bar">
-  <div class="command-brand"><span class="brand-mark">CC Team</span><h1 class="command-title">团队用量</h1><span class="command-status"><span class="led on"></span>监控服务运行中</span><span class="meta" id="meta">正在加载数据</span></div>
+  <div class="command-brand"><svg class="brand-logo" viewBox="0 0 96 96" aria-hidden="true"><rect width="96" height="96" rx="22" fill="#2f6e50"/><g fill="none" stroke="#fbfbf8" stroke-width="11" stroke-linecap="round" stroke-linejoin="round" transform="translate(48 48) scale(0.9) translate(-48 -48)"><path d="M37 26.5H31.5Q20.5 26.5 20.5 37.5V58.5Q20.5 69.5 31.5 69.5H37"/><path d="M59 26.5H64.5Q75.5 26.5 75.5 37.5V58.5Q75.5 69.5 64.5 69.5H59"/></g><circle cx="48" cy="48" r="4.95" fill="#fbfbf8"/></svg><span class="brand-mark">CC Team</span><h1 class="command-title">团队用量</h1><span class="command-status"><span class="led on"></span>监控服务运行中</span><span class="meta" id="meta">正在加载数据</span></div>
   <div class="controls"><select id="profileSel" aria-label="查看方案" onchange="switchProfileView(this.value)"><option value="">全部方案</option></select><a href="/settings">设置</a><button id="autoRefreshBtn" class="ar-on">自动刷新：开</button><button onclick="fetch('/api/logout',{method:'POST',headers:{'x-csrf-token':(document.cookie.match(/tm_csrf=([^;]+)/)||[])[1]||''}}).then(()=>toastThen('已退出登录',()=>location.reload()))">退出</button></div>
 </header>
 <section class="metric-strip" id="cards" aria-label="用量摘要"></section>
@@ -6629,14 +6629,14 @@ load();startAutoRefresh();
 // ─── Login Page HTML ─────────────────────────────────────────────────────────
 function loginHtml() {
   return `<!DOCTYPE html>
-<html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
+<html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%2096%2096%22%3E%3Crect%20width%3D%2296%22%20height%3D%2296%22%20rx%3D%2222%22%20fill%3D%22%232f6e50%22%2F%3E%3Cg%20fill%3D%22none%22%20stroke%3D%22%23fbfbf8%22%20stroke-width%3D%2213%22%20stroke-linecap%3D%22round%22%20stroke-linejoin%3D%22round%22%20transform%3D%22translate(48%2048)%20scale(0.88)%20translate(-48%20-48)%22%3E%3Cpath%20d%3D%22M37%2026.5H31.5Q20.5%2026.5%2020.5%2037.5V58.5Q20.5%2069.5%2031.5%2069.5H37%22%2F%3E%3Cpath%20d%3D%22M59%2026.5H64.5Q75.5%2026.5%2075.5%2037.5V58.5Q75.5%2069.5%2064.5%2069.5H59%22%2F%3E%3C%2Fg%3E%3Ccircle%20cx%3D%2248%22%20cy%3D%2248%22%20r%3D%226.2%22%20fill%3D%22%23fbfbf8%22%2F%3E%3C%2Fsvg%3E">
 <title>登录 - CC Team</title>
 <style>
 ${UI_THEME}
 ${TOAST_CSS}
 body{display:flex;justify-content:center;align-items:center;min-height:100vh;padding:24px}
 .wrap{width:100%;max-width:390px}
-.brand{margin-bottom:22px}.brand .t{font-size:24px;font-weight:650;margin-bottom:7px}.brand .s{font-size:13px;color:var(--dim)}
+.brand{margin-bottom:22px}.brand .t{font-size:24px;font-weight:650;margin-bottom:7px}.brand .s{font-size:13px;color:var(--dim)}.brand-row{display:flex;align-items:center;gap:12px}.brand-logo{width:38px;height:38px;flex:none}
 .term{background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:26px}
 .term .hd{font-size:13px;font-weight:600;margin-bottom:18px;color:var(--text)}
 .term label{display:block;font-size:12px;font-weight:550;color:var(--dim);margin-bottom:6px}
@@ -6647,7 +6647,7 @@ body{display:flex;justify-content:center;align-items:center;min-height:100vh;pad
 .err{color:var(--red);background:#fff2f0;border:1px solid #f1c8c2;border-radius:5px;padding:9px 10px;font-size:12px;margin-bottom:14px;display:none}
 </style></head><body data-theme="editorial-light">
 <div class="wrap">
-<div class="brand"><div class="t">CC Team</div><div class="s">团队 AI 编码用量网关</div></div>
+<div class="brand brand-row"><svg class="brand-logo" viewBox="0 0 96 96" aria-hidden="true"><rect width="96" height="96" rx="22" fill="#2f6e50"/><g fill="none" stroke="#fbfbf8" stroke-width="11" stroke-linecap="round" stroke-linejoin="round" transform="translate(48 48) scale(0.9) translate(-48 -48)"><path d="M37 26.5H31.5Q20.5 26.5 20.5 37.5V58.5Q20.5 69.5 31.5 69.5H37"/><path d="M59 26.5H64.5Q75.5 26.5 75.5 37.5V58.5Q75.5 69.5 64.5 69.5H59"/></g><circle cx="48" cy="48" r="4.95" fill="#fbfbf8"/></svg><div><div class="t">CC Team</div><div class="s">团队 AI 编码用量网关</div></div></div>
 <div class="term">
 <div class="hd">登录管理后台</div>
 <div class="err" id="err">密码错误，请重试。</div>
@@ -6664,20 +6664,20 @@ async function doLogin(){const pw=document.getElementById("pw").value;const r=aw
 
 // ─── Personal Usage Page HTML ─────────────────────────────────────────────────
 function personalUsageLandingHtml() {
-  return `<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
+  return `<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%2096%2096%22%3E%3Crect%20width%3D%2296%22%20height%3D%2296%22%20rx%3D%2222%22%20fill%3D%22%232f6e50%22%2F%3E%3Cg%20fill%3D%22none%22%20stroke%3D%22%23fbfbf8%22%20stroke-width%3D%2213%22%20stroke-linecap%3D%22round%22%20stroke-linejoin%3D%22round%22%20transform%3D%22translate(48%2048)%20scale(0.88)%20translate(-48%20-48)%22%3E%3Cpath%20d%3D%22M37%2026.5H31.5Q20.5%2026.5%2020.5%2037.5V58.5Q20.5%2069.5%2031.5%2069.5H37%22%2F%3E%3Cpath%20d%3D%22M59%2026.5H64.5Q75.5%2026.5%2075.5%2037.5V58.5Q75.5%2069.5%2064.5%2069.5H59%22%2F%3E%3C%2Fg%3E%3Ccircle%20cx%3D%2248%22%20cy%3D%2248%22%20r%3D%226.2%22%20fill%3D%22%23fbfbf8%22%2F%3E%3C%2Fsvg%3E">
 <title>我的用量</title>
 <style>
 ${UI_THEME}
 ${TOAST_CSS}
 body{display:flex;justify-content:center;align-items:center;min-height:100vh;padding:24px;margin:0}
-.wrap{width:100%;max-width:440px}.brand{margin-bottom:22px}.brand .t{font-size:24px;font-weight:650;margin-bottom:7px}.brand .s{font-size:13px;color:var(--dim)}
+.wrap{width:100%;max-width:440px}.brand{margin-bottom:22px}.brand .t{font-size:24px;font-weight:650;margin-bottom:7px}.brand .s{font-size:13px;color:var(--dim)}.brand-row{display:flex;align-items:center;gap:12px}.brand-logo{width:38px;height:38px;flex:none}
 .term{background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:26px}.term .hd{font-size:13px;font-weight:600;margin-bottom:18px;color:var(--text)}
 .term label{display:block;font-size:12px;font-weight:550;color:var(--dim);margin-bottom:6px}.term input{width:100%;padding:11px 12px;background:var(--surface);border:1px solid var(--border-strong);border-radius:5px;color:var(--text);font-size:14px;font-family:var(--font-mono);outline:none;margin-bottom:18px}.term input:focus{border-color:var(--accent)}
 .term button{width:100%;padding:11px 12px;background:var(--text);color:#fff;border:none;border-radius:5px;font-size:13px;font-weight:600;cursor:pointer}.term button:hover{background:#33332f}
 .note{font-size:12px;color:var(--dim);text-align:center;margin-top:14px}.note code{color:var(--accent);font-family:var(--font-mono)}
 </style></head><body data-theme="editorial-light">
 <div class="wrap">
-<div class="brand"><div class="t">我的用量</div><div class="s">输入虚拟 Key 查看个人配额与消耗。</div></div>
+<div class="brand brand-row"><svg class="brand-logo" width="38" height="38" viewBox="0 0 96 96" aria-hidden="true"><rect width="96" height="96" rx="22" fill="#2f6e50"/><g fill="none" stroke="#fbfbf8" stroke-width="11" stroke-linecap="round" stroke-linejoin="round" transform="translate(48 48) scale(0.9) translate(-48 -48)"><path d="M37 26.5H31.5Q20.5 26.5 20.5 37.5V58.5Q20.5 69.5 31.5 69.5H37"/><path d="M59 26.5H64.5Q75.5 26.5 75.5 37.5V58.5Q75.5 69.5 64.5 69.5H59"/></g><circle cx="48" cy="48" r="4.95" fill="#fbfbf8"/></svg><div><div class="t">我的用量</div><div class="s">输入虚拟 Key 查看个人配额与消耗。</div></div></div>
 <div class="term">
 <div class="hd">查询个人用量</div>
 <label>虚拟 Key</label>
@@ -6993,13 +6993,13 @@ function codexSetupHtml(virtualKey, state, catalog) {
     : state === "no-profile"
     ? `<div style="background:#fff7e6;border:1px solid #ffe1a6;color:#a1662f;padding:10px 14px;border-radius:6px;margin-bottom:16px;font-size:13px">该 Key 尚未分配到任何 Responses(Codex) 方案——请联系管理员在设置页为其分配后再来配置。</div>`
     : "";
-  return `<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
+  return `<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%2096%2096%22%3E%3Crect%20width%3D%2296%22%20height%3D%2296%22%20rx%3D%2222%22%20fill%3D%22%232f6e50%22%2F%3E%3Cg%20fill%3D%22none%22%20stroke%3D%22%23fbfbf8%22%20stroke-width%3D%2213%22%20stroke-linecap%3D%22round%22%20stroke-linejoin%3D%22round%22%20transform%3D%22translate(48%2048)%20scale(0.88)%20translate(-48%20-48)%22%3E%3Cpath%20d%3D%22M37%2026.5H31.5Q20.5%2026.5%2020.5%2037.5V58.5Q20.5%2069.5%2031.5%2069.5H37%22%2F%3E%3Cpath%20d%3D%22M59%2026.5H64.5Q75.5%2026.5%2075.5%2037.5V58.5Q75.5%2069.5%2064.5%2069.5H59%22%2F%3E%3C%2Fg%3E%3Ccircle%20cx%3D%2248%22%20cy%3D%2248%22%20r%3D%226.2%22%20fill%3D%22%23fbfbf8%22%2F%3E%3C%2Fsvg%3E">
 <title>Codex 接入配置 - 团队AI Coding监控</title>
 <style>
 ${UI_THEME}
 body{padding:28px clamp(18px,3vw,44px) 48px}
 body>div{max-width:880px;margin-left:auto;margin-right:auto}
-.top{margin-bottom:14px;padding-bottom:18px;border-bottom:1px solid var(--border)}
+.top{margin-bottom:14px;padding-bottom:18px;border-bottom:1px solid var(--border)}.top-brand{display:flex;align-items:center;gap:14px}
 .top h1{font-size:26px;font-weight:650;margin-bottom:6px}.top .sub{font-size:12px;color:var(--dim)}
 .host-row{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:16px;font-size:13px}
 .host-row code{font-size:11px;color:var(--dim)}
@@ -7017,7 +7017,7 @@ pre{position:relative;background:var(--bg);border:1px solid var(--border);border
 .note{font-size:11px;color:var(--dim);line-height:1.7}
 .warn{background:#fff7e6;border:1px solid #ffe1a6;color:#a1662f;padding:8px 12px;border-radius:5px;font-size:12px;margin-top:10px}
 </style></head><body data-theme="editorial-light">
-<div class="top"><h1>Codex 接入配置</h1><div class="sub">把你的 Codex 指向团队网关 — 三种方式任选其一</div></div>
+<div class="top"><div class="top-brand"><svg class="brand-logo" width="40" height="40" viewBox="0 0 96 96" aria-hidden="true"><rect width="96" height="96" rx="22" fill="#2f6e50"/><g fill="none" stroke="#fbfbf8" stroke-width="11" stroke-linecap="round" stroke-linejoin="round" transform="translate(48 48) scale(0.9) translate(-48 -48)"><path d="M37 26.5H31.5Q20.5 26.5 20.5 37.5V58.5Q20.5 69.5 31.5 69.5H37"/><path d="M59 26.5H64.5Q75.5 26.5 75.5 37.5V58.5Q75.5 69.5 64.5 69.5H59"/></g><circle cx="48" cy="48" r="4.95" fill="#fbfbf8"/></svg><div><h1>Codex 接入配置</h1><div class="sub">把你的 Codex 指向团队网关 — 三种方式任选其一</div></div></div></div>
 ${banner}
 <div class="host-row"><span>服务器地址：</span><span style="color:var(--dim)" id="schemeLabel">http://</span><input id="hostInput" value="" oninput="renderAll()" spellcheck="false"><code>自动取自当前访问地址（含 https），可修改</code>${cat.entries.length ? ` <code>可用模型：${cat.entries.map(e => e.slug).join(" / ")}（来自方案配置的别名）</code>` : ""}</div>
 <div class="tabs">
@@ -7084,7 +7084,7 @@ renderAll();
 }
 
 function personalUsageHtml(virtualKey) {
-  return `<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
+  return `<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%2096%2096%22%3E%3Crect%20width%3D%2296%22%20height%3D%2296%22%20rx%3D%2222%22%20fill%3D%22%232f6e50%22%2F%3E%3Cg%20fill%3D%22none%22%20stroke%3D%22%23fbfbf8%22%20stroke-width%3D%2213%22%20stroke-linecap%3D%22round%22%20stroke-linejoin%3D%22round%22%20transform%3D%22translate(48%2048)%20scale(0.88)%20translate(-48%20-48)%22%3E%3Cpath%20d%3D%22M37%2026.5H31.5Q20.5%2026.5%2020.5%2037.5V58.5Q20.5%2069.5%2031.5%2069.5H37%22%2F%3E%3Cpath%20d%3D%22M59%2026.5H64.5Q75.5%2026.5%2075.5%2037.5V58.5Q75.5%2069.5%2064.5%2069.5H59%22%2F%3E%3C%2Fg%3E%3Ccircle%20cx%3D%2248%22%20cy%3D%2248%22%20r%3D%226.2%22%20fill%3D%22%23fbfbf8%22%2F%3E%3C%2Fsvg%3E">
 <title>我的用量 - 团队AI Coding监控</title>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js"><\/script>
 <style>
@@ -7098,7 +7098,7 @@ body>div{max-width:1400px;margin-left:auto;margin-right:auto}
 .proto-seg button{font-size:11px;font-weight:600;padding:6px 12px;border:none;background:transparent;color:var(--dim);cursor:pointer}
 .proto-seg button+button{border-left:1px solid var(--border)}
 .proto-seg button.on{background:var(--accent-soft);color:var(--accent)}
-.top{display:flex;align-items:flex-start;justify-content:space-between;gap:24px;flex-wrap:wrap;margin-bottom:14px;padding-bottom:20px;border-bottom:1px solid var(--border)}
+.top{display:flex;align-items:flex-start;justify-content:space-between;gap:24px;flex-wrap:wrap;margin-bottom:14px;padding-bottom:20px;border-bottom:1px solid var(--border)}.top-brand{display:flex;align-items:center;gap:14px}
 .top h1{font-size:28px;font-weight:650;line-height:1.15;margin-bottom:7px}.top .sub{font-size:12px;color:var(--dim)}
 select{font-size:12px;background:var(--surface);color:var(--text);border:1px solid var(--border);border-radius:5px;padding:7px 10px;cursor:pointer}select:hover{background:var(--surface-subtle)}select:focus{border-color:var(--accent)}
 .meta{font-size:12px;color:var(--dim);margin-bottom:18px}
@@ -7137,7 +7137,7 @@ select{font-size:12px;background:var(--surface);color:var(--text);border:1px sol
 table{width:100%;border-collapse:collapse;min-width:560px}th{text-align:left;padding:9px 12px;font-size:11px;font-weight:550;color:var(--dim);border-bottom:1px solid var(--border);white-space:nowrap}td{padding:9px 12px;font-size:12px;border-bottom:1px solid #ecece8;white-space:nowrap}.n{text-align:right;font-variant-numeric:tabular-nums}tbody tr:hover td{background:#fafaf7}.tag{font-size:10px;background:var(--accent-soft);color:var(--accent);padding:2px 6px;border-radius:4px}
 @media(max-width:560px){body{padding:20px 14px 36px}.top h1{font-size:24px}.cards{grid-template-columns:1fr 1fr}.card .v{font-size:20px}.box{padding:14px}.pq-grid{grid-template-columns:1fr}}
 </style></head><body data-theme="editorial-light">
-<div class="top"><div><h1>我的用量</h1><div class="sub">查看个人配额、趋势和模型明细 · <a href="/setup/${escJs(virtualKey)}" style="color:var(--accent)">配置 Codex 接入 →</a></div></div><div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap"><div class="proto-seg" id="protoSeg" role="group" aria-label="协议分类"><button type="button" class="on" data-proto="">全部</button><button type="button" data-proto="anthropic">Anthropic</button><button type="button" data-proto="responses">OpenAI</button></div><select id="profileSel" onchange="switchProfile(this.value)"><option value="all">全部可用方案</option></select></div></div>
+<div class="top"><div class="top-brand"><svg class="brand-logo" width="40" height="40" viewBox="0 0 96 96" aria-hidden="true"><rect width="96" height="96" rx="22" fill="#2f6e50"/><g fill="none" stroke="#fbfbf8" stroke-width="11" stroke-linecap="round" stroke-linejoin="round" transform="translate(48 48) scale(0.9) translate(-48 -48)"><path d="M37 26.5H31.5Q20.5 26.5 20.5 37.5V58.5Q20.5 69.5 31.5 69.5H37"/><path d="M59 26.5H64.5Q75.5 26.5 75.5 37.5V58.5Q75.5 69.5 64.5 69.5H59"/></g><circle cx="48" cy="48" r="4.95" fill="#fbfbf8"/></svg><div><h1>我的用量</h1><div class="sub">查看个人配额、趋势和模型明细 · <a href="/setup/${escJs(virtualKey)}" style="color:var(--accent)">配置 Codex 接入 →</a></div></div></div><div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap"><div class="proto-seg" id="protoSeg" role="group" aria-label="协议分类"><button type="button" class="on" data-proto="">全部</button><button type="button" data-proto="anthropic">Anthropic</button><button type="button" data-proto="responses">OpenAI</button></div><select id="profileSel" onchange="switchProfile(this.value)"><option value="all">全部可用方案</option></select></div></div>
 <div class="meta" id="meta">加载中...</div>
 <div id="qNotice"></div>
 <div class="cards" id="cards"></div>
@@ -8800,12 +8800,14 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+  const keyNotFoundHtml = "<!DOCTYPE html><html lang=\"zh-CN\"><head><meta charset=\"UTF-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1.0\"><title>Key 不存在 - CC Team</title><link rel=\"icon\" type=\"image/svg+xml\" href=\"data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%2096%2096%22%3E%3Crect%20width%3D%2296%22%20height%3D%2296%22%20rx%3D%2222%22%20fill%3D%22%232f6e50%22%2F%3E%3Cg%20fill%3D%22none%22%20stroke%3D%22%23fbfbf8%22%20stroke-width%3D%2213%22%20stroke-linecap%3D%22round%22%20stroke-linejoin%3D%22round%22%20transform%3D%22translate(48%2048)%20scale(0.88)%20translate(-48%20-48)%22%3E%3Cpath%20d%3D%22M37%2026.5H31.5Q20.5%2026.5%2020.5%2037.5V58.5Q20.5%2069.5%2031.5%2069.5H37%22%2F%3E%3Cpath%20d%3D%22M59%2026.5H64.5Q75.5%2026.5%2075.5%2037.5V58.5Q75.5%2069.5%2064.5%2069.5H59%22%2F%3E%3C%2Fg%3E%3Ccircle%20cx%3D%2248%22%20cy%3D%2248%22%20r%3D%226.2%22%20fill%3D%22%23fbfbf8%22%2F%3E%3C%2Fsvg%3E\"><style>*{margin:0;padding:0;box-sizing:border-box}body{min-height:100vh;display:flex;align-items:center;justify-content:center;background:#f7f7f3;color:#181816;font-family:-apple-system,BlinkMacSystemFont,\"SF Pro Text\",\"PingFang SC\",\"Microsoft YaHei\",\"Segoe UI\",sans-serif}.card{text-align:center;padding:42px 52px;background:#fff;border:1px solid #deded8;border-radius:14px}.card svg{display:block;margin:0 auto 16px}h1{font-size:19px;font-weight:650;margin-bottom:7px}p{font-size:13px;color:#686863}</style></head><body><div class=\"card\"><svg class=\"brand-logo\" width=\"44\" height=\"44\" viewBox=\"0 0 96 96\" aria-hidden=\"true\"><rect width=\"96\" height=\"96\" rx=\"22\" fill=\"#2f6e50\"/><g fill=\"none\" stroke=\"#fbfbf8\" stroke-width=\"11\" stroke-linecap=\"round\" stroke-linejoin=\"round\" transform=\"translate(48 48) scale(0.9) translate(-48 -48)\"><path d=\"M37 26.5H31.5Q20.5 26.5 20.5 37.5V58.5Q20.5 69.5 31.5 69.5H37\"/><path d=\"M59 26.5H64.5Q75.5 26.5 75.5 37.5V58.5Q75.5 69.5 64.5 69.5H59\"/></g><circle cx=\"48\" cy=\"48\" r=\"4.95\" fill=\"#fbfbf8\"/></svg><h1>Key 不存在</h1><p>请检查你的虚拟 Key 是否正确。</p></div></body></html>";
+
   // Personal usage page
   if (req.method === "GET" && req.url.startsWith("/usage/")) {
     const vk = decodeURIComponent(req.url.slice(7).split("?")[0]);
     if (!rt || !vk || (!rt.users[vk] && !rt.globalUsers[vk])) {
       res.writeHead(404, { "Content-Type": "text/html; charset=utf-8" });
-      res.end("<h1>Key不存在</h1><p>请检查你的虚拟Key是否正确。</p>");
+      res.end(keyNotFoundHtml);
       return;
     }
     res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });

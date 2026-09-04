@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 96 96">
+  <!-- CC Team tile: brand green tile, warm-paper mark. Dot is paper here (mono, small-size safe). -->
+  <rect width="96" height="96" rx="22" fill="#2f6e50"/>
+  <g fill="none" stroke="#fbfbf8" stroke-width="11" stroke-linecap="round" stroke-linejoin="round" transform="translate(48 48) scale(0.9) translate(-48 -48)">
+    <path d="M37 26.5 H31.5 Q20.5 26.5 20.5 37.5 V58.5 Q20.5 69.5 31.5 69.5 H37"/>
+    <path d="M59 26.5 H64.5 Q75.5 26.5 75.5 37.5 V58.5 Q75.5 69.5 64.5 69.5 H59"/>
+  </g>
+  <circle cx="48" cy="48" r="4.95" fill="#fbfbf8"/>
+</svg>

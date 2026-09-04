@@ -76,8 +76,15 @@ button, input, select, textarea {
 }
 
 .logo {
+  display: flex;
+  align-items: center;
+  gap: 8px;
   font-weight: 700;
   letter-spacing: 0;
+}
+
+.logo svg {
+  display: block;
 }
 
 .nav-links {

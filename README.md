@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/logo/tile.svg" width="88" alt="CC Team Logo">
+</p>
+
 # CC Team
 
 面向 Claude Code 与 Codex 团队的 AI 编码网关。CC Team 将请求透明转发到多个兼容上游，通过虚拟 Key 管理成员访问，并提供 Token 统计、每日配额、错误记录和明亮极简的可视化工作台。

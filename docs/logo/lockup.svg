@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 340 96">
+  <!-- CC Team horizontal lockup: mark + wordmark. Text uses system font stack (matches dashboard). -->
+  <g fill="none" stroke="#181816" stroke-width="11" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M37 26.5 H31.5 Q20.5 26.5 20.5 37.5 V58.5 Q20.5 69.5 31.5 69.5 H37"/>
+    <path d="M59 26.5 H64.5 Q75.5 26.5 75.5 37.5 V58.5 Q75.5 69.5 64.5 69.5 H59"/>
+  </g>
+  <circle cx="48" cy="48" r="5.5" fill="#2f6e50"/>
+  <text x="104" y="62" font-family="-apple-system,BlinkMacSystemFont,'SF Pro Text','PingFang SC','Segoe UI',sans-serif" font-size="42" font-weight="700" letter-spacing="-0.5" fill="#181816">CC Team</text>
+</svg>

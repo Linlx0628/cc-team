@@ -4219,11 +4219,6 @@ async function bridgeImagesInRequest(body, runtime, clientState, alias, protocol
     ? extractImageBlocksAnthropic(parsed)
     : extractImagesFromResponsesBody(parsed);
   if (images.length === 0) return null;
-  if (images.length > IMAGE_BRIDGE_MAX_IMAGES) {
-    const err = new Error(`单次请求图片数量超过上限（${IMAGE_BRIDGE_MAX_IMAGES} 张），请分批发送`);
-    err.statusCode = 400;
-    throw err;
-  }
   // Helper model: manually configured one, else the first multimodal alias.
   const helperModel = resolveBridgeHelperModel(profileCfg, mm);
   if (!helperModel) {
@@ -4231,11 +4226,21 @@ async function bridgeImagesInRequest(body, runtime, clientState, alias, protocol
     err.statusCode = 400;
     throw err;
   }
-  for (const img of images) {
-    // Cache key includes the helper model: changing the helper (e.g. fixing a
-    // misconfigured blind model) invalidates stale garbage transcriptions
-    // instead of serving them forever.
-    const hash = `${helperModel}:${crypto.createHash("sha256").update(img.b64).digest("hex")}`;
+  // Cache key includes the helper model: changing the helper (e.g. fixing a
+  // misconfigured blind model) invalidates stale garbage transcriptions
+  // instead of serving them forever.
+  const keyed = images.map(img => ({ img, hash: `${helperModel}:${crypto.createHash("sha256").update(img.b64).digest("hex")}` }));
+  // The per-request cap counts only NEW (uncached) transcriptions. Both client
+  // protocols replay the FULL conversation every turn — old images are cache
+  // hits and cost nothing, so counting them (an earlier bug) made any
+  // conversation that had accumulated more than the cap fail entirely.
+  const misses = keyed.filter(k => bridgeCacheGet(k.hash) === null);
+  if (misses.length > IMAGE_BRIDGE_MAX_IMAGES) {
+    const err = new Error(`单次请求需新识别的图片超过上限（${IMAGE_BRIDGE_MAX_IMAGES} 张），请分批发送`);
+    err.statusCode = 400;
+    throw err;
+  }
+  for (const { img, hash } of keyed) {
     let desc = bridgeCacheGet(hash);
     if (desc === null) {
       desc = await describeImageViaHelper(img.b64, helperModel, runtime, clientState, profileCfg, protocol, img.mediaType);
@@ -4722,7 +4727,7 @@ function proxyRequest(req, res) {
             served = true;   // client disconnect is not a failure to surface
             break;
           }
-          lastFailure = { kind: "proxy", status: err.isTimeout ? 504 : 502, err, runtime: cruntime, suffix: csuffix };
+          lastFailure = { kind: "proxy", status: err.statusCode || (err.isTimeout ? 504 : 502), err, runtime: cruntime, suffix: csuffix };
           if (!isLastCandidate) continue;
           break;
         }
@@ -4756,8 +4761,11 @@ function proxyRequest(req, res) {
             recordError(apiKey, 429, `all profiles rate-limited until ${new Date(lastFailure.err.resumeAt).toISOString()}`, req.url, reqModel, lastFailure.suffix, lastFailure.runtime);
           } else {
             const status = lastFailure.status;
-            const label = status === 504 ? "Gateway Timeout" : "Bad Gateway";
-            sendOpenAiError(res, status, "proxy_error", `Proxy ${label}. Please try again later.`);
+            const label = status === 504 ? "Gateway Timeout" : status === 502 ? "Bad Gateway" : "Request Error";
+            // 4xx from gateway-internal validation (e.g. bridge limits): surface
+            // the actual status + message instead of masking it as Bad Gateway.
+            const clientMsg = status < 500 ? lastFailure.err.message : `Proxy ${label}. Please try again later.`;
+            sendOpenAiError(res, status, "proxy_error", clientMsg);
             recordError(apiKey, status, `${label}: ${lastFailure.err.message}`, req.url, reqModel, lastFailure.suffix, lastFailure.runtime);
           }
         } else if (lastFailure.kind === "model") {
@@ -4789,9 +4797,10 @@ function proxyRequest(req, res) {
           recordError(apiKey, 429, `all profiles rate-limited until ${new Date(lastFailure.err.resumeAt).toISOString()}`, req.url, reqModel, lastFailure.suffix, lastFailure.runtime);
         } else {
           const status = lastFailure.status;
-          const label = status === 504 ? "Gateway Timeout" : "Bad Gateway";
+          const label = status === 504 ? "Gateway Timeout" : status === 502 ? "Bad Gateway" : "Request Error";
+          const clientMsg = status < 500 ? lastFailure.err.message : `Proxy ${label}. Please try again later.`;
           res.writeHead(status, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ error: `Proxy ${label}. Please try again later.` }));
+          res.end(JSON.stringify({ error: clientMsg }));
           recordError(apiKey, status, `${label}: ${lastFailure.err.message}`, req.url, reqModel, lastFailure.suffix, lastFailure.runtime);
         }
       }

@@ -4236,7 +4236,7 @@ async function bridgeImagesInRequest(body, runtime, clientState, alias, protocol
   // conversation that had accumulated more than the cap fail entirely.
   const misses = keyed.filter(k => bridgeCacheGet(k.hash) === null);
   if (misses.length > IMAGE_BRIDGE_MAX_IMAGES) {
-    const err = new Error(`单次请求需新识别的图片超过上限（${IMAGE_BRIDGE_MAX_IMAGES} 张），请分批发送`);
+    const err = new Error(`单次请求新增待识别图片超过上限（${IMAGE_BRIDGE_MAX_IMAGES} 张），请减少一次发送的图片数量`);
     err.statusCode = 400;
     throw err;
   }
@@ -4245,7 +4245,7 @@ async function bridgeImagesInRequest(body, runtime, clientState, alias, protocol
     if (desc === null) {
       desc = await describeImageViaHelper(img.b64, helperModel, runtime, clientState, profileCfg, protocol, img.mediaType);
       if (desc === null) {
-        const err = new Error("图片识别失败：辅助模型未能生成图片描述，请稍后重试或改用原生支持视觉的别名");
+        const err = new Error(`图片识别失败：辅助模型 ${helperModel} 未能生成图片描述（失败原因见网关日志 [图片桥接]），请稍后重试或改用原生支持视觉的别名`);
         err.statusCode = 502;
         throw err;
       }
@@ -4309,7 +4309,10 @@ async function describeImageViaHelper(b64, helperModel, runtime, clientState, pr
   };
   try {
     const upRes = await sendUpstream(Buffer.from(body), isAnthropic ? "/v1/messages" : "/v1/responses", "POST", headers, 60000, runtime, clientState);
-    if (upRes.statusCode !== 200) return null;
+    if (upRes.statusCode !== 200) {
+      console.log(`[图片桥接] 辅助调用失败 模型=${helperModel} status=${upRes.statusCode} body=${upRes.body.toString().slice(0, 200).replace(/\n/g, " ")}`);
+      return null;
+    }
     const json = JSON.parse(upRes.body.toString());
     const text = isAnthropic
       ? (Array.isArray(json?.content) ? json.content : [])
@@ -4324,8 +4327,10 @@ async function describeImageViaHelper(b64, helperModel, runtime, clientState, pr
           .map(c => c.text || "")
           .join("\n")
           .trim();
+    if (!text) console.log(`[图片桥接] 辅助返回空描述 模型=${helperModel} body=${upRes.body.toString().slice(0, 200).replace(/\n/g, " ")}`);
     return text || null;
-  } catch {
+  } catch (e) {
+    console.log(`[图片桥接] 辅助调用异常 模型=${helperModel} err=${e.message}`);
     return null;
   }
 }

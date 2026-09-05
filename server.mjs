@@ -4042,7 +4042,9 @@ function createClientAbortState() {
   return {
     aborted: false,
     reason: "",
-    upstreamRequest: null,
+    // A set, not one slot: the image bridge fires several helper calls in
+    // parallel and every in-flight one must die when the client hangs up.
+    upstreamRequests: new Set(),
     listeners: new Set(),
   };
 }
@@ -4051,8 +4053,8 @@ function markClientAborted(state, reason) {
   if (!state || state.aborted) return;
   state.aborted = true;
   state.reason = reason || "unknown";
-  if (state.upstreamRequest && !state.upstreamRequest.destroyed) {
-    state.upstreamRequest.destroy(makeClientAbortError(state.reason));
+  for (const upReq of [...state.upstreamRequests]) {
+    if (!upReq.destroyed) upReq.destroy(makeClientAbortError(state.reason));
   }
   for (const listener of [...state.listeners]) {
     try { listener(state.reason); } catch {}
@@ -4071,13 +4073,11 @@ function addClientAbortListener(state, listener) {
 
 function setActiveUpstreamRequest(state, upReq) {
   if (!state) return () => {};
-  state.upstreamRequest = upReq;
+  state.upstreamRequests.add(upReq);
   if (state.aborted && !upReq.destroyed) {
     upReq.destroy(makeClientAbortError(state.reason));
   }
-  return () => {
-    if (state.upstreamRequest === upReq) state.upstreamRequest = null;
-  };
+  return () => { state.upstreamRequests.delete(upReq); };
 }
 
 function throwIfClientAborted(state) {
@@ -4135,6 +4135,26 @@ function buildUpstreamPath(reqUrl, runtime) {
 const IMAGE_BRIDGE_CACHE_MAX_ROWS = 5000;
 const IMAGE_BRIDGE_MAX_IMAGES = 8;
 const IMAGE_BRIDGE_MAX_B64 = 12 * 1024 * 1024;
+// Helper calls run before the first byte reaches the client, so their total cost
+// IS the client's wait. Serial calls at a 60s timeout each used to reach ~90s and
+// the client hung up mid-bridge; these three numbers bound it instead.
+const IMAGE_BRIDGE_CONCURRENCY = 4;            // parallel helper calls
+const IMAGE_BRIDGE_CALL_TIMEOUT_MS = 25000;    // per-image helper timeout
+const IMAGE_BRIDGE_TOTAL_BUDGET_MS = 35000;    // whole-request budget, shared across failover candidates
+// A helper that is genuinely broken should cost one second, not a full budget on
+// every turn: park it after a few consecutive failures.
+const IMAGE_BRIDGE_HELPER_FAIL_LIMIT = 3;
+const IMAGE_BRIDGE_HELPER_COOLDOWN_MS = 30000;
+const bridgeHelperHealth = new Map();          // "host|model" -> { fails, until }
+const bridgeThinkingUnsupported = new Set();   // upstreams that reject the `thinking` field
+
+// Rendered into the settings page: the cache is keyed by image and shared by all
+// profiles, so the count is global.
+function ibCacheRows() {
+  let n = 0;
+  try { n = stmts.bridgeCacheCount.get().n; } catch {}
+  return `已缓存 ${n} 张图片转述（全局共享，清空后这些图下一轮会重新识别）`;
+}
 
 function bridgeCacheGet(hash) {
   try {
@@ -4151,11 +4171,35 @@ function bridgeCacheSet(hash, text) {
   } catch (err) { console.warn("[图片桥接] 缓存写入失败:", err.message); }
 }
 
+// Replay protocols resend the whole conversation every turn, so "new" has to be
+// decided structurally: the trailing run of client-authored items is this turn,
+// everything before it is history that was already transcribed (or already
+// degraded) in an earlier turn.
+function responsesFreshStart(items) {
+  let i = items.length - 1;
+  while (i >= 0) {
+    const it = items[i];
+    if (!it || typeof it !== "object") break;
+    const isUserMsg = it.type === "message" && it.role === "user";
+    const isToolOut = typeof it.type === "string" && it.type.endsWith("_call_output");
+    if (!isUserMsg && !isToolOut) break;
+    i--;
+  }
+  return i + 1;
+}
+
+function anthropicFreshStart(msgs) {
+  let i = msgs.length - 1;
+  while (i >= 0 && msgs[i] && msgs[i].role === "user") i--;
+  return i + 1;
+}
+
 // Extract data:URL images from a parsed Responses request body (input items).
-// Returns the parsed input array (same ref) plus { index, hash } markers.
+// Returns markers { i, j, b64, fresh, tooLarge } into parsed.input.
 function extractImagesFromResponsesBody(parsed) {
   const images = [];
   const items = Array.isArray(parsed?.input) ? parsed.input : [];
+  const freshStart = responsesFreshStart(items);
   for (let i = 0; i < items.length; i++) {
     const item = items[i];
     if (!item || typeof item !== "object" || item.type !== "message") continue;
@@ -4166,9 +4210,9 @@ function extractImagesFromResponsesBody(parsed) {
       const raw = String(block.image_url || "");
       const m = /^data:image\/[a-zA-Z0-9.+-]+;base64,([A-Za-z0-9+/=]+)$/.exec(raw);
       if (!m) continue;
-      const b64 = m[1];
-      if (b64.length > IMAGE_BRIDGE_MAX_B64) continue;
-      images.push({ i, j, b64 });
+      // Oversized images are collected too, just flagged: skipping them left a raw
+      // image block in a request bound for a blind model — a guaranteed 400.
+      images.push({ i, j, b64: m[1], fresh: i >= freshStart, tooLarge: m[1].length > IMAGE_BRIDGE_MAX_B64 });
     }
   }
   return images;
@@ -4177,20 +4221,21 @@ function extractImagesFromResponsesBody(parsed) {
 // Extract base64 image blocks from a parsed Anthropic Messages body. Image
 // blocks live in message content arrays — including nested inside tool_result
 // content (Claude Code puts screenshots there). Returns reference-based
-// markers { arr, idx, b64, mediaType } so the caller can replace in place.
+// markers { arr, idx, b64, mediaType, fresh, tooLarge } for in-place replacement.
 function extractImageBlocksAnthropic(parsed) {
   const images = [];
   const msgs = Array.isArray(parsed?.messages) ? parsed.messages : [];
-  for (const msg of msgs) {
+  const freshStart = anthropicFreshStart(msgs);
+  for (let mi = 0; mi < msgs.length; mi++) {
+    const msg = msgs[mi];
+    const fresh = mi >= freshStart;
     const content = msg && msg.content;
     if (!Array.isArray(content)) continue;   // string content carries no images
     for (let idx = 0; idx < content.length; idx++) {
       const block = content[idx];
       if (!block || typeof block !== "object") continue;
       if (block.type === "image" && block.source?.type === "base64" && typeof block.source.data === "string") {
-        if (block.source.data.length <= IMAGE_BRIDGE_MAX_B64) {
-          images.push({ arr: content, idx, b64: block.source.data, mediaType: block.source.media_type || "image/png" });
-        }
+        images.push({ arr: content, idx, b64: block.source.data, mediaType: block.source.media_type || "image/png", fresh, tooLarge: block.source.data.length > IMAGE_BRIDGE_MAX_B64 });
         continue;
       }
       if (block.type === "tool_result" && Array.isArray(block.content)) {
@@ -4198,9 +4243,7 @@ function extractImageBlocksAnthropic(parsed) {
         for (let t = 0; t < inner.length; t++) {
           const tb = inner[t];
           if (tb && tb.type === "image" && tb.source?.type === "base64" && typeof tb.source.data === "string") {
-            if (tb.source.data.length <= IMAGE_BRIDGE_MAX_B64) {
-              images.push({ arr: inner, idx: t, b64: tb.source.data, mediaType: tb.source.media_type || "image/png" });
-            }
+            images.push({ arr: inner, idx: t, b64: tb.source.data, mediaType: tb.source.media_type || "image/png", fresh, tooLarge: tb.source.data.length > IMAGE_BRIDGE_MAX_B64 });
           }
         }
       }
@@ -4212,8 +4255,14 @@ function extractImageBlocksAnthropic(parsed) {
 // Bridge one request body (Buffer) through the profile's helper model.
 // `alias` is the model alias the client asked for: aliases marked multimodal
 // pass through untouched (native support); non-multimodal aliases with images
-// are rewritten via the helper. Returns the rewritten Buffer, or null to
+// are rewritten via the helper. Returns { body, helperModel, stats }, or null to
 // passthrough (no images, or the alias natively supports images).
+//
+// Failure policy: a single image must never be able to kill a turn. Images the
+// client just sent ("fresh") are the ones the user is waiting on — if those cannot
+// be transcribed we fail loudly with an actionable 400. Replayed history images
+// degrade to a text placeholder, because a replay protocol resends every image
+// every turn and a cold cache would otherwise fail the session forever.
 async function bridgeImagesInRequest(body, runtime, clientState, alias, protocol) {
   const profileCfg = config.profiles[runtime.profileName] || {};
   const mm = profileCfg.modelMultimodal || {};
@@ -4237,52 +4286,95 @@ async function bridgeImagesInRequest(body, runtime, clientState, alias, protocol
     err.statusCode = 400;
     throw err;
   }
-  // Cache key includes the helper model: changing the helper (e.g. fixing a
-  // misconfigured blind model) invalidates stale garbage transcriptions
-  // instead of serving them forever.
-  const keyed = images.map(img => ({ img, hash: `${helperModel}:${crypto.createHash("sha256").update(img.b64).digest("hex")}` }));
-  // Graceful overflow: the cap bounds per-request NEW transcriptions. Replay
-  // protocols resend the FULL history every turn — a long session right after a
-  // gateway restart would exceed it every turn — so beyond the cap the OLDEST
-  // images degrade to placeholders instead of failing the whole request; the
-  // newest images (most relevant context) are always transcribed.
-  const missFlags = keyed.map(k => bridgeCacheGet(k.hash) === null);
-  const missCount = missFlags.filter(Boolean).length;
-  const placeholder = new Array(keyed.length).fill(false);
-  let budget = IMAGE_BRIDGE_MAX_IMAGES;
-  for (let i = keyed.length - 1; i >= 0; i--) {   // newest first gets the budget
-    if (!missFlags[i]) continue;
-    if (budget > 0) budget--;
-    else placeholder[i] = true;
-  }
-  if (placeholder.some(Boolean)) {
-    console.log(`[图片桥接] 本轮新图 ${missCount} 张超上限，识别最近 ${IMAGE_BRIDGE_MAX_IMAGES} 张，其余以占位替换`);
-  }
+  const startedAt = Date.now();
+  // Cache key is the image itself — no helper prefix. A description is a
+  // description whichever vision model wrote it, so a failover to another profile
+  // reuses the work instead of re-transcribing the whole history under a second
+  // key (which is why the "new images" count never converged).
+  const keyed = images.map(img => ({ img, hash: crypto.createHash("sha256").update(img.b64).digest("hex") }));
+  const results = new Array(keyed.length).fill(null);
+  const pending = [];
   for (let i = 0; i < keyed.length; i++) {
-    const { img, hash } = keyed[i];
-    let desc;
-    if (placeholder[i]) {
-      desc = "（历史图片较多，此张本轮未识别；如需分析请重新发送该图）";
-    } else {
-      desc = bridgeCacheGet(hash);
-      if (desc === null) {
-        desc = await describeImageViaHelper(img.b64, helperModel, runtime, clientState, profileCfg, protocol, img.mediaType);
-        if (desc === null) {
-          const err = new Error(`图片识别失败：辅助模型 ${helperModel} 未能生成图片描述（失败原因见网关日志 [图片桥接]），请稍后重试或改用原生支持视觉的别名`);
-          err.statusCode = 502;
-          throw err;
-        }
-        bridgeCacheSet(hash, desc);
+    const img = keyed[i].img;
+    if (img.tooLarge) {
+      results[i] = { text: `（图片过大 ${(img.b64.length / 1024 / 1024).toFixed(1)}MB，超过网关识别上限，未识别）`, placeholder: true };
+      continue;
+    }
+    const cached = bridgeCacheGet(keyed[i].hash);
+    if (cached !== null) { results[i] = { text: cached, hit: true }; continue; }
+    pending.push(i);
+  }
+  // Budget the NEW transcriptions: this turn's images first, newest first within
+  // each class, so the wall-clock budget is always spent on what matters most.
+  pending.sort((a, b) => (keyed[b].img.fresh ? 1 : 0) - (keyed[a].img.fresh ? 1 : 0) || b - a);
+  const queue = pending.slice(0, IMAGE_BRIDGE_MAX_IMAGES);
+  for (const i of pending.slice(IMAGE_BRIDGE_MAX_IMAGES)) {
+    results[i] = {
+      text: keyed[i].img.fresh
+        ? `（本轮图片过多，超过网关单次识别上限 ${IMAGE_BRIDGE_MAX_IMAGES} 张，此张本轮未识别；请分批发送）`
+        : "（历史图片较多，此张本轮未识别；如需分析请重新发送该图）",
+      placeholder: true,
+    };
+  }
+  // One budget per client request, not per failover candidate: the second
+  // candidate re-bridges straight from cache and must not add another full wait.
+  if (clientState && !clientState.bridgeDeadline) clientState.bridgeDeadline = Date.now() + IMAGE_BRIDGE_TOTAL_BUDGET_MS;
+  const deadline = (clientState && clientState.bridgeDeadline) || (Date.now() + IMAGE_BRIDGE_TOTAL_BUDGET_MS);
+  let cursor = 0;
+  async function worker() {
+    for (;;) {
+      const at = cursor++;
+      if (at >= queue.length) return;
+      const i = queue[at];
+      throwIfClientAborted(clientState);
+      const left = deadline - Date.now();
+      if (left <= 500) {
+        results[i] = { failed: true, reason: `网关图片识别总预算 ${Math.round(IMAGE_BRIDGE_TOTAL_BUDGET_MS / 1000)}s 用尽` };
+        continue;
+      }
+      const r = await describeImageViaHelper(keyed[i].img.b64, helperModel, runtime, clientState, profileCfg, protocol, keyed[i].img.mediaType, Math.min(IMAGE_BRIDGE_CALL_TIMEOUT_MS, left));
+      if (r.ok) {
+        results[i] = { text: r.text, fetched: true };
+        bridgeCacheSet(keyed[i].hash, r.text);
+      } else {
+        results[i] = { failed: true, reason: r.reason };
       }
     }
+  }
+  await Promise.all(Array.from({ length: Math.max(1, Math.min(IMAGE_BRIDGE_CONCURRENCY, queue.length)) }, () => worker()));
+
+  const freshFails = [];
+  for (let i = 0; i < keyed.length; i++) {
+    const r = results[i] || { failed: true, reason: "未处理" };
+    if (r.failed && keyed[i].img.fresh) freshFails.push(r.reason);
+    const text = r.failed ? `（历史图片识别失败：${r.reason}）` : r.text;
     // Replace the image block with a text description (keep surrounding context).
+    const img = keyed[i].img;
     if (protocol === "anthropic") {
-      img.arr[img.idx] = { type: "text", text: `[图片内容] ${desc}` };
+      img.arr[img.idx] = { type: "text", text: `[图片内容] ${text}` };
     } else {
-      parsed.input[img.i].content[img.j] = { type: "input_text", text: `[图片内容] ${desc}` };
+      parsed.input[img.i].content[img.j] = { type: "input_text", text: `[图片内容] ${text}` };
     }
   }
-  return { body: Buffer.from(JSON.stringify(parsed)), helperModel };
+  if (freshFails.length) {
+    // 400, not 502: the gateway only surfaces its own message to the client for
+    // sub-500 statuses (a 502 reads as "Proxy Bad Gateway. Please try again
+    // later." and the real cause never reaches the user), and Claude Code retries
+    // 5xx — which would mean paying the whole bridge budget again per retry.
+    const nativeAlias = Object.keys(profileCfg.modelAliases || {}).find(a => mm[a] === true);
+    const err = new Error(`图片识别失败：方案「${runtime.profileName}」的辅助模型 ${helperModel} 没能转述本轮新贴的 ${freshFails.length} 张图片（原因：${freshFails[0]}）。可在设置页把辅助模型换成真正支持视觉的模型${nativeAlias ? `，或直接用已勾选多模态的别名 ${nativeAlias} 发图` : ""}。`);
+    err.statusCode = 400;
+    throw err;
+  }
+  const stats = {
+    total: keyed.length,
+    hit: results.filter(r => r && r.hit).length,
+    got: results.filter(r => r && r.fetched).length,
+    ph: results.filter(r => r && r.placeholder).length,
+    failed: results.filter(r => r && r.failed).length,
+    ms: Date.now() - startedAt,
+  };
+  return { body: Buffer.from(JSON.stringify(parsed)), helperModel, stats };
 }
 
 // Pick the helper model: imageBridge.model (manual override) → first alias
@@ -4295,20 +4387,79 @@ function resolveBridgeHelperModel(profileCfg, mm) {
   return first ? aliases[first] : "";
 }
 
-// Ask the helper model to describe a base64 image. Returns the description text
-// or null on any failure. Uses the profile's real upstream + key (same auth).
-// The helper call speaks the SAME protocol as the profile it serves: Responses
-// profiles ask /v1/responses with input_image, Anthropic profiles ask
-// /v1/messages with an image content block.
-async function describeImageViaHelper(b64, helperModel, runtime, clientState, profileCfg, protocol, mediaType) {
+function bridgeHelperCooldown(key) {
+  const h = bridgeHelperHealth.get(key);
+  return h && h.until > Date.now() ? h.until - Date.now() : 0;
+}
+function bridgeHelperNoteFailure(key, reason) {
+  const h = bridgeHelperHealth.get(key) || { fails: 0, until: 0 };
+  h.fails++;
+  if (h.fails >= IMAGE_BRIDGE_HELPER_FAIL_LIMIT) {
+    h.until = Date.now() + IMAGE_BRIDGE_HELPER_COOLDOWN_MS;
+    h.fails = 0;
+    console.log(`[图片桥接] 辅助模型连续失败，冷却 ${IMAGE_BRIDGE_HELPER_COOLDOWN_MS / 1000}s ${key} 最后原因=${reason}`);
+  }
+  bridgeHelperHealth.set(key, h);
+}
+function bridgeHelperNoteSuccess(key) {
+  if (bridgeHelperHealth.has(key)) bridgeHelperHealth.set(key, { fails: 0, until: 0 });
+}
+
+// Pull the description out of a helper reply. Helper models are usually reasoning
+// models: they emit a thinking/reasoning block first and can run out of tokens
+// before writing any prose (with the old max_tokens=1024 they always did, which is
+// what "辅助返回空描述" really was). Fall back to that block's text rather than
+// failing the image, and report block kinds + stop_reason so the log is diagnosable.
+function pickHelperDescription(json, isAnthropic) {
+  if (isAnthropic) {
+    const blocks = Array.isArray(json?.content) ? json.content : [];
+    const kinds = [...new Set(blocks.map(b => b?.type).filter(Boolean))].join("+") || "无内容";
+    const stop = json?.stop_reason || "?";
+    const text = blocks.filter(b => b?.type === "text").map(b => b.text || "").join("\n").trim();
+    if (text) return { text, kinds, stop };
+    const thinking = blocks.filter(b => b?.type === "thinking").map(b => b.thinking || "").join("\n").trim();
+    if (thinking) return { text: thinking.slice(0, 1200), kinds, stop, fromThinking: true };
+    return { text: "", kinds, stop };
+  }
+  const out = Array.isArray(json?.output) ? json.output : [];
+  const kinds = [...new Set(out.map(o => o?.type).filter(Boolean))].join("+") || "无内容";
+  const stop = json?.status || json?.incomplete_details?.reason || "?";
+  const text = out.filter(o => o?.type === "message")
+    .flatMap(o => (Array.isArray(o.content) ? o.content : []))
+    .filter(c => c?.type === "output_text")
+    .map(c => c.text || "").join("\n").trim();
+  if (text) return { text, kinds, stop };
+  const reasoning = out.filter(o => o?.type === "reasoning")
+    .flatMap(o => (Array.isArray(o.summary) ? o.summary : []))
+    .map(s => (typeof s === "string" ? s : s?.text || "")).join("\n").trim();
+  if (reasoning) return { text: reasoning.slice(0, 1200), kinds, stop, fromThinking: true };
+  return { text: "", kinds, stop };
+}
+
+// Ask the helper model to describe a base64 image. Returns { ok: true, text } or
+// { ok: false, reason } with a human-readable Chinese reason the caller can put in
+// front of the user. Client disconnects are RETHROWN, never turned into a failure:
+// a hang-up used to become a synthetic 502 that fooled the failover layer into
+// re-running the whole bridge against the next profile.
+// Uses the profile's real upstream + key (same auth). The helper call speaks the
+// SAME protocol as the profile it serves: Responses profiles ask /v1/responses
+// with input_image, Anthropic profiles ask /v1/messages with an image block.
+async function describeImageViaHelper(b64, helperModel, runtime, clientState, profileCfg, protocol, mediaType, timeoutMs) {
+  const timeout = timeoutMs || IMAGE_BRIDGE_CALL_TIMEOUT_MS;
+  const healthKey = `${runtime.upstreamUrl.host}|${helperModel}`;
+  const cooldown = bridgeHelperCooldown(healthKey);
+  if (cooldown > 0) return { ok: false, reason: `辅助模型 ${helperModel} 连续失败，冷却中（还剩 ${Math.ceil(cooldown / 1000)}s）` };
   const instruction = "你是图片描述助手。请用简体中文详细描述这张图片的内容，包括主体、布局、文字、颜色等，供另一个语言模型理解。只输出描述本身。";
   const mt = mediaType || "image/png";
   const isAnthropic = protocol === "anthropic";
-  const body = isAnthropic
+  const buildBody = (askNoThinking) => isAnthropic
     ? JSON.stringify({
         model: helperModel,
-        max_tokens: 1024,
+        // 4096, not 1024: a reasoning helper spends its budget on thinking first
+        // and truncates before any prose — leave room for both.
+        max_tokens: 4096,
         stream: false,
+        ...(askNoThinking ? { thinking: { type: "disabled" } } : {}),
         messages: [{ role: "user", content: [
           { type: "image", source: { type: "base64", media_type: mt, data: b64 } },
           { type: "text", text: instruction },
@@ -4325,37 +4476,57 @@ async function describeImageViaHelper(b64, helperModel, runtime, clientState, pr
         store: false,
         stream: false,
       });
-  const headers = {
-    "content-type": "application/json",
-    "content-length": Buffer.byteLength(body),
-    host: runtime.upstreamUrl.host,
-    authorization: `Bearer ${getRealKeyFromProfile(profileCfg)}`,
-  };
-  try {
-    const upRes = await sendUpstream(Buffer.from(body), isAnthropic ? "/v1/messages" : "/v1/responses", "POST", headers, 60000, runtime, clientState);
-    if (upRes.statusCode !== 200) {
-      console.log(`[图片桥接] 辅助调用失败 模型=${helperModel} status=${upRes.statusCode} body=${upRes.body.toString().slice(0, 200).replace(/\n/g, " ")}`);
-      return null;
+
+  for (let attempt = 0; ; attempt++) {
+    const askNoThinking = isAnthropic && attempt === 0 && !bridgeThinkingUnsupported.has(healthKey);
+    const body = buildBody(askNoThinking);
+    const headers = {
+      "content-type": "application/json",
+      "content-length": Buffer.byteLength(body),
+      host: runtime.upstreamUrl.host,
+      authorization: `Bearer ${getRealKeyFromProfile(profileCfg)}`,
+    };
+    let upRes;
+    try {
+      upRes = await sendUpstream(Buffer.from(body), isAnthropic ? "/v1/messages" : "/v1/responses", "POST", headers, timeout, runtime, clientState);
+    } catch (e) {
+      if (isClientAbortError(e)) throw e;
+      const reason = e.isTimeout ? `辅助模型超时（${Math.round(timeout / 1000)}s 未返回）` : `辅助模型连接失败：${e.message}`;
+      console.log(`[图片桥接] 辅助调用异常 模型=${helperModel} err=${e.message}`);
+      bridgeHelperNoteFailure(healthKey, reason);
+      return { ok: false, reason };
     }
-    const json = JSON.parse(upRes.body.toString());
-    const text = isAnthropic
-      ? (Array.isArray(json?.content) ? json.content : [])
-          .filter(c => c && c.type === "text")
-          .map(c => c.text || "")
-          .join("\n")
-          .trim()
-      : (json?.output || [])
-          .filter(o => o && o.type === "message")
-          .flatMap(o => (Array.isArray(o.content) ? o.content : []))
-          .filter(c => c && c.type === "output_text")
-          .map(c => c.text || "")
-          .join("\n")
-          .trim();
-    if (!text) console.log(`[图片桥接] 辅助返回空描述 模型=${helperModel} body=${upRes.body.toString().slice(0, 200).replace(/\n/g, " ")}`);
-    return text || null;
-  } catch (e) {
-    console.log(`[图片桥接] 辅助调用异常 模型=${helperModel} err=${e.message}`);
-    return null;
+    const snippet = () => upRes.body.toString().slice(0, 200).replace(/\s+/g, " ");
+    if (upRes.statusCode !== 200) {
+      // Some Anthropic-compatible upstreams reject an unknown `thinking` field:
+      // drop it once, remember that host+model, and retry instead of failing.
+      if (askNoThinking && upRes.statusCode < 500 && /thinking/i.test(snippet())) {
+        bridgeThinkingUnsupported.add(healthKey);
+        console.log(`[图片桥接] 上游不接受 thinking 字段，去掉后重试 模型=${helperModel}`);
+        continue;
+      }
+      console.log(`[图片桥接] 辅助调用失败 模型=${helperModel} status=${upRes.statusCode} body=${snippet()}`);
+      const reason = `辅助模型返回 ${upRes.statusCode}：${snippet().slice(0, 80)}`;
+      bridgeHelperNoteFailure(healthKey, reason);
+      return { ok: false, reason };
+    }
+    let json;
+    try { json = JSON.parse(upRes.body.toString()); } catch {
+      console.log(`[图片桥接] 辅助响应不是 JSON 模型=${helperModel} body=${snippet()}`);
+      const reason = "辅助模型响应不是合法 JSON";
+      bridgeHelperNoteFailure(healthKey, reason);
+      return { ok: false, reason };
+    }
+    const picked = pickHelperDescription(json, isAnthropic);
+    if (picked.text) {
+      if (picked.fromThinking) console.log(`[图片桥接] 辅助只给了思考过程，降级取思考文本 模型=${helperModel} stop_reason=${picked.stop}`);
+      bridgeHelperNoteSuccess(healthKey);
+      return { ok: true, text: picked.text };
+    }
+    console.log(`[图片桥接] 辅助返回空描述 模型=${helperModel} blocks=${picked.kinds} stop_reason=${picked.stop} body=${snippet()}`);
+    const reason = `辅助模型只返回 ${picked.kinds}、无描述正文（stop_reason=${picked.stop}）`;
+    bridgeHelperNoteFailure(healthKey, reason);
+    return { ok: false, reason };
   }
 }
 
@@ -4728,7 +4899,8 @@ function proxyRequest(req, res) {
             if (bridged) {
               cbody = bridged.body;
               reqHeaders["content-length"] = cbody.length;
-              console.log(`[图片桥接] ${getUserName(apiKey, cruntime)} 辅助模型=${bridged.helperModel} 已把图片转述后发往 ${creqModel}`);
+              const bs = bridged.stats;
+              console.log(`[图片桥接] ${getUserName(apiKey, cruntime)} 图 ${bs.total} 张（命中 ${bs.hit} / 新识 ${bs.got} / 占位 ${bs.ph} / 失败 ${bs.failed}）耗时 ${(bs.ms / 1000).toFixed(1)}s 辅助=${bridged.helperModel} → ${creqModel}`);
             }
           }
 
@@ -5658,6 +5830,10 @@ ${(() => { const mm = initialProfile.modelMultimodal || {}; const aliases = init
 </div>
 <div style="align-self:flex-end"><span class="note">勾选了「多模态」的别名收到图片会原样直通；未勾选的别名收到图片时（Claude Code 与 Codex 均生效），会自动用此辅助模型转述后再交给原模型。同图自动缓存，多轮对话不重复识别。辅助模型的每次新图片识别会产生少量额外 token。</span></div>
 </div>
+<div class="row" style="align-items:center;gap:10px;margin-top:6px">
+<button type="button" class="btn btn-outline btn-sm" onclick="clearImageBridgeCache()">清空转述缓存</button>
+<span class="note" id="ibCacheCount">${ibCacheRows()}</span>
+</div>
 </div>
 
 <h2>计费类型</h2>
@@ -6124,6 +6300,12 @@ async function clearRateLimitState(){
   const r=await fetch('/api/rate-limit/clear',{method:'POST',headers:csrfHeaders({})});
   if(r.ok){toast('限流状态已清除，各方案恢复参与 failover')}
   else{alert('清除失败')}
+}
+async function clearImageBridgeCache(){
+  if(!confirm('确定清空图片转述缓存？\\n缓存按图片本身共享给所有方案，清空后这些图片在下一轮对话会重新调用辅助模型识别（会产生额外 token）。'))return;
+  const r=await fetch('/api/image-bridge/cache/clear',{method:'POST',headers:csrfHeaders({})});
+  if(r.ok){const j=await r.json().catch(()=>({}));const el=document.getElementById('ibCacheCount');if(el)el.textContent='已缓存 0 张图片转述（全局共享，清空后这些图下一轮会重新识别）';toast('已清空 '+(j.cleared||0)+' 条图片转述缓存')}
+  else{alert('清空失败')}
 }
 function h(v){return String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
 function openDateTimePicker(input){if(typeof input.showPicker==='function'){try{input.showPicker()}catch{}}}
@@ -9343,9 +9525,11 @@ const server = http.createServer((req, res) => {
         clearInMemoryRequestState();
         reloadAllRuntimes();
         console.log("[DATA] All configuration and request data cleared");
+        // Audit before the ack: a destructive op must be on record by the time the
+        // caller is told it succeeded (recordAudit is fully guarded and cannot throw).
+        recordAdminAudit(req, "data.clear", "全局", "清空全部数据（方案、用户、密钥、配额、统计、错误），已自动备份；审计日志保留");
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ ok: true }));
-        recordAdminAudit(req, "data.clear", "全局", "清空全部数据（方案、用户、密钥、配额、统计、错误），已自动备份；审计日志保留");
       } catch (err) {
         res.writeHead(400, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ error: err.message }));
@@ -9847,6 +10031,28 @@ const server = http.createServer((req, res) => {
     persistRateLimitState();
     console.log(`[RateLimit] 已手动清除 ${cleared} 个方案的限流状态`);
     recordAdminAudit(req, "ratelimit.clear", "全局", `手动清除 ${cleared} 个方案的限流状态，立即恢复参与 failover`);
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ ok: true, cleared }));
+    return;
+  }
+
+  // Clear the image-bridge transcription cache (admin). Global on purpose:
+  // descriptions are keyed by the image itself and shared by every profile, so this
+  // is the escape hatch when a misconfigured helper model cached garbage.
+  if (req.method === "POST" && req.url === "/api/image-bridge/cache/clear") {
+    if (!checkAuth(req)) { res.writeHead(401); res.end("Unauthorized"); return; }
+    if (!checkCsrf(req)) { res.writeHead(403); res.end("CSRF validation failed"); return; }
+    let cleared = 0;
+    try {
+      cleared = stmts.bridgeCacheCount.get().n;
+      db.prepare("DELETE FROM image_bridge_cache").run();
+    } catch (err) {
+      res.writeHead(500, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ ok: false, error: err.message }));
+      return;
+    }
+    console.log(`[图片桥接] 已手动清空 ${cleared} 条图片转述缓存`);
+    recordAdminAudit(req, "imagebridge.cache.clear", "全局", `手动清空 ${cleared} 条图片转述缓存，涉及图片下一轮重新识别`);
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ ok: true, cleared }));
     return;

@@ -363,6 +363,21 @@ const removedOpenAIUserKeys = new Set();
   if (migrated) { saveConfig(config); console.log("[MIGRATE] Added profile config fields"); }
 })();
 
+// Auto-migrate: member gamification defaults — the daily check-in reward range
+// and the weekly cap on quota requests. Both stay admin-tunable in Settings;
+// this only seeds first-boot values.
+(function migrateCheckInAndRequestConfig() {
+  let migrated = false;
+  if (!config.checkIn || typeof config.checkIn !== "object") { config.checkIn = {}; migrated = true; }
+  if (config.checkIn.enabled === undefined) { config.checkIn.enabled = true; migrated = true; }
+  if (!Number.isInteger(config.checkIn.minTokens) || config.checkIn.minTokens < 0) { config.checkIn.minTokens = 10000; migrated = true; }
+  if (!Number.isInteger(config.checkIn.maxTokens) || config.checkIn.maxTokens < config.checkIn.minTokens) { config.checkIn.maxTokens = 100000; migrated = true; }
+  if (!config.quotaRequest || typeof config.quotaRequest !== "object") { config.quotaRequest = {}; migrated = true; }
+  if (config.quotaRequest.enabled === undefined) { config.quotaRequest.enabled = true; migrated = true; }
+  if (!Number.isInteger(config.quotaRequest.weeklyLimit) || config.quotaRequest.weeklyLimit < 0) { config.quotaRequest.weeklyLimit = 3; migrated = true; }
+  if (migrated) { saveConfig(config); console.log("[MIGRATE] Added check-in / quota-request defaults"); }
+})();
+
 // ─── Quota Pools ─────────────────────────────────────────────────────────────
 // A quota pool is the billing boundary: the profiles inside it draw from ONE
 // allowance. This exists because several profiles routinely share a single
@@ -1404,6 +1419,26 @@ function initDb() {
       ip TEXT
     );
     CREATE INDEX IF NOT EXISTS idx_audit_time ON audit_log(time);
+    CREATE TABLE IF NOT EXISTS check_ins (
+      user_key TEXT NOT NULL, date TEXT NOT NULL,
+      amount INTEGER NOT NULL,
+      pools TEXT NOT NULL DEFAULT '[]',
+      created_at TEXT,
+      PRIMARY KEY (user_key, date)
+    );
+    CREATE TABLE IF NOT EXISTS quota_requests (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_key TEXT NOT NULL,
+      username TEXT,
+      reason TEXT,
+      amount INTEGER,
+      status TEXT NOT NULL DEFAULT 'pending',
+      admin_note TEXT,
+      created_at TEXT NOT NULL,
+      handled_at TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_quota_requests_user ON quota_requests(user_key, id);
+    CREATE INDEX IF NOT EXISTS idx_quota_requests_status ON quota_requests(status, id);
   `);
 
   // ── Column migration: weighted_tokens (peak/off-peak quota weighting) ──
@@ -1431,6 +1466,37 @@ function initDb() {
     });
     tx();
     console.log(`[MIGRATE] weighted_tokens added + backfilled: ${weightedTargets.join(", ")}`);
+  }
+
+  // ── Column migration: audit_log.category (explicit log-type separation) ──
+  // Entries used to be classified by deriving actor/action prefixes at query
+  // time — fine while every entry was admin or system. Member-facing actions
+  // (check-in, quota requests) add log types that don't fit that dichotomy, so
+  // the type becomes an explicit column. Legacy rows are backfilled with the
+  // exact derivation the old queries used, so old filters stay equivalent.
+  const auditCols = db.prepare("PRAGMA table_info(audit_log)").all().map(c => c.name);
+  if (auditCols.length > 0 && !auditCols.includes("category")) {
+    const backup = backupDatabaseSync("audit-category-migration");
+    if (backup) console.log(`[MIGRATE] Pre-migration backup: ${path.basename(backup)}`);
+    const tx = db.transaction(() => {
+      db.exec("ALTER TABLE audit_log ADD COLUMN category TEXT NOT NULL DEFAULT 'admin'");
+      db.exec("UPDATE audit_log SET category = 'auth' WHERE action LIKE 'auth.%'");
+      db.exec("UPDATE audit_log SET category = 'system' WHERE actor = 'system' AND action NOT LIKE 'auth.%'");
+    });
+    tx();
+    console.log("[MIGRATE] audit_log.category added + backfilled (admin/system/auth)");
+  }
+
+  // ── Column migration: quota_requests.pool (the member picks the pool) ──
+  const qrCols = db.prepare("PRAGMA table_info(quota_requests)").all().map(c => c.name);
+  if (qrCols.length > 0 && !qrCols.includes("pool")) {
+    const backup = backupDatabaseSync("quota-request-pool-migration");
+    if (backup) console.log(`[MIGRATE] Pre-migration backup: ${path.basename(backup)}`);
+    const tx = db.transaction(() => {
+      db.exec("ALTER TABLE quota_requests ADD COLUMN pool TEXT");
+    });
+    tx();
+    console.log("[MIGRATE] quota_requests.pool added");
   }
 
   // ── Table migration: quota_daily_ops keyed by pool instead of profile ──
@@ -1538,9 +1604,16 @@ function initDb() {
   stmts.deleteQuotaDailyOp = db.prepare(`DELETE FROM quota_daily_ops WHERE pool=? AND user_key=? AND date=?`);
   stmts.pruneQuotaDailyOps = db.prepare(`DELETE FROM quota_daily_ops WHERE date < ?`);
   stmts.upsertMeta = db.prepare(`INSERT INTO kv_meta (key,value) VALUES (@k,@v) ON CONFLICT(key) DO UPDATE SET value=excluded.value`);
-  stmts.insertAudit = db.prepare(`INSERT INTO audit_log (time,actor,action,target,detail,ip)
-    VALUES (@time,@actor,@action,@target,@detail,@ip)`);
-  stmts.trimAudit = db.prepare(`DELETE FROM audit_log WHERE id NOT IN (SELECT id FROM audit_log ORDER BY id DESC LIMIT 1000)`);
+  stmts.insertAudit = db.prepare(`INSERT INTO audit_log (time,actor,action,target,detail,ip,category)
+    VALUES (@time,@actor,@action,@target,@detail,@ip,@category)`);
+  // Check-ins land once per user per day, so the audit trail grows faster now;
+  // raise the cap so admin/system entries don't age out too quickly. (check_ins
+  // itself keeps the complete, untrimmed check-in history.)
+  stmts.trimAudit = db.prepare(`DELETE FROM audit_log WHERE id NOT IN (SELECT id FROM audit_log ORDER BY id DESC LIMIT 3000)`);
+  stmts.insertCheckIn = db.prepare(`INSERT INTO check_ins (user_key,date,amount,pools,created_at)
+    VALUES (@key,@date,@amount,@pools,@createdAt)`);
+  stmts.insertQuotaRequest = db.prepare(`INSERT INTO quota_requests (user_key,username,reason,pool,status,created_at)
+    VALUES (@key,@username,@reason,@pool,'pending',@createdAt)`);
 
   // ── Read statements ──
   // Single-profile variant of the pooled usage query above; still used where the
@@ -1565,6 +1638,21 @@ function initDb() {
   stmts.auditTotalAdmin = db.prepare(`SELECT COUNT(*) AS c FROM audit_log WHERE actor='admin' AND action NOT LIKE 'auth.%'`);
   stmts.auditTotalSystem = db.prepare(`SELECT COUNT(*) AS c FROM audit_log WHERE actor='system'`);
   stmts.auditTotalAuth = db.prepare(`SELECT COUNT(*) AS c FROM audit_log WHERE action LIKE 'auth.%'`);
+  stmts.auditPageForCategory = db.prepare(`SELECT * FROM audit_log WHERE category=? ORDER BY id DESC LIMIT ? OFFSET ?`);
+  stmts.auditTotalForCategory = db.prepare(`SELECT COUNT(*) AS c FROM audit_log WHERE category=?`);
+  // ── Check-in & quota-request reads ──
+  stmts.getCheckIn = db.prepare(`SELECT * FROM check_ins WHERE user_key=? AND date=?`);
+  stmts.checkInDatesSince = db.prepare(`SELECT date FROM check_ins WHERE user_key=? AND date>=? ORDER BY date DESC`);
+  stmts.checkInTotals = db.prepare(`SELECT COUNT(*) AS days, COALESCE(SUM(amount),0) AS tokens FROM check_ins WHERE user_key=?`);
+  stmts.getQuotaRequest = db.prepare(`SELECT * FROM quota_requests WHERE id=?`);
+  stmts.listQuotaRequests = db.prepare(`SELECT * FROM quota_requests ORDER BY id DESC LIMIT ?`);
+  stmts.listQuotaRequestsByStatus = db.prepare(`SELECT * FROM quota_requests WHERE status=? ORDER BY id DESC LIMIT ?`);
+  stmts.countQuotaRequestsSince = db.prepare(`SELECT COUNT(*) AS c FROM quota_requests WHERE user_key=? AND created_at>=?`);
+  // The weekly cap counts requests the admin has HANDLED, not submissions.
+  stmts.countHandledQuotaRequestsSince = db.prepare(`SELECT COUNT(*) AS c FROM quota_requests WHERE user_key=? AND status='handled' AND handled_at>=?`);
+  stmts.myQuotaRequests = db.prepare(`SELECT id,reason,pool,status,admin_note,created_at,handled_at FROM quota_requests WHERE user_key=? ORDER BY id DESC LIMIT 5`);
+  stmts.updateQuotaRequest = db.prepare(`UPDATE quota_requests SET status=@status, admin_note=@note, handled_at=@handledAt WHERE id=@id`);
+  stmts.countPendingQuotaRequests = db.prepare(`SELECT COUNT(*) AS c FROM quota_requests WHERE status='pending'`);
 }
 
 // ── Pruning (called once a day via a lazy check) ──
@@ -3110,7 +3198,21 @@ function recordError(apiKey, statusCode, errorMessage, path, model, suffix, _rt)
 // ─── Audit Log ────────────────────────────────────────────────────────────────
 // Every config mutation and runtime state transition (failover / breaker /
 // rate-limit / auto quota) lands here. Never throws into the caller.
-function recordAudit(actor, action, target, detail, ip) {
+// Explicit log types. Legacy entries (and any caller that omits `category`)
+// keep the historical derivation: auth.* prefix → auth, system actor → system,
+// everything else → admin. checkin / request are always written explicitly by
+// the check-in and quota-request flows.
+function deriveAuditCategory(actor, action) {
+  if (action && action.startsWith("auth.")) return "auth";
+  if (actor === "system") return "system";
+  if (actor === "user") {
+    if (action && action.startsWith("checkin.")) return "checkin";
+    if (action && action.startsWith("request.")) return "request";
+  }
+  return "admin";
+}
+
+function recordAudit(actor, action, target, detail, ip, category) {
   try {
     const time = new Date().toISOString();
     stmts.insertAudit.run({
@@ -3120,6 +3222,7 @@ function recordAudit(actor, action, target, detail, ip) {
       target: String(target || ""),
       detail: String(detail || ""),
       ip: String(ip || ""),
+      category: category || deriveAuditCategory(actor, action),
     });
     stmts.trimAudit.run();
     // Best-effort push of system failure/recovery events; must never affect the
@@ -3131,13 +3234,277 @@ function recordAudit(actor, action, target, detail, ip) {
   }
 }
 
-function recordAdminAudit(req, action, target, detail) {
-  recordAudit("admin", action, target, detail, getClientIp(req));
+function recordAdminAudit(req, action, target, detail, category) {
+  recordAudit("admin", action, target, detail, getClientIp(req), category);
 }
 
 function maskAuditKey(key) {
   const s = String(key || "");
   return s.length > 8 ? s.slice(0, 8) + "****" : s;
+}
+
+// ─── Daily Check-in & Quota Requests (member gamification) ───────────────────
+// Both features share one shape: the member acts from the personal usage page
+// with their virtual key, the effect lands in quota_daily_ops / quota_requests,
+// and every action is audited under its own log type (checkin / request) so it
+// never mixes into the admin/system trail.
+
+// Resolve a member key against the shared global-users map. check_ins /
+// quota_requests store the FULL virtual key (not the 12-char truncated form),
+// so every read path goes through this first.
+function resolveGlobalUserKey(apiKey) {
+  const full = String(apiKey || "");
+  const short = full.slice(0, 12);
+  for (const runtime of Object.values(runtimes)) {
+    if (runtime.globalUsers[full]) return full;
+    if (runtime.globalUsers[short]) return short;
+  }
+  return null;
+}
+
+// Distinct pools behind the profiles this user can actually use. The check-in
+// reward is ONE random draw applied to every pool ("为 N 个池各 +X"), not an
+// independent draw per pool, so the reward reads as a single number.
+function getUserPoolNames(apiKey) {
+  const out = [];
+  const seen = new Set();
+  for (const p of getAccessibleProfiles(apiKey)) {
+    const poolName = getPoolForSuffix(p.suffix)?.name;
+    if (poolName && !seen.has(poolName)) { seen.add(poolName); out.push(poolName); }
+  }
+  return out;
+}
+
+function poolLabelOf(name) {
+  return config.quotaPools?.[name]?.label || name;
+}
+
+// Check-in streak counted in Beijing days. If today isn't checked in yet, the
+// count still anchors on yesterday — the flame shows what's at stake today,
+// not an instant reset at midnight.
+function getCheckInStatus(apiKey) {
+  const key = resolveGlobalUserKey(apiKey);
+  if (!key) return { available: false };
+  const today = cnDate();
+  const row = stmts.getCheckIn.get(key, today);
+  const totals = stmts.checkInTotals.get(key);
+  const since = cnNow(Date.now() - 400 * 86400000).toISOString().slice(0, 10);
+  const dates = new Set(stmts.checkInDatesSince.all(key, since).map(r => r.date));
+  let cursor = row ? today : cnNow(Date.now() - 86400000).toISOString().slice(0, 10);
+  let streak = 0;
+  while (dates.has(cursor)) {
+    streak++;
+    cursor = cnNow(new Date(`${cursor}T12:00:00Z`).getTime() - 86400000).toISOString().slice(0, 10);
+  }
+  const ci = config.checkIn || {};
+  return {
+    available: true,
+    enabled: ci.enabled !== false,
+    checkedInToday: !!row,
+    todayAmount: row ? (row.amount || 0) : 0,
+    todayPools: (() => { try { return JSON.parse(row?.pools || "[]"); } catch { return []; } })(),
+    streak,
+    totalCheckIns: totals.days || 0,
+    totalTokens: totals.tokens || 0,
+    minTokens: Number.isInteger(ci.minTokens) ? ci.minTokens : 0,
+    maxTokens: Number.isInteger(ci.maxTokens) ? ci.maxTokens : 0,
+  };
+}
+
+// One check-in per user per Beijing day, enforced by the (user_key, date)
+// primary key — the INSERT inside the transaction is the second line of
+// defence if two requests race past the pre-check.
+function performCheckIn(apiKey, ip) {
+  if (config.checkIn?.enabled === false) throw new Error("签到功能未开启");
+  const key = resolveGlobalUserKey(apiKey);
+  if (!key) throw new Error("无效的用户 Key");
+  const gu = getGlobalUser(key);
+  if (!gu) throw new Error("无效的用户 Key");
+  if (gu.disabled) throw new Error("账号已被禁用，无法签到");
+  if (checkKeyExpired(key)) throw new Error("账号已过期，无法签到");
+  const today = cnDate();
+  if (stmts.getCheckIn.get(key, today)) throw new Error("今日已签到，明天再来吧");
+
+  const min = Math.max(0, Number.isInteger(config.checkIn?.minTokens) ? config.checkIn.minTokens : 0);
+  const max = Math.max(min, Number.isInteger(config.checkIn?.maxTokens) ? config.checkIn.maxTokens : min);
+  const amount = min + Math.floor(Math.random() * (max - min + 1));
+
+  const poolNames = getUserPoolNames(apiKey);
+  const now = new Date().toISOString();
+  const tx = db.transaction(() => {
+    stmts.insertCheckIn.run({ key, date: today, amount, pools: JSON.stringify(poolNames), createdAt: now });
+    for (const poolName of poolNames) {
+      const op = stmts.getQuotaDailyOp.get(poolName, key, today) || {};
+      // ACCUMULATE, never overwrite: an admin's manual bonus and the check-in
+      // reward must coexist — both are "extra allowance for today".
+      stmts.upsertQuotaDailyOp.run({
+        pool: poolName, key, date: today,
+        bonus: (op.bonus || 0) + amount,
+        baseline: op.reset_baseline || 0,
+        resetTime: op.reset_time || null,
+        updatedAt: now,
+      });
+    }
+  });
+  tx();
+
+  const labels = poolNames.map(poolLabelOf);
+  const username = gu.username || maskAuditKey(key);
+  recordAudit("user", "checkin.success", username,
+    `每日签到：获得 ${amount.toLocaleString()} token，已加入 ${poolNames.length} 个额度池的今日临时加量${labels.length ? `（${labels.join("、")}）` : ""}，明日自动失效`,
+    ip, "checkin");
+  console.log(`[签到] ${username} +${amount.toLocaleString()} token × ${poolNames.length} 个池`);
+  return { ...getCheckInStatus(apiKey), amount, pools: labels };
+}
+
+// Week window starts Monday 00:00 Beijing time — the same clock the quota
+// system counts days in. Returns an ISO timestamp usable in >= comparisons.
+function cnWeekStartIso(nowMs = Date.now()) {
+  const shifted = cnNow(nowMs);
+  const dow = (shifted.getUTCDay() + 6) % 7; // Monday = 0
+  const mondayShiftedMidnight = Date.UTC(shifted.getUTCFullYear(), shifted.getUTCMonth(), shifted.getUTCDate() - dow);
+  return new Date(mondayShiftedMidnight - 8 * 3600000).toISOString();
+}
+
+// Today 00:00 Beijing as ISO — anchors the fixed "one submission per day" rule.
+function cnDayStartIso(nowMs = Date.now()) {
+  const shifted = cnNow(nowMs);
+  const dayStart = Date.UTC(shifted.getUTCFullYear(), shifted.getUTCMonth(), shifted.getUTCDate());
+  return new Date(dayStart - 8 * 3600000).toISOString();
+}
+
+function quotaRequestWeeklyLimit() {
+  return Math.max(0, Number.isInteger(config.quotaRequest?.weeklyLimit) ? config.quotaRequest.weeklyLimit : 3);
+}
+
+function getQuotaRequestStatus(apiKey) {
+  const key = resolveGlobalUserKey(apiKey);
+  if (!key) return { available: false };
+  const weeklyLimit = quotaRequestWeeklyLimit();
+  const handled = stmts.countHandledQuotaRequestsSince.get(key, cnWeekStartIso()).c;
+  const todaySubmitted = stmts.countQuotaRequestsSince.get(key, cnDayStartIso()).c > 0;
+  return {
+    available: true,
+    enabled: config.quotaRequest?.enabled !== false,
+    weeklyLimit,
+    handledThisWeek: handled,
+    remaining: Math.max(0, weeklyLimit - handled),
+    todaySubmitted,
+    pools: getUserPoolNames(apiKey).map(n => ({ name: n, label: poolLabelOf(n), limited: (getUserPoolQuota(n, key) || getPoolQuota(n)) > 0 })),
+    myRecent: stmts.myQuotaRequests.all(key).map(r => ({
+      id: r.id, reason: r.reason, pool: r.pool, poolLabel: r.pool ? poolLabelOf(r.pool) : "",
+      status: r.status, adminNote: r.admin_note, createdAt: r.created_at, handledAt: r.handled_at,
+    })),
+  };
+}
+
+// A request is a notification, not an entitlement: it lands in the admin's
+// queue (webhook + 设置页「加量申请」), the admin grants quota with the
+// existing tools, then marks the request handled/rejected.
+// Submission rules: the member picks WHICH pool (the admin decides how much),
+// at most one submission per Beijing day (fixed rule), and submitting is free —
+// only requests the admin has handled count against the weekly cap.
+function createQuotaRequest(apiKey, reason, pool, ip) {
+  if (config.quotaRequest?.enabled === false) throw new Error("加量申请功能未开启");
+  const key = resolveGlobalUserKey(apiKey);
+  if (!key) throw new Error("无效的用户 Key");
+  const gu = getGlobalUser(key);
+  if (!gu) throw new Error("无效的用户 Key");
+  if (gu.disabled) throw new Error("账号已被禁用");
+  if (checkKeyExpired(key)) throw new Error("账号已过期");
+  const reasonText = String(reason || "").trim().slice(0, 200);
+  if (!reasonText) throw new Error("请填写申请理由");
+  if (stmts.countQuotaRequestsSince.get(key, cnDayStartIso()).c > 0) {
+    throw new Error("今天已经提交过申请了，每天限 1 次，明天再来");
+  }
+  const poolName = String(pool || "").trim();
+  if (!getUserPoolNames(apiKey).includes(poolName)) throw new Error("请选择你要申请加量的额度池");
+  // An unlimited pool has nothing to grant — reject up front instead of letting
+  // the request reach the admin queue just to be bounced there.
+  const poolBase = getUserPoolQuota(poolName, key) || getPoolQuota(poolName);
+  if (poolBase <= 0) throw new Error(`额度池「${poolLabelOf(poolName)}」当前不限量，无需申请加量`);
+  const weeklyLimit = quotaRequestWeeklyLimit();
+  const handled = stmts.countHandledQuotaRequestsSince.get(key, cnWeekStartIso()).c;
+  if (handled >= weeklyLimit) throw new Error(`本周已有 ${handled} 次申请被处理，达到每周上限 ${weeklyLimit} 次，下周一刷新`);
+
+  const now = new Date().toISOString();
+  const username = gu.username || maskAuditKey(key);
+  stmts.insertQuotaRequest.run({ key, username, reason: reasonText, pool: poolName, createdAt: now });
+  recordAudit("user", "request.create", username,
+    `申请额度池「${poolLabelOf(poolName)}」加量，理由「${reasonText}」（本周已处理 ${handled}/${weeklyLimit} 次）`,
+    ip, "request");
+  try { notifyQuotaRequest({ username, reason: reasonText, pool: poolLabelOf(poolName), handledThisWeek: handled, weeklyLimit }); }
+  catch (err) { console.error("[通知] 加量申请推送失败:", err.message); }
+  console.log(`[加量申请] ${username}：「${reasonText}」@${poolLabelOf(poolName)}`);
+  const status = getQuotaRequestStatus(apiKey);
+  return { ...status, justCreated: true };
+}
+
+// Admin-side status transition. `handled` means quota was granted (the admin
+// does that with the regular pool tools), `rejected` means refused with a note.
+function updateQuotaRequest(id, status, note) {
+  const row = stmts.getQuotaRequest.get(id);
+  if (!row) throw new Error(`申请 #${id} 不存在`);
+  if (row.status !== "pending") throw new Error(`申请 #${id} 已处理过（当前状态 ${row.status}）`);
+  if (!["handled", "rejected"].includes(status)) throw new Error("status 必须为 handled | rejected");
+  const noteText = String(note || "").trim().slice(0, 200);
+  stmts.updateQuotaRequest.run({ id, status, note: noteText, handledAt: new Date().toISOString() });
+  return row;
+}
+
+// Push a new quota request through the configured notifier channels. Unlike
+// system failure events this is business traffic the admin asked for, so no
+// cooldown — the weekly per-user cap already bounds the volume.
+function notifyQuotaRequest(info) {
+  const cfg = config.notifier || {};
+  if (!cfg.enabled) return;
+  const channels = NOTIFY_SENDERS.filter(s => s.enabled(cfg));
+  if (!channels.length) return;
+  const msg = `【加量申请】${info.username}\n申请额度池：${info.pool}\n理由：${info.reason}\n请到 设置 → 加量申请 处理（该成员本周已处理 ${info.handledThisWeek}/${info.weeklyLimit} 次）\n—— ${beijingTimeString()}（token-monitor）`;
+  for (const s of channels) {
+    s.send(cfg, msg)
+      .then(() => console.log(`[通知] 已推送 ${s.channel}: 加量申请 ${info.username}`))
+      .catch(err => console.error(`[通知] ${s.channel} 推送失败: ${err.message}`));
+  }
+}
+
+// ── Usage calendar (GitHub-style heatmap) ──
+// usage_daily keeps one row per (profile, date, user_key) forever, so the
+// calendar is a plain GROUP BY over the last 53 weeks. Rows are sparse (only
+// days with traffic); the frontend fills the gaps so every calendar cell exists.
+const heatmapStmts = new Map();
+function usageHeatmapRows(key, suffixes, startDate) {
+  if (!suffixes.length) return [];
+  let stmt = heatmapStmts.get(suffixes.length);
+  if (!stmt) {
+    const holes = suffixes.map(() => "?").join(",");
+    stmt = db.prepare(`SELECT date, SUM(input_tokens+output_tokens) AS total, SUM(weighted_tokens) AS weighted, SUM(requests) AS requests
+      FROM usage_daily WHERE user_key=? AND date>=? AND profile IN (${holes}) GROUP BY date ORDER BY date`);
+    heatmapStmts.set(suffixes.length, stmt);
+  }
+  return stmt.all(key, startDate, ...suffixes);
+}
+
+function buildUsageHeatmap(apiKey, suffixes) {
+  const key = resolveGlobalUserKey(apiKey);
+  if (!key) return { days: [], summary: null };
+  const startDate = cnNow(Date.now() - 370 * 86400000).toISOString().slice(0, 10);
+  const days = usageHeatmapRows(key, suffixes, startDate).map(r => ({
+    date: r.date, total: r.total || 0, weighted: r.weighted || 0, requests: r.requests || 0,
+  }));
+  let totalTokens = 0, activeDays = 0, maxDay = null, longestStreak = 0, run = 0;
+  for (const d of days) {
+    totalTokens += d.total;
+    activeDays++;
+    if (!maxDay || d.total > maxDay.total) maxDay = d;
+    if (d.total > 0) { run++; if (run > longestStreak) longestStreak = run; } else run = 0;
+  }
+  return {
+    startDate,
+    endDate: cnDate(),
+    days,
+    summary: { totalTokens, activeDays, maxDay, longestStreak },
+  };
 }
 
 // ─── Request Log (daily JSONL files under logs/) ──────────────────────────────
@@ -3613,8 +3980,17 @@ function getPersonalUsageData(apiKey, requestedProfile = "all", protocol = "") {
     availableProfiles = availableProfiles.filter(p => p.protocol === protocol);
   }
 
+  // Member-facing features ride along on every response: check-in state,
+  // quota-request state, and the usage calendar scoped to the current view.
+  const memberExtras = {
+    checkin: getCheckInStatus(apiKey),
+    quotaRequest: getQuotaRequestStatus(apiKey),
+  };
+
   if (profile === "all") {
-    return { username, availableProfiles, protocolView: protocol || null, ...getAggregatedPersonalUsage(apiKey, availableProfiles) };
+    return { username, availableProfiles, protocolView: protocol || null, ...memberExtras,
+      ...getAggregatedPersonalUsage(apiKey, availableProfiles),
+      heatmap: buildUsageHeatmap(apiKey, availableProfiles.map(p => p.suffix)) };
   }
 
   const suffix = normalizeProfileSuffix(profile);
@@ -3624,7 +4000,9 @@ function getPersonalUsageData(apiKey, requestedProfile = "all", protocol = "") {
     err.statusCode = 403;
     throw err;
   }
-  return { username, availableProfiles, ...getProfilePersonalUsage(apiKey, suffix, runtime) };
+  return { username, availableProfiles, ...memberExtras,
+    ...getProfilePersonalUsage(apiKey, suffix, runtime),
+    heatmap: buildUsageHeatmap(apiKey, [suffix]) };
 }
 
 // ─── API Proxy ───────────────────────────────────────────────────────────────
@@ -4817,6 +5195,8 @@ function getPublicSettings() {
     hasPassword: !!dashboardPassword,
     profileQuota: getPoolQuota(defaultPool.name),
     autoQuotaAdjust: config.autoQuotaAdjust || {},
+    checkIn: config.checkIn || {},
+    quotaRequest: config.quotaRequest || {},
   };
 }
 
@@ -4945,6 +5325,10 @@ body{padding:0;overflow:hidden;height:100vh}
 .sidebar-global{padding:10px 12px;border-top:1px solid var(--border);background:var(--surface)}
 .sidebar-nav{display:grid;grid-template-columns:1fr 1fr 1fr;gap:4px;padding:8px 12px;border-top:1px solid var(--border);background:var(--surface)}
 .sidebar-nav .nav-btn{font-size:11px;font-weight:600;padding:7px 4px;border:1px solid var(--border);border-radius:6px;background:var(--surface);color:var(--dim);cursor:pointer;text-align:center;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.seg{display:inline-flex;border:1px solid var(--border);border-radius:6px;overflow:hidden;background:var(--bg)}
+.seg button{font-size:11.5px;font-weight:600;padding:5px 12px;border:none;background:transparent;color:var(--dim);cursor:pointer}
+.seg button+button{border-left:1px solid var(--border)}
+.seg button.on{background:var(--accent-soft);color:var(--accent)}
 .sidebar-nav .nav-btn:hover{border-color:var(--border-strong);background:var(--surface-subtle);color:var(--text)}
 .sidebar-nav .nav-btn.active{border-color:var(--accent);background:var(--accent-soft);color:var(--accent)}
 /* Popover listing not-yet-grouped profiles, anchored right of a failover group.
@@ -5095,6 +5479,7 @@ td{padding:8px;border-bottom:1px solid #ecece8;font-size:12px}
   <button type="button" class="nav-btn" id="quotaPoolNav" onclick="openQuotaPoolView()" title="额度池（${quotaPoolCount} 个池）——共享额度与定价">额度池</button>
   <button type="button" class="nav-btn" id="dataManagementNav" onclick="openDataManagementView()" title="全局数据管理——导入、备份与清空">数据管理</button>
   <button type="button" class="nav-btn" id="auditLogNav" onclick="openAuditLogView()" title="操作日志——谁在何时改了什么">操作日志</button>
+  <button type="button" class="nav-btn" id="quotaRequestNav" onclick="openQuotaRequestView()" title="加量申请——成员发起的用量增加申请">加量申请<span id="qrPendingBadge" style="display:none;margin-left:6px;background:var(--orange);color:#fff;border-radius:8px;font-size:10px;padding:1px 6px;vertical-align:1px"></span></button>
 </div>
 <div class="sidebar-ft" style="display:flex;gap:6px"><button class="btn btn-outline btn-sm" onclick="openUserModal()" style="flex:1">用户管理</button><button class="btn btn-outline btn-sm" onclick="openProfileModal()" style="flex:1">新增方案</button></div>
 </div>
@@ -5304,6 +5689,24 @@ ${(() => {
 </div>
 ${((() => { const qa = stmts.quotaAdjustRecent.all(); return qa.length > 0 ? `<h4 style="font-size:13px;color:var(--accent);margin:16px 0 8px">调整历史</h4><table style="width:100%;border-collapse:collapse;font-size:12px"><thead><tr><th style="text-align:left;padding:4px 8px;border-bottom:1px solid var(--border)">时间</th><th style="text-align:left;padding:4px 8px;border-bottom:1px solid var(--border)">用户</th><th style="text-align:left;padding:4px 8px;border-bottom:1px solid var(--border)">方式</th><th style="text-align:right;padding:4px 8px;border-bottom:1px solid var(--border)">旧配额</th><th style="text-align:right;padding:4px 8px;border-bottom:1px solid var(--border)">新配额</th><th style="text-align:right;padding:4px 8px;border-bottom:1px solid var(--border)">命中率</th><th style="text-align:right;padding:4px 8px;border-bottom:1px solid var(--border)">日均用量</th></tr></thead><tbody>${qa.map(h => `<tr><td style="padding:4px 8px">${h.date}</td><td style="padding:4px 8px">${h.user_name || h.user_key.slice(0, 8)}</td><td style="padding:4px 8px">${h.auto === 0 ? '<span style="color:var(--accent);border:1px solid var(--accent);border-radius:3px;padding:0 4px;font-size:11px" title="管理员当日临时加量，次日自动失效">手动·当日</span>' : '<span style="color:var(--dim)">自动</span>'}</td><td style="text-align:right;padding:4px 8px">${(h.old_quota || 0).toLocaleString()}</td><td style="text-align:right;padding:4px 8px;color:var(--green)">${(h.new_quota || 0).toLocaleString()}</td><td style="text-align:right;padding:4px 8px">${h.auto === 0 ? "-" : Math.round((h.hit_rate || 0) * 100) + "%"}</td><td style="text-align:right;padding:4px 8px">${h.auto === 0 ? "-" : (h.avg_daily_usage || 0).toLocaleString()}</td></tr>`).join("")}</tbody></table>` : '<div class="note" style="margin-top:8px">暂无调整记录</div>'; })())}
 </div>
+<h2>签到与加量申请 <span style="font-size:11px;color:var(--dim);font-weight:400">成员在「我的用量」页可用的趣味功能</span></h2>
+<div class="section">
+<div style="display:grid;grid-template-columns:1fr 1fr;gap:18px">
+<div style="border-right:1px solid var(--border);padding-right:18px">
+<label style="display:flex;align-items:center;gap:6px;cursor:pointer"><input type="checkbox" name="checkInEnabled" ${s.checkIn?.enabled !== false ? "checked" : ""} style="width:auto"> 启用每日签到</label>
+<div class="note" style="margin:8px 0 12px">成员每天可签到一次，随机奖励一定量 token，自动加入其所有额度池的当日临时加量（明日自动失效，与手工加量累加）。</div>
+<div style="display:grid;grid-template-columns:1fr 1fr;gap:10px">
+<div><label>随机奖励最小（token）</label><input type="number" name="checkInMin" value="${s.checkIn?.minTokens ?? 10000}" min="0" step="1000"></div>
+<div><label>随机奖励最大（token）</label><input type="number" name="checkInMax" value="${s.checkIn?.maxTokens ?? 100000}" min="0" step="1000"></div>
+</div>
+</div>
+<div>
+<label style="display:flex;align-items:center;gap:6px;cursor:pointer"><input type="checkbox" name="quotaRequestEnabled" ${s.quotaRequest?.enabled !== false ? "checked" : ""} style="width:auto"> 启用加量申请</label>
+<div class="note" style="margin:8px 0 12px">成员可在「我的用量」页选择额度池申请加量（每人每天限提交 1 次，提交不占次数）；新申请通过通知渠道推送给你，并在侧栏「加量申请」里处理。</div>
+<div><label>每人每周处理上限（次）</label><input type="number" name="quotaRequestWeeklyLimit" value="${s.quotaRequest?.weeklyLimit ?? 3}" min="0" max="1000"><span class="note">次 / 周 · 管理员处理后计入，周一刷新（设为 0 相当于关闭）</span></div>
+</div>
+</div>
+</div>
 <div class="actions" style="position:static;padding:12px 0;background:transparent;border-top:0">
 <button type="submit" class="btn btn-primary">保存全局配置</button>
 </div>
@@ -5437,14 +5840,16 @@ ${(() => {
 </div>
 
 <div id="auditLogView" hidden aria-hidden="true">
-<div class="note" style="margin-bottom:12px">记录全部管理操作与系统自动事件（failover 切换/恢复、熔断、限流、自动配额调整）。最多保留最近 1000 条；「清空全部数据」不会删除审计记录。</div>
+<div class="note" style="margin-bottom:12px">记录全部管理操作、系统自动事件（failover 切换/恢复、熔断、限流、自动配额调整）与成员动作（每日签到、加量申请），按类型筛选互不混杂。最多保留最近 3000 条；「清空全部数据」不会删除审计记录。</div>
 <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:12px">
-  <select id="auditFilter" onchange="switchAuditFilter()" style="background:var(--bg);border:1px solid var(--border);color:var(--text);padding:5px 8px;border-radius:4px;font-size:12px">
-    <option value="">全部记录</option>
-    <option value="admin">管理操作</option>
-    <option value="system">系统自动事件</option>
-    <option value="auth">认证事件</option>
-  </select>
+  <div class="seg" id="auditFilter" role="group" aria-label="日志类型筛选">
+    <button type="button" class="on" data-cat="" onclick="switchAuditFilter('')">全部</button>
+    <button type="button" data-cat="admin" onclick="switchAuditFilter('admin')">管理操作</button>
+    <button type="button" data-cat="system" onclick="switchAuditFilter('system')">系统事件</button>
+    <button type="button" data-cat="auth" onclick="switchAuditFilter('auth')">认证事件</button>
+    <button type="button" data-cat="checkin" onclick="switchAuditFilter('checkin')">签到记录</button>
+    <button type="button" data-cat="request" onclick="switchAuditFilter('request')">加量申请</button>
+  </div>
   <button type="button" class="btn btn-outline btn-sm" onclick="loadAuditLog(true)">刷新</button>
   <span class="inline-status" id="auditStatus" role="status"></span>
 </div>
@@ -5456,6 +5861,42 @@ ${(() => {
 </div>
 <div style="display:flex;justify-content:center;margin-top:12px">
   <button type="button" class="btn btn-outline btn-sm" id="auditMoreBtn" onclick="loadMoreAudit()" hidden>加载更多</button>
+</div>
+</div>
+
+<div id="quotaRequestView" hidden aria-hidden="true">
+<div class="note" style="margin-bottom:12px">成员从「我的用量」页发起的加量申请（每人每天限提交 1 次，提交不占用次数；每周处理上限在「签到与加量申请」设置中配置）。「发放加量」将奖励以当日临时加量发到其指定的额度池（明日自动失效），并自动标记该申请为已处理；驳回时可留一句备注，成员在其页面可见。</div>
+<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:12px">
+  <div class="seg" id="qrFilter" role="group" aria-label="申请状态筛选">
+    <button type="button" class="on" data-st="pending" onclick="qrSwitchFilter('pending')">待处理</button>
+    <button type="button" data-st="" onclick="qrSwitchFilter('')">全部</button>
+    <button type="button" data-st="handled" onclick="qrSwitchFilter('handled')">已加量</button>
+    <button type="button" data-st="rejected" onclick="qrSwitchFilter('rejected')">已驳回</button>
+  </div>
+  <button type="button" class="btn btn-outline btn-sm" onclick="loadQuotaRequests(true)">刷新</button>
+  <span class="inline-status" id="qrStatus" role="status"></span>
+</div>
+<div class="section" style="padding:0;overflow-x:auto">
+  <table>
+    <thead><tr><th style="width:150px">时间</th><th style="width:110px">成员</th><th style="width:130px">额度池</th><th>理由</th><th style="width:80px">状态</th><th style="width:230px">操作 / 处理备注</th></tr></thead>
+    <tbody id="qrBody"><tr><td colspan="6" style="color:var(--dim);text-align:center;padding:18px">打开本页时自动加载</td></tr></tbody>
+  </table>
+</div>
+</div>
+
+<div class="modal-overlay" id="qrGrantModal">
+<div class="modal" style="max-width:470px">
+<div class="modal-hd"><h3>发放加量 · <span id="qrGrantUser"></span></h3><button class="modal-close" onclick="closeQrGrant()">关闭</button></div>
+<div class="modal-body">
+<div class="note" id="qrGrantReason" style="margin-bottom:12px"></div>
+<input type="hidden" id="qrGrantId">
+<div style="margin-bottom:12px"><label>发放到额度池</label><select id="qrGrantPool" style="width:100%"></select></div>
+<div><label>加量数量（token）</label><input type="number" id="qrGrantAmount" min="1" step="1000" placeholder="如 500000" style="width:100%;box-sizing:border-box"><span class="note">以当日临时加量发放，明日自动失效，与签到奖励累加</span></div>
+<div style="margin-top:14px;display:flex;gap:8px;justify-content:flex-end">
+<button type="button" class="btn btn-outline btn-sm" onclick="closeQrGrant()">取消</button>
+<button type="button" class="btn btn-primary btn-sm" id="qrGrantSubmit" onclick="submitQrGrant()">发放并标记已处理</button>
+</div>
+</div>
 </div>
 </div>
 </div>
@@ -5801,13 +6242,14 @@ function showProfileSettings(){
   const pn=document.getElementById('quotaPoolNav');if(pn)pn.classList.remove('active');
 }
 function hideAllSecondaryViews(){
-  const dm=document.getElementById('dataManagementView'),audit=document.getElementById('auditLogView'),pool=document.getElementById('quotaPoolView');
+  const dm=document.getElementById('dataManagementView'),audit=document.getElementById('auditLogView'),pool=document.getElementById('quotaPoolView'),qr=document.getElementById('quotaRequestView');
   dm.hidden=true;dm.setAttribute('aria-hidden','true');
   audit.hidden=true;audit.setAttribute('aria-hidden','true');
   if(pool){pool.hidden=true;pool.setAttribute('aria-hidden','true')}
+  if(qr){qr.hidden=true;qr.setAttribute('aria-hidden','true')}
   document.querySelectorAll('.pl-item').forEach(function(el){el.classList.remove('active')});
   // Nav buttons live outside .pl-item now, so clear their highlight explicitly.
-  ['quotaPoolNav','dataManagementNav','auditLogNav'].forEach(function(id){
+  ['quotaPoolNav','dataManagementNav','auditLogNav','quotaRequestNav'].forEach(function(id){
     const el=document.getElementById(id);
     if(el)el.classList.remove('active');
   });
@@ -5898,7 +6340,15 @@ function openAuditLogView(){
 function auditActorBadge(a){
   if(a==='admin')return '<span style="color:var(--accent);font-weight:600">管理员</span>';
   if(a==='system')return '<span style="color:var(--blue);font-weight:600">系统</span>';
+  if(a==='user')return '<span style="color:var(--green);font-weight:600">成员</span>';
   return '<span style="color:var(--orange);font-weight:600">'+h(a||'?')+'</span>';
+}
+// Coloured type tag next to the action code — makes check-in / request entries
+// visually distinct even inside the "全部记录" view.
+function auditCatTag(c){
+  if(c==='checkin')return ' <span style="font-size:10px;background:var(--accent-soft);color:var(--green);padding:1px 6px;border-radius:4px;white-space:nowrap">签到</span>';
+  if(c==='request')return ' <span style="font-size:10px;background:rgba(74,111,165,.14);color:#456b8a;padding:1px 6px;border-radius:4px;white-space:nowrap">申请</span>';
+  return '';
 }
 function auditTime(iso){
   const d=new Date(iso);function p(n){return String(n).padStart(2,'0')}
@@ -5920,9 +6370,113 @@ async function loadAuditLog(reset){
   }catch(e){status.textContent=e.message||'加载失败';status.className='inline-status error'}
 }
 function loadMoreAudit(){auditOffset+=AUDIT_PAGE;loadAuditLog(false)}
-function switchAuditFilter(){
-  const v=document.getElementById('auditFilter').value;
-  auditCategory=(v==='admin'||v==='system'||v==='auth')?v:'';
+// ─── 加量申请（quota_requests）───
+let qrRows=[],qrFilterVal='pending';
+function qrSwitchFilter(v){
+  qrFilterVal=['pending','handled','rejected'].indexOf(v)>=0?v:'';
+  document.querySelectorAll('#qrFilter button').forEach(function(b){b.classList.toggle('on',b.dataset.st===qrFilterVal)});
+  loadQuotaRequests(true);
+}
+function updateQrPendingBadge(pending){
+  const b=document.getElementById('qrPendingBadge');
+  if(!b)return;
+  if(pending>0){b.style.display='';b.textContent=pending}else{b.style.display='none'}
+}
+async function loadQrPendingBadge(){
+  try{
+    const r=await fetch('/api/quota-requests?limit=1');
+    if(!r.ok)return;
+    const j=await r.json();
+    updateQrPendingBadge(j.pending||0);
+  }catch(e){}
+}
+loadQrPendingBadge();
+async function loadQuotaRequests(reset){
+  const status=document.getElementById('qrStatus');
+  status.textContent='加载中...';status.className='inline-status';
+  try{
+    const f=qrFilterVal;
+    const r=await fetch('/api/quota-requests?limit=200'+(f?'&status='+f:''));
+    if(!r.ok)throw new Error('加载失败');
+    const data=await r.json();
+    qrRows=data.rows||[];
+    renderQuotaRequests(data.pending);
+    status.textContent=qrRows.length+' 条'+(data.pending!=null?' · 待处理 '+data.pending+' 条':'');
+    status.className='inline-status';
+  }catch(e){status.textContent=e.message||'加载失败';status.className='inline-status error'}
+}
+function openQuotaRequestView(){
+  const form=document.getElementById('settingsForm');
+  hideAllSecondaryViews();
+  form.hidden=true;
+  const view=document.getElementById('quotaRequestView');
+  view.hidden=false;view.setAttribute('aria-hidden','false');
+  document.getElementById('quotaRequestNav').classList.add('active');
+  loadQuotaRequests(true);
+}
+function qrRowBadge(s){
+  if(s==='pending')return '<span style="color:var(--orange);font-weight:600">待处理</span>';
+  if(s==='handled')return '<span style="color:var(--green);font-weight:600">已加量</span>';
+  if(s==='rejected')return '<span style="color:var(--red);font-weight:600">已驳回</span>';
+  return h(s||'?');
+}
+function renderQuotaRequests(pending){
+  updateQrPendingBadge(pending);
+  const tb=document.getElementById('qrBody');
+  if(!qrRows.length){tb.innerHTML='<tr><td colspan="6" style="color:var(--dim);text-align:center;padding:18px">暂无申请</td></tr>';return}
+  tb.innerHTML=qrRows.map(function(r){
+    const ops=r.status==='pending'
+      ?'<button type="button" class="btn btn-primary btn-sm" onclick="openQrGrant('+r.id+')">发放加量</button> <button type="button" class="btn btn-outline btn-sm" onclick="rejectQuotaRequest('+r.id+')">驳回</button>'
+      :'<span style="font-size:11px;color:var(--dim)">'+h(r.admin_note||'-')+'</span>';
+    return '<tr><td style="font-size:11px;color:var(--dim);white-space:nowrap">'+auditTime(r.created_at)+'</td>'
+      +'<td style="font-weight:600">'+h(r.username||'-')+'</td>'
+      +'<td style="font-weight:600">'+(r.poolLabel?h(r.poolLabel):'<span style="color:var(--dim)">-</span>')+'</td>'
+      +'<td style="max-width:320px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="'+h(r.reason||'')+'">'+h(r.reason||'-')+'</td>'
+      +'<td>'+qrRowBadge(r.status)+'</td>'
+      +'<td style="white-space:nowrap">'+ops+'</td></tr>';
+  }).join('');
+}
+function openQrGrant(id){
+  const r=qrRows.find(function(x){return x.id===id});
+  if(!r||r.status!=='pending')return;
+  document.getElementById('qrGrantUser').textContent=r.username||'-';
+  document.getElementById('qrGrantReason').textContent='申请理由「'+(r.reason||'')+'」'+(r.poolLabel?' · 申请额度池：'+r.poolLabel:'');
+  document.getElementById('qrGrantId').value=id;
+  const sel=document.getElementById('qrGrantPool');
+  sel.innerHTML=(r.pools&&r.pools.length?r.pools:[]).map(function(p){return '<option value="'+h(p.name)+'">'+h(p.label)+'</option>'}).join('');
+  if(r.pool)sel.value=r.pool;
+  document.getElementById('qrGrantAmount').value='';
+  document.getElementById('qrGrantModal').classList.add('open');
+}
+function closeQrGrant(){document.getElementById('qrGrantModal').classList.remove('open')}
+async function submitQrGrant(){
+  const btn=document.getElementById('qrGrantSubmit');
+  btn.disabled=true;
+  try{
+    const body={id:Number(document.getElementById('qrGrantId').value),pool:document.getElementById('qrGrantPool').value,amount:Number(document.getElementById('qrGrantAmount').value)};
+    const r=await fetch('/api/quota-request/grant',{method:'POST',headers:Object.assign({'Content-Type':'application/json'},csrfHeaders()),body:JSON.stringify(body)});
+    const j=await r.json().catch(function(){return{}});
+    if(!r.ok)throw new Error(j.error||'发放失败');
+    toast('已发放加量并标记该申请为已处理');
+    closeQrGrant();
+    loadQuotaRequests(true);
+  }catch(e){alert(e.message||'发放失败')}
+  btn.disabled=false;
+}
+async function rejectQuotaRequest(id){
+  const note=prompt('驳回备注（成员在其页面可见，可留空）：','');
+  if(note===null)return;
+  try{
+    const r=await fetch('/api/quota-request/update',{method:'POST',headers:Object.assign({'Content-Type':'application/json'},csrfHeaders()),body:JSON.stringify({id:id,status:'rejected',note:note})});
+    const j=await r.json().catch(function(){return{}});
+    if(!r.ok)throw new Error(j.error||'操作失败');
+    toast('已驳回该申请');
+    loadQuotaRequests(true);
+  }catch(e){alert(e.message||'操作失败')}
+}
+function switchAuditFilter(v){
+  auditCategory=['admin','system','auth','checkin','request'].indexOf(v)>=0?v:'';
+  document.querySelectorAll('#auditFilter button').forEach(function(b){b.classList.toggle('on',b.dataset.cat===auditCategory)});
   loadAuditLog(true);
 }
 function renderAuditLog(){
@@ -5932,7 +6486,7 @@ function renderAuditLog(){
     tb.innerHTML=auditRows.map(function(r){
       return '<tr><td style="font-size:11px;color:var(--dim);white-space:nowrap">'+auditTime(r.time)+'</td>'
         +'<td>'+auditActorBadge(r.actor)+'</td>'
-        +'<td><code style="font-size:11px;color:var(--accent)">'+h(r.action)+'</code></td>'
+        +'<td><code style="font-size:11px;color:var(--accent)">'+h(r.action)+'</code>'+auditCatTag(r.category)+'</td>'
         +'<td style="font-size:11px">'+h(r.target||'-')+'</td>'
         +'<td style="font-size:12px;min-width:260px">'+h(r.detail||'')+'</td>'
         +'<td style="font-size:11px;color:var(--dim)">'+h(r.ip||'-')+'</td></tr>';
@@ -7610,16 +8164,94 @@ select{font-size:12px;background:var(--surface);color:var(--text);border:1px sol
 .card{background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:15px 16px;min-height:88px}.card:first-child{border-top:2px solid var(--accent)}
 .card .l{font-size:11px;font-weight:550;color:var(--dim);margin-bottom:12px}.card .v{font-size:22px;line-height:1;font-weight:650;font-variant-numeric:tabular-nums;color:var(--text)!important}
 .box{background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:17px;margin-bottom:14px;overflow-x:auto}.box h3{font-size:13px;font-weight:650;color:var(--text);margin-bottom:12px}.box canvas{max-height:220px}
+.chart-row{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-bottom:14px;align-items:start}
+.chart-row .box{margin-bottom:0;min-width:0}
+.chart-row .box canvas{max-height:190px}
+@media(max-width:900px){.chart-row{grid-template-columns:1fr}.chart-row .box canvas{max-height:220px}}
 table{width:100%;border-collapse:collapse;min-width:560px}th{text-align:left;padding:9px 12px;font-size:11px;font-weight:550;color:var(--dim);border-bottom:1px solid var(--border);white-space:nowrap}td{padding:9px 12px;font-size:12px;border-bottom:1px solid #ecece8;white-space:nowrap}.n{text-align:right;font-variant-numeric:tabular-nums}tbody tr:hover td{background:#fafaf7}.tag{font-size:10px;background:var(--accent-soft);color:var(--accent);padding:2px 6px;border-radius:4px}
+/* ── Daily check-in bar ── */
+.checkin-bar{display:none;align-items:center;justify-content:space-between;gap:16px;flex-wrap:wrap;background:linear-gradient(135deg,#f2f7f3,#fbfbf8);border:1px solid #cfe0d5;border-left:3px solid var(--green);border-radius:6px;padding:14px 18px;margin-bottom:12px}
+.checkin-bar.show{display:flex}
+.ci-title{font-size:13.5px;font-weight:700;color:var(--text)}
+.ci-check{display:inline-flex;width:18px;height:18px;border-radius:50%;background:var(--green);color:#fff;font-size:11px;align-items:center;justify-content:center;margin-right:7px;vertical-align:-3px}
+.ci-sub{font-size:11.5px;color:var(--dim);margin-top:4px;line-height:1.6}
+.ci-sub b{color:var(--green);font-weight:700}
+.ci-stats{display:flex;gap:22px;flex-wrap:wrap}
+.ci-stats>div{text-align:center;min-width:52px}
+.ci-stats b{display:block;font-size:15px;font-weight:700;font-variant-numeric:tabular-nums;color:var(--text)}
+.ci-stats span{font-size:10px;color:var(--dim)}
+.btn-checkin{font-size:12.5px;font-weight:650;padding:10px 22px;border-radius:5px;border:none;background:#181816;color:#fff;cursor:pointer;transition:background .15s}
+.btn-checkin:hover:not(:disabled){background:#33332f}
+.btn-checkin:active:not(:disabled){transform:translateY(1px)}
+.btn-checkin:disabled{background:#deded8;color:#686863;cursor:default}
+/* ── Quota-request entry button + modal ── */
+.qr-open-btn{font-size:11.5px;font-weight:600;padding:8px 14px;border-radius:5px;border:1px solid var(--border-strong);background:var(--surface);color:var(--text);cursor:pointer}
+.qr-open-btn:hover{background:var(--accent-soft);border-color:var(--accent);color:var(--accent)}
+.modal-overlay{display:none;position:fixed;inset:0;max-width:none;margin:0;background:rgba(24,24,22,.35);z-index:50;align-items:center;justify-content:center;padding:20px}
+.modal-overlay.open{display:flex}
+.qr-modal{background:var(--surface);border-radius:8px;width:100%;max-width:500px;max-height:86vh;overflow:auto;box-shadow:0 18px 50px rgba(24,24,22,.18)}
+.qr-mhd{display:flex;align-items:center;justify-content:space-between;padding:14px 18px;border-bottom:1px solid var(--border);font-size:14px}
+.qr-close{border:none;background:transparent;font-size:13px;color:var(--dim);cursor:pointer;padding:4px 8px;border-radius:4px}
+.qr-close:hover{background:rgba(0,0,0,.05);color:var(--text)}
+.qr-mbody{padding:16px 18px}
+.qr-info{font-size:12px;color:var(--dim);background:var(--accent-soft);border-radius:5px;padding:9px 12px;margin-bottom:12px;line-height:1.6}
+.qr-info b{color:var(--accent)}
+.qr-hd{font-size:11px;font-weight:600;color:var(--dim);margin:2px 0 7px}
+.qr-row{display:flex;align-items:center;gap:8px;padding:7px 0;border-bottom:1px solid #f0f0ec;font-size:12px;flex-wrap:wrap}
+.qr-row:last-child{border-bottom:none}
+.qr-reason{flex:1;min-width:120px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.qr-amt{color:var(--accent);font-weight:600;font-variant-numeric:tabular-nums}
+.qr-time{color:var(--dim);font-size:10.5px}
+.qr-note{width:100%;font-size:10.5px;color:var(--orange)}
+.qr-badge{font-size:10px;padding:2px 7px;border-radius:4px;font-weight:600;flex:none}
+.qr-badge.pending{background:#faf5e6;color:var(--orange)}
+.qr-badge.handled{background:var(--accent-soft);color:var(--green)}
+.qr-badge.rejected{background:#fbeae8;color:var(--red)}
+.qr-empty{font-size:11.5px;color:var(--dim);padding:2px 0 10px}
+.qr-form{margin-top:14px;border-top:1px solid var(--border);padding-top:14px}
+.qr-form label{display:block;font-size:11px;font-weight:600;color:var(--dim);margin-bottom:6px}
+.qr-form label i{color:var(--red);font-style:normal}
+.qr-form select{width:100%;box-sizing:border-box;font-size:12.5px;font-family:inherit;background:var(--surface);color:var(--text);border:1px solid var(--border);border-radius:5px;padding:8px 11px;margin-bottom:12px;cursor:pointer}
+.qr-form select:focus{outline:none;border-color:var(--accent)}
+.qr-form input,.qr-form textarea{width:100%;box-sizing:border-box;font-size:12.5px;font-family:inherit;background:var(--surface);color:var(--text);border:1px solid var(--border);border-radius:5px;padding:8px 11px}
+.qr-form input:focus,.qr-form textarea:focus{outline:none;border-color:var(--accent)}
+.qr-form textarea{resize:vertical}
+.qr-actions{margin-top:14px;display:flex;justify-content:flex-end}
+/* ── Usage calendar (GitHub-style heatmap) ── */
+.cal-summary{font-size:11.5px;color:var(--dim);margin-bottom:12px;line-height:1.7}
+.cal-summary b{color:var(--text);font-weight:650;font-variant-numeric:tabular-nums}
+.cal-scroll{overflow-x:auto;padding:3px 3px 4px;scrollbar-width:none}
+.cal-scroll::-webkit-scrollbar{display:none}
+.cal-inner{min-width:100%}
+.cal-months{position:relative;height:15px;margin-bottom:8px;font-size:10px;color:var(--dim)}
+.cal-months span{position:absolute;top:0;white-space:nowrap}
+.cal-row{display:flex;gap:8px;align-items:flex-start}
+.cal-main{flex:1;min-width:0;overflow:hidden}
+.cal-daylabels{flex:none;width:27px;display:grid;gap:3px;font-size:9px;color:var(--dim);padding-top:23px}
+.cal-daylabels i{display:flex;align-items:center;font-style:normal;min-height:1px}
+.cal-grid{display:grid;grid-auto-flow:column;gap:3px}
+.cal-cell{display:block;border-radius:var(--cal-r,2.5px)}
+.cal-cell.ghost{background:transparent}
+.cal-cell.today{outline:1.5px solid var(--accent);outline-offset:1.5px}
+.cal-legend{display:flex;align-items:center;gap:4px;justify-content:flex-end;font-size:10px;color:var(--dim);margin-top:8px}
+.cal-legend .cal-cell{display:inline-block;width:11px;height:11px}
+.cal-tip{display:none;position:fixed;z-index:60;background:#181816;color:#fbfbf8;font-size:11px;padding:6px 10px;border-radius:5px;pointer-events:none;white-space:nowrap;box-shadow:0 6px 18px rgba(24,24,22,.3)}
+.cal-tip b{color:#a8ccb7}
 @media(max-width:560px){body{padding:20px 14px 36px}.top h1{font-size:24px}.cards{grid-template-columns:1fr 1fr}.card .v{font-size:20px}.box{padding:14px}.pq-grid{grid-template-columns:1fr}}
 </style></head><body data-theme="editorial-light">
-<div class="top"><div class="top-brand"><svg class="brand-logo" width="40" height="40" viewBox="0 0 96 96" aria-hidden="true"><rect width="96" height="96" rx="22" fill="#2f6e50"/><g fill="none" stroke="#fbfbf8" stroke-width="11" stroke-linecap="round" stroke-linejoin="round" transform="translate(48 48) scale(0.9) translate(-48 -48)"><path d="M37 26.5H31.5Q20.5 26.5 20.5 37.5V58.5Q20.5 69.5 31.5 69.5H37"/><path d="M59 26.5H64.5Q75.5 26.5 75.5 37.5V58.5Q75.5 69.5 64.5 69.5H59"/></g><circle cx="48" cy="48" r="4.95" fill="#fbfbf8"/></svg><div><h1>我的用量</h1><div class="sub">查看个人配额、趋势和模型明细 · <a href="/setup/${escJs(virtualKey)}" style="color:var(--accent)">配置 Codex 接入 →</a></div></div></div><div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap"><div class="proto-seg" id="protoSeg" role="group" aria-label="协议分类"><button type="button" class="on" data-proto="">全部</button><button type="button" data-proto="anthropic">Anthropic</button><button type="button" data-proto="responses">OpenAI</button></div><select id="profileSel" onchange="switchProfile(this.value)"><option value="all">全部可用方案</option></select></div></div>
+<div class="top"><div class="top-brand"><svg class="brand-logo" width="40" height="40" viewBox="0 0 96 96" aria-hidden="true"><rect width="96" height="96" rx="22" fill="#2f6e50"/><g fill="none" stroke="#fbfbf8" stroke-width="11" stroke-linecap="round" stroke-linejoin="round" transform="translate(48 48) scale(0.9) translate(-48 -48)"><path d="M37 26.5H31.5Q20.5 26.5 20.5 37.5V58.5Q20.5 69.5 31.5 69.5H37"/><path d="M59 26.5H64.5Q75.5 26.5 75.5 37.5V58.5Q75.5 69.5 64.5 69.5H59"/></g><circle cx="48" cy="48" r="4.95" fill="#fbfbf8"/></svg><div><h1>我的用量</h1><div class="sub">查看个人配额、趋势和模型明细 · <a href="/setup/${escJs(virtualKey)}" style="color:var(--accent)">配置 Codex 接入 →</a></div></div></div><div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap"><div class="proto-seg" id="protoSeg" role="group" aria-label="协议分类"><button type="button" class="on" data-proto="">全部</button><button type="button" data-proto="anthropic">Anthropic</button><button type="button" data-proto="responses">OpenAI</button></div><select id="profileSel" onchange="switchProfile(this.value)"><option value="all">全部可用方案</option></select><button type="button" id="qrBtn" class="qr-open-btn" style="display:none" onclick="openQrModal()">申请加量</button></div></div>
 <div class="meta" id="meta">加载中...</div>
 <div id="qNotice"></div>
+<div class="checkin-bar" id="checkinBar"></div>
 <div class="cards" id="cards"></div>
 <div id="pqSection" style="display:none"><h3 style="font-size:13px;font-weight:650;margin:0 0 10px">各方案配额 <span style="font-size:11px;color:var(--dim);font-weight:400" id="pqHint"></span></h3><div class="pq-grid" id="pqGrid"></div></div>
+<div class="box" id="calendarBox" style="display:none"><h3>使用日历 <span style="font-size:11px;color:var(--dim);font-weight:400">过去一年 · 颜色代表每日输入+输出总量，悬浮查看明细</span></h3><div class="cal-summary" id="calSummary"></div><div class="cal-row"><div class="cal-daylabels"><i>一</i><i></i><i>三</i><i></i><i>五</i><i></i><i></i></div><div class="cal-main"><div class="cal-scroll"><div class="cal-inner"><div class="cal-months" id="calMonths"></div><div class="cal-grid" id="calGrid"></div></div></div></div></div><div class="cal-legend">少 <span class="cal-cell" style="background:#e9e9e3"></span><span class="cal-cell" style="background:#cfe3d7"></span><span class="cal-cell" style="background:#9dc4ab"></span><span class="cal-cell" style="background:#5f9a7a"></span><span class="cal-cell" style="background:#2f6e50"></span> 多</div></div>
+<div class="chart-row">
 <div class="box"><h3>今日24小时趋势</h3><canvas id="hourChart"></canvas></div>
 <div class="box"><h3>近7天趋势</h3><canvas id="trendChart"></canvas></div>
+</div>
+<div class="cal-tip" id="calTip"></div>
+<div class="modal-overlay" id="qrModal" onclick="if(event.target===this)closeQrModal()"><div class="qr-modal" role="dialog" aria-label="申请加量"><div class="qr-mhd"><b>申请加量</b><button type="button" class="qr-close" onclick="closeQrModal()" aria-label="关闭">✕</button></div><div class="qr-mbody"><div class="qr-info" id="qrQuotaInfo"></div><div id="qrHistory"></div><div class="qr-form"><label>申请额度池 <i>*</i></label><select id="qrPool"></select><label>申请理由 <i>*</i></label><textarea id="qrReason" maxlength="200" rows="3" placeholder="说明一下用途和期望，管理员处理时会看到"></textarea></div><div class="qr-actions"><button type="button" class="btn-checkin" id="qrSubmit" onclick="submitQuotaRequest()">提交申请</button></div></div></div></div>
 <div class="box"><h3>今日模型请求</h3><table id="modelTable"><thead><tr><th>模型</th><th class="n">请求数</th><th class="n">实际 Token</th><th class="n">倍率</th><th class="n">计入配额</th></tr></thead><tbody></tbody></table><div class="note" id="modelTableNote" style="font-size:11px;color:var(--dim);margin-top:8px"></div></div>
 <div class="box" id="rateCardBox" style="display:none"><h3>配额价目表 <span style="font-size:11px;color:var(--dim);font-weight:400">当前时段每个模型消耗 1 token 扣多少额度</span></h3><div id="rateCardBody"></div></div>
 <script>
@@ -7634,6 +8266,175 @@ const fmtT=n=>n.toLocaleString("zh-CN");
 const esc=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const fmtTk=n=>{if(n>=1e6)return(n/1e6).toFixed(1)+"M";if(n>=1e3)return(n/1e3).toFixed(1)+"k";return n.toString()};
 const COL=["#2f6e50","#4a6fa5","#c2604f","#c4a23a","#7a6bb0","#d4824a","#4a9ba8","#c47a99","#6ba368","#5a6bc4","#8a6db5","#5a9b8e"];
+// ── Daily check-in ──
+function fmtWan(n){if(n>=1e8)return(Math.round(n/1e8*10)/10)+'亿';if(n>=1e4)return(Math.round(n/1e4*10)/10)+'万';return String(n)}
+// Bonus attribution: when today's check-in reward is part of the bonus, the
+// copy must not credit it all to the admin.
+function bonusTip(){const c=D&&D.checkin;return (c&&c.checkedInToday)?'今日临时加量（含签到奖励），明日自动失效':'管理员今日临时加量，明日自动失效'}
+function renderCheckin(){
+  const bar=document.getElementById('checkinBar'),c=D.checkin;
+  if(!bar)return;
+  if(!c||!c.available||c.enabled===false){bar.classList.remove('show');return}
+  bar.classList.add('show');
+  const stats='<div class="ci-stats"><div><b>'+c.streak+'</b><span>连续签到</span></div><div><b>'+c.totalCheckIns+'</b><span>累计签到</span></div><div><b>'+fmtTk(c.totalTokens)+'</b><span>累计获得</span></div></div>';
+  if(c.checkedInToday){
+    const pools=(c.todayPools||[]).length;
+    bar.innerHTML='<div><div class="ci-title"><span class="ci-check">✓</span>今日已签到</div><div class="ci-sub">获得 <b>+'+fmtT(c.todayAmount)+'</b> token'+(pools>1?' · 已加入 '+pools+' 个额度池':' · 已加入额度池')+'（今日有效，明日自动失效）</div></div>'+stats+'<button type="button" class="btn-checkin" disabled>已签到</button>';
+  }else{
+    bar.innerHTML='<div><div class="ci-title">每日签到</div><div class="ci-sub">今日随机 <b>+'+fmtWan(c.minTokens)+' ~ '+fmtWan(c.maxTokens)+'</b> token，加到你可用的每个额度池（今日有效）</div></div>'+stats+'<button type="button" class="btn-checkin" id="ciBtn" onclick="doCheckIn()">签到领 token</button>';
+  }
+}
+async function doCheckIn(){
+  const btn=document.getElementById('ciBtn');
+  if(!btn||btn.disabled)return;
+  btn.disabled=true;btn.textContent='签到中…';
+  try{
+    const r=await fetch('/api/checkin',{method:'POST',headers:{'Authorization':'Bearer '+VK}});
+    const j=await r.json();
+    if(!r.ok)throw new Error(j.error||'签到失败');
+    toast('签到成功！获得 '+fmtTk(j.amount)+' token，已加入 '+j.pools.length+' 个额度池');
+    await load();
+  }catch(e){
+    toast(e.message||'签到失败');
+    btn.disabled=false;btn.textContent='签到领 token';
+  }
+}
+// ── Quota request ──
+function qrBadge(s){
+  if(s==='pending')return '<span class="qr-badge pending">待处理</span>';
+  if(s==='handled')return '<span class="qr-badge handled">已加量</span>';
+  if(s==='rejected')return '<span class="qr-badge rejected">已驳回</span>';
+  return '';
+}
+function fmtQrTime(iso){const d=new Date(iso);const p=n=>String(n).padStart(2,'0');return (d.getMonth()+1)+'-'+p(d.getDate())+' '+p(d.getHours())+':'+p(d.getMinutes())}
+function renderQuotaRequest(){
+  const btn=document.getElementById('qrBtn'),qr=D.quotaRequest;
+  if(!btn)return;
+  if(!qr||!qr.available||qr.enabled===false){btn.style.display='none';return}
+  btn.style.display='';
+  btn.textContent=qr.todaySubmitted?'今日已申请':(qr.remaining>0?'申请加量':'申请 · 本周已满');
+  if(document.getElementById('qrModal').classList.contains('open'))renderQrBody();
+}
+function renderQrBody(){
+  const qr=D.quotaRequest;
+  if(!qr)return;
+  document.getElementById('qrQuotaInfo').innerHTML='提交后管理员会收到通知，处理结果会显示在这里。提交不占用次数，管理员<b>处理后</b>才计入每周 '+qr.weeklyLimit+' 次上限（本周已处理 '+qr.handledThisWeek+' 次，周一刷新）；每天限提交 1 次。';
+  const rows=qr.myRecent||[];
+  document.getElementById('qrHistory').innerHTML='<div class="qr-hd">我的近期申请</div>'
+    +(rows.length?rows.map(r=>'<div class="qr-row">'+qrBadge(r.status)+'<span class="qr-reason" title="'+esc(r.reason)+'">'+esc(r.reason)+'</span>'+(r.poolLabel?'<span class="qr-amt">'+esc(r.poolLabel)+'</span>':'')+'<span class="qr-time">'+fmtQrTime(r.createdAt)+'</span>'+(r.adminNote?'<span class="qr-note">管理员备注：'+esc(r.adminNote)+'</span>':'')+'</div>').join(''):'<div class="qr-empty">还没有申请记录</div>');
+  const sel=document.getElementById('qrPool');
+  sel.innerHTML=(qr.pools||[]).map(p=>'<option value="'+esc(p.name)+'"'+(p.limited?'':' disabled')+'>'+esc(p.label)+(p.limited?'':'（不限量，无需申请）')+'</option>').join('');
+  const blocked=qr.todaySubmitted||qr.remaining<=0;
+  document.getElementById('qrSubmit').disabled=blocked;
+  document.getElementById('qrSubmit').textContent=qr.todaySubmitted?'今天已申请过':(qr.remaining<=0?'本周处理次数已用完':'提交申请');
+}
+function openQrModal(){renderQrBody();document.getElementById('qrReason').value='';document.getElementById('qrModal').classList.add('open')}
+function closeQrModal(){document.getElementById('qrModal').classList.remove('open')}
+async function submitQuotaRequest(){
+  const pool=document.getElementById('qrPool').value;
+  const reason=document.getElementById('qrReason').value.trim();
+  const btn=document.getElementById('qrSubmit');
+  if(!pool){toast('请选择申请的额度池');return}
+  if(!reason){toast('请填写申请理由');return}
+  btn.disabled=true;btn.textContent='提交中…';
+  try{
+    const r=await fetch('/api/quota-request',{method:'POST',headers:{'Authorization':'Bearer '+VK,'Content-Type':'application/json'},body:JSON.stringify({reason:reason,pool:pool})});
+    const j=await r.json();
+    if(!r.ok)throw new Error(j.error||'提交失败');
+    toast('申请已提交，等待管理员处理');
+    closeQrModal();
+    await load();
+  }catch(e){
+    toast(e.message||'提交失败');
+    btn.disabled=false;btn.textContent='提交申请';
+  }
+}
+// ── Usage calendar (GitHub-style heatmap) ──
+const CAL_COLORS=['#e9e9e3','#cfe3d7','#9dc4ab','#5f9a7a','#2f6e50'];
+function calWeekday(dateStr){return (new Date(dateStr+'T12:00:00Z').getUTCDay()+6)%7}
+function calMonthDay(dateStr){return parseInt(dateStr.slice(5,7),10)+'月'+parseInt(dateStr.slice(8,10),10)+'日'}
+function renderCalendar(){
+  const box=document.getElementById('calendarBox'),hm=D.heatmap;
+  if(!box||!hm||!Array.isArray(hm.days)){box.style.display='none';return}
+  box.style.display='';
+  const s=hm.summary;
+  document.getElementById('calSummary').innerHTML=(s&&s.activeDays>0)
+    ?'过去一年共 <b>'+fmtTk(s.totalTokens)+'</b> token（输入+输出） · 活跃 <b>'+s.activeDays+'</b> 天 · 最长连续使用 <b>'+s.longestStreak+'</b> 天'+(s.maxDay?' · 最高单日 <b>'+calMonthDay(s.maxDay.date)+' · '+fmtTk(s.maxDay.total)+'</b>':'')
+    :'过去一年暂无使用记录——开始使用后，这里会像 GitHub 一样点亮你的每一天';
+  const byDate={};hm.days.forEach(d=>{byDate[d.date]=d});
+  const cells=[];
+  for(let i=0;i<calWeekday(hm.startDate);i++)cells.push(null);
+  const start=new Date(hm.startDate+'T12:00:00Z'),end=new Date(hm.endDate+'T12:00:00Z');
+  const todayStr=hm.endDate;
+  for(let cur=new Date(start);cur<=end;cur=new Date(cur.getTime()+86400000)){
+    const ds=cur.toISOString().slice(0,10),v=byDate[ds];
+    cells.push({date:ds,total:v?v.total:0,weighted:v?v.weighted:0,requests:v?v.requests:0});
+  }
+  // Colour thresholds are relative quartiles of ACTIVE days — GitHub-style: the
+  // scale adapts to the user's own range instead of a fixed absolute cutoff.
+  const active=cells.filter(c=>c&&c.total>0).map(c=>c.total).sort((a,b)=>a-b);
+  const q=p=>active.length?active[Math.min(active.length-1,Math.floor(active.length*p))]:Infinity;
+  const t1=q(.25),t2=q(.5),t3=q(.75);
+  const lvOf=v=>v<=0?0:v<=t1?1:v<=t2?2:v<=t3?3:4;
+  const grid=document.getElementById('calGrid'),days=document.querySelector('#calendarBox .cal-daylabels');
+  // Size cells from the card width so the 53-week grid spans the full row:
+  // fixed-size cells would float small inside a wide box. Square cells keep a
+  // GitHub-like pitch ratio; below 9px the card scrolls instead of shrinking.
+  // The grid spans ceil(cells/7) columns — 54 when the 371-day window starts
+  // mid-week, 53 when it doesn't. Sizing against a hardcoded 53 left the grid
+  // one column wider than the card, clipping "today" on every load.
+  const cols=Math.ceil(cells.length/7)||53;
+  const avail=Math.max(300,(box.clientWidth||1200)-34-35-6);
+  let gap=3,cell=Math.floor((avail-(cols-1)*gap)/cols);
+  if(cell>22){cell=22;gap=Math.min(6,Math.max(3,Math.floor((avail-cols*cell)/(cols-1))))}
+  if(cell<9)cell=9;
+  grid.style.gridTemplateRows='repeat(7,'+cell+'px)';
+  grid.style.gridAutoColumns=cell+'px';
+  grid.style.gap=gap+'px';
+  grid.style.setProperty('--cal-r',Math.max(2,Math.round(cell*0.2))+'px');
+  if(days){days.style.gridTemplateRows='repeat(7,'+cell+'px)';days.style.gap=gap+'px'}
+  grid.innerHTML=cells.map(c=>{
+    if(!c)return '<span class="cal-cell ghost"></span>';
+    const lv=lvOf(c.total);
+    return '<span class="cal-cell'+(c.date===todayStr?' today':'')+'" style="background:'+CAL_COLORS[lv]+'" data-date="'+c.date+'" data-total="'+c.total+'" data-weighted="'+c.weighted+'" data-req="'+c.requests+'"></span>';
+  }).join('');
+  const STEP=cell+gap,labs=[];let lastLeft=-999;const seen={};
+  cells.forEach((c,i)=>{
+    if(!c)return;
+    const ym=c.date.slice(0,7);
+    if(seen[ym])return;
+    seen[ym]=true;
+    const left=Math.floor(i/7)*STEP;
+    if(lastLeft<0||left-lastLeft>=STEP+18){labs.push('<span style="left:'+left+'px">'+parseInt(c.date.slice(5,7),10)+'月</span>');lastLeft=left}
+  });
+  document.getElementById('calMonths').innerHTML=labs.join('');
+  // Newest weeks live at the right edge — start there so the current month is
+  // visible first. Only act when the last (today) cell is actually cut off:
+  // the grid box always fits (fixed tracks overflow it) and month labels may
+  // overhang a few px, so pixel arithmetic is unreliable — let the browser
+  // bring the today cell into view instead.
+  const scroller=box.querySelector('.cal-scroll');
+  if(scroller&&grid.lastElementChild){
+    const lastR=grid.lastElementChild.getBoundingClientRect().right;
+    if(lastR>scroller.getBoundingClientRect().right){
+      try{grid.lastElementChild.scrollIntoView({inline:'end',block:'nearest'});}
+      catch(e){scroller.scrollLeft=scroller.scrollWidth;}
+    }else{
+      scroller.scrollLeft=0;
+    }
+  }
+  const tip=document.getElementById('calTip');
+  grid.onmousemove=e=>{
+    const el=e.target.closest('.cal-cell');
+    if(!el||!el.dataset.date){tip.style.display='none';return}
+    const used=+el.dataset.total>0;
+    tip.innerHTML='<b>'+calMonthDay(el.dataset.date)+'</b> · '+(used?fmtTk(+el.dataset.total)+' token'+(+el.dataset.weighted&&+el.dataset.weighted!==+el.dataset.total?' · 计权 '+fmtTk(+el.dataset.weighted):'')+' · '+(+el.dataset.req||0)+' 次请求':'无使用');
+    tip.style.display='block';
+    const x=Math.min(e.clientX+14,window.innerWidth-tip.offsetWidth-10);
+    tip.style.left=Math.max(8,x)+'px';tip.style.top=Math.max(8,e.clientY-36)+'px';
+  };
+  grid.onmouseleave=()=>{tip.style.display='none'};
+}
 async function load(){
   try{
     const qs=['profile='+encodeURIComponent(currentProfile)];
@@ -7679,7 +8480,7 @@ function renderQNotice(q){
   let html='';
   if(q.limit>0&&q.bonus>0){
     const base=q.limit-q.bonus;
-    html+='<div class="qnotice bonus show"><span class="qi">加</span><div><b>今日临时加量已生效</b> — 管理员为你追加 <span class="hl">+'+fmtTk(q.bonus)+'</span> 临时额度（'+fmtT(q.bonus)+' tokens）。今日总额度 <b>'+fmtT(q.limit)+'</b>（基础 '+fmtT(base)+' + 临时 '+fmtTk(q.bonus)+'），将于<b>明日零点自动恢复</b>为基础额度，无需任何操作。</div></div>';
+    {const c=D.checkin,ciPart=(c&&c.checkedInToday&&q.bonus>=c.todayAmount)?'（含今日签到 <span class="hl">+'+fmtTk(c.todayAmount)+'</span>）':'';html+='<div class="qnotice bonus show"><span class="qi">加</span><div><b>今日临时加量已生效</b> — 为你追加 <span class="hl">+'+fmtTk(q.bonus)+'</span> 临时额度'+ciPart+'（'+fmtT(q.bonus)+' tokens）。今日总额度 <b>'+fmtT(q.limit)+'</b>（基础 '+fmtT(base)+' + 临时 '+fmtTk(q.bonus)+'），将于<b>明日零点自动恢复</b>为基础额度，无需任何操作。</div></div>';}
   }
   if(q.rawUsed!=null&&q.rawUsed!==q.used){
     const slot=q.rate===null?'':(q.inPeak?'高峰':'低谷');
@@ -7728,7 +8529,7 @@ function renderProfileQuotas(){
     if(r.isPool&&r.poolProfiles&&r.poolProfiles.length>1)tags.push('<span class="tag" style="background:rgba(0,0,0,.04);color:var(--dim)" title="此额度池包含：'+esc((r.poolProfiles||[]).join('、'))+'">'+r.poolProfiles.length+' 个方案</span>');
     else tags.push('<span class="tag" style="background:rgba(0,0,0,.04);color:var(--dim)">'+(r.protocol==='responses'?'Codex':'Claude Code')+'</span>');
     if(r.rate!=null&&r.rate!==1)tags.push('<span class="tag" style="background:rgba(0,0,0,.04);color:'+(r.inPeak?'var(--orange)':'var(--green)')+'" title="'+(r.inPeak?'高峰':'低谷')+'时段默认倍率 ×'+r.rate+'">'+(r.inPeak?'高峰':'低谷')+' ×'+r.rate+'</span>');
-    if(r.bonus>0)tags.push('<span class="tag" style="background:rgba(46,164,79,.12);color:var(--green)" title="管理员今日临时加量，明日自动失效">临时+'+fmtTk(r.bonus)+'</span>');
+    if(r.bonus>0)tags.push('<span class="tag" style="background:rgba(46,164,79,.12);color:var(--green)" title="'+bonusTip()+'">临时+'+fmtTk(r.bonus)+'</span>');
     if(r.resetApplied)tags.push('<span class="tag" title="管理员已重置今日用量，统计数据保留">已重置</span>');
     const nums=free
       ? '<div class="pq-nums"><span>今日已用 <b>'+fmtT(r.used)+'</b> tokens</span> · <span>该方案无每日上限</span></div>'
@@ -7757,7 +8558,7 @@ function render(){
   const q=D.quota,t=D.today;
   const pct=q.limit>0?Math.min(100,Math.round(q.used/q.limit*100)):0;
   const color=pct>90?'var(--red)':pct>70?'var(--orange)':'var(--green)';
-  document.getElementById('meta').innerHTML=D.username+' · 方案: '+D.profile+linkTag+(q.limit>0?' · <span style="color:'+color+'">'+pct+'% 已用</span> '+hpBar(pct,16)+rateTag(q)+(q.autoAdjusted?' <span class="tag">AUTO</span>':'')+(q.bonus>0?' <span class="tag" style="background:rgba(46,164,79,.12);color:var(--green)" title="管理员今日临时加量，明日自动失效">临时+'+fmtTk(q.bonus)+'</span>':'')+(q.resetApplied?' <span class="tag" title="管理员已重置今日用量，统计数据保留">已重置</span>':''):' · 无配额限制'+rateTag(q));
+  document.getElementById('meta').innerHTML=D.username+' · 方案: '+D.profile+linkTag+(q.limit>0?' · <span style="color:'+color+'">'+pct+'% 已用</span> '+hpBar(pct,16)+rateTag(q)+(q.autoAdjusted?' <span class="tag">AUTO</span>':'')+(q.bonus>0?' <span class="tag" style="background:rgba(46,164,79,.12);color:var(--green)" title="'+bonusTip()+'">临时+'+fmtTk(q.bonus)+'</span>':'')+(q.resetApplied?' <span class="tag" title="管理员已重置今日用量，统计数据保留">已重置</span>':''):' · 无配额限制'+rateTag(q));
   renderQNotice(q);
   document.getElementById('cards').innerHTML=
     '<div class="card"><div class="l">今日用量 <span style="font-size:9px;color:var(--dim);font-weight:400">输入+输出</span></div><div class="v" data-cu="'+ioTokens(t)+'" data-cu-k style="color:var(--accent)">0</div></div>'+
@@ -7767,8 +8568,8 @@ function render(){
     (((q.rawUsed!=null&&q.rawUsed!==q.used)||(q.rate!==null&&q.rate!==undefined&&q.rate!==1))?'<div class="card" style="border-top:2px solid var(--accent)"><div class="l">计权用量 <span style="font-size:9px;color:var(--dim);font-weight:400">计入配额</span></div><div class="v" data-cu="'+q.used+'" data-cu-k style="color:var(--accent)">0</div>'+rateFootnote(q)+'</div>':'')+
     (q.limit>0?'<div class="card"'+(q.bonus>0?' style="border-top:2px solid var(--green)"':'')+'><div class="l">剩余额度'+(q.bonus>0?' <span class="tag" style="background:rgba(47,110,80,.1);color:var(--green)">含临时加量</span>':'')+'</div><div class="v" data-cu="'+q.remaining+'" data-cu-k style="color:'+color+'">0</div><div style="margin-top:8px">'+hpBar(pct,16)+'</div>'+rateFootnote(q)+'</div>'+
     '<div class="card"><div class="l">每日限额'+((q.rate!==null&&q.rate!==undefined&&q.rate!==1)?' <span style="font-size:9px;color:var(--dim);font-weight:400">计权口径</span>':'')+'</div><div class="v" data-cu="'+q.limit+'" data-cu-k style="color:var(--dim)">0</div>'+(q.bonus>0?'<div style="margin-top:6px;font-size:10px;color:var(--green);font-weight:550">基础 '+fmtTk(q.limit-q.bonus)+' + 临时 '+fmtTk(q.bonus)+'</div>':'')+'</div>':'')+
-    '<div class="card"><div class="l">今日输入</div><div class="v" data-cu="'+t.input+'" data-cu-k style="color:var(--green)">0</div></div>'+
-    '<div class="card"><div class="l">今日输出</div><div class="v" data-cu="'+t.output+'" data-cu-k style="color:var(--orange)">0</div></div>'+
+    // 输入/输出 merged into one card so all nine stats stay on a single row.
+    '<div class="card"><div class="l">今日输入 / 输出</div><div class="v" style="font-size:19px"><span style="color:var(--green)">'+fmtTk(t.input)+'</span><span style="color:var(--dim2);font-weight:400"> / </span><span style="color:var(--orange)">'+fmtTk(t.output)+'</span></div><div style="margin-top:6px;font-size:10px;color:var(--dim);font-variant-numeric:tabular-nums">'+fmtT(t.input)+' / '+fmtT(t.output)+'</div></div>'+
     '<div class="card"><div class="l">今日缓存写入</div><div class="v" data-cu="'+t.cacheWrite+'" data-cu-k>0</div></div>'+
     '<div class="card"><div class="l">今日缓存命中</div><div class="v" data-cu="'+t.cacheRead+'" data-cu-k>0</div></div>';
   runCountUps(document.getElementById('cards'));
@@ -7809,6 +8610,9 @@ function render(){
     ?'「实际 Token」是真实消耗，「计入配额」是按倍率折算后从每日额度里扣掉的数额。倍率列为今日实际计权比例，跨高峰边界或期间调整过倍率时会落在两档之间。'
     :'当前所有模型倍率均为 1.0，实际消耗与计入配额相同。';
   renderRateCard();
+  renderCheckin();
+  renderQuotaRequest();
+  renderCalendar();
 }
 // Price list: what each alias costs right now. Answers "为什么额度掉这么快" before
 // the user spends, not after. Cheapest first — the cheap option should be the one
@@ -7822,18 +8626,19 @@ function renderRateCard(){
   box.style.display='';
   body.innerHTML=meaningful.map(c=>{
     const rows=c.rows.map(r=>'<tr><td style="color:var(--blue)">'+r.alias+'</td>'
-      +'<td style="color:var(--dim);font-size:11px">'+r.model+'</td>'
+      +'<td style="color:var(--dim);font-size:11px;overflow:hidden;text-overflow:ellipsis">'+r.model+'</td>'
       +'<td class="n"'+(r.rate<1?' style="color:var(--green);font-weight:600"':r.rate>1?' style="color:var(--orange);font-weight:600"':'')+'>×'+r.rate+'</td>'
       +'<td class="n" style="color:var(--dim);font-size:11px">'+(r.custom?'峰 ×'+r.peak+' / 谷 ×'+r.offPeak:'跟随默认')+'</td></tr>').join('');
     return '<div style="margin-bottom:14px">'
       +'<div style="font-size:12px;font-weight:600;margin-bottom:6px">'+c.profile
       +' <span class="tag" style="background:rgba(0,0,0,.04);color:'+(c.inPeak?'var(--orange)':'var(--green)')+'">'+(c.inPeak?'高峰时段':'低谷时段')+'</span>'
       +' <span style="font-size:10px;color:var(--dim);font-weight:400">默认 ×'+(c.inPeak?c.defaultPeak:c.defaultOffPeak)+'</span></div>'
-      +'<table style="min-width:auto"><thead><tr><th>别名</th><th>实际模型</th><th class="n">当前倍率</th><th class="n">峰/谷</th></tr></thead><tbody>'+rows+'</tbody></table>'
+      +'<table style="min-width:auto;table-layout:fixed;width:100%"><thead><tr><th style="width:20%">别名</th><th style="width:42%">实际模型</th><th class="n" style="width:16%">当前倍率</th><th class="n" style="width:22%">峰/谷</th></tr></thead><tbody>'+rows+'</tbody></table>'
       +'</div>';
   }).join('')
     +'<div class="note" style="font-size:11px;color:var(--dim)">倍率越低越省额度：×0.5 表示消耗 1000 token 只扣 500 额度。倍率随时段自动切换，调整只影响之后的请求。</div>';
 }
+let calRz;window.addEventListener('resize',function(){clearTimeout(calRz);calRz=setTimeout(function(){if(D)renderCalendar()},150)});
 load();setInterval(load,30000);
 <\/script></body></html>`;
 }
@@ -7859,6 +8664,8 @@ function settingsAuditSnapshot() {
   return {
     proxy: JSON.stringify(config.proxy || {}),
     autoQuotaAdjust: JSON.stringify(config.autoQuotaAdjust || {}),
+    checkIn: JSON.stringify(config.checkIn || {}),
+    quotaRequest: JSON.stringify(config.quotaRequest || {}),
     users: JSON.stringify(Object.fromEntries(Object.entries(config.users || {}).map(([k, v]) => [maskAuditKey(k), v]))),
     profiles: Object.fromEntries(Object.entries(config.profiles || {}).map(([n, p]) => [n, JSON.stringify(p)])),
   };
@@ -8028,6 +8835,19 @@ function applySettings(formData) {
   if (formData.aqMaxQuota) config.autoQuotaAdjust.maxAutoQuota = parseInt(formData.aqMaxQuota, 10) || 10000000;
   if (formData.aqCooldown) config.autoQuotaAdjust.cooldownDays = Math.max(1, parseInt(formData.aqCooldown, 10) || 3);
   setMeta("lastQuotaEval", ""); // Reset eval date so new config takes effect immediately
+
+  // Check-in reward range & quota-request weekly cap (member gamification).
+  // Unchecked boxes submit nothing, so absence means OFF for both toggles.
+  if (!config.checkIn) config.checkIn = {};
+  config.checkIn.enabled = formData.checkInEnabled === "on";
+  const ciMin = parseInt(formData.checkInMin, 10);
+  const ciMax = parseInt(formData.checkInMax, 10);
+  if (Number.isFinite(ciMin) && ciMin >= 0) config.checkIn.minTokens = ciMin;
+  if (Number.isFinite(ciMax) && ciMax >= 0) config.checkIn.maxTokens = Math.max(ciMax, config.checkIn.minTokens || 0);
+  if (!config.quotaRequest) config.quotaRequest = {};
+  config.quotaRequest.enabled = formData.quotaRequestEnabled === "on";
+  const qrWk = parseInt(formData.quotaRequestWeeklyLimit, 10);
+  if (Number.isFinite(qrWk) && qrWk >= 0 && qrWk <= 1000) config.quotaRequest.weeklyLimit = qrWk;
 
   // Restrict default-group members to /v1 only (block direct /<suffix>/... access).
   // Default ON (undefined → enabled) to prevent bypassing failover to on-demand profiles.
@@ -9172,15 +9992,15 @@ const server = http.createServer((req, res) => {
     const offset = Math.max(0, parseInt(url.searchParams.get("offset") || "0", 10) || 0);
     const actor = url.searchParams.get("actor") || "";
     const category = url.searchParams.get("category") || "";
-    const pairs = {
-      admin: [stmts.auditPageAdmin, stmts.auditTotalAdmin],
-      system: [stmts.auditPageSystem, stmts.auditTotalSystem],
-      auth: [stmts.auditPageAuth, stmts.auditTotalAuth],
-    };
+    // Every row carries an explicit category since the audit-category
+    // migration backfilled history, so one parameterised pair serves all five
+    // types. The legacy actor/action-prefix statements stay defined above for
+    // compatibility but are no longer the query path here.
+    const CATEGORIES = new Set(["admin", "system", "auth", "checkin", "request"]);
     let rows, total;
-    if (pairs[category]) {
-      rows = pairs[category][0].all(limit, offset);
-      total = pairs[category][1].get().c;
+    if (CATEGORIES.has(category)) {
+      rows = stmts.auditPageForCategory.all(category, limit, offset);
+      total = stmts.auditTotalForCategory.get(category).c;
     } else if (actor) {
       rows = stmts.auditPageForActor.all(actor, limit, offset);
       total = stmts.auditTotalForActor.get(actor).c;
@@ -9190,6 +10010,95 @@ const server = http.createServer((req, res) => {
     }
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ rows, total }));
+    return;
+  }
+
+  // Quota-request list (admin): newest first, optional status filter.
+  if (req.method === "GET" && req.url.startsWith("/api/quota-requests")) {
+    if (!checkAuth(req)) { res.writeHead(401); res.end("Unauthorized"); return; }
+    const url = new URL(req.url, `http://localhost`);
+    const status = url.searchParams.get("status") || "";
+    const limit = Math.min(500, Math.max(1, parseInt(url.searchParams.get("limit") || "200", 10) || 200));
+    const rows = (status === "pending" || status === "handled" || status === "rejected")
+      ? stmts.listQuotaRequestsByStatus.all(status, limit)
+      : stmts.listQuotaRequests.all(limit);
+    const pending = stmts.countPendingQuotaRequests.get().c;
+    // Pending rows carry the member's grantable pools so the admin's 发放加量
+    // dialog can offer exactly the pools the request can actually benefit.
+    const enriched = rows.map(r => ({
+      ...r,
+      poolLabel: r.pool ? poolLabelOf(r.pool) : "",
+      ...(r.status === "pending" ? { pools: getUserPoolNames(r.user_key).map(n => ({ name: n, label: poolLabelOf(n) })) } : {}),
+    }));
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ rows: enriched, pending }));
+    return;
+  }
+
+  // Quota-request grant (admin): adds a today bonus to the member's pool and
+  // marks the request handled in one call, so the admin never has to hop between
+  // the request queue and the pool tools for the common path.
+  if (req.method === "POST" && req.url === "/api/quota-request/grant") {
+    if (!checkAuth(req)) { res.writeHead(401); res.end("Unauthorized"); return; }
+    if (!checkCsrf(req)) { res.writeHead(403); res.end("CSRF validation failed"); return; }
+    readBody(req).then(buf => {
+      try {
+        const { id, pool, amount } = JSON.parse(buf.toString());
+        const n = Number(amount);
+        if (!Number.isInteger(n) || n <= 0 || n > 1e10) throw new Error("amount 必须为 1~100亿 的整数（token 数）");
+        const row = stmts.getQuotaRequest.get(id);
+        if (!row) throw new Error(`申请 #${id} 不存在`);
+        if (row.status !== "pending") throw new Error(`申请 #${row.id} 已处理过`);
+        const validPools = getUserPoolNames(row.user_key);
+        if (!validPools.includes(pool)) throw new Error(`该成员不在额度池「${poolLabelOf(pool)}」中（可发放：${validPools.map(poolLabelOf).join("、") || "无"}）`);
+        const baseLimit = getUserPoolQuota(pool, row.user_key) || getPoolQuota(pool);
+        if (baseLimit <= 0) throw new Error(`额度池「${poolLabelOf(pool)}」与该成员均未设置每日配额（当前无限制），加量无意义；请先在额度池管理中设置限额`);
+        const today = cnDate();
+        const now = new Date().toISOString();
+        const tx = db.transaction(() => {
+          const op = stmts.getQuotaDailyOp.get(pool, row.user_key, today) || {};
+          stmts.upsertQuotaDailyOp.run({ pool, key: row.user_key, date: today,
+            bonus: (op.bonus || 0) + n, baseline: op.reset_baseline || 0, resetTime: op.reset_time || null, updatedAt: now });
+          stmts.insertQuotaAdjustManual.run({ user: row.user_key, username: row.username, date: today,
+            oldQuota: baseLimit + (op.bonus || 0), newQuota: baseLimit + (op.bonus || 0) + n, time: now });
+          stmts.trimQuotaAdjust.run();
+          stmts.updateQuotaRequest.run({ id: row.id, status: "handled",
+            note: `已发放 +${n.toLocaleString()} token 到额度池「${poolLabelOf(pool)}」（当日有效）`, handledAt: now });
+        });
+        tx();
+        recordAdminAudit(req, "request.handle", `${row.username} · #${row.id}`,
+          `通过 ${row.username} 的加量申请并发放 +${n.toLocaleString()} token 到额度池「${poolLabelOf(pool)}」（当日临时加量，明日自动失效；理由「${row.reason}」）`, "request");
+        console.log(`[加量申请] 已发放：${row.username} +${n.toLocaleString()} @${poolLabelOf(pool)}`);
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: true }));
+      } catch (err) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: err.message }));
+      }
+    }).catch(() => { res.writeHead(413); res.end("Request too large"); });
+    return;
+  }
+
+  // Quota-request status transition (admin)
+  if (req.method === "POST" && req.url === "/api/quota-request/update") {
+    if (!checkAuth(req)) { res.writeHead(401); res.end("Unauthorized"); return; }
+    if (!checkCsrf(req)) { res.writeHead(403); res.end("CSRF validation failed"); return; }
+    readBody(req).then(buf => {
+      try {
+        const { id, status, note } = JSON.parse(buf.toString());
+        const row = updateQuotaRequest(id, status, note);
+        const granted = status === "handled";
+        recordAdminAudit(req, granted ? "request.handle" : "request.reject",
+          `${row.username} · #${row.id}`,
+          `${granted ? "已处理" : "驳回"} ${row.username} 的加量申请（理由「${row.reason}」${row.pool ? `，额度池「${poolLabelOf(row.pool)}」` : ""}）${note ? `，备注：${note}` : ""}`,
+          "request");
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: true }));
+      } catch (err) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: err.message }));
+      }
+    }).catch(() => { res.writeHead(413); res.end("Request too large"); });
     return;
   }
 
@@ -9479,6 +10388,39 @@ const server = http.createServer((req, res) => {
   }
 
   // Personal usage API (authenticated by API key, supports ?profile=<suffix>)
+  // Daily check-in (member, virtual-key auth — same scheme as /api/my-usage)
+  if (req.method === "POST" && req.url.split("?")[0] === "/api/checkin") {
+    const apiKey = getApiKey(req);
+    try {
+      if (!hasGlobalUser(apiKey)) throw new Error("认证失败：请提供有效的虚拟Key");
+      const result = performCheckIn(apiKey, getClientIp(req));
+      res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+      res.end(JSON.stringify(result));
+    } catch (err) {
+      res.writeHead(400, { "Content-Type": "application/json; charset=utf-8" });
+      res.end(JSON.stringify({ error: err.message }));
+    }
+    return;
+  }
+
+  // Quota increase request (member, virtual-key auth)
+  if (req.method === "POST" && req.url.split("?")[0] === "/api/quota-request") {
+    const apiKey = getApiKey(req);
+    readBody(req, 10_000).then(buf => {
+      try {
+        if (!hasGlobalUser(apiKey)) throw new Error("认证失败：请提供有效的虚拟Key");
+        const { reason, pool } = JSON.parse(buf.toString() || "{}");
+        const result = createQuotaRequest(apiKey, reason, pool, getClientIp(req));
+        res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+        res.end(JSON.stringify(result));
+      } catch (err) {
+        res.writeHead(400, { "Content-Type": "application/json; charset=utf-8" });
+        res.end(JSON.stringify({ error: err.message }));
+      }
+    }).catch(() => { res.writeHead(413); res.end("Request too large"); });
+    return;
+  }
+
   if (req.method === "GET" && req.url.startsWith("/api/my-usage")) {
     const apiKey = getApiKey(req);
     const url = new URL(req.url, `http://localhost`);

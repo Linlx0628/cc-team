@@ -1401,6 +1401,11 @@ function initDb() {
       avg_daily_usage INTEGER, auto INTEGER DEFAULT 1, time TEXT NOT NULL
     );
     CREATE TABLE IF NOT EXISTS kv_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS image_bridge_cache (
+      hash TEXT PRIMARY KEY,
+      text TEXT NOT NULL,
+      ts INTEGER NOT NULL
+    );
     CREATE TABLE IF NOT EXISTS quota_daily_ops (
       pool TEXT NOT NULL, user_key TEXT NOT NULL, date TEXT NOT NULL,
       bonus INTEGER NOT NULL DEFAULT 0,
@@ -1604,6 +1609,14 @@ function initDb() {
   stmts.deleteQuotaDailyOp = db.prepare(`DELETE FROM quota_daily_ops WHERE pool=? AND user_key=? AND date=?`);
   stmts.pruneQuotaDailyOps = db.prepare(`DELETE FROM quota_daily_ops WHERE date < ?`);
   stmts.upsertMeta = db.prepare(`INSERT INTO kv_meta (key,value) VALUES (@k,@v) ON CONFLICT(key) DO UPDATE SET value=excluded.value`);
+  // Image-bridge transcription cache (persisted so a gateway restart never
+  // re-transcribes replayed history images).
+  stmts.bridgeCacheGet = db.prepare(`SELECT text FROM image_bridge_cache WHERE hash=?`);
+  stmts.bridgeCacheSet = db.prepare(`INSERT INTO image_bridge_cache (hash,text,ts) VALUES (?,?,?)
+    ON CONFLICT(hash) DO UPDATE SET text=excluded.text, ts=excluded.ts`);
+  stmts.bridgeCacheCount = db.prepare(`SELECT COUNT(*) AS n FROM image_bridge_cache`);
+  stmts.bridgeCachePrune = db.prepare(`DELETE FROM image_bridge_cache WHERE hash IN (
+    SELECT hash FROM image_bridge_cache ORDER BY ts DESC LIMIT -1 OFFSET ?)`);
   stmts.insertAudit = db.prepare(`INSERT INTO audit_log (time,actor,action,target,detail,ip,category)
     VALUES (@time,@actor,@action,@target,@detail,@ip,@category)`);
   // Check-ins land once per user per day, so the audit trail grows faster now;
@@ -4116,28 +4129,26 @@ function buildUpstreamPath(reqUrl, runtime) {
 
 // ─── 图片识别桥接（vision bridge）───────────────────────────────────────────
 // 目标别名不支持视觉时，先用方案指定的辅助模型把图片转成文字描述，再替换
-// 请求里的图片块交给原模型——Codex 端对所有别名放行贴图（见 models.json 的
-// modalities 联动），纯文本模型实际收到的是图片的文字转述。
-// 转述按图片内容 sha256 缓存（对话每轮重发历史，同图重放零额外成本）。
-const imageBridgeCache = new Map();   // sha256 -> { text, ts }
-const IMAGE_BRIDGE_CACHE_MAX = 500;
+// 请求里的图片块交给原模型——Claude Code/ZCode/Codex 端贴图即可用。
+// 转述按 helperModel:sha256(b64) 持久化到 SQLite：重放协议每轮重发全部历史
+// 图片，缓存跨重启存活才不会在网关重启后批量重转或撞上限。
+const IMAGE_BRIDGE_CACHE_MAX_ROWS = 5000;
 const IMAGE_BRIDGE_MAX_IMAGES = 8;
 const IMAGE_BRIDGE_MAX_B64 = 12 * 1024 * 1024;
 
 function bridgeCacheGet(hash) {
-  const hit = imageBridgeCache.get(hash);
-  if (!hit) return null;
-  return hit.text;
+  try {
+    const row = stmts.bridgeCacheGet.get(hash);
+    return row ? row.text : null;
+  } catch { return null; }
 }
 function bridgeCacheSet(hash, text) {
-  imageBridgeCache.set(hash, { text, ts: Date.now() });
-  if (imageBridgeCache.size > IMAGE_BRIDGE_CACHE_MAX) {
-    let oldest = null, oldestKey = null;
-    for (const [k, v] of imageBridgeCache) {
-      if (!oldest || v.ts < oldest) { oldest = v.ts; oldestKey = k; }
+  try {
+    stmts.bridgeCacheSet.run(hash, text, Date.now());
+    if (stmts.bridgeCacheCount.get().n > IMAGE_BRIDGE_CACHE_MAX_ROWS) {
+      stmts.bridgeCachePrune.run(IMAGE_BRIDGE_CACHE_MAX_ROWS);
     }
-    if (oldestKey) imageBridgeCache.delete(oldestKey);
-  }
+  } catch (err) { console.warn("[图片桥接] 缓存写入失败:", err.message); }
 }
 
 // Extract data:URL images from a parsed Responses request body (input items).
@@ -4230,26 +4241,39 @@ async function bridgeImagesInRequest(body, runtime, clientState, alias, protocol
   // misconfigured blind model) invalidates stale garbage transcriptions
   // instead of serving them forever.
   const keyed = images.map(img => ({ img, hash: `${helperModel}:${crypto.createHash("sha256").update(img.b64).digest("hex")}` }));
-  // The per-request cap counts only NEW (uncached) transcriptions. Both client
-  // protocols replay the FULL conversation every turn — old images are cache
-  // hits and cost nothing, so counting them (an earlier bug) made any
-  // conversation that had accumulated more than the cap fail entirely.
-  const misses = keyed.filter(k => bridgeCacheGet(k.hash) === null);
-  if (misses.length > IMAGE_BRIDGE_MAX_IMAGES) {
-    const err = new Error(`单次请求新增待识别图片超过上限（${IMAGE_BRIDGE_MAX_IMAGES} 张），请减少一次发送的图片数量`);
-    err.statusCode = 400;
-    throw err;
+  // Graceful overflow: the cap bounds per-request NEW transcriptions. Replay
+  // protocols resend the FULL history every turn — a long session right after a
+  // gateway restart would exceed it every turn — so beyond the cap the OLDEST
+  // images degrade to placeholders instead of failing the whole request; the
+  // newest images (most relevant context) are always transcribed.
+  const missFlags = keyed.map(k => bridgeCacheGet(k.hash) === null);
+  const missCount = missFlags.filter(Boolean).length;
+  const placeholder = new Array(keyed.length).fill(false);
+  let budget = IMAGE_BRIDGE_MAX_IMAGES;
+  for (let i = keyed.length - 1; i >= 0; i--) {   // newest first gets the budget
+    if (!missFlags[i]) continue;
+    if (budget > 0) budget--;
+    else placeholder[i] = true;
   }
-  for (const { img, hash } of keyed) {
-    let desc = bridgeCacheGet(hash);
-    if (desc === null) {
-      desc = await describeImageViaHelper(img.b64, helperModel, runtime, clientState, profileCfg, protocol, img.mediaType);
+  if (placeholder.some(Boolean)) {
+    console.log(`[图片桥接] 本轮新图 ${missCount} 张超上限，识别最近 ${IMAGE_BRIDGE_MAX_IMAGES} 张，其余以占位替换`);
+  }
+  for (let i = 0; i < keyed.length; i++) {
+    const { img, hash } = keyed[i];
+    let desc;
+    if (placeholder[i]) {
+      desc = "（历史图片较多，此张本轮未识别；如需分析请重新发送该图）";
+    } else {
+      desc = bridgeCacheGet(hash);
       if (desc === null) {
-        const err = new Error(`图片识别失败：辅助模型 ${helperModel} 未能生成图片描述（失败原因见网关日志 [图片桥接]），请稍后重试或改用原生支持视觉的别名`);
-        err.statusCode = 502;
-        throw err;
+        desc = await describeImageViaHelper(img.b64, helperModel, runtime, clientState, profileCfg, protocol, img.mediaType);
+        if (desc === null) {
+          const err = new Error(`图片识别失败：辅助模型 ${helperModel} 未能生成图片描述（失败原因见网关日志 [图片桥接]），请稍后重试或改用原生支持视觉的别名`);
+          err.statusCode = 502;
+          throw err;
+        }
+        bridgeCacheSet(hash, desc);
       }
-      bridgeCacheSet(hash, desc);
     }
     // Replace the image block with a text description (keep surrounding context).
     if (protocol === "anthropic") {

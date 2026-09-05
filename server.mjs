@@ -1611,7 +1611,8 @@ function initDb() {
   stmts.upsertMeta = db.prepare(`INSERT INTO kv_meta (key,value) VALUES (@k,@v) ON CONFLICT(key) DO UPDATE SET value=excluded.value`);
   // Image-bridge transcription cache (persisted so a gateway restart never
   // re-transcribes replayed history images).
-  stmts.bridgeCacheGet = db.prepare(`SELECT text FROM image_bridge_cache WHERE hash=?`);
+  stmts.bridgeCacheGet = db.prepare(`SELECT text, ts FROM image_bridge_cache WHERE hash=?`);
+  stmts.bridgeCacheTouch = db.prepare(`UPDATE image_bridge_cache SET ts=? WHERE hash=?`);
   stmts.bridgeCacheSet = db.prepare(`INSERT INTO image_bridge_cache (hash,text,ts) VALUES (?,?,?)
     ON CONFLICT(hash) DO UPDATE SET text=excluded.text, ts=excluded.ts`);
   stmts.bridgeCacheCount = db.prepare(`SELECT COUNT(*) AS n FROM image_bridge_cache`);
@@ -4142,6 +4143,7 @@ const IMAGE_BRIDGE_CONCURRENCY = 4;            // parallel helper calls
 const IMAGE_BRIDGE_CALL_TIMEOUT_MS = 25000;    // per-image helper timeout
 const IMAGE_BRIDGE_TOTAL_BUDGET_MS = 35000;    // whole-request budget, shared across failover candidates
 const IMAGE_BRIDGE_MIN_CALL_MS = 8000;         // never start a call the budget would clip
+const IMAGE_BRIDGE_DESC_MAX_CHARS = 1000;      // a transcription is replayed every turn, forever
 // A helper that is genuinely broken should cost one second, not a full budget on
 // every turn: park it after a few consecutive failures.
 const IMAGE_BRIDGE_HELPER_FAIL_LIMIT = 3;
@@ -4160,9 +4162,31 @@ function ibCacheRows() {
 function bridgeCacheGet(hash) {
   try {
     const row = stmts.bridgeCacheGet.get(hash);
-    return row ? row.text : null;
+    if (!row) return null;
+    // Pruning keeps the newest IMAGE_BRIDGE_CACHE_MAX_ROWS by ts, so ts has to track
+    // USE and not just insertion: otherwise a long conversation's images get evicted
+    // while they are still replayed every turn, flip back to placeholders, and take
+    // the upstream's prompt cache with them. Hour granularity keeps writes cheap.
+    if (Date.now() - row.ts > 3600_000) {
+      try { stmts.bridgeCacheTouch.run(Date.now(), hash); } catch {}
+    }
+    return row.text;
   } catch { return null; }
 }
+// A transcription replaces its image for good: it is cached and replayed on every
+// later turn, so its length is a permanent per-turn tax. A chatty helper writing
+// 2000 chars about each of 27 screenshots would quietly add tens of thousands of
+// tokens to every single request, which is why this is capped rather than trusted.
+function clampDescription(text) {
+  const s = String(text || "").trim();
+  if (s.length <= IMAGE_BRIDGE_DESC_MAX_CHARS) return s;
+  const cut = s.slice(0, IMAGE_BRIDGE_DESC_MAX_CHARS);
+  let stop = -1;
+  for (const mark of ["。", "；", "\n", ". "]) stop = Math.max(stop, cut.lastIndexOf(mark));
+  const body = stop > IMAGE_BRIDGE_DESC_MAX_CHARS * 0.6 ? cut.slice(0, stop + 1) : cut;
+  return body + "…（描述过长，已截断）";
+}
+
 function bridgeCacheSet(hash, text) {
   try {
     stmts.bridgeCacheSet.run(hash, text, Date.now());
@@ -4195,25 +4219,49 @@ function anthropicFreshStart(msgs) {
   return i + 1;
 }
 
+// A user message names its text parts `input_text`; some servers use `output_text`
+// inside a tool result. Mirror whatever the sibling parts already use so the
+// rewritten block stays valid for that container.
+function responsesTextType(arr, field) {
+  if (field === "content") return "input_text";
+  const sibling = arr.find(b => b && typeof b.type === "string" && b.type.endsWith("_text"));
+  return sibling ? sibling.type : "input_text";
+}
+
 // Extract data:URL images from a parsed Responses request body (input items).
-// Returns markers { i, j, b64, fresh, tooLarge } into parsed.input.
+// Returns markers { i, j, field, textType, b64, fresh, tooLarge } into
+// parsed.input[i][field][j].
 function extractImagesFromResponsesBody(parsed) {
   const images = [];
   const items = Array.isArray(parsed?.input) ? parsed.input : [];
   const freshStart = responsesFreshStart(items);
-  for (let i = 0; i < items.length; i++) {
-    const item = items[i];
-    if (!item || typeof item !== "object" || item.type !== "message") continue;
-    const content = Array.isArray(item.content) ? item.content : [];
-    for (let j = 0; j < content.length; j++) {
-      const block = content[j];
+  const scan = (arr, i, field) => {
+    for (let j = 0; j < arr.length; j++) {
+      const block = arr[j];
       if (!block || block.type !== "input_image") continue;
       const raw = String(block.image_url || "");
-      const m = /^data:image\/[a-zA-Z0-9.+-]+;base64,([A-Za-z0-9+/=]+)$/.exec(raw);
+      const m = /^data:image\/[a-zA-Z0-9.+-]+;base64,([A-Za-z0-9+/=\s]+)$/.exec(raw);
       if (!m) continue;
+      const b64 = m[1].replace(/\s+/g, "");
+      if (!b64) continue;
       // Oversized images are collected too, just flagged: skipping them left a raw
       // image block in a request bound for a blind model — a guaranteed 400.
-      images.push({ i, j, b64: m[1], fresh: i >= freshStart, tooLarge: m[1].length > IMAGE_BRIDGE_MAX_B64 });
+      images.push({ i, j, field, textType: responsesTextType(arr, field), b64,
+        fresh: i >= freshStart, tooLarge: b64.length > IMAGE_BRIDGE_MAX_B64 });
+    }
+  };
+  for (let i = 0; i < items.length; i++) {
+    const item = items[i];
+    if (!item || typeof item !== "object") continue;
+    if (item.type === "message") {
+      if (Array.isArray(item.content)) scan(item.content, i, "content");
+      continue;
+    }
+    // Tool results can carry screenshots as well, in the array form of `output` on a
+    // *_call_output item. Left unextracted, that raw image block would travel to a
+    // model with no vision and take the whole request down with it.
+    if (typeof item.type === "string" && item.type.endsWith("_call_output") && Array.isArray(item.output)) {
+      scan(item.output, i, "output");
     }
   }
   return images;
@@ -4362,7 +4410,7 @@ async function bridgeImagesInRequest(body, runtime, clientState, alias, protocol
     if (protocol === "anthropic") {
       img.arr[img.idx] = { type: "text", text: `[图片内容] ${text}` };
     } else {
-      parsed.input[img.i].content[img.j] = { type: "input_text", text: `[图片内容] ${text}` };
+      parsed.input[img.i][img.field][img.j] = { type: img.textType, text: `[图片内容] ${text}` };
     }
   }
   if (freshFails.length) {
@@ -4425,23 +4473,37 @@ function pickHelperDescription(json, isAnthropic) {
     const kinds = [...new Set(blocks.map(b => b?.type).filter(Boolean))].join("+") || "无内容";
     const stop = json?.stop_reason || "?";
     const text = blocks.filter(b => b?.type === "text").map(b => b.text || "").join("\n").trim();
-    if (text) return { text, kinds, stop };
+    if (text) return { text: clampDescription(text), kinds, stop };
     const thinking = blocks.filter(b => b?.type === "thinking").map(b => b.thinking || "").join("\n").trim();
-    if (thinking) return { text: thinking.slice(0, 1200), kinds, stop, fromThinking: true };
+    if (thinking) return { text: clampDescription(thinking), kinds, stop, fromThinking: true };
     return { text: "", kinds, stop };
   }
   const out = Array.isArray(json?.output) ? json.output : [];
   const kinds = [...new Set(out.map(o => o?.type).filter(Boolean))].join("+") || "无内容";
   const stop = json?.status || json?.incomplete_details?.reason || "?";
-  const text = out.filter(o => o?.type === "message")
+  // Responses implementations disagree on where the prose ends up, and the Anthropic
+  // side's thinking-block rescue has no direct equivalent here — so walk every place
+  // a description can legitimately live before giving up on the image.
+  let text = out.filter(o => o?.type === "message")
     .flatMap(o => (Array.isArray(o.content) ? o.content : []))
     .filter(c => c?.type === "output_text")
     .map(c => c.text || "").join("\n").trim();
-  if (text) return { text, kinds, stop };
+  if (!text) {
+    // The convenience field: some servers fill only this and leave `output` empty.
+    const ot = json?.output_text;
+    text = (Array.isArray(ot) ? ot.join("\n") : String(ot || "")).trim();
+  }
+  if (!text) {
+    // Any non-reasoning part carrying text, whatever the server chose to call it.
+    text = out.filter(o => o?.type !== "reasoning")
+      .flatMap(o => (Array.isArray(o.content) ? o.content : []))
+      .map(c => (typeof c?.text === "string" ? c.text : "")).join("\n").trim();
+  }
+  if (text) return { text: clampDescription(text), kinds, stop };
   const reasoning = out.filter(o => o?.type === "reasoning")
-    .flatMap(o => (Array.isArray(o.summary) ? o.summary : []))
+    .flatMap(o => [...(Array.isArray(o.summary) ? o.summary : []), ...(Array.isArray(o.content) ? o.content : [])])
     .map(s => (typeof s === "string" ? s : s?.text || "")).join("\n").trim();
-  if (reasoning) return { text: reasoning.slice(0, 1200), kinds, stop, fromThinking: true };
+  if (reasoning) return { text: clampDescription(reasoning), kinds, stop, fromThinking: true };
   return { text: "", kinds, stop };
 }
 
@@ -4458,7 +4520,12 @@ async function describeImageViaHelper(b64, helperModel, runtime, clientState, pr
   const healthKey = `${runtime.upstreamUrl.host}|${helperModel}`;
   const cooldown = bridgeHelperCooldown(healthKey);
   if (cooldown > 0) return { ok: false, reason: `辅助模型 ${helperModel} 连续失败，冷却中（还剩 ${Math.ceil(cooldown / 1000)}s）` };
-  const instruction = "你是图片描述助手。请用简体中文详细描述这张图片的内容，包括主体、布局、文字、颜色等，供另一个语言模型理解。只输出描述本身。";
+  // The helper never sees the user's question and gets exactly one shot: its text
+  // replaces the image permanently and is cached, so anything left out is lost for
+  // good. Hence the explicit priority order, the verbatim-text rule, and the length
+  // ceiling. "不要解释你在做什么" also steers reasoning helpers away from spending
+  // their whole budget narrating the task instead of describing the image.
+  const instruction = "你是图片转述助手。你写的描述会替换掉这张图片本身，交给一个看不到图的语言模型，并且会被缓存复用——这是唯一一次机会，写漏的信息将永久丢失。请用简体中文按以下优先级转述：①图片类型与主体（截图／照片／图表／代码等）；②图中所有可见文字，原样抄录，不要改写或翻译；③布局、元素位置与控件状态（选中／报错／高亮等）；④配色与其他视觉特征。要求完整但紧凑，普通图片控制在 400 字以内，文字密集的截图最多 800 字。只输出描述本身，不要任何前后缀，不要解释你在做什么。";
   const mt = mediaType || "image/png";
   const isAnthropic = protocol === "anthropic";
   const buildBody = (askNoThinking) => isAnthropic

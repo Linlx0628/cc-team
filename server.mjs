@@ -2434,7 +2434,7 @@ function getModelRateBoard(suffixFilter) {
   const today = cnDate();
   const usage = {};   // suffix → model → { raw, weighted, requests }
   const hasFilter = Array.isArray(suffixFilter);
-  const binds = hasFilter ? (suffixFilter.length ? suffixFilter : [" none"]) : [];
+  const binds = hasFilter ? (suffixFilter.length ? suffixFilter : ["\u0000none"]) : [];
   const where = hasFilter ? `AND profile IN (${binds.map(() => "?").join(",")})` : "";
   const rows = db.prepare(
     `SELECT profile, model, SUM(requests) AS r, SUM(input_tokens+output_tokens) AS raw, SUM(weighted_tokens) AS w
@@ -4163,19 +4163,61 @@ function extractImagesFromResponsesBody(parsed) {
   return images;
 }
 
+// Extract base64 image blocks from a parsed Anthropic Messages body. Image
+// blocks live in message content arrays — including nested inside tool_result
+// content (Claude Code puts screenshots there). Returns reference-based
+// markers { arr, idx, b64, mediaType } so the caller can replace in place.
+function extractImageBlocksAnthropic(parsed) {
+  const images = [];
+  const msgs = Array.isArray(parsed?.messages) ? parsed.messages : [];
+  for (const msg of msgs) {
+    const content = msg && msg.content;
+    if (!Array.isArray(content)) continue;   // string content carries no images
+    for (let idx = 0; idx < content.length; idx++) {
+      const block = content[idx];
+      if (!block || typeof block !== "object") continue;
+      if (block.type === "image" && block.source?.type === "base64" && typeof block.source.data === "string") {
+        if (block.source.data.length <= IMAGE_BRIDGE_MAX_B64) {
+          images.push({ arr: content, idx, b64: block.source.data, mediaType: block.source.media_type || "image/png" });
+        }
+        continue;
+      }
+      if (block.type === "tool_result" && Array.isArray(block.content)) {
+        const inner = block.content;
+        for (let t = 0; t < inner.length; t++) {
+          const tb = inner[t];
+          if (tb && tb.type === "image" && tb.source?.type === "base64" && typeof tb.source.data === "string") {
+            if (tb.source.data.length <= IMAGE_BRIDGE_MAX_B64) {
+              images.push({ arr: inner, idx: t, b64: tb.source.data, mediaType: tb.source.media_type || "image/png" });
+            }
+          }
+        }
+      }
+    }
+  }
+  return images;
+}
+
 // Bridge one request body (Buffer) through the profile's helper model.
 // `alias` is the model alias the client asked for: aliases marked multimodal
 // pass through untouched (native support); non-multimodal aliases with images
 // are rewritten via the helper. Returns the rewritten Buffer, or null to
 // passthrough (no images, or the alias natively supports images).
-async function bridgeImagesInRequest(body, runtime, clientState, alias) {
+async function bridgeImagesInRequest(body, runtime, clientState, alias, protocol) {
   const profileCfg = config.profiles[runtime.profileName] || {};
   const mm = profileCfg.modelMultimodal || {};
-  // Native support (or unknown alias) → passthrough, zero cost.
-  if (mm[alias] !== false) return null;
+  // Native support (or unknown alias) → passthrough, zero cost. Lookup is
+  // case-insensitive: clients send aliases with arbitrary casing (Claude Code
+  // was observed sending "Jx-Opus"), while resolveModel already matches
+  // case-insensitively.
+  const aliasKey = String(alias || "");
+  const mmEntry = Object.keys(mm).find(k => k.toLowerCase() === aliasKey.toLowerCase());
+  if (!mmEntry || mm[mmEntry] !== false) return null;
   let parsed;
   try { parsed = JSON.parse(body.toString()); } catch { return null; }
-  const images = extractImagesFromResponsesBody(parsed);
+  const images = protocol === "anthropic"
+    ? extractImageBlocksAnthropic(parsed)
+    : extractImagesFromResponsesBody(parsed);
   if (images.length === 0) return null;
   if (images.length > IMAGE_BRIDGE_MAX_IMAGES) {
     const err = new Error(`单次请求图片数量超过上限（${IMAGE_BRIDGE_MAX_IMAGES} 张），请分批发送`);
@@ -4189,12 +4231,14 @@ async function bridgeImagesInRequest(body, runtime, clientState, alias) {
     err.statusCode = 400;
     throw err;
   }
-  const items = parsed.input;
-  for (const { i, j, b64 } of images) {
-    const hash = crypto.createHash("sha256").update(b64).digest("hex");
+  for (const img of images) {
+    // Cache key includes the helper model: changing the helper (e.g. fixing a
+    // misconfigured blind model) invalidates stale garbage transcriptions
+    // instead of serving them forever.
+    const hash = `${helperModel}:${crypto.createHash("sha256").update(img.b64).digest("hex")}`;
     let desc = bridgeCacheGet(hash);
     if (desc === null) {
-      desc = await describeImageViaHelper(b64, helperModel, runtime, clientState, profileCfg);
+      desc = await describeImageViaHelper(img.b64, helperModel, runtime, clientState, profileCfg, protocol, img.mediaType);
       if (desc === null) {
         const err = new Error("图片识别失败：辅助模型未能生成图片描述，请稍后重试或改用原生支持视觉的别名");
         err.statusCode = 502;
@@ -4203,9 +4247,13 @@ async function bridgeImagesInRequest(body, runtime, clientState, alias) {
       bridgeCacheSet(hash, desc);
     }
     // Replace the image block with a text description (keep surrounding context).
-    items[i].content[j] = { type: "input_text", text: `[图片内容] ${desc}` };
+    if (protocol === "anthropic") {
+      img.arr[img.idx] = { type: "text", text: `[图片内容] ${desc}` };
+    } else {
+      parsed.input[img.i].content[img.j] = { type: "input_text", text: `[图片内容] ${desc}` };
+    }
   }
-  return Buffer.from(JSON.stringify(parsed));
+  return { body: Buffer.from(JSON.stringify(parsed)), helperModel };
 }
 
 // Pick the helper model: imageBridge.model (manual override) → first alias
@@ -4220,18 +4268,34 @@ function resolveBridgeHelperModel(profileCfg, mm) {
 
 // Ask the helper model to describe a base64 image. Returns the description text
 // or null on any failure. Uses the profile's real upstream + key (same auth).
-async function describeImageViaHelper(b64, helperModel, runtime, clientState, profileCfg) {
-  const body = JSON.stringify({
-    model: helperModel,
-    instructions: "你是图片描述助手。请用简体中文详细描述这张图片的内容，包括主体、布局、文字、颜色等，供另一个语言模型理解。只输出描述本身。",
-    input: [
-      { type: "message", role: "user", content: [
-        { type: "input_image", image_url: `data:image/png;base64,${b64}` },
-      ] },
-    ],
-    store: false,
-    stream: false,
-  });
+// The helper call speaks the SAME protocol as the profile it serves: Responses
+// profiles ask /v1/responses with input_image, Anthropic profiles ask
+// /v1/messages with an image content block.
+async function describeImageViaHelper(b64, helperModel, runtime, clientState, profileCfg, protocol, mediaType) {
+  const instruction = "你是图片描述助手。请用简体中文详细描述这张图片的内容，包括主体、布局、文字、颜色等，供另一个语言模型理解。只输出描述本身。";
+  const mt = mediaType || "image/png";
+  const isAnthropic = protocol === "anthropic";
+  const body = isAnthropic
+    ? JSON.stringify({
+        model: helperModel,
+        max_tokens: 1024,
+        stream: false,
+        messages: [{ role: "user", content: [
+          { type: "image", source: { type: "base64", media_type: mt, data: b64 } },
+          { type: "text", text: instruction },
+        ] }],
+      })
+    : JSON.stringify({
+        model: helperModel,
+        instructions: instruction,
+        input: [
+          { type: "message", role: "user", content: [
+            { type: "input_image", image_url: `data:${mt};base64,${b64}` },
+          ] },
+        ],
+        store: false,
+        stream: false,
+      });
   const headers = {
     "content-type": "application/json",
     "content-length": Buffer.byteLength(body),
@@ -4239,17 +4303,22 @@ async function describeImageViaHelper(b64, helperModel, runtime, clientState, pr
     authorization: `Bearer ${getRealKeyFromProfile(profileCfg)}`,
   };
   try {
-    const upRes = await sendUpstream(Buffer.from(body), "/v1/responses", "POST", headers, 60000, runtime, clientState);
+    const upRes = await sendUpstream(Buffer.from(body), isAnthropic ? "/v1/messages" : "/v1/responses", "POST", headers, 60000, runtime, clientState);
     if (upRes.statusCode !== 200) return null;
     const json = JSON.parse(upRes.body.toString());
-    const out = json?.output || [];
-    const text = out
-      .filter(o => o && o.type === "message")
-      .flatMap(o => (Array.isArray(o.content) ? o.content : []))
-      .filter(c => c && c.type === "output_text")
-      .map(c => c.text || "")
-      .join("\n")
-      .trim();
+    const text = isAnthropic
+      ? (Array.isArray(json?.content) ? json.content : [])
+          .filter(c => c && c.type === "text")
+          .map(c => c.text || "")
+          .join("\n")
+          .trim()
+      : (json?.output || [])
+          .filter(o => o && o.type === "message")
+          .flatMap(o => (Array.isArray(o.content) ? o.content : []))
+          .filter(c => c && c.type === "output_text")
+          .map(c => c.text || "")
+          .join("\n")
+          .trim();
     return text || null;
   } catch {
     return null;
@@ -4616,16 +4685,16 @@ function proxyRequest(req, res) {
           const isStreamRequest = (req.headers["accept"] || "").includes("text/event-stream") ||
             (function() { try { return JSON.parse(cbody.toString()).stream; } catch { return false; } })();
 
-          // Image-recognition bridge (Responses only): non-multimodal aliases
+          // Image-recognition bridge (both protocols): non-multimodal aliases
           // with images are rewritten into helper-model descriptions before the
           // request goes upstream. Runs for both streaming and JSON requests
           // (only the request body is touched; the response mode is unaffected).
-          if (protocol === "responses") {
-            const bridged = await bridgeImagesInRequest(cbody, cruntime, clientState, originalModel);
+          {
+            const bridged = await bridgeImagesInRequest(cbody, cruntime, clientState, originalModel, protocol);
             if (bridged) {
-              cbody = bridged;
+              cbody = bridged.body;
               reqHeaders["content-length"] = cbody.length;
-              console.log(`[图片桥接] ${getUserName(apiKey, cruntime)} 已把图片转述后发往 ${creqModel}`);
+              console.log(`[图片桥接] ${getUserName(apiKey, cruntime)} 辅助模型=${bridged.helperModel} 已把图片转述后发往 ${creqModel}`);
             }
           }
 
@@ -5540,7 +5609,7 @@ ${errDiv}
 <div class="note" id="allowedModelsNote">自动汇总上方所有别名（含高峰期覆盖）的实际模型并去重。不在列表中的模型请求将被拦截返回 403。</div>
 </div>
 
-<h2>图片识别辅助模型<span style="font-size:11px;color:var(--dim);font-weight:400">仅 OpenAI(Codex) 方案</span></h2>
+<h2>图片识别辅助模型<span style="font-size:11px;color:var(--dim);font-weight:400">Claude Code 与 Codex 方案通用</span></h2>
 <div class="section">
 <div class="row">
 <div><label>辅助模型（用于识别图片，可选）</label>
@@ -5549,7 +5618,7 @@ ${errDiv}
 ${(() => { const mm = initialProfile.modelMultimodal || {}; const aliases = initialProfile.modelAliases || {}; return Object.keys(aliases).filter(a => mm[a] !== false).map(a => `<option value="${escHtml(aliases[a])}" ${initialProfile.imageBridge?.model === aliases[a] ? "selected" : ""}>${escHtml(a)} → ${escHtml(aliases[a])}</option>`).join("") })()}
 </select>
 </div>
-<div style="align-self:flex-end"><span class="note">所有别名在 Codex 里都允许上传图片：勾选了「多模态」的别名会原样直通；未勾选的别名收到图片时，会自动用此辅助模型转述后再交给原模型。同图自动缓存，多轮对话不重复识别。辅助模型的每次新图片识别会产生少量额外 token。</span></div>
+<div style="align-self:flex-end"><span class="note">勾选了「多模态」的别名收到图片会原样直通；未勾选的别名收到图片时（Claude Code 与 Codex 均生效），会自动用此辅助模型转述后再交给原模型。同图自动缓存，多轮对话不重复识别。辅助模型的每次新图片识别会产生少量额外 token。</span></div>
 </div>
 </div>
 
@@ -8892,7 +8961,7 @@ function applySettings(formData) {
     editingProfile.modelAliases = parsedAliases;
   }
 
-  // Image-recognition helper model (Responses profiles). Access is always on —
+  // Image-recognition helper model (both protocols). Access is always on —
   // non-multimodal aliases are transcribed automatically; the legacy
   // imgBridgeEnabled checkbox is ignored (kept for config compatibility).
   if (formData.imgBridgeModel !== undefined) {

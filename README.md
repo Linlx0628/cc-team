@@ -229,6 +229,12 @@ experimental_bearer_token = "jx-your-virtual-key"
 
 指定方案时把 base_url 改为带后缀地址（`http://localhost:6789/<suffix>/v1`，如 `http://localhost:6789/glmcodex/v1`）。
 
+### 图片识别桥接（Claude Code 与 Codex 通用）
+
+- 方案别名的「多模态」勾选表示原生支持视觉：该别名收到图片**原样直通**，且可作为图片识别辅助模型
+- 未勾选的别名收到图片时，网关自动用辅助模型（设置页可手动指定，留空自动取第一个勾选的别名）把图片转成文字描述，替换图片块后交给原模型——纯文本模型也能"看"图，用户无需手动切模型
+- Claude Code（含 tool_result 内截图）与 Codex 均生效；同图按内容哈希缓存，多轮重放零额外成本；单请求最多 8 张、单图 12MB；辅助池为空时返回明确的 400 提示
+
 说明：
 
 - Codex 的 `Authorization: Bearer jx-...` 与 Claude Code 共用同一套虚拟 Key 与成员体系

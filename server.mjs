@@ -5041,8 +5041,21 @@ function proxyRequest(req, res) {
       // Timings on the closing line: total, time-to-first-byte and how much of it
       // the image bridge spent, so "why was that turn slow" is answerable from the log.
       const secs = (ms) => (ms / 1000).toFixed(1) + "s";
-      const parts = [`总耗时 ${secs(Date.now() - proxyStartTime)}`];
-      if (clientState.firstByteAt) parts.push(`首字节 ${secs(clientState.firstByteAt - proxyStartTime)}`);
+      const totalMs = Date.now() - proxyStartTime;
+      const parts = [`总耗时 ${secs(totalMs)}`];
+      if (clientState.firstByteAt) {
+        parts.push(`首字节 ${secs(clientState.firstByteAt - proxyStartTime)}`);
+        // Split what is left into generation time + rate: prefill-bound turns (huge
+        // context, cold prompt cache) and generation-bound turns (slow upstream)
+        // look identical from the total alone.
+        const genMs = Date.now() - clientState.firstByteAt;
+        const outTok = clientState.lastUsage?.usage?.output_tokens || 0;
+        if (genMs > 500) {
+          parts.push(outTok > 0
+            ? `生成 ${secs(genMs)}(${outTok}tok ${(outTok / (genMs / 1000)).toFixed(1)}tok/s)`
+            : `生成 ${secs(genMs)}`);
+        }
+      }
       if (clientState.bridgeMs) parts.push(`图片桥接 ${secs(clientState.bridgeMs)}`);
       console.log(`── 请求结束 ── ${getUserName(apiKey, runtime)} ${parts.join(" ")} ──`);
     }

@@ -4141,6 +4141,7 @@ const IMAGE_BRIDGE_MAX_B64 = 12 * 1024 * 1024;
 const IMAGE_BRIDGE_CONCURRENCY = 4;            // parallel helper calls
 const IMAGE_BRIDGE_CALL_TIMEOUT_MS = 25000;    // per-image helper timeout
 const IMAGE_BRIDGE_TOTAL_BUDGET_MS = 35000;    // whole-request budget, shared across failover candidates
+const IMAGE_BRIDGE_MIN_CALL_MS = 8000;         // never start a call the budget would clip
 // A helper that is genuinely broken should cost one second, not a full budget on
 // every turn: park it after a few consecutive failures.
 const IMAGE_BRIDGE_HELPER_FAIL_LIMIT = 3;
@@ -4304,17 +4305,21 @@ async function bridgeImagesInRequest(body, runtime, clientState, alias, protocol
     if (cached !== null) { results[i] = { text: cached, hit: true }; continue; }
     pending.push(i);
   }
-  // Budget the NEW transcriptions: this turn's images first, newest first within
-  // each class, so the wall-clock budget is always spent on what matters most.
-  pending.sort((a, b) => (keyed[b].img.fresh ? 1 : 0) - (keyed[a].img.fresh ? 1 : 0) || b - a);
-  const queue = pending.slice(0, IMAGE_BRIDGE_MAX_IMAGES);
-  for (const i of pending.slice(IMAGE_BRIDGE_MAX_IMAGES)) {
-    results[i] = {
-      text: keyed[i].img.fresh
-        ? `（本轮图片过多，超过网关单次识别上限 ${IMAGE_BRIDGE_MAX_IMAGES} 张，此张本轮未识别；请分批发送）`
-        : "（历史图片较多，此张本轮未识别；如需分析请重新发送该图）",
-      placeholder: true,
-    };
+  // Only THIS turn's images earn a helper call. An uncached history image is one
+  // that was never transcribed while it was fresh (bridge was off, cache cleared,
+  // an earlier failure) — transcribing it now spends the client's wait on context
+  // the user stopped asking about, and it rewrites the middle of the prompt every
+  // turn, which throws away the upstream's prompt cache. So: placeholder, instantly.
+  // A turn that adds no image therefore costs zero helper calls no matter how many
+  // images the replayed history carries.
+  const queue = [];
+  for (const i of pending) {
+    if (keyed[i].img.fresh) queue.push(i);
+    else results[i] = { text: "（历史图片本轮未识别；如需分析请重新发送该图）", placeholder: true };
+  }
+  queue.sort((a, b) => b - a);   // newest first gets the budget
+  for (const i of queue.splice(IMAGE_BRIDGE_MAX_IMAGES)) {
+    results[i] = { text: `（本轮图片过多，超过网关单次识别上限 ${IMAGE_BRIDGE_MAX_IMAGES} 张，此张本轮未识别；请分批发送）`, placeholder: true };
   }
   // One budget per client request, not per failover candidate: the second
   // candidate re-bridges straight from cache and must not add another full wait.
@@ -4328,8 +4333,10 @@ async function bridgeImagesInRequest(body, runtime, clientState, alias, protocol
       const i = queue[at];
       throwIfClientAborted(clientState);
       const left = deadline - Date.now();
-      if (left <= 500) {
-        results[i] = { failed: true, reason: `网关图片识别总预算 ${Math.round(IMAGE_BRIDGE_TOTAL_BUDGET_MS / 1000)}s 用尽` };
+      if (left < IMAGE_BRIDGE_MIN_CALL_MS) {
+        // Starting a call the deadline will cut short only burns tokens and reports
+        // a misleading "timeout" — stop instead.
+        results[i] = { failed: true, reason: `网关图片识别预算 ${Math.round(IMAGE_BRIDGE_TOTAL_BUDGET_MS / 1000)}s 已用尽，剩余时间不足以再识别一张` };
         continue;
       }
       const r = await describeImageViaHelper(keyed[i].img.b64, helperModel, runtime, clientState, profileCfg, protocol, keyed[i].img.mediaType, Math.min(IMAGE_BRIDGE_CALL_TIMEOUT_MS, left));
@@ -4347,7 +4354,9 @@ async function bridgeImagesInRequest(body, runtime, clientState, alias, protocol
   for (let i = 0; i < keyed.length; i++) {
     const r = results[i] || { failed: true, reason: "未处理" };
     if (r.failed && keyed[i].img.fresh) freshFails.push(r.reason);
-    const text = r.failed ? `（历史图片识别失败：${r.reason}）` : r.text;
+    // Only this turn's images are ever attempted, so a failure here always throws
+    // below; the text is a belt-and-braces fallback.
+    const text = r.failed ? `（图片识别失败：${r.reason}）` : r.text;
     // Replace the image block with a text description (keep surrounding context).
     const img = keyed[i].img;
     if (protocol === "anthropic") {
@@ -4900,6 +4909,7 @@ function proxyRequest(req, res) {
               cbody = bridged.body;
               reqHeaders["content-length"] = cbody.length;
               const bs = bridged.stats;
+              clientState.bridgeMs = (clientState.bridgeMs || 0) + bs.ms;
               console.log(`[图片桥接] ${getUserName(apiKey, cruntime)} 图 ${bs.total} 张（命中 ${bs.hit} / 新识 ${bs.got} / 占位 ${bs.ph} / 失败 ${bs.failed}）耗时 ${(bs.ms / 1000).toFixed(1)}s 辅助=${bridged.helperModel} → ${creqModel}`);
             }
           }
@@ -5028,7 +5038,13 @@ function proxyRequest(req, res) {
       }
     } finally {
       releaseConcurrency(userKey);
-      console.log(`── 请求结束 ── ${getUserName(apiKey, runtime)} ──`);
+      // Timings on the closing line: total, time-to-first-byte and how much of it
+      // the image bridge spent, so "why was that turn slow" is answerable from the log.
+      const secs = (ms) => (ms / 1000).toFixed(1) + "s";
+      const parts = [`总耗时 ${secs(Date.now() - proxyStartTime)}`];
+      if (clientState.firstByteAt) parts.push(`首字节 ${secs(clientState.firstByteAt - proxyStartTime)}`);
+      if (clientState.bridgeMs) parts.push(`图片桥接 ${secs(clientState.bridgeMs)}`);
+      console.log(`── 请求结束 ── ${getUserName(apiKey, runtime)} ${parts.join(" ")} ──`);
     }
   }).catch(() => {
     if (!res.headersSent) {
@@ -5107,6 +5123,7 @@ async function handleJsonProxy(req, res, body, reqHeaders, apiKey, reqModel, tim
       delete respHeaders["content-encoding"];
       delete respHeaders["content-length"];
       if (attempt > 0) respHeaders["x-proxy-retry"] = String(attempt);
+      if (clientState && !clientState.firstByteAt) clientState.firstByteAt = Date.now();
       res.writeHead(upRes.statusCode, respHeaders);
       res.end(text);
       return;
@@ -5261,6 +5278,7 @@ async function handleStreamingProxy(req, res, body, reqHeaders, apiKey, reqModel
       const flushPrelude = () => {
         if (started) return;
         started = true;
+        if (clientState && !clientState.firstByteAt) clientState.firstByteAt = Date.now();
         res.writeHead(upRes.statusCode, h);
         runtime.breaker.recordSuccess();
         armIdleTimer();

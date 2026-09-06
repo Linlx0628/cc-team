@@ -38,7 +38,40 @@ export function createProductionTracker({ db, getConfig, log = console.log, now 
       log(`[production] 解析异常已忽略: ${err?.message}`);
     }
   }
-  function parseAndStore(_info, _cfg) {}   // 占位,Task 4 替换
+  const stmts = {
+    insertEvent: db.prepare(`INSERT INTO tool_events
+      (time,user_key,user_name,profile,session,tool_id,tool,file_path,ext,lines_add,lines_del,outcome,cmd_class,model)
+      VALUES (@time,@user_key,@user_name,@profile,@session,@tool_id,@tool,@file_path,@ext,@lines_add,@lines_del,'pending',@cmd_class,@model)
+      ON CONFLICT(tool_id) DO NOTHING`),
+    setResult: db.prepare(`UPDATE tool_events SET outcome=@outcome, error_kind=@error_kind WHERE tool_id=@tool_id AND outcome='pending'`),
+    setResultPrefix: db.prepare(`UPDATE tool_events SET outcome=@outcome, error_kind=@error_kind WHERE tool_id LIKE @prefix AND outcome='pending'`),
+  };
+  function parseAndStore(info, cfg) {
+    const extract = info.protocol === "responses" ? extractResponsesEvents : extractAnthropicEvents;
+    const prev = cursors.has(info.session) ? cursors.get(info.session) : 0;
+    const { calls, results, cursor } = extract(info.parsed, prev);
+    cursors.delete(info.session); cursors.set(info.session, cursor);   // LRU touch
+    if (cursors.size > CURSOR_LIMIT) cursors.delete(cursors.keys().next().value);
+    const storePaths = cfg.storeFilePaths !== false;
+    db.transaction(() => {
+      for (const c of calls) {
+        stmts.insertEvent.run({
+          time: now(), user_key: info.userKey, user_name: info.userName || null,
+          profile: info.profile || null, session: info.session || null,
+          tool_id: c.tool_id, tool: c.tool,
+          file_path: storePaths ? (c.file_path || null) : null,
+          ext: c.ext || null, lines_add: c.tool === "apply_patch" || FILE_TOOLS.includes(c.tool) ? (c.lines_add | 0) : 0,
+          lines_del: c.tool === "apply_patch" || FILE_TOOLS.includes(c.tool) ? (c.lines_del | 0) : 0,
+          cmd_class: c.cmd_class || null, model: info.model || null,
+        });
+      }
+      for (const r of results) {
+        if (!r) continue;
+        stmts.setResult.run(r);
+        if (r.tool_id && !r.tool_id.includes("#")) stmts.setResultPrefix.run({ prefix: r.tool_id + "#%", outcome: r.outcome, error_kind: r.error_kind });
+      }
+    })();
+  }
   function scanAlerts(_thresholds, _now) { return []; }   // Task 7 替换
   function maybePrune() {}                                 // Task 7 替换
   return { observe, scanAlerts, maybePrune, cursors };

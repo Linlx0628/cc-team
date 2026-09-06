@@ -352,7 +352,7 @@ export function productionAlerts(db, { from, to }) {
     FROM production_alerts WHERE date(time,'+8 hours') BETWEEN ? AND ? ORDER BY time DESC LIMIT 200`).all(from, to);
 }
 
-export function markAlertSeen(db, id) { db.prepare(`UPDATE production_alerts SET seen=1 WHERE id=?`).run(id); }
+export function markAlertSeen(db, id) { return db.prepare(`UPDATE production_alerts SET seen=1 WHERE id=?`).run(id).changes; }
 
 export function pruneProductionData(db, days) {
   db.prepare(`DELETE FROM tool_events WHERE date(time,'+8 hours') < date('now','+8 hours', ?)`).run(`-${Math.max(1, days|0)} days`);
@@ -423,4 +423,69 @@ export function contextHealth(db, { from, to }) {
       : "缓存命中率偏低:长会话尽量连续使用、避免反复粘贴大段上下文";
   }
   return rows;
+}
+
+// —— Task 9: 报告导出(自包含单文件 HTML,零外部依赖)——
+function esc(s) {
+  return String(s ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+const pct = (x) => x == null ? "—" : (x * 100).toFixed(0) + "%";
+const num = (x) => x == null ? "—" : Number(x).toLocaleString("zh-CN");
+
+const ALERT_KIND_LABEL = { idle_burn: "空转消耗", error_loop: "错误循环", edit_failure_burst: "失败爆发" };
+// 库里 detail 存的是 JSON 串;报告里翻译成人类话,解析失败退回原文(调用侧统一 esc)
+function alertDetailText(kind, detail) {
+  let d = {};
+  try { d = JSON.parse(detail || "{}") || {}; } catch {}
+  if (kind === "idle_burn") return `近一小时消耗 ${num(d.output_tokens ?? 0)} output tokens,无任何文件产出`;
+  if (kind === "error_loop") return `同类错误「${d.error_kind ?? "?"}」×${num(d.count ?? 0)},疑似循环`;
+  if (kind === "edit_failure_burst") return `编辑 ${num(d.edits ?? 0)} 次失败 ${num(d.errors ?? 0)} 次`;
+  return String(detail ?? "");
+}
+
+// 统一空态:无数据时渲染单行占位,不留空区块
+function renderRows(rows, fn, colSpan) {
+  return rows && rows.length ? rows.map(fn).join("") : `<tr><td colspan="${colSpan}" class="empty">该周期无数据</td></tr>`;
+}
+
+export function buildReportHTML({ summary, projects, costs, health, alerts, from, to }) {
+  const s = summary || { rows: [], zeroOutput: [] };
+  const rowsHtml = renderRows(s.rows, r => `<tr><td>${esc(r.user_name)}</td><td class="n">${num(r.net_lines)}</td>
+    <td class="n">${r.files ?? 0}</td><td class="n">${pct(r.fail_rate)}</td><td class="n">${pct(r.rewrite_rate)}</td>
+    <td class="n">${(r.verify_density ?? 0).toFixed(1)}</td><td class="n">${r.token_per_line == null ? "—" : Math.round(r.token_per_line).toLocaleString("zh-CN")}</td></tr>`, 7);
+  const zeroNote = (s.zeroOutput || []).length
+    ? `<p class="note">周期内零产出成员（有 token 消耗、无文件编辑事件）：${s.zeroOutput.map(u => esc(u.user_name)).join("、")}</p>`
+    : "";
+  const projHtml = renderRows(projects, r => `<tr><td>${esc(r.project)}</td><td class="n">${r.users}</td><td class="n">${r.files}</td>
+    <td class="n">${num(r.lines_add)}</td><td class="n">${num(r.lines_del)}</td><td class="n">${r.edits}</td></tr>`, 6);
+  const unpriced = (costs && costs.unpriced) || [];
+  const unpricedNote = unpriced.length
+    ? `<p class="note">未配置单价的模型（按 0 计）：${unpriced.map(esc).join("、")} —— 可在设置页补充牌价</p>`
+    : "";
+  const costHtml = renderRows(costs && costs.rows, r => `<tr><td>${esc(r.user_name)}<span class="note">（${esc(r.profile)}）</span></td>
+    <td class="n">$${Number(r.model_cost).toFixed(4)}</td><td class="n">$${Number(r.cache_cost).toFixed(4)}</td><td class="n"><b>$${Number(r.total_cost).toFixed(4)}</b></td></tr>`, 4);
+  const alertHtml = renderRows(alerts, a => `<tr><td>${esc(a.time)}</td><td>${esc(a.user_name)}</td>
+    <td>${esc(ALERT_KIND_LABEL[a.kind] || a.kind)}</td><td>${esc(alertDetailText(a.kind, a.detail))}</td>
+    <td>${a.seen ? "已读" : "未读"}</td></tr>`, 5);
+  const healthHtml = renderRows(health, r => `<tr><td>${esc(r.user_name)}</td>
+    <td class="n">${num(r.cr)}</td><td class="n">${num(r.i)}</td><td class="n">${pct(r.ratio)}</td><td>${esc(r.advice)}</td></tr>`, 5);
+
+  return `<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8"><title>产出质量报告 ${esc(from)} ~ ${esc(to)}</title>
+<style>body{font:14px/1.6 -apple-system,"PingFang SC",sans-serif;background:#fbfbf8;color:#1f2937;max-width:960px;margin:24px auto;padding:0 16px}
+h1{font-size:20px}h2{font-size:16px;margin-top:28px;border-left:3px solid #2f6e50;padding-left:8px}
+table{border-collapse:collapse;width:100%;margin:8px 0}th,td{border:1px solid #e5e7eb;padding:6px 10px;text-align:left}th{background:#f3f4f1}
+.n{text-align:right;font-variant-numeric:tabular-nums}.note{color:#6b7280;font-size:12px}.empty{color:#6b7280;text-align:center}</style></head><body>
+<h1>CC Team 产出质量报告</h1><p class="note">${esc(from)} ~ ${esc(to)} · 自动生成 · 全部指标口径见附录</p>
+<h2>成员产出对比</h2><table><thead><tr><th>成员</th><th>净产出</th><th>文件数</th><th>失败率</th><th>重写率</th><th>验证密度</th><th>token/行</th></tr></thead><tbody>${rowsHtml}</tbody></table>${zeroNote}
+<h2>项目分布</h2><table><thead><tr><th>项目</th><th>成员数</th><th>文件数</th><th>新增行</th><th>删除行</th><th>编辑次数</th></tr></thead><tbody>${projHtml}</tbody></table>
+<h2>等值成本（参考牌价）</h2><table><thead><tr><th>成员</th><th>模型成本</th><th>缓存成本</th><th>合计成本</th></tr></thead><tbody>${costHtml}</tbody></table>${unpricedNote}<p class="note">USD/1M tokens，参考牌价折算，非实际账单</p>
+<h2>告警</h2><table><thead><tr><th>时间</th><th>成员</th><th>类型</th><th>详情</th><th>状态</th></tr></thead><tbody>${alertHtml}</tbody></table>
+<h2>上下文缓存健康度</h2><table><thead><tr><th>成员</th><th>缓存读取 tokens</th><th>输入 tokens</th><th>命中率</th><th>建议</th></tr></thead><tbody>${healthHtml}</tbody></table>
+<h2>附录：指标口径</h2><ul class="note">
+<li>净产出 = Σ新增行 − Σ删除行（Write 记全量，Edit 记新旧串行数，apply_patch 记补丁行）</li>
+<li>失败率 = 文件类编辑 outcome=error 占比；重写率 = Σdel ÷ Σadd；验证密度 = (test+lint 命令) ÷ 编辑次数</li>
+<li>token/行 = output_tokens ÷ 净产出（联 usage_daily）</li>
+<li>成本 = Σ(tokens × 单价/1M)，缓存按用户模型权重混合折算，cacheRead≈cacheWrite÷12.5（Claude 牌价比例）</li>
+<li>仅统计结构化指标，不存储任何代码内容；Codex 协议为指标子集（shell/apply_patch）</li></ul>
+</body></html>`;
 }

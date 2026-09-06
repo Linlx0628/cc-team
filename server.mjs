@@ -7,7 +7,9 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import Database from "better-sqlite3";
-import { initProductionDb, createProductionTracker } from "./production.mjs";
+import { initProductionDb, createProductionTracker, rangeFromTo, productionSummary, productionUserDetail,
+  productionProjects, productionAlerts, markAlertSeen, pruneProductionData, DEFAULT_COST_RATES,
+  computeCosts, contextHealth, buildReportHTML } from "./production.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -10446,6 +10448,116 @@ const server = http.createServer((req, res) => {
     }).catch(() => {
       res.writeHead(413); res.end("Request too large");
     });
+    return;
+  }
+
+  // ── 产出质量与洞察(管理 API + 报告导出)──
+  if (req.method === "GET" && req.url.startsWith("/api/production/summary")) {
+    if (!checkAuth(req)) { res.writeHead(401); res.end("Unauthorized"); return; }
+    const { from, to } = rangeFromTo(new URL(req.url, "http://localhost").searchParams.get("range") || "7d");
+    const s = productionSummary(db, { from, to });
+    s.health = contextHealth(db, { from, to });
+    s.range = { from, to };
+    res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+    res.end(JSON.stringify(s));
+    return;
+  }
+  if (req.method === "GET" && req.url.startsWith("/api/production/user/")) {
+    if (!checkAuth(req)) { res.writeHead(401); res.end("Unauthorized"); return; }
+    try {
+      const u = new URL(req.url, "http://localhost");
+      const key = decodeURIComponent(u.pathname.slice("/api/production/user/".length));
+      const { from, to } = rangeFromTo(u.searchParams.get("range") || "7d");
+      res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+      res.end(JSON.stringify({ ...productionUserDetail(db, key, { from, to }), range: { from, to } }));
+    } catch {
+      res.writeHead(400); res.end("Bad request");
+    }
+    return;
+  }
+  if (req.method === "GET" && req.url.startsWith("/api/production/projects")) {
+    if (!checkAuth(req)) { res.writeHead(401); res.end("Unauthorized"); return; }
+    const { from, to } = rangeFromTo(new URL(req.url, "http://localhost").searchParams.get("range") || "7d");
+    res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+    res.end(JSON.stringify({ rows: productionProjects(db, { from, to }) }));
+    return;
+  }
+  if (req.method === "GET" && req.url.startsWith("/api/production/alerts")) {
+    if (!checkAuth(req)) { res.writeHead(401); res.end("Unauthorized"); return; }
+    const { from, to } = rangeFromTo(new URL(req.url, "http://localhost").searchParams.get("range") || "7d");
+    res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+    res.end(JSON.stringify({ rows: productionAlerts(db, { from, to }) }));
+    return;
+  }
+  if (req.method === "POST" && req.url === "/api/production/alerts/seen") {
+    if (!checkAuth(req)) { res.writeHead(401); res.end("Unauthorized"); return; }
+    if (!checkCsrf(req)) { res.writeHead(403); res.end("CSRF validation failed"); return; }
+    readBody(req, 10_000).then(buf => {
+      const { id } = JSON.parse(buf.toString() || "{}");
+      const n = Number(id);
+      const changed = Number.isFinite(n) ? markAlertSeen(db, n) : 0;
+      res.writeHead(changed ? 200 : 404, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ ok: !!changed }));
+    }).catch(() => { if (!res.headersSent) { res.writeHead(400); res.end("Bad request"); } });
+    return;
+  }
+  if (req.method === "GET" && req.url.startsWith("/api/production/costs")) {
+    if (!checkAuth(req)) { res.writeHead(401); res.end("Unauthorized"); return; }
+    const { from, to } = rangeFromTo(new URL(req.url, "http://localhost").searchParams.get("range") || "7d");
+    res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+    res.end(JSON.stringify({ ...computeCosts(db, config.costRates || DEFAULT_COST_RATES, { from, to }), rateNote: "USD/1M tokens,参考牌价折算,非实际账单" }));
+    return;
+  }
+  if (req.method === "GET" && req.url.startsWith("/api/production/report")) {
+    if (!checkAuth(req)) { res.writeHead(401); res.end("Unauthorized"); return; }
+    const u = new URL(req.url, "http://localhost");
+    const { from, to } = rangeFromTo(u.searchParams.get("range") || "7d");
+    const html = buildReportHTML({
+      summary: productionSummary(db, { from, to }),
+      projects: productionProjects(db, { from, to }),
+      costs: computeCosts(db, config.costRates || DEFAULT_COST_RATES, { from, to }),
+      health: contextHealth(db, { from, to }),
+      alerts: productionAlerts(db, { from, to }),
+      from, to,
+    });
+    res.writeHead(200, { "Content-Type": "text/html; charset=utf-8", "Content-Disposition": `attachment; filename="production-report-${from}_${to}.html"` });
+    res.end(html);
+    return;
+  }
+  if (req.method === "POST" && req.url === "/api/production/prune") {
+    if (!checkAuth(req)) { res.writeHead(401); res.end("Unauthorized"); return; }
+    if (!checkCsrf(req)) { res.writeHead(403); res.end("CSRF validation failed"); return; }
+    readBody(req, 10_000).then(buf => {
+      const { days } = JSON.parse(buf.toString() || "{}");
+      pruneProductionData(db, Number(days) || 90);
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ ok: true }));
+    }).catch(() => { if (!res.headersSent) { res.writeHead(400); res.end("Bad request"); } });
+    return;
+  }
+  if (req.method === "POST" && req.url === "/api/production/settings") {
+    if (!checkAuth(req)) { res.writeHead(401); res.end("Unauthorized"); return; }
+    if (!checkCsrf(req)) { res.writeHead(403); res.end("CSRF validation failed"); return; }
+    readBody(req, 200_000).then(buf => {
+      const body = JSON.parse(buf.toString() || "{}");
+      if (body.productionTracking && typeof body.productionTracking === "object") {
+        const p = config.productionTracking || {};
+        if (typeof body.productionTracking.enabled === "boolean") p.enabled = body.productionTracking.enabled;
+        if (typeof body.productionTracking.storeFilePaths === "boolean") p.storeFilePaths = body.productionTracking.storeFilePaths;
+        config.productionTracking = p;
+      }
+      if (body.costRates && typeof body.costRates === "object") {
+        const clean = {};
+        for (const [m, r] of Object.entries(body.costRates)) {
+          if (!r || typeof r !== "object") continue;
+          clean[m] = { input: +r.input || 0, output: +r.output || 0, cacheWrite: +r.cacheWrite || 0, cacheRead: +r.cacheRead || 0 };
+        }
+        config.costRates = clean;
+      }
+      saveConfig(config);
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ ok: true }));
+    }).catch(() => { if (!res.headersSent) { res.writeHead(400); res.end("Bad request"); } });
     return;
   }
 

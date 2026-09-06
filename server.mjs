@@ -8826,6 +8826,7 @@ table{width:100%;border-collapse:collapse;min-width:560px}th{text-align:left;pad
 <div class="box"><h3>今日24小时趋势</h3><canvas id="hourChart"></canvas></div>
 <div class="box"><h3>近7天趋势</h3><canvas id="trendChart"></canvas></div>
 </div>
+<div class="box" id="prodProfile"><h3>产出画像 <span style="font-size:11px;color:var(--dim);font-weight:400">仅自己可见 · 只统计指标,不存储代码</span></h3><div id="prodMeMetrics" style="display:flex;gap:16px;flex-wrap:wrap;font-size:12px"></div><div id="prodMeTrend" style="font-size:11px;color:var(--dim);margin-top:6px"></div><div id="prodMeLangs" style="font-size:11px;margin-top:4px"></div></div>
 <div class="cal-tip" id="calTip"></div>
 <div class="modal-overlay" id="qrModal" onclick="if(event.target===this)closeQrModal()"><div class="qr-modal" role="dialog" aria-label="申请加量"><div class="qr-mhd"><b>申请加量</b><button type="button" class="qr-close" onclick="closeQrModal()" aria-label="关闭">✕</button></div><div class="qr-mbody"><div class="qr-info" id="qrQuotaInfo"></div><div id="qrHistory"></div><div class="qr-form"><label>申请额度池 <i>*</i></label><select id="qrPool"></select><label>申请理由 <i>*</i></label><textarea id="qrReason" maxlength="200" rows="3" placeholder="说明一下用途和期望，管理员处理时会看到"></textarea></div><div class="qr-actions"><button type="button" class="btn-checkin" id="qrSubmit" onclick="submitQuotaRequest()">提交申请</button></div></div></div></div>
 <div class="box"><h3>今日模型请求</h3><table id="modelTable"><thead><tr><th>模型</th><th class="n">请求数</th><th class="n">实际 Token</th><th class="n">倍率</th><th class="n">计入配额</th></tr></thead><tbody></tbody></table><div class="note" id="modelTableNote" style="font-size:11px;color:var(--dim);margin-top:8px"></div></div>
@@ -9215,6 +9216,26 @@ function renderRateCard(){
     +'<div class="note" style="font-size:11px;color:var(--dim)">倍率越低越省额度：×0.5 表示消耗 1000 token 只扣 500 额度。倍率随时段自动切换，调整只影响之后的请求。</div>';
 }
 let calRz;window.addEventListener('resize',function(){clearTimeout(calRz);calRz=setTimeout(function(){if(D)renderCalendar()},150)});
+// ── 产出画像(仅本人;拉 /api/production/me,接口不可用时整块隐藏)──
+// 注意:本页面由服务端模板字符串生成,这里只能用字符串拼接,不能出现反引号或插值序列。
+(function loadProdMe(){
+  const ph=esc;
+  fetch('/api/production/me?range=7d',{headers:{'Authorization':'Bearer '+VK}})
+    .then(r=>r.ok?r.json():Promise.reject(new Error('未开放')))
+    .then(d=>{
+      const net=d.days.reduce((x,y)=>x+(y.la-y.ld),0);
+      const edits=d.days.reduce((x,y)=>x+y.edits,0);
+      const errs=d.days.reduce((x,y)=>x+y.errs,0);
+      document.getElementById('prodMeMetrics').innerHTML=
+        '<div>近7天净产出 <b>'+net.toLocaleString('zh-CN')+'</b> 行</div>'+
+        '<div>编辑 <b>'+edits+'</b> 次</div>'+
+        '<div>失败率 <b>'+(edits?Math.round(errs*100/edits):0)+'%</b></div>'+
+        (d.health?'<div>缓存命中率 <b>'+Math.round(d.health.ratio*100)+'%</b> · '+ph(d.health.advice)+'</div>':'');
+      document.getElementById('prodMeTrend').textContent='日趋势:'+(d.days.map(x=>x.date.slice(5)+':'+(x.la-x.ld)+'行').join(' · ')||'暂无');
+      document.getElementById('prodMeLangs').textContent='语言分布:'+(d.languages.map(l=>(l.ext||'其他')+' +'+l.la).join(' · ')||'暂无');
+    })
+    .catch(()=>{const el=document.getElementById('prodProfile');if(el)el.style.display='none'});
+})();
 load();setInterval(load,30000);
 <\/script></body></html>`;
 }

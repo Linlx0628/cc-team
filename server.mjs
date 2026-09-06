@@ -7,6 +7,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import Database from "better-sqlite3";
+import { initProductionDb, createProductionTracker } from "./production.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -623,6 +624,15 @@ function nextRateChangeHint(runtime, date = new Date(), model = null) {
       if (config.notifier[k] === undefined) { config.notifier[k] = v; patched = true; }
     }
     if (patched) { saveConfig(config); console.log("[MIGRATE] Patched notifier config"); }
+  }
+})();
+
+// Auto-migrate: ensure productionTracking config exists (产出质量观测)
+(function migrateProductionTrackingConfig() {
+  if (!config.productionTracking || typeof config.productionTracking !== "object") {
+    config.productionTracking = { enabled: true, storeFilePaths: true };
+    saveConfig(config);
+    console.log("[MIGRATE] Added productionTracking config");
   }
 })();
 
@@ -2305,6 +2315,25 @@ function loadProfileSnapshot(suffix) {
 }
 
 initDb();
+initProductionDb(db);   // 产出质量表(tool_events / production_alerts),先于 tracker 建语句
+function productionEnabled() { return (config.productionTracking || {}).enabled !== false; }
+const productionTracker = createProductionTracker({ db, getConfig: () => config.productionTracking || {}, log: console.log });
+
+// 产出质量:60s 告警扫描 + 过期清理(unref 不阻止进程退出);告警先只打日志,Task 7 接通知渠道。
+const prodNotifyCooldown = new Map();
+function pushProductionAlert(a) {
+  const key = a.kind + ":" + a.user_key;
+  if (Date.now() - (prodNotifyCooldown.get(key) || 0) < 60_000) return;
+  prodNotifyCooldown.set(key, Date.now());
+  console.log(`[production] 告警 ${a.kind} ${a.user_name || a.user_key} ${a.detail || ""}`);
+}
+setInterval(() => {
+  try {
+    const fired = productionTracker.scanAlerts((config.productionTracking || {}).alerts || {});
+    for (const a of fired) pushProductionAlert(a);
+    productionTracker.maybePrune();
+  } catch (err) { console.log(`[production] 告警扫描异常: ${err?.message}`); }
+}, 60_000).unref();
 migrateFromJsonIfNeeded();
 pruneOldDataIfNewDay(); // also run at startup so rows pruned under an old policy converge immediately
 loadRateLimitState();
@@ -4869,6 +4898,16 @@ function proxyRequest(req, res) {
 
     // Sticky-session signal for cache-affinity routing (group entries only).
     const sessionSignal = extractSessionSignal(protocol, req.headers, parsedBody);
+
+    // 产出质量观测:纯观察旁路,setImmediate 不阻塞代理主路径,不改请求/响应字节。
+    if (parsedBody && productionEnabled()) {
+      const prodUser = resolveUserKey(apiKey, runtime);
+      setImmediate(() => productionTracker.observe({
+        protocol, userKey: prodUser, userName: getUserName(prodUser, runtime),
+        profile: runtime?.profileName || "", model: originalModel,
+        session: sessionSignal || "nosession", parsed: parsedBody,
+      }));
+    }
 
     // Save the pre-resolve body so each failover candidate can re-resolve the model
     // against its own modelAliases.

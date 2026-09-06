@@ -65,7 +65,7 @@ export function classifyError(text) {
   if (/Exit code [1-9]/.test(t)) return "bash_fail";
   if (/not found|does not exist|String to replace/i.test(t)) return "not_found";
   if (/appears? \d+ times?|Found \d+ matches?|matches multiple/i.test(t)) return "ambiguous";
-  if (/assert|test .*fail|FAILED|✗/i.test(t)) return "test_fail";
+  if (/AssertionError|✗|\btests?\b[^\n]*\bfail/i.test(t)) return "test_fail";
   return "tool_error";
 }
 

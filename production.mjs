@@ -221,3 +221,76 @@ export function extractResponsesEvents(parsed, cursor = 0) {
   }
   return { calls, results, cursor: items.length };
 }
+
+// —— Task 6: 指标聚合查询(summary/user/projects,纯读路径)——
+function cnDateStr(now = Date.now()) { return new Date(now + 8 * 3600000).toISOString().slice(0, 10); }
+
+export function rangeFromTo(range) {
+  const days = range === "today" ? 1 : range === "30d" ? 30 : 7;
+  return { from: cnDateStr(Date.now() - (days - 1) * 86400000), to: cnDateStr() };
+}
+
+// 文件工具谓词从 FILE_TOOLS 派生——与落库侧单一口径,防漂移
+const FILE_SQL = "tool IN (" + FILE_TOOLS.map(t => `'${t}'`).join(",") + ")";
+
+export function productionSummary(db, { from, to }) {
+  const rows = db.prepare(`
+    SELECT user_key, MAX(COALESCE(NULLIF(user_name,''), user_key)) AS user_name,
+      COUNT(*) AS tool_calls,
+      SUM(CASE WHEN ${FILE_SQL} THEN 1 ELSE 0 END) AS edit_count,
+      SUM(CASE WHEN ${FILE_SQL} THEN lines_add ELSE 0 END) AS lines_add,
+      SUM(CASE WHEN ${FILE_SQL} THEN lines_del ELSE 0 END) AS lines_del,
+      COUNT(DISTINCT CASE WHEN ${FILE_SQL} THEN file_path END) AS files,
+      SUM(CASE WHEN ${FILE_SQL} AND outcome='error' THEN 1 ELSE 0 END) AS edit_errors,
+      SUM(CASE WHEN cmd_class IN ('test','lint') THEN 1 ELSE 0 END) AS verify_runs
+    FROM tool_events WHERE date(time,'+8 hours') BETWEEN ? AND ?
+    GROUP BY user_key ORDER BY lines_add DESC`).all(from, to);
+  const usage = Object.fromEntries(db.prepare(`
+    SELECT user_key, SUM(output_tokens) o FROM usage_daily WHERE date BETWEEN ? AND ? GROUP BY user_key`).all(from, to).map(r => [r.user_key, r.o]));
+  for (const r of rows) {
+    r.net_lines = (r.lines_add || 0) - (r.lines_del || 0);
+    r.fail_rate = r.edit_count ? (r.edit_errors || 0) / r.edit_count : 0;
+    r.rewrite_rate = r.lines_add ? (r.lines_del || 0) / r.lines_add : 0;
+    r.verify_density = r.edit_count ? (r.verify_runs || 0) / r.edit_count : 0;
+    const out = usage[r.user_key] || 0;
+    r.token_per_line = r.net_lines > 0 ? out / r.net_lines : null;
+  }
+  const active = new Set(rows.map(r => r.user_key));
+  const zeroOutput = db.prepare(`
+    SELECT DISTINCT ud.user_key, MAX(COALESCE(u.name, ud.user_key)) AS user_name, SUM(ud.output_tokens) AS output_tokens
+    FROM usage_daily ud LEFT JOIN users u ON u.user_key = ud.user_key
+    WHERE ud.date BETWEEN ? AND ? GROUP BY ud.user_key`).all(from, to)
+    .filter(r => !active.has(r.user_key));
+  return { rows, zeroOutput };
+}
+
+export function productionProjects(db, { from, to }) {
+  // 项目 = 绝对路径取去掉根后的前两段(proj/app);相对路径取首段;无分隔归(根)
+  return db.prepare(`
+    SELECT CASE
+        WHEN file_path LIKE '/%' THEN printf('%s/%s', substr(file_path, 2, instr(substr(file_path, 2) || '/', '/') - 1), substr(substr(file_path, instr(substr(file_path, 2), '/') + 2), 1, instr(substr(file_path, instr(substr(file_path, 2), '/') + 2) || '/', '/') - 1))
+        WHEN instr(file_path, '/') > 0 THEN substr(file_path, 1, instr(file_path || '/', '/') - 1)
+        ELSE '(根)' END AS project,
+      COUNT(DISTINCT user_key) AS users, COUNT(DISTINCT file_path) AS files,
+      SUM(lines_add) AS lines_add, SUM(lines_del) AS lines_del, COUNT(*) AS edits
+    FROM tool_events WHERE date(time,'+8 hours') BETWEEN ? AND ? AND file_path IS NOT NULL
+    GROUP BY project ORDER BY lines_add DESC LIMIT 50`).all(from, to);
+}
+
+export function productionUserDetail(db, userKey, { from, to }) {
+  const days = db.prepare(`
+    SELECT date(time,'+8 hours') AS date, SUM(lines_add) la, SUM(lines_del) ld, COUNT(*) edits,
+      SUM(CASE WHEN outcome='error' THEN 1 ELSE 0 END) errs
+    FROM tool_events WHERE user_key=? AND date(time,'+8 hours') BETWEEN ? AND ?
+    GROUP BY date ORDER BY date`).all(userKey, from, to);
+  const files = db.prepare(`
+    SELECT file_path, SUM(lines_add) la, SUM(lines_del) ld, COUNT(*) edits,
+      SUM(CASE WHEN outcome='error' THEN 1 ELSE 0 END) errs
+    FROM tool_events WHERE user_key=? AND date(time,'+8 hours') BETWEEN ? AND ? AND file_path IS NOT NULL
+    GROUP BY file_path ORDER BY edits DESC, la DESC LIMIT 10`).all(userKey, from, to);
+  const languages = db.prepare(`
+    SELECT ext, COUNT(*) edits, SUM(lines_add) la FROM tool_events
+    WHERE user_key=? AND date(time,'+8 hours') BETWEEN ? AND ? AND ext IS NOT NULL
+    GROUP BY ext ORDER BY la DESC LIMIT 10`).all(userKey, from, to);
+  return { days, files, languages };
+}

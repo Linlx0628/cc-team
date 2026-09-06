@@ -10998,6 +10998,24 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+  // 成员产出画像(成员,虚拟Key 鉴权 — 同 /api/my-usage 口径;只返回本人明细与健康度)
+  if (req.method === "GET" && req.url.startsWith("/api/production/me")) {
+    const apiKey = getApiKey(req);
+    if (!getAccessibleProfiles(apiKey).length) {
+      const knownUser = hasGlobalUser(apiKey);
+      res.writeHead(knownUser ? 403 : 401, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: knownUser ? "User is not allowed to view any profile." : "认证失败：请提供有效的虚拟Key (Authorization: Bearer jx-...)" }));
+      return;
+    }
+    const { from, to } = rangeFromTo(new URL(req.url, "http://localhost").searchParams.get("range") || "7d");
+    const key = resolveUserKey(apiKey, rt);
+    const detail = productionUserDetail(db, key, { from, to });
+    const health = contextHealth(db, { from, to }).find(h => h.user_key === key) || null;
+    res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+    res.end(JSON.stringify({ ...detail, health }));
+    return;
+  }
+
   if (req.method === "GET" && req.url.startsWith("/api/my-usage")) {
     const apiKey = getApiKey(req);
     const url = new URL(req.url, `http://localhost`);

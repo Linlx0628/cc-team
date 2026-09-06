@@ -72,8 +72,59 @@ export function createProductionTracker({ db, getConfig, log = console.log, now 
       }
     })();
   }
-  function scanAlerts(_thresholds, _now) { return []; }   // Task 7 替换
-  function maybePrune() {}                                 // Task 7 替换
+  const DEFAULT_ALERTS = { idleHourTokens: 100000, loopWindowMinutes: 10, loopCount: 3,
+    burstWindowMinutes: 30, burstMinEdits: 10, burstFailRate: 0.5, cooldownMinutes: 30 };
+  let lastPruneDate = null;
+  function alertCooldownKey(kind, user) { return kind + ":" + user; }
+  function scanAlerts(thresholds = {}, now = Date.now()) {
+    const cfg = { ...DEFAULT_ALERTS, ...thresholds };
+    const fired = [];
+    const insert = db.prepare(`INSERT INTO production_alerts (time,user_key,user_name,kind,detail) VALUES (?,?,?,?,?)`);
+    const recentAlert = db.prepare(`SELECT COUNT(*) n FROM production_alerts WHERE kind=? AND user_key=? AND time>=?`);
+    const cn = new Date(now + 8 * 3600000);
+    const dateKey = cn.toISOString().slice(0, 10), hourKey = cn.toISOString().slice(11, 13);
+    // 1) idle_burn:当前小时 output ≥ 阈值 且 60 分钟内无文件类事件(usage 表无 user_name,经 users 表解析显示名)
+    const hot = db.prepare(`SELECT h.user_key, MAX(COALESCE(NULLIF(u.name,''), h.user_key)) user_name, h.o
+      FROM (SELECT user_key, SUM(output_tokens) o FROM usage_daily_hourly WHERE date=? AND hour=? GROUP BY user_key HAVING o >= ?) h
+      LEFT JOIN users u ON u.user_key = h.user_key GROUP BY h.user_key`).all(dateKey, hourKey, cfg.idleHourTokens);
+    const cutoffHour = new Date(now - 3600_000).toISOString();
+    for (const u of hot) {
+      const hasFiles = db.prepare(`SELECT COUNT(*) n FROM tool_events WHERE user_key=? AND ${FILE_SQL} AND time>=?`).get(u.user_key, cutoffHour).n;
+      if (hasFiles) continue;
+      if (recentAlert.get("idle_burn", u.user_key, new Date(now - cfg.cooldownMinutes * 60_000).toISOString()).n) continue;
+      insert.run(new Date(now).toISOString(), u.user_key, u.user_name, "idle_burn", JSON.stringify({ hour: hourKey, output_tokens: u.o }));
+      fired.push({ kind: "idle_burn", user_key: u.user_key, user_name: u.user_name, detail: `近一小时消耗 ${u.o.toLocaleString("zh-CN")} output tokens,无任何文件产出` });
+    }
+    // 2) error_loop:窗口内同 error_kind 次数 ≥ loopCount
+    const cutoffLoop = new Date(now - cfg.loopWindowMinutes * 60_000).toISOString();
+    const loops = db.prepare(`SELECT user_key, MAX(COALESCE(NULLIF(user_name,''),user_key)) user_name, error_kind, COUNT(*) c
+      FROM tool_events WHERE outcome='error' AND error_kind IS NOT NULL AND time>=?
+      GROUP BY user_key, error_kind HAVING c >= ?`).all(cutoffLoop, cfg.loopCount);
+    for (const l of loops) {
+      if (recentAlert.get("error_loop", l.user_key, new Date(now - cfg.cooldownMinutes * 60_000).toISOString()).n) continue;
+      insert.run(new Date(now).toISOString(), l.user_key, l.user_name, "error_loop", JSON.stringify({ error_kind: l.error_kind, count: l.c }));
+      fired.push({ kind: "error_loop", user_key: l.user_key, user_name: l.user_name, detail: `${cfg.loopWindowMinutes} 分钟内同类错误「${l.error_kind}」×${l.c},疑似循环` });
+    }
+    // 3) edit_failure_burst
+    const cutoffBurst = new Date(now - cfg.burstWindowMinutes * 60_000).toISOString();
+    const bursts = db.prepare(`SELECT user_key, MAX(COALESCE(NULLIF(user_name,''),user_key)) user_name,
+        COUNT(*) n, SUM(CASE WHEN outcome='error' THEN 1 ELSE 0 END) e
+      FROM tool_events WHERE ${FILE_SQL} AND time>=? GROUP BY user_key
+      HAVING n >= ? AND e * 1.0 / n > ?`).all(cutoffBurst, cfg.burstMinEdits, cfg.burstFailRate);
+    for (const b of bursts) {
+      if (recentAlert.get("edit_failure_burst", b.user_key, new Date(now - cfg.cooldownMinutes * 60_000).toISOString()).n) continue;
+      insert.run(new Date(now).toISOString(), b.user_key, b.user_name, "edit_failure_burst", JSON.stringify({ edits: b.n, errors: b.e }));
+      fired.push({ kind: "edit_failure_burst", user_key: b.user_key, user_name: b.user_name, detail: `${cfg.burstWindowMinutes} 分钟内 ${b.n} 次编辑失败 ${b.e} 次(>${Math.round(cfg.burstFailRate*100)}%)` });
+    }
+    return fired;
+  }
+  function maybePrune() {
+    const today = cnDateStr();
+    if (lastPruneDate === today) return;
+    lastPruneDate = today;
+    db.prepare(`DELETE FROM tool_events WHERE date(time,'+8 hours') < date(?, '-90 days')`).run(today);
+    db.prepare(`DELETE FROM production_alerts WHERE date(time,'+8 hours') < date(?, '-90 days')`).run(today);
+  }
   return { observe, scanAlerts, maybePrune, cursors };
 }
 
@@ -293,4 +344,16 @@ export function productionUserDetail(db, userKey, { from, to }) {
     WHERE user_key=? AND date(time,'+8 hours') BETWEEN ? AND ? AND ext IS NOT NULL
     GROUP BY ext ORDER BY la DESC LIMIT 10`).all(userKey, from, to);
   return { days, files, languages };
+}
+
+// —— Task 7: 告警查询/已读/90 天清理(API 任务消费)——
+export function productionAlerts(db, { from, to }) {
+  return db.prepare(`SELECT id, time, user_key, COALESCE(NULLIF(user_name,''),user_key) AS user_name, kind, detail, seen
+    FROM production_alerts WHERE date(time,'+8 hours') BETWEEN ? AND ? ORDER BY time DESC LIMIT 200`).all(from, to);
+}
+
+export function markAlertSeen(db, id) { db.prepare(`UPDATE production_alerts SET seen=1 WHERE id=?`).run(id); }
+
+export function pruneProductionData(db, days) {
+  db.prepare(`DELETE FROM tool_events WHERE date(time,'+8 hours') < date('now','+8 hours', ?)`).run(`-${Math.max(1, days|0)} days`);
 }

@@ -2319,13 +2319,20 @@ initProductionDb(db);   // 产出质量表(tool_events / production_alerts),先�
 function productionEnabled() { return (config.productionTracking || {}).enabled !== false; }
 const productionTracker = createProductionTracker({ db, getConfig: () => config.productionTracking || {}, log: console.log });
 
-// 产出质量:60s 告警扫描 + 过期清理(unref 不阻止进程退出);告警先只打日志,Task 7 接通知渠道。
+// 产出质量:60s 告警扫描 + 过期清理(unref 不阻止进程退出);告警经既有通知渠道 webhook 推送。
 const prodNotifyCooldown = new Map();
 function pushProductionAlert(a) {
+  const cfg = config.notifier || {};
+  if (!cfg.enabled) return;
   const key = a.kind + ":" + a.user_key;
   if (Date.now() - (prodNotifyCooldown.get(key) || 0) < 60_000) return;
   prodNotifyCooldown.set(key, Date.now());
-  console.log(`[production] 告警 ${a.kind} ${a.user_name || a.user_key} ${a.detail || ""}`);
+  const names = { idle_burn: "空转消耗", error_loop: "错误循环", edit_failure_burst: "编辑失败爆发" };
+  const msg = `【产出告警】${names[a.kind] || a.kind} · ${a.user_name || a.user_key}\n${a.detail || ""}\n—— ${beijingTimeString()}（token-monitor）`;
+  for (const s of NOTIFY_SENDERS.filter(s => s.enabled(cfg))) {
+    s.send(cfg, msg).then(() => console.log(`[通知] 已推送 ${s.channel}: 产出告警 ${a.kind}`))
+      .catch(err => console.error(`[通知] ${s.channel} 推送失败: ${err.message}`));
+  }
 }
 setInterval(() => {
   try {

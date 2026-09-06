@@ -357,3 +357,70 @@ export function markAlertSeen(db, id) { db.prepare(`UPDATE production_alerts SET
 export function pruneProductionData(db, days) {
   db.prepare(`DELETE FROM tool_events WHERE date(time,'+8 hours') < date('now','+8 hours', ?)`).run(`-${Math.max(1, days|0)} days`);
 }
+
+// —— Task 8: 等值成本引擎 + 上下文健康度(纯读路径)——
+// 参考价:USD / 1M tokens(Claude 家族官方牌价;其余模型在设置页补充;未配置的模型计 0 并列入 unpriced)
+export const DEFAULT_COST_RATES = {
+  "claude-opus":   { input: 15, output: 75, cacheWrite: 18.75, cacheRead: 1.5 },
+  "claude-sonnet": { input: 3,  output: 15, cacheWrite: 3.75,  cacheRead: 0.3 },
+  "claude-haiku":  { input: 1,  output: 5,  cacheWrite: 1.25,  cacheRead: 0.1 },
+};
+export function resolveRate(rates, model) {
+  const m = String(model || "");
+  if (rates[m]) return rates[m];
+  const keys = Object.keys(rates).filter(k => k !== "*" && m.startsWith(k)).sort((a, b) => b.length - a.length);
+  if (keys.length) return rates[keys[0]];
+  return rates["*"] || null;
+}
+export function computeCosts(db, rates, { from, to }) {
+  const models = db.prepare(`SELECT profile, user_key, model, SUM(input_tokens) i, SUM(output_tokens) o
+    FROM usage_daily_model WHERE date BETWEEN ? AND ? GROUP BY profile, user_key, model`).all(from, to);
+  const caches = db.prepare(`SELECT profile, user_key, SUM(cache_creation) cc, SUM(cache_read) cr
+    FROM usage_daily WHERE date BETWEEN ? AND ? GROUP BY profile, user_key`).all(from, to);
+  const byUser = new Map(), unpricedSet = new Set();
+  const bucket = (profile, user) => {
+    const k = profile + "|" + user;
+    if (!byUser.has(k)) byUser.set(k, { profile, user_key: user, user_name: null, model_cost: 0, cache_cost: 0, models: [], in_weighted_rate: 0, in_total: 0, cc: 0, cr: 0 });
+    return byUser.get(k);
+  };
+  for (const m of models) {
+    const b = bucket(m.profile, m.user_key);
+    const r = resolveRate(rates, m.model);
+    const c = r ? (m.i * r.input + m.o * r.output) / 1e6 : 0;
+    if (!r) unpricedSet.add(m.model);
+    b.model_cost += c;
+    b.models.push({ model: m.model, input_tokens: m.i, output_tokens: m.o, cost: +c.toFixed(4), priced: !!r });
+    b.in_total += m.i;
+    if (r) b.in_weighted_rate += m.i * (r.cacheWrite ?? 0);   // 以 input 为权重累积,稍后求 blended
+  }
+  for (const c of caches) {
+    const b = bucket(c.profile, c.user_key);
+    b.cc += c.cc || 0; b.cr += c.cr || 0;
+  }
+  const nameOf = db.prepare(`SELECT name FROM users WHERE user_key=? AND name IS NOT NULL LIMIT 1`);
+  const rows = [...byUser.values()].map(b => {
+    const names = nameOf.all(b.user_key);
+    b.user_name = names.length ? names[0].name : b.user_key;
+    const bw = b.in_total ? b.in_weighted_rate / b.in_total : 0;          // blended cacheWrite
+    const br = bw / 12.5;                                                  // Claude 家族 cacheRead=cacheWrite×0.08 的近似;统一用 write/12.5
+    b.cache_cost = (b.cc * bw + b.cr * br) / 1e6;
+    b.total_cost = +(b.model_cost + b.cache_cost).toFixed(4);
+    b.model_cost = +b.model_cost.toFixed(4); b.cache_cost = +b.cache_cost.toFixed(4);
+    return b;
+  }).sort((a, b) => b.total_cost - a.total_cost);
+  return { rows, unpriced: [...unpricedSet] };
+}
+export function contextHealth(db, { from, to }) {
+  const rows = db.prepare(`SELECT ud.user_key, MAX(COALESCE(u.name, ud.user_key)) user_name,
+      SUM(ud.cache_read) cr, SUM(ud.input_tokens) i
+    FROM usage_daily ud LEFT JOIN users u ON u.user_key=ud.user_key
+    WHERE ud.date BETWEEN ? AND ? GROUP BY ud.user_key`).all(from, to);
+  for (const r of rows) {
+    const denom = (r.cr || 0) + (r.i || 0);
+    r.ratio = denom ? (r.cr || 0) / denom : 0;
+    r.advice = r.ratio >= 0.8 ? "缓存命中率优秀,会话结构良好"
+      : r.ratio >= 0.5 ? "缓存命中率良好;减少频繁切换会话可进一步提升"
+      : "缓存命中率偏低:长会话尽量连续使用、避免反复粘贴大段上下文";
+  }
+  return rows;
+}

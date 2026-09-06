@@ -10608,15 +10608,26 @@ const server = http.createServer((req, res) => {
   // ── 产出质量与洞察(管理 API + 报告导出)──
   if (req.method === "GET" && req.url.startsWith("/api/production/summary")) {
     if (!checkAuth(req)) { res.writeHead(401); res.end("Unauthorized"); return; }
-    const { from, to } = rangeFromTo(new URL(req.url, "http://localhost").searchParams.get("range") || "7d");
-    const s = productionSummary(db, { from, to });
-    s.health = contextHealth(db, { from, to });
-    s.range = { from, to };
-    // 未读告警按 user 计数(初始 0 再累计 seen=0),供工作区表格末列展示
-    s.alertCounts = Object.fromEntries(s.rows.map(r => [r.user_key, 0]));
-    for (const a of productionAlerts(db, { from, to })) s.alertCounts[a.user_key] = (s.alertCounts[a.user_key] || 0) + (a.seen ? 0 : 1);
-    res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
-    res.end(JSON.stringify(s));
+    try {
+      const { from, to } = rangeFromTo(new URL(req.url, "http://localhost").searchParams.get("range") || "7d");
+      const s = productionSummary(db, { from, to });
+      s.health = contextHealth(db, { from, to });
+      s.range = { from, to };
+      // 未读告警按 user 计数(初始 0 再累计 seen=0),供工作区表格末列展示
+      s.alertCounts = Object.fromEntries(s.rows.map(r => [r.user_key, 0]));
+      for (const a of productionAlerts(db, { from, to })) s.alertCounts[a.user_key] = (s.alertCounts[a.user_key] || 0) + (a.seen ? 0 : 1);
+      res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+      res.end(JSON.stringify(s));
+    } catch (err) {
+      if (!res.headersSent) {
+        res.writeHead(err.statusCode || 500, { "Content-Type": "application/json; charset=utf-8" });
+        res.end(JSON.stringify({ error: err.message }));
+      } else {
+        // Headers already sent — can't change status, just end the response.
+        console.log(`[production-api] 响应已开始但出错: ${err.message}`);
+        if (!res.writableEnded) res.end();
+      }
+    }
     return;
   }
   if (req.method === "GET" && req.url.startsWith("/api/production/user/")) {
@@ -10634,16 +10645,38 @@ const server = http.createServer((req, res) => {
   }
   if (req.method === "GET" && req.url.startsWith("/api/production/projects")) {
     if (!checkAuth(req)) { res.writeHead(401); res.end("Unauthorized"); return; }
-    const { from, to } = rangeFromTo(new URL(req.url, "http://localhost").searchParams.get("range") || "7d");
-    res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
-    res.end(JSON.stringify({ rows: productionProjects(db, { from, to }) }));
+    try {
+      const { from, to } = rangeFromTo(new URL(req.url, "http://localhost").searchParams.get("range") || "7d");
+      res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+      res.end(JSON.stringify({ rows: productionProjects(db, { from, to }) }));
+    } catch (err) {
+      if (!res.headersSent) {
+        res.writeHead(err.statusCode || 500, { "Content-Type": "application/json; charset=utf-8" });
+        res.end(JSON.stringify({ error: err.message }));
+      } else {
+        // Headers already sent — can't change status, just end the response.
+        console.log(`[production-api] 响应已开始但出错: ${err.message}`);
+        if (!res.writableEnded) res.end();
+      }
+    }
     return;
   }
   if (req.method === "GET" && req.url.startsWith("/api/production/alerts")) {
     if (!checkAuth(req)) { res.writeHead(401); res.end("Unauthorized"); return; }
-    const { from, to } = rangeFromTo(new URL(req.url, "http://localhost").searchParams.get("range") || "7d");
-    res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
-    res.end(JSON.stringify({ rows: productionAlerts(db, { from, to }) }));
+    try {
+      const { from, to } = rangeFromTo(new URL(req.url, "http://localhost").searchParams.get("range") || "7d");
+      res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+      res.end(JSON.stringify({ rows: productionAlerts(db, { from, to }) }));
+    } catch (err) {
+      if (!res.headersSent) {
+        res.writeHead(err.statusCode || 500, { "Content-Type": "application/json; charset=utf-8" });
+        res.end(JSON.stringify({ error: err.message }));
+      } else {
+        // Headers already sent — can't change status, just end the response.
+        console.log(`[production-api] 响应已开始但出错: ${err.message}`);
+        if (!res.writableEnded) res.end();
+      }
+    }
     return;
   }
   if (req.method === "POST" && req.url === "/api/production/alerts/seen") {
@@ -10667,25 +10700,47 @@ const server = http.createServer((req, res) => {
   }
   if (req.method === "GET" && req.url.startsWith("/api/production/costs")) {
     if (!checkAuth(req)) { res.writeHead(401); res.end("Unauthorized"); return; }
-    const { from, to } = rangeFromTo(new URL(req.url, "http://localhost").searchParams.get("range") || "7d");
-    res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
-    res.end(JSON.stringify({ ...computeCosts(db, config.costRates || DEFAULT_COST_RATES, { from, to }), rateNote: "USD/1M tokens,参考牌价折算,非实际账单" }));
+    try {
+      const { from, to } = rangeFromTo(new URL(req.url, "http://localhost").searchParams.get("range") || "7d");
+      res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+      res.end(JSON.stringify({ ...computeCosts(db, config.costRates || DEFAULT_COST_RATES, { from, to }), rateNote: "USD/1M tokens,参考牌价折算,非实际账单" }));
+    } catch (err) {
+      if (!res.headersSent) {
+        res.writeHead(err.statusCode || 500, { "Content-Type": "application/json; charset=utf-8" });
+        res.end(JSON.stringify({ error: err.message }));
+      } else {
+        // Headers already sent — can't change status, just end the response.
+        console.log(`[production-api] 响应已开始但出错: ${err.message}`);
+        if (!res.writableEnded) res.end();
+      }
+    }
     return;
   }
   if (req.method === "GET" && req.url.startsWith("/api/production/report")) {
     if (!checkAuth(req)) { res.writeHead(401); res.end("Unauthorized"); return; }
-    const u = new URL(req.url, "http://localhost");
-    const { from, to } = rangeFromTo(u.searchParams.get("range") || "7d");
-    const html = buildReportHTML({
-      summary: productionSummary(db, { from, to }),
-      projects: productionProjects(db, { from, to }),
-      costs: computeCosts(db, config.costRates || DEFAULT_COST_RATES, { from, to }),
-      health: contextHealth(db, { from, to }),
-      alerts: productionAlerts(db, { from, to }),
-      from, to,
-    });
-    res.writeHead(200, { "Content-Type": "text/html; charset=utf-8", "Content-Disposition": `attachment; filename="production-report-${from}_${to}.html"` });
-    res.end(html);
+    try {
+      const u = new URL(req.url, "http://localhost");
+      const { from, to } = rangeFromTo(u.searchParams.get("range") || "7d");
+      const html = buildReportHTML({
+        summary: productionSummary(db, { from, to }),
+        projects: productionProjects(db, { from, to }),
+        costs: computeCosts(db, config.costRates || DEFAULT_COST_RATES, { from, to }),
+        health: contextHealth(db, { from, to }),
+        alerts: productionAlerts(db, { from, to }),
+        from, to,
+      });
+      res.writeHead(200, { "Content-Type": "text/html; charset=utf-8", "Content-Disposition": `attachment; filename="production-report-${from}_${to}.html"` });
+      res.end(html);
+    } catch (err) {
+      if (!res.headersSent) {
+        res.writeHead(err.statusCode || 500, { "Content-Type": "application/json; charset=utf-8" });
+        res.end(JSON.stringify({ error: err.message }));
+      } else {
+        // Headers already sent — can't change status, just end the response.
+        console.log(`[production-api] 响应已开始但出错: ${err.message}`);
+        if (!res.writableEnded) res.end();
+      }
+    }
     return;
   }
   if (req.method === "POST" && req.url === "/api/production/prune") {

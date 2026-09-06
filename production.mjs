@@ -125,3 +125,65 @@ export function extractAnthropicEvents(parsed, cursor = 0) {
   }
   return { calls, results, cursor: msgs.length };
 }
+
+// —— Task 3: Codex Responses 协议解析(纯函数,无 db 访问)——
+export function parseApplyPatch(text) {
+  const out = [];
+  let cur = null;
+  for (const raw of String(text || "").split("\n")) {
+    const m = raw.match(/^\*\*\* (Update|Add|Delete) File: (.+?)\s*$/);
+    if (m) { cur = { file_path: m[2], op: m[1], lines_add: 0, lines_del: 0 }; out.push(cur); continue; }
+    if (raw.startsWith("*** End Patch")) { cur = null; continue; }
+    if (!cur) continue;
+    if (raw.startsWith("+") && !raw.startsWith("+++")) cur.lines_add++;
+    else if (raw.startsWith("-") && !raw.startsWith("---")) cur.lines_del++;
+  }
+  return out;
+}
+
+function commandText(cmd) {
+  if (typeof cmd === "string") return cmd;
+  if (Array.isArray(cmd)) return cmd.map(p => (typeof p === "string" ? p : (p && typeof p.text === "string" ? p.text : ""))).join("");
+  return "";
+}
+
+export function extractResponsesEvents(parsed, cursor = 0) {
+  const items = Array.isArray(parsed?.input) ? parsed.input : [];
+  const start = scanStart(items, cursor);
+  const calls = [], results = [];
+  for (let i = start; i < items.length; i++) {
+    const it = items[i];
+    if (!it || typeof it !== "object") continue;
+    if (it.type === "function_call") {
+      const callId = String(it.call_id || it.id || "");
+      if (!callId) continue;
+      const name = String(it.name || "unknown");
+      let args = {};
+      try { args = JSON.parse(it.arguments || "{}"); } catch {}
+      const cmd = commandText(args.command ?? args.cmd);
+      if (cmd.includes("*** Begin Patch")) {
+        const files = parseApplyPatch(cmd);
+        files.forEach((f, idx) => calls.push({
+          tool_id: `${callId}#${idx}`, tool: "apply_patch",
+          file_path: f.file_path, ext: extOf(f.file_path),
+          lines_add: f.lines_add, lines_del: f.lines_del, cmd_class: null,
+        }));
+      } else {
+        calls.push({ tool_id: callId, tool: name, file_path: null, ext: null, lines_add: 0, lines_del: 0,
+          cmd_class: cmd ? classifyCommand(cmd) : null });
+      }
+    } else if (it.type === "function_call_output") {
+      const id = String(it.call_id || "");
+      if (!id) continue;
+      let exitCode = 0, outText = "";
+      try {
+        const o = JSON.parse(it.output || "{}");
+        exitCode = Number(o.exit_code ?? o.exitCode ?? 0);
+        outText = String(o.output || "");
+      } catch { outText = String(it.output || ""); }
+      if (exitCode !== 0) results.push({ tool_id: id, outcome: "error", error_kind: classifyError(`Exit code ${exitCode}\n${outText}`) });
+      else results.push({ tool_id: id, outcome: "ok", error_kind: null });
+    }
+  }
+  return { calls, results, cursor: items.length };
+}

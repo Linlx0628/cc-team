@@ -7629,6 +7629,7 @@ td{padding:8px 12px;font-size:11px;border-bottom:1px solid #ecece8;white-space:n
     <button id="workspace-tab-profiles" role="tab" aria-controls="workspace-panel-profiles" aria-selected="false" tabindex="-1" class="workspace-tab">方案中心<span class="workspace-tab-count" id="workspaceCountProfiles">0</span></button>
     <button id="workspace-tab-rates" role="tab" aria-controls="workspace-panel-rates" aria-selected="false" tabindex="-1" class="workspace-tab">配额倍率<span class="workspace-tab-count" id="workspaceCountRates">0</span></button>
     <button id="workspace-tab-errors" role="tab" aria-controls="workspace-panel-errors" aria-selected="false" tabindex="-1" class="workspace-tab">错误记录<span class="workspace-tab-count" id="workspaceCountErrors">0</span></button>
+    <button id="workspace-tab-production" role="tab" aria-controls="workspace-panel-production" aria-selected="false" tabindex="-1" class="workspace-tab">产出质量<span class="workspace-tab-count" id="workspaceCountProd">0</span></button>
   </div>
   <div class="workspace-content">
     <section id="workspace-panel-users" role="tabpanel" aria-labelledby="workspace-tab-users" class="workspace-panel active"><div class="workspace-panel-inner">
@@ -7657,6 +7658,18 @@ td{padding:8px 12px;font-size:11px;border-bottom:1px solid #ecece8;white-space:n
     <section id="workspace-panel-errors" role="tabpanel" aria-labelledby="workspace-tab-errors" class="workspace-panel" hidden><div id="errorSec">
       <div class="workspace-panel-head"><span class="sec-toggle" id="errorSecIcon"></span><strong>错误记录</strong><span id="errorCount" style="font-size:10px;color:var(--red)"></span><span class="workspace-panel-summary" id="errorHint">暂无错误</span><button id="clearErrors" class="clear-btn">清除</button></div>
       <div class="sec-body" id="errorSecBody"><table id="eTable"><thead><tr><th>时间</th><th>用户</th><th class="n">状态码</th><th>模型</th><th>路径</th><th>错误信息</th></tr></thead><tbody></tbody></table><div id="errPages" style="padding:8px 12px;text-align:right"></div></div>
+    </div></section>
+    <section id="workspace-panel-production" role="tabpanel" aria-labelledby="workspace-tab-production" class="workspace-panel" hidden><div class="workspace-panel-inner">
+      <div class="workspace-panel-head"><strong>产出质量</strong><select id="prodRangeSel" onchange="loadProduction()"><option value="today">今日</option><option value="7d" selected>近7天</option><option value="30d">近30天</option></select><a id="prodReportLink" href="/api/production/report?range=7d" target="_blank" style="font-size:11px;color:var(--accent)">导出报告</a><span class="workspace-panel-summary" id="prodSummary"></span></div>
+      <div class="workspace-panel-scroll">
+        <table id="prodTable"><thead><tr><th>成员</th><th class="n">净产出</th><th class="n">文件</th><th class="n">失败率</th><th class="n">重写率</th><th class="n">验证密度</th><th class="n">token/行</th><th class="n">告警</th></tr></thead><tbody></tbody></table>
+        <div id="prodZero" style="padding:6px 12px;font-size:11px;color:var(--orange)"></div>
+        <div id="prodDetail" style="padding:8px 12px;display:none"></div>
+        <div class="workspace-panel-head" style="border-top:1px solid var(--border)"><strong>项目分布</strong></div>
+        <table id="projTable"><thead><tr><th>项目</th><th class="n">成员</th><th class="n">文件</th><th class="n">净产出</th></tr></thead><tbody></tbody></table>
+        <div class="workspace-panel-head" style="border-top:1px solid var(--border)"><strong>空转 / 循环告警</strong><button onclick="markProdAlerts()" style="margin-left:auto">全部已读</button></div>
+        <table id="prodAlertTable"><thead><tr><th>时间</th><th>成员</th><th>类型</th><th>说明</th></tr></thead><tbody></tbody></table>
+      </div>
     </div></section>
   </div>
 </section>
@@ -8092,6 +8105,54 @@ document.getElementById("userSel").addEventListener("change",e=>{USR=e.target.va
 function resetChartFilters(){P="day";MT="tokens";MDL="all";USR="all";DS="";DE="";PROTO="";setProtoSeg("");document.querySelectorAll("#globalTabs .tab").forEach(x=>x.classList.toggle("on",x.dataset.p==="day"));document.getElementById("metricSel").value="tokens";document.getElementById("modelSel").value="all";document.getElementById("userSel").value="all";document.getElementById("dateStart").value="";document.getElementById("dateEnd").value="";if(currentProfile!=="all"){currentProfile="all";document.getElementById("profileSel").value="all"}resetDetailGrouping();load()}
 document.querySelectorAll(".workspace-tab").forEach(button=>{button.addEventListener("click",()=>setWorkspaceTab(button.id.replace("workspace-tab-","")));button.addEventListener("keydown",handleWorkspaceTabKeydown)});
 document.getElementById("clearErrors").addEventListener("click",async()=>{if(confirm("确定清除所有错误记录？")){const csrf=(document.cookie.match(/tm_csrf=([^;]+)/)||[])[1]||'';await fetch("/api/clear-errors",{method:"POST",headers:{"x-csrf-token":csrf}});toast('错误记录已清除');errPage=1;load()}});
+// ── 产出质量 tab(懒加载:首次切到该 tab 才拉数据)──
+const ph=escH;
+let prodData=null,prodLoaded=false;
+async function loadProduction(){
+  const range=document.getElementById('prodRangeSel').value;
+  document.getElementById('prodReportLink').href='/api/production/report?range='+range;
+  try{
+    const [s,p,a]=await Promise.all([
+      fetch('/api/production/summary?range='+range).then(r=>r.json()),
+      fetch('/api/production/projects?range='+range).then(r=>r.json()),
+      fetch('/api/production/alerts?range='+range).then(r=>r.json()),
+    ]);
+    prodData=s;
+    document.getElementById('workspaceCountProd').textContent=s.rows.length;
+    document.getElementById('prodSummary').textContent='净产出 '+s.rows.reduce((x,r)=>x+r.net_lines,0).toLocaleString('zh-CN')+' 行 · '+s.rows.length+' 人有产出';
+    const tb=document.querySelector('#prodTable tbody');
+    tb.innerHTML=s.rows.map(r=>'<tr data-key="'+ph(r.user_key)+'" style="cursor:pointer">'
+      +'<td>'+ph(r.user_name)+'</td><td class="n">'+fmtT(r.net_lines)+'</td><td class="n">'+(r.files||0)+'</td>'
+      +'<td class="n">'+(r.fail_rate*100).toFixed(0)+'%</td><td class="n">'+(r.rewrite_rate*100).toFixed(0)+'%</td>'
+      +'<td class="n">'+r.verify_density.toFixed(1)+'</td><td class="n">'+(r.token_per_line==null?'—':fmtT(Math.round(r.token_per_line)))+'</td>'
+      +'<td class="n">'+((s.alertCounts&&s.alertCounts[r.user_key])?'<span style="color:var(--orange)">'+s.alertCounts[r.user_key]+'</span>':'')+'</td></tr>').join('')
+      ||'<tr><td colspan="8" style="color:var(--dim)">该周期无产出数据</td></tr>';
+    tb.querySelectorAll('tr[data-key]').forEach(tr=>tr.addEventListener('click',()=>loadProdDetail(tr.dataset.key,range)));
+    document.getElementById('prodZero').textContent=s.zeroOutput.length
+      ?'有用量但零文件产出:'+s.zeroOutput.map(u=>ph(u.user_name)).join('、'):'';
+    document.querySelector('#projTable tbody').innerHTML=(p.rows||[]).map(r=>
+      '<tr><td>'+ph(r.project)+'</td><td class="n">'+r.users+'</td><td class="n">'+r.files+'</td><td class="n">'+fmtT((r.lines_add||0)-(r.lines_del||0))+'</td></tr>').join('')
+      ||'<tr><td colspan="4" style="color:var(--dim)">该周期无数据</td></tr>';
+    document.querySelector('#prodAlertTable tbody').innerHTML=(a.rows||[]).map(r=>
+      '<tr style="'+(r.seen?'color:var(--dim)':'')+'"><td>'+ph(r.time.slice(5,16).replace('T',' '))+'</td><td>'+ph(r.user_name)+'</td><td>'+ph(r.kind)+'</td><td>'+ph(r.detail)+'</td></tr>').join('')
+      ||'<tr><td colspan="4" style="color:var(--dim)">无告警</td></tr>';
+  }catch(e){document.getElementById('prodSummary').textContent='加载失败: '+e.message}
+}
+async function loadProdDetail(key,range){
+  const d=await fetch('/api/production/user/'+encodeURIComponent(key)+'?range='+range).then(r=>r.json());
+  const el=document.getElementById('prodDetail');
+  el.style.display='block';
+  el.innerHTML='<div style="font-weight:650;margin-bottom:4px">成员明细</div>'
+    +'<div style="font-size:11px;color:var(--dim)">日趋势:'+(d.days.map(x=>x.date.slice(5)+':'+(x.la-x.ld)).join(' · ')||'无')+'</div>'
+    +'<div style="font-size:11px;margin-top:4px">文件 Top:'+(d.files.map(f=>ph(f.file_path.split('/').pop())+'(+'+f.la+'/-'+f.ld+')').join(' · ')||'无')+'</div>'
+    +'<div style="font-size:11px;margin-top:4px">语言:'+(d.languages.map(l=>ph(l.ext||'其他')).join(' · ')||'无')+'</div>';
+}
+async function markProdAlerts(){
+  const csrf=(document.cookie.match(/tm_csrf=([^;]+)/)||[])[1]||'';
+  await fetch('/api/production/alerts/seen',{method:'POST',headers:{'Content-Type':'application/json','x-csrf-token':csrf},body:JSON.stringify({id:0})});
+  loadProduction();
+}
+document.getElementById('workspace-tab-production').addEventListener('click',()=>{if(!prodLoaded){prodLoaded=true;loadProduction()}});
 function startAutoRefresh(){if(refreshTimer)clearInterval(refreshTimer);refreshTimer=setInterval(()=>{if(autoRefresh)load()},30000)}
 document.getElementById("autoRefreshBtn").addEventListener("click",()=>{autoRefresh=!autoRefresh;const btn=document.getElementById("autoRefreshBtn");btn.textContent="自动刷新: "+(autoRefresh?"开":"关");btn.className=autoRefresh?"ar-on":"ar-off"});
 window.addEventListener("resize",scheduleChartResize);
@@ -10458,6 +10519,9 @@ const server = http.createServer((req, res) => {
     const s = productionSummary(db, { from, to });
     s.health = contextHealth(db, { from, to });
     s.range = { from, to };
+    // 未读告警按 user 计数(初始 0 再累计 seen=0),供工作区表格末列展示
+    s.alertCounts = Object.fromEntries(s.rows.map(r => [r.user_key, 0]));
+    for (const a of productionAlerts(db, { from, to })) s.alertCounts[a.user_key] = (s.alertCounts[a.user_key] || 0) + (a.seen ? 0 : 1);
     res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
     res.end(JSON.stringify(s));
     return;
@@ -10495,9 +10559,16 @@ const server = http.createServer((req, res) => {
     readBody(req, 10_000).then(buf => {
       const { id } = JSON.parse(buf.toString() || "{}");
       const n = Number(id);
-      const changed = Number.isFinite(n) ? markAlertSeen(db, n) : 0;
-      res.writeHead(changed ? 200 : 404, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ ok: !!changed }));
+      // id 为 0 或缺失视为「全部已读」;非 0 按 markAlertSeen 保持原 200/404 语义
+      if (Number.isFinite(n) && n !== 0) {
+        const changed = markAlertSeen(db, n);
+        res.writeHead(changed ? 200 : 404, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: !!changed }));
+      } else {
+        db.prepare(`UPDATE production_alerts SET seen=1 WHERE seen=0`).run();
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: true }));
+      }
     }).catch(() => { if (!res.headersSent) { res.writeHead(400); res.end("Bad request"); } });
     return;
   }

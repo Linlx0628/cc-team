@@ -11007,12 +11007,23 @@ const server = http.createServer((req, res) => {
       res.end(JSON.stringify({ error: knownUser ? "User is not allowed to view any profile." : "认证失败：请提供有效的虚拟Key (Authorization: Bearer jx-...)" }));
       return;
     }
-    const { from, to } = rangeFromTo(new URL(req.url, "http://localhost").searchParams.get("range") || "7d");
-    const key = resolveUserKey(apiKey, rt);
-    const detail = productionUserDetail(db, key, { from, to });
-    const health = contextHealth(db, { from, to }).find(h => h.user_key === key) || null;
-    res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
-    res.end(JSON.stringify({ ...detail, health }));
+    try {
+      const { from, to } = rangeFromTo(new URL(req.url, "http://localhost").searchParams.get("range") || "7d");
+      const key = resolveUserKey(apiKey, rt);
+      const detail = productionUserDetail(db, key, { from, to });
+      const health = contextHealth(db, { from, to }).find(h => h.user_key === key) || null;
+      res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+      res.end(JSON.stringify({ ...detail, health }));
+    } catch (err) {
+      if (!res.headersSent) {
+        res.writeHead(err.statusCode || 500, { "Content-Type": "application/json; charset=utf-8" });
+        res.end(JSON.stringify({ error: err.message }));
+      } else {
+        // Headers already sent — can't change status, just end the response.
+        console.log(`[production-me] 响应已开始但出错: ${err.message}`);
+        if (!res.writableEnded) res.end();
+      }
+    }
     return;
   }
 

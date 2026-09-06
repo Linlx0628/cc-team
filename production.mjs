@@ -143,7 +143,7 @@ export function parseApplyPatch(text) {
 
 function commandText(cmd) {
   if (typeof cmd === "string") return cmd;
-  if (Array.isArray(cmd)) return cmd.map(p => (typeof p === "string" ? p : (p && typeof p.text === "string" ? p.text : ""))).join("");
+  if (Array.isArray(cmd)) return cmd.map(p => (typeof p === "string" ? p.trim() : (p && typeof p.text === "string" ? p.text : ""))).filter(Boolean).join(" ");
   return "";
 }
 
@@ -178,7 +178,8 @@ export function extractResponsesEvents(parsed, cursor = 0) {
       let exitCode = 0, outText = "";
       try {
         const o = JSON.parse(it.output || "{}");
-        exitCode = Number(o.exit_code ?? o.exitCode ?? 0);
+        const rawExit = o.exit_code ?? o.exitCode ?? o.metadata?.exit_code ?? o.metadata?.exitCode;
+        exitCode = Number.isFinite(Number(rawExit)) ? Number(rawExit) : 0;
         outText = String(o.output || "");
       } catch { outText = String(it.output || ""); }
       if (exitCode !== 0) results.push({ tool_id: id, outcome: "error", error_kind: classifyError(`Exit code ${exitCode}\n${outText}`) });

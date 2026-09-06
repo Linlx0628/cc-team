@@ -4568,7 +4568,7 @@ async function describeImageViaHelper(b64, helperModel, runtime, clientState, pr
     } catch (e) {
       if (isClientAbortError(e)) throw e;
       const reason = e.isTimeout ? `辅助模型超时（${Math.round(timeout / 1000)}s 未返回）` : `辅助模型连接失败：${e.message}`;
-      console.log(`[图片桥接] 辅助调用异常 模型=${helperModel} err=${e.message}`);
+      console.log(`${clientState.tag || ""} [图片桥接] 辅助调用异常 模型=${helperModel} err=${e.message}`);
       bridgeHelperNoteFailure(healthKey, reason);
       return { ok: false, reason };
     }
@@ -4578,28 +4578,28 @@ async function describeImageViaHelper(b64, helperModel, runtime, clientState, pr
       // drop it once, remember that host+model, and retry instead of failing.
       if (askNoThinking && upRes.statusCode < 500 && /thinking/i.test(snippet())) {
         bridgeThinkingUnsupported.add(healthKey);
-        console.log(`[图片桥接] 上游不接受 thinking 字段，去掉后重试 模型=${helperModel}`);
+        console.log(`${clientState.tag || ""} [图片桥接] 上游不接受 thinking 字段，去掉后重试 模型=${helperModel}`);
         continue;
       }
-      console.log(`[图片桥接] 辅助调用失败 模型=${helperModel} status=${upRes.statusCode} body=${snippet()}`);
+      console.log(`${clientState.tag || ""} [图片桥接] 辅助调用失败 模型=${helperModel} status=${upRes.statusCode} body=${snippet()}`);
       const reason = `辅助模型返回 ${upRes.statusCode}：${snippet().slice(0, 80)}`;
       bridgeHelperNoteFailure(healthKey, reason);
       return { ok: false, reason };
     }
     let json;
     try { json = JSON.parse(upRes.body.toString()); } catch {
-      console.log(`[图片桥接] 辅助响应不是 JSON 模型=${helperModel} body=${snippet()}`);
+      console.log(`${clientState.tag || ""} [图片桥接] 辅助响应不是 JSON 模型=${helperModel} body=${snippet()}`);
       const reason = "辅助模型响应不是合法 JSON";
       bridgeHelperNoteFailure(healthKey, reason);
       return { ok: false, reason };
     }
     const picked = pickHelperDescription(json, isAnthropic);
     if (picked.text) {
-      if (picked.fromThinking) console.log(`[图片桥接] 辅助只给了思考过程，降级取思考文本 模型=${helperModel} stop_reason=${picked.stop}`);
+      if (picked.fromThinking) console.log(`${clientState.tag || ""} [图片桥接] 辅助只给了思考过程，降级取思考文本 模型=${helperModel} stop_reason=${picked.stop}`);
       bridgeHelperNoteSuccess(healthKey);
       return { ok: true, text: picked.text };
     }
-    console.log(`[图片桥接] 辅助返回空描述 模型=${helperModel} blocks=${picked.kinds} stop_reason=${picked.stop} body=${snippet()}`);
+    console.log(`${clientState.tag || ""} [图片桥接] 辅助返回空描述 模型=${helperModel} blocks=${picked.kinds} stop_reason=${picked.stop} body=${snippet()}`);
     const reason = `辅助模型只返回 ${picked.kinds}、无描述正文（stop_reason=${picked.stop}）`;
     bridgeHelperNoteFailure(healthKey, reason);
     return { ok: false, reason };
@@ -4666,6 +4666,10 @@ function sendUpstream(body, reqUrl, reqMethod, reqHeaders, timeout, _rt, clientS
 }
 
 function proxyRequest(req, res) {
+  // Correlation tag: concurrent clients (Claude Code + Codex) interleave their log
+  // lines in one console; every line of a request carries the same tag so the
+  // interleaving can be undone by eye. Short on purpose — 2 bytes of hex.
+  const reqTag = "#" + crypto.randomBytes(2).toString("hex");
   const inbound = classifyInboundPath(req.url, req.method);
   if (inbound.kind === "unsupported") {
     sendOpenAiError(res, 404, "unsupported_endpoint", unsupportedInboundMessage(inbound.reason));
@@ -4726,7 +4730,7 @@ function proxyRequest(req, res) {
     res.writeHead(400, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ error: `方案 "${runtime.profileName}" 是 Responses(Codex) 方案，不能通过 /v1/messages 访问。请通过 /v1/responses 或 /${suffix}/v1/responses 使用。` }));
     recordError(apiKey, 400, `cross_protocol: /${suffix} Responses 方案收到 /v1/messages 请求`, req.url, "unknown", suffix, runtime);
-    console.log(`[拦截] ${getUserName(apiKey, runtime)} 跨协议访问被拒 /${suffix} 是 Responses 方案`);
+    console.log(`${reqTag} [拦截] ${getUserName(apiKey, runtime)} 跨协议访问被拒 /${suffix} 是 Responses 方案`);
     return;
   }
 
@@ -4761,13 +4765,14 @@ function proxyRequest(req, res) {
       }));
     }
     recordError(apiKey, 403, `group_member_restricted: /${suffix} 直连被拒，引导走 ${groupEntryPath}`, req.url, "unknown", suffix, runtime);
-    console.log(`[拦截] ${getUserName(apiKey, runtime)} 直连组内方案 /${suffix} 被拒 → 引导 ${groupEntryPath}`);
+    console.log(`${reqTag} [拦截] ${getUserName(apiKey, runtime)} 直连组内方案 /${suffix} 被拒 → 引导 ${groupEntryPath}`);
     return;
   }
 
   const proxyStartTime = Date.now();
   let proxyPhase = "init";
   const clientState = createClientAbortState();
+  clientState.tag = reqTag;
   clientState.reqLog = reqLog;
   attachRequestLogger(res, clientState, reqLog);
 
@@ -4784,22 +4789,22 @@ function proxyRequest(req, res) {
   }
 
   req.on("error", (err) => {
-    console.error(`[Socket] 客户端请求错误 phase=${proxyPhase} elapsed=${Date.now() - proxyStartTime}ms user=${getUserName(apiKey, runtime)} err=${err.message}`);
+    console.error(`${reqTag} [Socket] 客户端请求错误 phase=${proxyPhase} elapsed=${Date.now() - proxyStartTime}ms user=${getUserName(apiKey, runtime)} err=${err.message}`);
   });
   res.on("error", (err) => {
-    console.error(`[Socket] 客户端响应错误 phase=${proxyPhase} elapsed=${Date.now() - proxyStartTime}ms user=${getUserName(apiKey, runtime)} err=${err.message}`);
+    console.error(`${reqTag} [Socket] 客户端响应错误 phase=${proxyPhase} elapsed=${Date.now() - proxyStartTime}ms user=${getUserName(apiKey, runtime)} err=${err.message}`);
     markClientAborted(clientState, "response-error");
   });
   req.on("aborted", () => {
     if (!res.writableEnded) {
       markClientAborted(clientState, "request-aborted");
-      console.log(`[Socket] 客户端提前断开 phase=${proxyPhase} elapsed=${Date.now() - proxyStartTime}ms user=${getUserName(apiKey, runtime)} reason=request-aborted`);
+      console.log(`${reqTag} [Socket] 客户端提前断开 phase=${proxyPhase} elapsed=${Date.now() - proxyStartTime}ms user=${getUserName(apiKey, runtime)} reason=request-aborted`);
     }
   });
   res.on("close", () => {
     if (!res.writableEnded) {
       markClientAborted(clientState, "response-closed");
-      console.log(`[Socket] 客户端提前断开 phase=${proxyPhase} elapsed=${Date.now() - proxyStartTime}ms user=${getUserName(apiKey, runtime)} reason=response-closed`);
+      console.log(`${reqTag} [Socket] 客户端提前断开 phase=${proxyPhase} elapsed=${Date.now() - proxyStartTime}ms user=${getUserName(apiKey, runtime)} reason=response-closed`);
     }
   });
 
@@ -4954,10 +4959,10 @@ function proxyRequest(req, res) {
           proxyPhase = "upstream-connect";
           const realKey = getRealKey(apiKey, cruntime);
           const reqHeaders = { ...req.headers, host: cruntime.upstreamUrl.host, "content-length": cbody.length };
-          console.log(`── 请求开始 ── ${getUserName(apiKey, cruntime)} [${reqSource}] 模型=${originalModel}${originalModel !== creqModel ? "→" + creqModel : ""}${csuffix ? ` [${csuffix}]` : ""} ──`);
+          console.log(`── 请求开始 ── ${reqTag} ${getUserName(apiKey, cruntime)} [${reqSource}] 模型=${originalModel}${originalModel !== creqModel ? "→" + creqModel : ""}${csuffix ? ` [${csuffix}]` : ""} ──`);
           if (realKey !== apiKey) {
             reqHeaders["authorization"] = `Bearer ${realKey}`;
-            console.log(`[映射] ${getUserName(apiKey, cruntime)} 虚拟key=${apiKey.slice(0,8)}**** 请求模型=${originalModel}${originalModel !== creqModel ? " → 实际=" + creqModel : ""}`);
+            console.log(`${reqTag} [映射] ${getUserName(apiKey, cruntime)} 虚拟key=${apiKey.slice(0,8)}**** 请求模型=${originalModel}${originalModel !== creqModel ? " → 实际=" + creqModel : ""}`);
           }
           delete reqHeaders["connection"];
           delete reqHeaders["transfer-encoding"];
@@ -4977,7 +4982,8 @@ function proxyRequest(req, res) {
               reqHeaders["content-length"] = cbody.length;
               const bs = bridged.stats;
               clientState.bridgeMs = (clientState.bridgeMs || 0) + bs.ms;
-              console.log(`[图片桥接] ${getUserName(apiKey, cruntime)} 图 ${bs.total} 张（命中 ${bs.hit} / 新识 ${bs.got} / 占位 ${bs.ph} / 失败 ${bs.failed}）耗时 ${(bs.ms / 1000).toFixed(1)}s 辅助=${bridged.helperModel} → ${creqModel}`);
+              clientState.bridgeRan = true;
+              console.log(`${reqTag} [图片桥接] ${getUserName(apiKey, cruntime)} 图 ${bs.total} 张（命中 ${bs.hit} / 新识 ${bs.got} / 占位 ${bs.ph} / 失败 ${bs.failed}）耗时 ${(bs.ms / 1000).toFixed(1)}s 辅助=${bridged.helperModel} → ${creqModel}`);
             }
           }
 
@@ -5001,7 +5007,7 @@ function proxyRequest(req, res) {
             break;
           }
           if (isClientAbortError(err)) {
-            console.log(`[取消] ${getUserName(apiKey, cruntime)} 客户端已断开，停止代理 model=${creqModel} phase=${proxyPhase}`);
+            console.log(`${reqTag} [取消] ${getUserName(apiKey, cruntime)} 客户端已断开，停止代理 model=${creqModel} phase=${proxyPhase}`);
             served = true;   // client disconnect is not a failure to surface
             break;
           }
@@ -5017,7 +5023,7 @@ function proxyRequest(req, res) {
           // Responses-protocol clients (Codex) get OpenAI-style error bodies.
           if (lastFailure.kind === "model") {
             sendOpenAiError(res, 403, "model_not_allowed", lastFailure.message);
-            console.log(`[拦截] ${apiKey.slice(0, 8)}**** profile=${lastFailure.runtime.profileName} model 拒绝 请求模型=${lastFailure.originalModel} 解析后=${lastFailure.model} 允许=${(lastFailure.runtime.allowedModels || []).join(",")}`);
+            console.log(`${reqTag} [拦截] ${apiKey.slice(0, 8)}**** profile=${lastFailure.runtime.profileName} model 拒绝 请求模型=${lastFailure.originalModel} 解析后=${lastFailure.model} 允许=${(lastFailure.runtime.allowedModels || []).join(",")}`);
           } else if (lastFailure.kind === "breaker") {
             const remaining = Math.ceil(lastFailure.runtime.breaker.status().cooldownRemaining / 1000);
             sendOpenAiError(res, 503, "upstream_unavailable", `Upstream temporarily unavailable. Circuit open, retry in ${remaining}s.`);
@@ -5049,7 +5055,7 @@ function proxyRequest(req, res) {
         } else if (lastFailure.kind === "model") {
           res.writeHead(403, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ error: lastFailure.message }));
-          console.log(`[拦截] ${apiKey.slice(0, 8)}**** profile=${lastFailure.runtime.profileName} model 拒绝 请求模型=${lastFailure.originalModel} 解析后=${lastFailure.model} 允许=${(lastFailure.runtime.allowedModels || []).join(",")}`);
+          console.log(`${reqTag} [拦截] ${apiKey.slice(0, 8)}**** profile=${lastFailure.runtime.profileName} model 拒绝 请求模型=${lastFailure.originalModel} 解析后=${lastFailure.model} 允许=${(lastFailure.runtime.allowedModels || []).join(",")}`);
         } else if (lastFailure.kind === "breaker") {
           const remaining = Math.ceil(lastFailure.runtime.breaker.status().cooldownRemaining / 1000);
           res.writeHead(503, { "Content-Type": "application/json" });
@@ -5123,8 +5129,10 @@ function proxyRequest(req, res) {
             : `生成 ${secs(genMs)}`);
         }
       }
-      if (clientState.bridgeMs) parts.push(`图片桥接 ${secs(clientState.bridgeMs)}`);
-      console.log(`── 请求结束 ── ${getUserName(apiKey, runtime)} ${parts.join(" ")} ──`);
+      // bridgeRan, not bridgeMs: a 0ms bridge is exactly the "cost zero helper
+      // calls" proof worth seeing, and 0 is falsy.
+      if (clientState.bridgeRan) parts.push(`图片桥接 ${secs(clientState.bridgeMs || 0)}`);
+      console.log(`── 请求结束 ── ${reqTag} ${getUserName(apiKey, runtime)} ${parts.join(" ")} ──`);
     }
   }).catch(() => {
     if (!res.headersSent) {
@@ -5185,7 +5193,7 @@ async function handleJsonProxy(req, res, body, reqHeaders, apiKey, reqModel, tim
             recordUsage(apiKey, usage, json.model, suffix, runtime);
             clientState.lastUsage = { usage, model: json.model || reqModel };
             const modelName = json.model || reqModel;
-            console.log(`[Token] ${getUserName(apiKey, runtime)} [${reqSource}] model=${modelName} 输入=${usage.input_tokens || usage.prompt_tokens || 0} 输出=${usage.output_tokens || usage.completion_tokens || 0} 缓存写=${usage.cache_creation_input_tokens || 0} 缓存读=${usage.cache_read_input_tokens || 0}`);
+            console.log(`${clientState.tag || ""} [Token] ${getUserName(apiKey, runtime)} [${reqSource}] model=${modelName} 输入=${usage.input_tokens || usage.prompt_tokens || 0} 输出=${usage.output_tokens || usage.completion_tokens || 0} 缓存写=${usage.cache_creation_input_tokens || 0} 缓存读=${usage.cache_read_input_tokens || 0}`);
           } else {
             console.log(`[响应] ${getUserName(apiKey, runtime)} 200 OK 但无usage字段 model=${reqModel} body[0:300]=${text.slice(0, 300).replace(/\n/g, "\\n")}`);
           }
@@ -5210,7 +5218,7 @@ async function handleJsonProxy(req, res, body, reqHeaders, apiKey, reqModel, tim
     } catch (err) {
       if (err?.isRateLimited) throw err;   // propagate to outer failover loop — no breaker/retry
       if (isClientAbortError(err)) {
-        console.log(`[取消] ${getUserName(apiKey, runtime)} JSON 客户端断开 model=${reqModel}`);
+        console.log(`${clientState.tag || ""} [取消] ${getUserName(apiKey, runtime)} JSON 客户端断开 model=${reqModel}`);
         return;
       }
       lastError = err;
@@ -5266,7 +5274,7 @@ async function handleStreamingProxy(req, res, body, reqHeaders, apiKey, reqModel
       if (idleTimer) clearTimeout(idleTimer);
       idleTimer = setTimeout(() => {
         idleTimer = null;
-        console.log(`[超时] ${getUserName(apiKey, runtime)} 流式空闲超过 ${idleMs}ms，中断上游 model=${reqModel}`);
+        console.log(`${clientState.tag || ""} [超时] ${getUserName(apiKey, runtime)} 流式空闲超过 ${idleMs}ms，中断上游 model=${reqModel}`);
         upReq.destroy(new Error(`Upstream stream idle timeout (${idleMs}ms)`));
       }, idleMs);
       idleTimer.unref?.();
@@ -5398,7 +5406,7 @@ async function handleStreamingProxy(req, res, body, reqHeaders, apiKey, reqModel
           sseDataLines++;
           try {
             const d = JSON.parse(jsonStr);
-            if (sseDataLines <= 3) console.log(`[SSE] ${getUserName(apiKey, runtime)} 第${sseDataLines}条 类型=${d.type} 字段=${Object.keys(d).join(",")}`);
+            if (sseDataLines <= 3) console.log(`${clientState.tag || ""} [SSE] ${getUserName(apiKey, runtime)} 第${sseDataLines}条 类型=${d.type} 字段=${Object.keys(d).join(",")}`);
             if (d.type === "message_start") {
               if (d.message) {
                 model = d.message.model || model;
@@ -5468,7 +5476,7 @@ async function handleStreamingProxy(req, res, body, reqHeaders, apiKey, reqModel
         if (usageHasTokens(usage)) {
           recordUsage(apiKey, usage, model, suffix, runtime);
           clientState.lastUsage = { usage, model };
-          console.log(`[Token] ${getUserName(apiKey, runtime)} [${reqSource}] model=${model} 输入=${usage.input_tokens} 输出=${usage.output_tokens} 缓存写=${usage.cache_creation_input_tokens || 0} 缓存读=${usage.cache_read_input_tokens || 0}`);
+          console.log(`${clientState.tag || ""} [Token] ${getUserName(apiKey, runtime)} [${reqSource}] model=${model} 输入=${usage.input_tokens} 输出=${usage.output_tokens} 缓存写=${usage.cache_creation_input_tokens || 0} 缓存读=${usage.cache_read_input_tokens || 0}`);
         } else {
           console.log(`[响应] ${getUserName(apiKey, runtime)} 流结束 无usage数据 model=${model} sse行数=${sseDataLines} 原始数据[0:200]=${rawSample.slice(0, 200).replace(/\n/g, "\\n")}`);
         }
@@ -5493,7 +5501,7 @@ async function handleStreamingProxy(req, res, body, reqHeaders, apiKey, reqModel
     upReq.on("error", (err) => {
       if (resolved) return;   // already failover'd or resolved — don't write a 502
       if (isClientAbortError(err) || clientState?.aborted) {
-        console.log(`[取消] ${getUserName(apiKey, runtime)} 流式客户端断开 model=${reqModel}`);
+        console.log(`${clientState.tag || ""} [取消] ${getUserName(apiKey, runtime)} 流式客户端断开 model=${reqModel}`);
         safeResolve();
         return;
       }

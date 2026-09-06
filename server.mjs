@@ -6149,6 +6149,21 @@ ${((() => { const qa = stmts.quotaAdjustRecent.all(); return qa.length > 0 ? `<h
 </div>
 </form>
 
+<h2 id="costRatesCard">产出与成本设置 <span style="font-size:11px;color:var(--dim);font-weight:400">全局生效,不随方案切换;价格表驱动「等值成本」工作区</span></h2>
+<div class="section">
+<label style="display:flex;align-items:center;gap:6px;cursor:pointer"><input type="checkbox" id="prodTrackingToggle" style="width:auto"> 启用产出解析<span class="note" style="margin:0">仅统计结构化指标,不存储代码内容</span></label>
+<label style="display:flex;align-items:center;gap:6px;cursor:pointer;margin-top:8px"><input type="checkbox" id="prodPathToggle" style="width:auto"> 记录文件路径<span class="note" style="margin:0">关闭则仅保留扩展名</span></label>
+<label style="margin-top:14px">模型参考牌价(USD / 1M tokens) — 支持前缀匹配,如 claude-sonnet 覆盖所有 claude-sonnet-* 变体</label>
+<div class="alias-head rate" style="grid-template-columns:2fr 1fr 1fr 1fr 1fr auto"><span>模型名</span><span>输入</span><span>输出</span><span>缓存写</span><span>缓存读</span><span></span></div>
+<div id="costRateRows"></div>
+<div style="display:flex;align-items:center;gap:10px;margin-top:8px">
+<button type="button" class="btn btn-outline btn-sm" onclick="addRateRow('', {input:0,output:0,cacheWrite:0,cacheRead:0})">＋添加模型价格</button>
+<button type="button" class="btn btn-primary btn-sm" onclick="saveProdSettings()">保存</button>
+<span class="note" id="prodSettingsMsg" style="margin:0"></span>
+</div>
+<div class="note">牌价用于把 token 用量折算为等值美元成本(参考牌价,非实际账单)。未配置价格的模型计 0 并在「等值成本」工作区列出,可在此补充。改动保存后立即生效,已折算的历史数据不会重算。</div>
+</div>
+
 <h2>旧数据导入</h2>
 <div class="section">
 <div class="import-tools">
@@ -7491,6 +7506,40 @@ else{renderAliasRows(SETTINGS.profiles.find(p=>p.suffix===SETTINGS.selectedProfi
 try{if(sessionStorage.getItem('tm_return_pool_view')==='1'){sessionStorage.removeItem('tm_return_pool_view');openQuotaPoolView()}}catch(e){}
 })();
 document.addEventListener("keydown",e=>{if(e.key==="Enter"&&e.target.tagName!=="TEXTAREA"&&e.target.tagName!=="INPUT")e.preventDefault()});
+// ─── 产出与成本设置(参考牌价表 + 产出解析开关;走 /api/production/settings,独立于 settings-save 表单)───
+const INITIAL_PROD=${JSON.stringify({ productionTracking: config.productionTracking || { enabled: true, storeFilePaths: true }, costRates: config.costRates || DEFAULT_COST_RATES }).replace(/</g, "\\x3c")};
+function rateRow(m,r,i){
+  return '<div data-i="'+i+'" style="display:flex;gap:6px;margin:4px 0;align-items:center">'
+    +'<input class="cr-model" value="'+h(m)+'" placeholder="模型名(支持前缀)" style="flex:2;min-width:0">'
+    +'<input class="cr-in" type="number" step="0.01" min="0" value="'+Number(r.input||0)+'" placeholder="输入" style="flex:1;min-width:0">'
+    +'<input class="cr-out" type="number" step="0.01" min="0" value="'+Number(r.output||0)+'" placeholder="输出" style="flex:1;min-width:0">'
+    +'<input class="cr-cw" type="number" step="0.01" min="0" value="'+Number(r.cacheWrite||0)+'" placeholder="缓存写" style="flex:1;min-width:0">'
+    +'<input class="cr-cr" type="number" step="0.01" min="0" value="'+Number(r.cacheRead||0)+'" placeholder="缓存读" style="flex:1;min-width:0">'
+    +'<button type="button" class="btn btn-outline btn-sm" onclick="this.parentElement.remove()">删</button></div>';
+}
+function addRateRow(m,r){document.getElementById('costRateRows').insertAdjacentHTML('beforeend',rateRow(m,r,document.querySelectorAll('#costRateRows > div').length))}
+function saveProdSettings(){
+  const costRates={};
+  document.querySelectorAll('#costRateRows > div').forEach(row=>{
+    const m=row.querySelector('.cr-model').value.trim();if(!m)return;
+    costRates[m]={input:+row.querySelector('.cr-in').value||0,output:+row.querySelector('.cr-out').value||0,
+      cacheWrite:+row.querySelector('.cr-cw').value||0,cacheRead:+row.querySelector('.cr-cr').value||0};
+  });
+  const msg=document.getElementById('prodSettingsMsg');
+  msg.textContent='保存中...';
+  fetch('/api/production/settings',{method:'POST',headers:csrfHeaders({'Content-Type':'application/json'}),
+    body:JSON.stringify({productionTracking:{enabled:document.getElementById('prodTrackingToggle').checked,storeFilePaths:document.getElementById('prodPathToggle').checked},costRates:costRates})})
+    .then(r=>r.json()).then(()=>{msg.textContent='已保存';setTimeout(()=>location.reload(),600)})
+    .catch(e=>{msg.textContent='保存失败: '+e.message});
+}
+(function(){
+  document.getElementById('prodTrackingToggle').checked=INITIAL_PROD.productionTracking.enabled!==false;
+  document.getElementById('prodPathToggle').checked=INITIAL_PROD.productionTracking.storeFilePaths!==false;
+  const rates=INITIAL_PROD.costRates||{};
+  const names=Object.keys(rates);
+  if(names.length){names.forEach(m=>addRateRow(m,rates[m]))}
+  else{addRateRow('',{input:0,output:0,cacheWrite:0,cacheRead:0})}
+})();
 </script>
 </body></html>`;
 }
@@ -7630,6 +7679,7 @@ td{padding:8px 12px;font-size:11px;border-bottom:1px solid #ecece8;white-space:n
     <button id="workspace-tab-rates" role="tab" aria-controls="workspace-panel-rates" aria-selected="false" tabindex="-1" class="workspace-tab">配额倍率<span class="workspace-tab-count" id="workspaceCountRates">0</span></button>
     <button id="workspace-tab-errors" role="tab" aria-controls="workspace-panel-errors" aria-selected="false" tabindex="-1" class="workspace-tab">错误记录<span class="workspace-tab-count" id="workspaceCountErrors">0</span></button>
     <button id="workspace-tab-production" role="tab" aria-controls="workspace-panel-production" aria-selected="false" tabindex="-1" class="workspace-tab">产出质量<span class="workspace-tab-count" id="workspaceCountProd">0</span></button>
+    <button id="workspace-tab-costs" role="tab" aria-controls="workspace-panel-costs" aria-selected="false" tabindex="-1" class="workspace-tab">等值成本</button>
   </div>
   <div class="workspace-content">
     <section id="workspace-panel-users" role="tabpanel" aria-labelledby="workspace-tab-users" class="workspace-panel active"><div class="workspace-panel-inner">
@@ -7669,6 +7719,14 @@ td{padding:8px 12px;font-size:11px;border-bottom:1px solid #ecece8;white-space:n
         <table id="projTable"><thead><tr><th>项目</th><th class="n">成员</th><th class="n">文件</th><th class="n">净产出</th></tr></thead><tbody></tbody></table>
         <div class="workspace-panel-head" style="border-top:1px solid var(--border)"><strong>空转 / 循环告警</strong><button onclick="markProdAlerts()" style="margin-left:auto">全部已读</button></div>
         <table id="prodAlertTable"><thead><tr><th>时间</th><th>成员</th><th>类型</th><th>说明</th></tr></thead><tbody></tbody></table>
+      </div>
+    </div></section>
+    <section id="workspace-panel-costs" role="tabpanel" aria-labelledby="workspace-tab-costs" class="workspace-panel" hidden><div class="workspace-panel-inner">
+      <div class="workspace-panel-head"><strong>等值成本</strong><select id="costRangeSel" onchange="loadCosts()"><option value="today">今日</option><option value="7d" selected>近7天</option><option value="30d">近30天</option></select><span class="workspace-panel-summary" id="costSummary"></span></div>
+      <div class="workspace-panel-scroll">
+        <div class="note" style="padding:6px 12px;margin-top:0;text-align:left;font-size:11px;color:var(--dim)">按参考牌价(USD/1M tokens)折算,非实际账单;未配置价格的模型计 0 并列出。</div>
+        <table id="costTable"><thead><tr><th>成员</th><th>方案</th><th class="n">模型成本</th><th class="n">缓存成本</th><th class="n">合计</th></tr></thead><tbody></tbody></table>
+        <div id="unpricedNote" style="padding:4px 12px;font-size:11px;color:var(--orange)"></div>
       </div>
     </div></section>
   </div>
@@ -8153,6 +8211,20 @@ async function markProdAlerts(){
   loadProduction();
 }
 document.getElementById('workspace-tab-production').addEventListener('click',()=>{if(!prodLoaded){prodLoaded=true;loadProduction()}});
+// ── 等值成本 tab(懒加载:首次切到该 tab 才拉数据)──
+let costsLoaded=false;
+async function loadCosts(){
+  const range=document.getElementById('costRangeSel').value;
+  try{
+    const c=await fetch('/api/production/costs?range='+range).then(r=>r.json());
+    document.getElementById('costSummary').textContent='合计 $'+c.rows.reduce((x,r)=>x+r.total_cost,0).toFixed(2);
+    document.querySelector('#costTable tbody').innerHTML=c.rows.map(r=>
+      '<tr><td>'+ph(r.user_name)+'</td><td>'+ph(r.profile)+'</td><td class="n">$'+r.model_cost.toFixed(2)+'</td><td class="n">$'+r.cache_cost.toFixed(2)+'</td><td class="n"><b>$'+r.total_cost.toFixed(2)+'</b></td></tr>').join('')
+      ||'<tr><td colspan="5" style="color:var(--dim)">该周期无用量</td></tr>';
+    document.getElementById('unpricedNote').textContent=c.unpriced.length?'未配置价格:'+c.unpriced.map(ph).join('、')+'(在设置页补充)':'';
+  }catch(e){document.getElementById('costSummary').textContent='加载失败: '+e.message}
+}
+document.getElementById('workspace-tab-costs').addEventListener('click',()=>{if(!costsLoaded){costsLoaded=true;loadCosts()}});
 function startAutoRefresh(){if(refreshTimer)clearInterval(refreshTimer);refreshTimer=setInterval(()=>{if(autoRefresh)load()},30000)}
 document.getElementById("autoRefreshBtn").addEventListener("click",()=>{autoRefresh=!autoRefresh;const btn=document.getElementById("autoRefreshBtn");btn.textContent="自动刷新: "+(autoRefresh?"开":"关");btn.className=autoRefresh?"ar-on":"ar-off"});
 window.addEventListener("resize",scheduleChartResize);

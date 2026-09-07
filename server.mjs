@@ -5924,7 +5924,6 @@ td{padding:8px;border-bottom:1px solid #ecece8;font-size:12px}
 ${errDiv}
 <form method="post" action="/api/settings-save" id="settingsForm">
 <input type="hidden" name="_csrf" id="csrfToken" value="${CSRF_TOKEN}">
-<input type="hidden" name="restrictGroupSuffix" id="restrictGroupSuffixHidden" value="${config.restrictGroupSuffix !== false ? "on" : "off"}">
 <input type="hidden" name="profileName" id="profileNameInput" value="${escHtml(initialProfile.name || "")}">
 <input type="hidden" name="profileSuffix" id="profileSuffixInput" value="${escHtml(initialSuffix)}">
 
@@ -6550,11 +6549,24 @@ function closeUserModal(){document.getElementById('userModal').classList.remove(
 document.getElementById('userModal').addEventListener('click',function(e){if(e.target===this)closeUserModal()});
 function openProfileModal(protocol){document.getElementById('profileModal').classList.add('open');if(protocol){var sel=document.getElementById('newProfileProtocol');sel.value=protocol;updateNewProfileProtocolHint()}document.getElementById('newProfileName').focus()}
 // 限制直连 is ONE shared setting rendered in both protocol panes — keep the
-// two checkboxes and the hidden form field in sync whichever one is toggled.
+// two checkboxes in sync whichever one is toggled, and persist the choice
+// right away: the checkboxes live outside both forms, so an unsaved toggle
+// used to be lost (or silently flipped by the next form save). On failure
+// roll both checkboxes back to the previous state and surface the error.
 function setRestrictGroupSuffix(checked){
-  document.getElementById('restrictGroupSuffixHidden').value=checked?'on':'off';
   var a=document.getElementById('restrictGroupSuffixCb'),b=document.getElementById('restrictGroupSuffixCb2');
+  var prev=!checked; // checkboxes are kept in sync, so the prior state is the inverse
   if(a)a.checked=checked;if(b)b.checked=checked;
+  fetch('/api/restrict-group-suffix',{method:'POST',headers:csrfHeaders({'Content-Type':'application/json'}),body:JSON.stringify({on:checked})})
+    .then(function(r){return r.text().then(function(t){
+      var j=null;try{j=JSON.parse(t)}catch(e){}
+      if(!r.ok){throw new Error((j&&j.error)||('HTTP '+r.status))}
+    })})
+    .then(function(){toast(checked?'限制直连已开启':'限制直连已关闭')})
+    .catch(function(err){
+      if(a)a.checked=prev;if(b)b.checked=prev;
+      toast('保存失败:'+(err&&err.message?err.message:'未知错误'));
+    });
 }
 // Protocol tabs: each pane owns its protocol's profiles; the failover group
 // editors live in the bottom dock and swap with the same toggle. Switching tabs
@@ -9527,7 +9539,10 @@ function applySettings(formData) {
 
   // Restrict default-group members to /v1 only (block direct /<suffix>/... access).
   // Default ON (undefined → enabled) to prevent bypassing failover to on-demand profiles.
-  config.restrictGroupSuffix = formData.restrictGroupSuffix === "on";
+  // The toggle persists itself instantly via /api/restrict-group-suffix; neither
+  // settings form carries it anymore, so only apply it when a form actually
+  // submitted the field (otherwise a global save would silently flip it off).
+  if (formData.restrictGroupSuffix !== undefined) config.restrictGroupSuffix = formData.restrictGroupSuffix === "on";
 
   // Update retryable status codes
   if (formData.retryableStatusCodes) {
@@ -9960,6 +9975,32 @@ const server = http.createServer((req, res) => {
       }
     }).catch(() => {
       res.writeHead(413); res.end("Request too large");
+    });
+    return;
+  }
+
+  // Restrict-direct-access toggle (限制直连): instant save from the settings
+  // page checkboxes. They live outside both settings forms, so the form route
+  // no longer carries the field — this endpoint is the only writer besides
+  // applySettings (which now applies it only when a form actually submits it).
+  if (req.method === "POST" && req.url === "/api/restrict-group-suffix") {
+    if (!checkAuth(req)) { res.writeHead(401); res.end("Unauthorized"); return; }
+    if (!checkCsrf(req)) { res.writeHead(403); res.end("CSRF validation failed"); return; }
+    readBody(req, 10_000).then((buf) => {
+      try {
+        const { on } = JSON.parse(buf.toString());
+        config.restrictGroupSuffix = !!on;
+        saveConfig(config);
+        recordAdminAudit(req, "settings.restrict_suffix", "全局", on ? "开启限制直连（默认组仅允许 /v1、/v1/responses 入口）" : "关闭限制直连（默认组允许直连 /<suffix>/... 访问）");
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: true }));
+      } catch (err) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: err.message }));
+      }
+    }).catch(() => {
+      res.writeHead(413, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Request too large" }));
     });
     return;
   }

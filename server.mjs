@@ -6156,15 +6156,23 @@ ${((() => { const qa = stmts.quotaAdjustRecent.all(); return qa.length > 0 ? `<h
 <div class="section">
 <label style="display:flex;align-items:center;gap:6px;cursor:pointer"><input type="checkbox" id="prodTrackingToggle" style="width:auto"> 启用产出解析<span class="note" style="margin:0">仅统计结构化指标,不存储代码内容</span></label>
 <label style="display:flex;align-items:center;gap:6px;cursor:pointer;margin-top:8px"><input type="checkbox" id="prodPathToggle" style="width:auto"> 记录文件路径<span class="note" style="margin:0">关闭则仅保留扩展名</span></label>
+<label style="margin-top:14px;display:block">等值成本高峰时段(按北京时间,命中时走下方「高峰In/Out」牌价;不设 = 全天按基础价)</label>
+<div id="costPeakList"></div>
+<div style="display:flex;align-items:center;gap:10px;margin-top:6px">
+<button type="button" class="btn btn-outline btn-sm" onclick="addCostPeakRow('','')">＋添加时段</button>
+<span class="note" style="margin:0">结束早于开始 = 跨零点(如 22:00-06:00)</span>
+</div>
 <label style="margin-top:14px">模型参考牌价(USD / 1M tokens) — 支持前缀匹配,如 claude-sonnet 覆盖所有 claude-sonnet-* 变体</label>
-<div class="alias-head rate" style="grid-template-columns:2fr 1fr 1fr 1fr 1fr auto"><span>模型名</span><span>输入</span><span>输出</span><span>缓存写</span><span>缓存读</span><span></span></div>
+<div class="alias-head rate" style="grid-template-columns:2fr 1fr 1fr 1fr 1fr 1fr 1fr auto"><span>模型名</span><span>输入</span><span>输出</span><span>缓存写</span><span>缓存读</span><span>高峰In</span><span>高峰Out</span><span></span></div>
 <div id="costRateRows"></div>
 <div style="display:flex;align-items:center;gap:10px;margin-top:8px">
 <button type="button" class="btn btn-outline btn-sm" onclick="addRateRow('', {input:0,output:0,cacheWrite:0,cacheRead:0})">＋添加模型价格</button>
 <button type="button" class="btn btn-primary btn-sm" onclick="saveProdSettings()">保存</button>
 <span class="note" id="prodSettingsMsg" style="margin:0"></span>
 </div>
-<div class="note">牌价用于把 token 用量折算为等值美元成本(参考牌价,非实际账单)。未配置价格的模型计 0 并在「等值成本」工作区列出,可在此补充。改动保存后立即生效,已折算的历史数据不会重算。</div>
+<div class="note">牌价用于把 token 用量折算为等值美元成本(参考牌价,非实际账单)。未配置价格的模型计 0 并在「等值成本」工作区列出,可在此补充。价格为查询时现算,修改后全部历史立即按新价重算;高峰价留空 = 同基础价,建议时段用整点。</div>
+<label style="margin-top:14px;display:block">项目名归并(每行一条 <span style="font-family:var(--font-mono)">正则=显示名</span>,按首个命中归并)</label>
+<textarea id="projectAliasText" rows="4" placeholder="正则=显示名,每行一条" style="resize:vertical"></textarea>
 </div>
 
 <h2>旧数据导入</h2>
@@ -7510,7 +7518,7 @@ try{if(sessionStorage.getItem('tm_return_pool_view')==='1'){sessionStorage.remov
 })();
 document.addEventListener("keydown",e=>{if(e.key==="Enter"&&e.target.tagName!=="TEXTAREA"&&e.target.tagName!=="INPUT")e.preventDefault()});
 // ─── 产出与成本设置(参考牌价表 + 产出解析开关;走 /api/production/settings,独立于 settings-save 表单)───
-const INITIAL_PROD=${JSON.stringify({ productionTracking: config.productionTracking || { enabled: true, storeFilePaths: true }, costRates: config.costRates || DEFAULT_COST_RATES }).replace(/</g, "\\x3c")};
+const INITIAL_PROD=${JSON.stringify({ productionTracking: Object.assign({ enabled: true, storeFilePaths: true, costPeakHours: [], projectAliases: [] }, config.productionTracking || {}), costRates: config.costRates || DEFAULT_COST_RATES }).replace(/</g, "\\x3c")};
 function rateRow(m,r,i){
   return '<div data-i="'+i+'" style="display:flex;gap:6px;margin:4px 0;align-items:center">'
     +'<input class="cr-model" value="'+h(m)+'" placeholder="模型名(支持前缀)" style="flex:2;min-width:0">'
@@ -7518,26 +7526,63 @@ function rateRow(m,r,i){
     +'<input class="cr-out" type="number" step="0.01" min="0" value="'+Number(r.output||0)+'" placeholder="输出" style="flex:1;min-width:0">'
     +'<input class="cr-cw" type="number" step="0.01" min="0" value="'+Number(r.cacheWrite||0)+'" placeholder="缓存写" style="flex:1;min-width:0">'
     +'<input class="cr-cr" type="number" step="0.01" min="0" value="'+Number(r.cacheRead||0)+'" placeholder="缓存读" style="flex:1;min-width:0">'
+    +'<input class="cr-pin" type="number" step="0.01" min="0" value="'+(r.peakInput==null?'':r.peakInput)+'" placeholder="峰In" style="flex:1;min-width:0">'
+    +'<input class="cr-pout" type="number" step="0.01" min="0" value="'+(r.peakOutput==null?'':r.peakOutput)+'" placeholder="峰Out" style="flex:1;min-width:0">'
     +'<button type="button" class="btn btn-outline btn-sm" onclick="this.parentElement.remove()">删</button></div>';
 }
 function addRateRow(m,r){document.getElementById('costRateRows').insertAdjacentHTML('beforeend',rateRow(m,r,document.querySelectorAll('#costRateRows > div').length))}
+// ─── costPeakList:峰谷计价时段编辑器(行 = 时/分×2 select,样式同 profile 的高峰时段编辑器)───
+// 收集后随 saveProdSettings 走 /api/production/settings;select 无 name,不混入 settings-save 表单。
+function costPeakOpt(n,sel){var out='';for(var i=0;i<n;i++){var v=String(i).padStart(2,'0');out+='<option value="'+v+'"'+(v===sel?' selected':'')+'>'+v+'</option>'}return out}
+function addCostPeakRow(start,end){
+  const list=document.getElementById('costPeakList');if(!list)return;
+  const sVal=/^\\d{2}:\\d{2}$/.test(start||'')?start:'09:00';
+  const eVal=/^\\d{2}:\\d{2}$/.test(end||'')?end:'12:00';
+  const selStyle='width:auto;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:3px 6px;border-radius:4px;font-size:12px';
+  const [sh,sm]=sVal.split(':'),[eh,em]=eVal.split(':');
+  const sel=function(k,n,v,label){return '<select data-cp="'+k+'" aria-label="'+label+'" style="'+selStyle+'">'+costPeakOpt(n,v)+'</select>'};
+  list.insertAdjacentHTML('beforeend','<div style="display:flex;align-items:center;gap:6px;margin-bottom:6px">'
+    +sel('sh',24,sh,'高峰开始时')+':'+sel('sm',60,sm,'高峰开始分')
+    +' <span style="color:var(--dim)">至</span> '
+    +sel('eh',24,eh,'高峰结束时')+':'+sel('em',60,em,'高峰结束分')
+    +' <button type="button" class="btn btn-outline btn-sm" onclick="this.parentElement.remove()">删除</button></div>');
+}
+function collectCostPeakHours(){
+  return Array.prototype.map.call(document.querySelectorAll('#costPeakList > div'),function(row){
+    const q=function(k){const s=row.querySelector('select[data-cp="'+k+'"]');return s?s.value:'00'};
+    return {start:q('sh')+':'+q('sm'),end:q('eh')+':'+q('em')};
+  });
+}
+function parseProjectAliasText(){
+  // 每行 pattern=name:按第一个 = 切,两端 trim,空段整行跳过(服务端再校验正则合法性)
+  return (document.getElementById('projectAliasText').value||'').split('\\n').map(function(line){
+    const i=line.indexOf('=');if(i<1)return null;
+    const pattern=line.slice(0,i).trim(),name=line.slice(i+1).trim();
+    if(!pattern||!name)return null;
+    return {pattern:pattern,name:name};
+  }).filter(Boolean);
+}
 function saveProdSettings(){
   const costRates={};
   document.querySelectorAll('#costRateRows > div').forEach(row=>{
     const m=row.querySelector('.cr-model').value.trim();if(!m)return;
     costRates[m]={input:+row.querySelector('.cr-in').value||0,output:+row.querySelector('.cr-out').value||0,
-      cacheWrite:+row.querySelector('.cr-cw').value||0,cacheRead:+row.querySelector('.cr-cr').value||0};
+      cacheWrite:+row.querySelector('.cr-cw').value||0,cacheRead:+row.querySelector('.cr-cr').value||0,
+      peakInput:row.querySelector('.cr-pin').value.trim(),peakOutput:row.querySelector('.cr-pout').value.trim()};
   });
   const msg=document.getElementById('prodSettingsMsg');
   msg.textContent='保存中...';
   fetch('/api/production/settings',{method:'POST',headers:csrfHeaders({'Content-Type':'application/json'}),
-    body:JSON.stringify({productionTracking:{enabled:document.getElementById('prodTrackingToggle').checked,storeFilePaths:document.getElementById('prodPathToggle').checked},costRates:costRates})})
+    body:JSON.stringify({productionTracking:{enabled:document.getElementById('prodTrackingToggle').checked,storeFilePaths:document.getElementById('prodPathToggle').checked,
+      costPeakHours:collectCostPeakHours(),projectAliases:parseProjectAliasText()},costRates:costRates})})
     .then(r=>r.json()).then(()=>{msg.textContent='已保存';setTimeout(()=>location.reload(),600)})
     .catch(e=>{msg.textContent='保存失败: '+e.message});
 }
 (function(){
   document.getElementById('prodTrackingToggle').checked=INITIAL_PROD.productionTracking.enabled!==false;
   document.getElementById('prodPathToggle').checked=INITIAL_PROD.productionTracking.storeFilePaths!==false;
+  (INITIAL_PROD.productionTracking.costPeakHours||[]).forEach(r=>addCostPeakRow(r.start,r.end));
+  document.getElementById('projectAliasText').value=(INITIAL_PROD.productionTracking.projectAliases||[]).map(a=>a.pattern+'='+a.name).join('\\n');
   const rates=INITIAL_PROD.costRates||{};
   const names=Object.keys(rates);
   if(names.length){names.forEach(m=>addRateRow(m,rates[m]))}

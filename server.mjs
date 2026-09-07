@@ -8853,7 +8853,7 @@ table{width:100%;border-collapse:collapse;min-width:560px}th{text-align:left;pad
 <div class="box"><h3>今日24小时趋势</h3><canvas id="hourChart"></canvas></div>
 <div class="box"><h3>近7天趋势</h3><canvas id="trendChart"></canvas></div>
 </div>
-<div class="box" id="prodProfile"><h3>产出画像 <span style="font-size:11px;color:var(--dim);font-weight:400">仅自己可见 · 只统计指标,不存储代码</span></h3><div id="prodMeMetrics" style="display:flex;gap:16px;flex-wrap:wrap;font-size:12px"></div><div id="prodMeTrend" style="font-size:11px;color:var(--dim);margin-top:6px"></div><div id="prodMeLangs" style="font-size:11px;margin-top:4px"></div></div>
+<div class="box" id="prodProfile"><h3>产出画像 <span style="font-size:11px;color:var(--dim);font-weight:400">仅自己可见 · 只统计指标,不存储代码</span></h3><div id="prodMeMetrics" class="cards" style="margin-bottom:8px"></div><div id="prodMeTrend" style="font-size:11px;color:var(--dim);margin-top:6px"></div><div id="prodMeLangs" style="font-size:11px;margin-top:4px"></div></div>
 <div class="cal-tip" id="calTip"></div>
 <div class="modal-overlay" id="qrModal" onclick="if(event.target===this)closeQrModal()"><div class="qr-modal" role="dialog" aria-label="申请加量"><div class="qr-mhd"><b>申请加量</b><button type="button" class="qr-close" onclick="closeQrModal()" aria-label="关闭">✕</button></div><div class="qr-mbody"><div class="qr-info" id="qrQuotaInfo"></div><div id="qrHistory"></div><div class="qr-form"><label>申请额度池 <i>*</i></label><select id="qrPool"></select><label>申请理由 <i>*</i></label><textarea id="qrReason" maxlength="200" rows="3" placeholder="说明一下用途和期望，管理员处理时会看到"></textarea></div><div class="qr-actions"><button type="button" class="btn-checkin" id="qrSubmit" onclick="submitQuotaRequest()">提交申请</button></div></div></div></div>
 <div class="box"><h3>今日模型请求</h3><table id="modelTable"><thead><tr><th>模型</th><th class="n">请求数</th><th class="n">实际 Token</th><th class="n">倍率</th><th class="n">计入配额</th></tr></thead><tbody></tbody></table><div class="note" id="modelTableNote" style="font-size:11px;color:var(--dim);margin-top:8px"></div></div>
@@ -9253,13 +9253,20 @@ let calRz;window.addEventListener('resize',function(){clearTimeout(calRz);calRz=
       const net=d.days.reduce((x,y)=>x+(y.la-y.ld),0);
       const edits=d.days.reduce((x,y)=>x+y.edits,0);
       const errs=d.days.reduce((x,y)=>x+y.errs,0);
+      const failPct=edits?Math.round(errs*100/edits):0;
+      // 阈值着色:失败率 <10% 绿 / 10-30% 默认 / ≥30% 橙;缓存命中率 ≥80% 绿。
+      // .card .v 的 color 带 !important,着色要落在内层 span 上才会生效。
+      const failColor=failPct>=30?'color:var(--orange)':(failPct<10?'color:var(--green)':'');
+      const hitPct=d.health?Math.round(d.health.ratio*100):0;
+      const hitColor=hitPct>=80?'color:var(--green)':'';
+      const val=(v,c)=>'<div class="v">'+(c?'<span style="'+c+'">'+v+'</span>':v)+'</div>';
       document.getElementById('prodMeMetrics').innerHTML=
-        '<div>近7天净产出 <b>'+net.toLocaleString('zh-CN')+'</b> 行</div>'+
-        '<div>编辑 <b>'+edits+'</b> 次</div>'+
-        '<div>失败率 <b>'+(edits?Math.round(errs*100/edits):0)+'%</b></div>'+
-        (d.health?'<div>缓存命中率 <b>'+Math.round(d.health.ratio*100)+'%</b> · '+ph(d.health.advice)+'</div>':'');
+        '<div class="card"><div class="l">净产出(行)</div>'+val(net.toLocaleString('zh-CN'))+'</div>'+
+        '<div class="card"><div class="l">编辑次数</div>'+val(edits)+'</div>'+
+        '<div class="card"><div class="l">失败率</div>'+val(failPct+'%',failColor)+'</div>'+
+        (d.health?'<div class="card"><div class="l">缓存命中率</div>'+val(hitPct+'%',hitColor)+(d.health.advice?'<div style="font-size:10px;color:var(--dim);margin-top:6px;line-height:1.5">'+ph(d.health.advice)+'</div>':'')+'</div>':'');
       document.getElementById('prodMeTrend').textContent='日趋势:'+(d.days.map(x=>x.date.slice(5)+':'+(x.la-x.ld)+'行').join(' · ')||'暂无');
-      document.getElementById('prodMeLangs').textContent='语言分布:'+(d.languages.map(l=>(l.ext||'其他')+' +'+l.la).join(' · ')||'暂无');
+      document.getElementById('prodMeLangs').innerHTML='语言分布:'+(d.languages.length?d.languages.map(l=>'<span style="display:inline-block;font-size:10px;color:var(--dim);border:1px solid var(--border-strong);border-radius:9px;padding:1px 8px;margin:0 4px 4px 0">'+ph(l.ext||'其他')+' +'+l.la+'</span>').join(''):'暂无');
     })
     .catch(()=>{const el=document.getElementById('prodProfile');if(el)el.style.display='none'});
 })();

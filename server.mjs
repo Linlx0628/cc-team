@@ -9,7 +9,7 @@ import { fileURLToPath } from "node:url";
 import Database from "better-sqlite3";
 import { initProductionDb, createProductionTracker, rangeFromTo, productionSummary, productionUserDetail,
   productionProjects, productionAlerts, markAlertSeen, pruneProductionData, DEFAULT_COST_RATES,
-  computeCosts, contextHealth, buildReportHTML } from "./production.mjs";
+  computeCosts, contextHealth, buildReportHTML, ALERT_KIND_LABEL, alertDetailText } from "./production.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -7627,6 +7627,9 @@ body{padding:16px clamp(14px,2vw,28px) 28px}
 .detail-field input,.detail-field select,.detail-reset{width:100%;height:30px;border:1px solid var(--border);border-radius:5px;background:var(--surface);color:var(--text);font-size:11px;padding:0 9px;outline:none}
 .detail-field input:hover,.detail-field select:hover,.detail-reset:hover{border-color:var(--border-strong);background:var(--surface-subtle)}.detail-field input:focus,.detail-field select:focus{border-color:var(--accent)}
 .detail-reset{width:auto;min-width:68px;cursor:pointer;font-weight:600}
+.pill-warn{display:inline-block;font-size:10px;line-height:1.5;color:var(--orange);border:1px solid var(--orange);border-radius:9px;padding:1px 7px;font-variant-numeric:tabular-nums}
+.chip{display:inline-block;font-size:10px;color:var(--dim);border:1px solid var(--border-strong);border-radius:9px;padding:1px 8px;margin:0 4px 4px 0}.chip-warn{color:var(--orange);border-color:var(--orange)}
+.prod-bar{height:6px;background:var(--accent);border-radius:3px;display:inline-block;max-width:100%}
 .detail-table-wrap{flex:1;min-height:0;overflow:auto;border-top:1px solid var(--border)}
 #dTable{min-width:860px}#dTable thead th{position:sticky;top:0;z-index:3;background:#fafaf7}
 #dTable .detail-sticky{position:sticky;left:0;z-index:2;background:var(--surface);min-width:220px}#dTable thead .detail-sticky{z-index:4;background:#fafaf7}
@@ -7720,7 +7723,7 @@ td{padding:8px 12px;font-size:11px;border-bottom:1px solid #ecece8;white-space:n
         <div id="prodDetail" style="padding:8px 12px;display:none"></div>
         <div class="workspace-panel-head" style="border-top:1px solid var(--border)"><strong>项目分布</strong></div>
         <table id="projTable"><thead><tr><th>项目</th><th class="n">成员</th><th class="n">文件</th><th class="n">净产出</th></tr></thead><tbody></tbody></table>
-        <div class="workspace-panel-head" style="border-top:1px solid var(--border)"><strong>空转 / 循环告警</strong><button onclick="markProdAlerts()" style="margin-left:auto">全部已读</button></div>
+        <div class="workspace-panel-head" style="border-top:1px solid var(--border)"><strong>空转 / 循环告警</strong><button type="button" class="detail-reset" onclick="markProdAlerts()" style="margin-left:auto">全部已读</button></div>
         <table id="prodAlertTable"><thead><tr><th>时间</th><th>成员</th><th>类型</th><th>说明</th></tr></thead><tbody></tbody></table>
       </div>
     </div></section>
@@ -8168,7 +8171,7 @@ document.querySelectorAll(".workspace-tab").forEach(button=>{button.addEventList
 document.getElementById("clearErrors").addEventListener("click",async()=>{if(confirm("确定清除所有错误记录？")){const csrf=(document.cookie.match(/tm_csrf=([^;]+)/)||[])[1]||'';await fetch("/api/clear-errors",{method:"POST",headers:{"x-csrf-token":csrf}});toast('错误记录已清除');errPage=1;load()}});
 // ── 产出质量 tab(懒加载:首次切到该 tab 才拉数据)──
 const ph=escH;
-let prodData=null,prodLoaded=false;
+let prodData=null,prodLoaded=false,prodDetailChart=null;
 async function loadProduction(){
   const range=document.getElementById('prodRangeSel').value;
   document.getElementById('prodReportLink').href='/api/production/report?range='+range;
@@ -8186,27 +8189,40 @@ async function loadProduction(){
       +'<td>'+ph(r.user_name)+'</td><td class="n">'+fmtT(r.net_lines)+'</td><td class="n">'+(r.files||0)+'</td>'
       +'<td class="n">'+(r.fail_rate*100).toFixed(0)+'%</td><td class="n">'+(r.rewrite_rate*100).toFixed(0)+'%</td>'
       +'<td class="n">'+r.verify_density.toFixed(1)+'</td><td class="n">'+(r.token_per_line==null?'—':fmtT(Math.round(r.token_per_line)))+'</td>'
-      +'<td class="n">'+((s.alertCounts&&s.alertCounts[r.user_key])?'<span style="color:var(--orange)">'+s.alertCounts[r.user_key]+'</span>':'')+'</td></tr>').join('')
-      ||'<tr><td colspan="8" style="color:var(--dim)">该周期无产出数据</td></tr>';
+      +'<td class="n">'+((s.alertCounts&&s.alertCounts[r.user_key]>0)?'<span class="pill-warn">'+s.alertCounts[r.user_key]+'</span>':'')+'</td></tr>').join('')
+      ||'<tr><td colspan="8" class="empty">该周期无产出数据</td></tr>';
     tb.querySelectorAll('tr[data-key]').forEach(tr=>tr.addEventListener('click',()=>loadProdDetail(tr.dataset.key,range)));
-    document.getElementById('prodZero').textContent=s.zeroOutput.length
-      ?'有用量但零文件产出:'+s.zeroOutput.map(u=>ph(u.user_name)).join('、'):'';
-    document.querySelector('#projTable tbody').innerHTML=(p.rows||[]).map(r=>
-      '<tr><td>'+ph(r.project)+'</td><td class="n">'+r.users+'</td><td class="n">'+r.files+'</td><td class="n">'+fmtT((r.lines_add||0)-(r.lines_del||0))+'</td></tr>').join('')
-      ||'<tr><td colspan="4" style="color:var(--dim)">该周期无数据</td></tr>';
+    document.getElementById('prodZero').innerHTML=s.zeroOutput.length
+      ?'<span style="font-size:11px;color:var(--orange)">有用量但零文件产出:</span> '+s.zeroOutput.map(u=>'<span class="chip chip-warn">'+ph(u.user_name)+'</span>').join(''):'';
+    const projRows=(p.rows||[]),projMax=Math.max(1,...projRows.map(r=>(r.lines_add||0)-(r.lines_del||0)));
+    document.querySelector('#projTable tbody').innerHTML=projRows.map(r=>
+      '<tr><td><div>'+ph(r.project)+'</div><span class="prod-bar" style="width:'+Math.max(2,Math.round(((r.lines_add||0)-(r.lines_del||0))/projMax*100))+'%" title="净产出占比 '+Math.round(((r.lines_add||0)-(r.lines_del||0))/projMax*100)+'%"></span></td><td class="n">'+r.users+'</td><td class="n">'+r.files+'</td><td class="n">'+fmtT((r.lines_add||0)-(r.lines_del||0))+'</td></tr>').join('')
+      ||'<tr><td colspan="4" class="empty">该周期无数据</td></tr>';
     document.querySelector('#prodAlertTable tbody').innerHTML=(a.rows||[]).map(r=>
-      '<tr style="'+(r.seen?'color:var(--dim)':'')+'"><td>'+ph(r.time.slice(5,16).replace('T',' '))+'</td><td>'+ph(r.user_name)+'</td><td>'+ph(r.kind)+'</td><td>'+ph(r.detail)+'</td></tr>').join('')
-      ||'<tr><td colspan="4" style="color:var(--dim)">无告警</td></tr>';
+      '<tr'+(r.seen?' style="color:var(--dim)"':'')+'><td>'+ph(r.time.slice(5,16).replace('T',' '))+'</td><td>'+ph(r.user_name)+'</td><td>'+ph(r.kindLabel||r.kind)+'</td><td style="white-space:normal">'+ph(r.detailText||r.detail)+'</td></tr>').join('')
+      ||'<tr><td colspan="4" class="empty">无告警</td></tr>';
   }catch(e){document.getElementById('prodSummary').textContent='加载失败: '+e.message}
 }
 async function loadProdDetail(key,range){
   const d=await fetch('/api/production/user/'+encodeURIComponent(key)+'?range='+range).then(r=>r.json());
   const el=document.getElementById('prodDetail');
   el.style.display='block';
+  const fileRows=d.files.map(f=>{const segs=String(f.file_path||'').split('/').filter(Boolean);const short=segs.slice(-2).join('/')||String(f.file_path||'-');return '<tr><td style="max-width:340px;overflow:hidden;text-overflow:ellipsis" title="'+ph(f.file_path)+'">'+ph(short)+'</td><td class="n">+'+fmtT(f.la||0)+'</td><td class="n">-'+fmtT(f.ld||0)+'</td></tr>'}).join('')
+    ||'<tr><td colspan="3" class="empty">无文件记录</td></tr>';
+  const langChips=d.languages.map(l=>'<span class="chip">'+ph(l.ext||'其他')+'</span>').join('')
+    ||'<span style="font-size:11px;color:var(--dim)">无</span>';
   el.innerHTML='<div style="font-weight:650;margin-bottom:4px">成员明细</div>'
-    +'<div style="font-size:11px;color:var(--dim)">日趋势:'+(d.days.map(x=>x.date.slice(5)+':'+(x.la-x.ld)).join(' · ')||'无')+'</div>'
-    +'<div style="font-size:11px;margin-top:4px">文件 Top:'+(d.files.map(f=>ph(f.file_path.split('/').pop())+'(+'+f.la+'/-'+f.ld+')').join(' · ')||'无')+'</div>'
-    +'<div style="font-size:11px;margin-top:4px">语言:'+(d.languages.map(l=>ph(l.ext||'其他')).join(' · ')||'无')+'</div>';
+    +'<div style="height:120px;margin-bottom:10px"><canvas id="prodDetailTrend"></canvas></div>'
+    +'<div style="font-size:11px;color:var(--dim);font-weight:600;margin-bottom:2px">文件 Top</div>'
+    +'<table style="min-width:0"><thead><tr><th>文件</th><th class="n">新增</th><th class="n">删除</th></tr></thead><tbody>'+fileRows+'</tbody></table>'
+    +'<div style="font-size:11px;color:var(--dim);font-weight:600;margin:8px 0 3px">语言</div><div>'+langChips+'</div>';
+  if(prodDetailChart)prodDetailChart.destroy();
+  prodDetailChart=new Chart(document.getElementById('prodDetailTrend'),{type:'line',
+    data:{labels:d.days.map(x=>x.date.slice(5)),datasets:[{label:'日净产出',data:d.days.map(x=>(x.la||0)-(x.ld||0)),
+      borderColor:'#2f6e50',backgroundColor:'rgba(47,110,80,.12)',fill:true,tension:.28,pointRadius:2,pointBackgroundColor:'#2f6e50',pointHoverRadius:4,borderWidth:2}]},
+    options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false},tooltip:{callbacks:{label:ctx=>ctx.dataset.label+': '+fmtT(ctx.raw)}}},
+      scales:{x:{ticks:{color:'#686863',font:{size:9},maxRotation:0,autoSkip:true,maxTicksLimit:12},grid:{display:false}},
+        y:{ticks:{color:'#686863',callback:v=>fmtTk(v)},grid:{color:'rgba(24,24,22,.08)'}}}}});
 }
 async function markProdAlerts(){
   const csrf=(document.cookie.match(/tm_csrf=([^;]+)/)||[])[1]||'';
@@ -10669,7 +10685,9 @@ const server = http.createServer((req, res) => {
     try {
       const { from, to } = rangeFromTo(new URL(req.url, "http://localhost").searchParams.get("range") || "7d");
       res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
-      res.end(JSON.stringify({ rows: productionAlerts(db, { from, to }) }));
+      // 行附服务端翻译字段 kindLabel/detailText(与导出报告同一套文案),前端只渲染不再自行翻译
+      res.end(JSON.stringify({ rows: productionAlerts(db, { from, to }).map(r => ({
+        ...r, kindLabel: ALERT_KIND_LABEL[r.kind] || r.kind, detailText: alertDetailText(r.kind, r.detail) })) }));
     } catch (err) {
       if (!res.headersSent) {
         res.writeHead(err.statusCode || 500, { "Content-Type": "application/json; charset=utf-8" });

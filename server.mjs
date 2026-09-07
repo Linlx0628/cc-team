@@ -7628,6 +7628,7 @@ body{padding:16px clamp(14px,2vw,28px) 28px}
 .detail-field input:hover,.detail-field select:hover,.detail-reset:hover{border-color:var(--border-strong);background:var(--surface-subtle)}.detail-field input:focus,.detail-field select:focus{border-color:var(--accent)}
 .detail-reset{width:auto;min-width:68px;cursor:pointer;font-weight:600}
 .pill-warn{display:inline-block;font-size:10px;line-height:1.5;color:var(--orange);border:1px solid var(--orange);border-radius:9px;padding:1px 7px;font-variant-numeric:tabular-nums}
+.pill-ok{display:inline-block;font-size:10px;line-height:1.5;color:var(--green);border:1px solid var(--green);border-radius:9px;padding:1px 7px;font-variant-numeric:tabular-nums}
 .chip{display:inline-block;font-size:10px;color:var(--dim);border:1px solid var(--border-strong);border-radius:9px;padding:1px 8px;margin:0 4px 4px 0}.chip-warn{color:var(--orange);border-color:var(--orange)}
 .prod-bar{height:6px;background:var(--accent);border-radius:3px;display:inline-block;max-width:100%}
 .detail-table-wrap{flex:1;min-height:0;overflow:auto;border-top:1px solid var(--border)}
@@ -7728,9 +7729,9 @@ td{padding:8px 12px;font-size:11px;border-bottom:1px solid #ecece8;white-space:n
       </div>
     </div></section>
     <section id="workspace-panel-costs" role="tabpanel" aria-labelledby="workspace-tab-costs" class="workspace-panel" hidden><div class="workspace-panel-inner">
-      <div class="workspace-panel-head"><strong>等值成本</strong><select id="costRangeSel" onchange="loadCosts()"><option value="today">今日</option><option value="7d" selected>近7天</option><option value="30d">近30天</option></select><span class="workspace-panel-summary" id="costSummary"></span></div>
+      <div class="workspace-panel-head"><strong>等值成本</strong><span id="costPeakBadge"></span><select id="costRangeSel" onchange="loadCosts()"><option value="today">今日</option><option value="7d" selected>近7天</option><option value="30d">近30天</option></select><span class="workspace-panel-summary" id="costSummary"></span></div>
       <div class="workspace-panel-scroll">
-        <div class="note" style="padding:6px 12px;margin-top:0;text-align:left;font-size:11px;color:var(--dim)">按参考牌价(USD/1M tokens)折算,非实际账单;未配置价格的模型计 0 并列出。</div>
+        <div class="note" style="padding:6px 12px;margin-top:0;text-align:left;font-size:11px;color:var(--dim)">按参考牌价(USD/1M tokens)折算,非实际账单;高峰时段按高峰价、其余按基础价;缓存部分按日表混合折算。未配置价格的模型计 0 并列出。</div>
         <table id="costTable"><thead><tr><th>成员</th><th>方案</th><th class="n">模型成本</th><th class="n">缓存成本</th><th class="n">合计</th></tr></thead><tbody></tbody></table>
         <div id="unpricedNote" style="padding:4px 12px;font-size:11px;color:var(--orange)"></div>
       </div>
@@ -8238,9 +8239,16 @@ async function loadCosts(){
     const c=await fetch('/api/production/costs?range='+range).then(r=>r.json());
     document.getElementById('costSummary').textContent='合计 $'+c.rows.reduce((x,r)=>x+r.total_cost,0).toFixed(2);
     document.querySelector('#costTable tbody').innerHTML=c.rows.map(r=>
-      '<tr><td>'+ph(r.user_name)+'</td><td>'+ph(r.profile)+'</td><td class="n">$'+r.model_cost.toFixed(2)+'</td><td class="n">$'+r.cache_cost.toFixed(2)+'</td><td class="n"><b>$'+r.total_cost.toFixed(2)+'</b></td></tr>').join('')
-      ||'<tr><td colspan="5" style="color:var(--dim)">该周期无用量</td></tr>';
-    document.getElementById('unpricedNote').textContent=c.unpriced.length?'未配置价格:'+c.unpriced.map(ph).join('、')+'(在设置页补充)':'';
+      '<tr><td>'+ph(r.user_name)+'</td><td>'+ph(r.profile)+'</td><td class="n">$'+r.model_cost.toFixed(2)+'</td><td class="n">$'+r.cache_cost.toFixed(2)+'</td><td class="n hl">$'+r.total_cost.toFixed(2)+'</td></tr>').join('')
+      ||'<tr><td colspan="5" class="empty">该周期无用量</td></tr>';
+    const pk=c.peak||{},badge=document.getElementById('costPeakBadge');
+    badge.className='';badge.textContent='';
+    if(pk.enabled){
+      const hours=(pk.hours||[]).map(h=>ph(h.start)+'-'+ph(h.end)).join(', ');
+      if(pk.inPeakNow){badge.className='pill-warn';badge.textContent='高峰 '+hours+' 生效中';}
+      else{badge.className='pill-ok';badge.textContent='低谷时段';}
+    }
+    document.getElementById('unpricedNote').innerHTML=c.unpriced.length?'未配置价格:'+c.unpriced.map(u=>'<span class="chip chip-warn">'+ph(u)+'</span>').join('')+'(在设置页补充)':'';
   }catch(e){document.getElementById('costSummary').textContent='加载失败: '+e.message}
 }
 document.getElementById('workspace-tab-costs').addEventListener('click',()=>{if(!costsLoaded){costsLoaded=true;loadCosts()}});

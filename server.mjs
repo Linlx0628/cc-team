@@ -7774,14 +7774,15 @@ td{padding:8px 12px;font-size:11px;border-bottom:1px solid #ecece8;white-space:n
       <div class="sec-body" id="errorSecBody"><table id="eTable"><thead><tr><th>时间</th><th>用户</th><th class="n">状态码</th><th>模型</th><th>路径</th><th>错误信息</th></tr></thead><tbody></tbody></table><div id="errPages" style="padding:8px 12px;text-align:right"></div></div>
     </div></section>
     <section id="workspace-panel-production" role="tabpanel" aria-labelledby="workspace-tab-production" class="workspace-panel" hidden><div class="workspace-panel-inner">
-      <div class="workspace-panel-head"><strong>产出质量</strong><select id="prodRangeSel" onchange="loadProduction()"><option value="today">今日</option><option value="7d" selected>近7天</option><option value="30d">近30天</option></select><a id="prodReportLink" href="/api/production/report?range=7d" target="_blank" style="font-size:11px;color:var(--accent)">导出报告</a><span class="workspace-panel-summary" id="prodSummary"></span></div>
+      <div class="workspace-panel-head"><strong>产出质量</strong><select id="prodRangeSel" onchange="loadProduction()"><option value="today">今日</option><option value="7d" selected>近7天</option><option value="30d">近30天</option></select><a id="prodReportLink" href="/api/production/report?range=7d" target="_blank" style="font-size:11px;color:var(--accent)">导出报告</a><span class="workspace-panel-summary" id="prodSummary"></span><a id="prodMetricHelp" style="font-size:11px;color:var(--accent);cursor:pointer">指标口径</a></div>
+      <div id="prodMetricHelpBody" style="display:none;padding:6px 12px;font-size:11px;color:var(--dim)">失败率:编辑失败占比 · 重写率:每写10行删几行 · 验证密度:每次编辑的验证命令数 · token/行:每行产出的输出token(仅对比用)</div>
       <div class="workspace-panel-scroll">
-        <table id="prodTable"><thead><tr><th>成员</th><th class="n">净产出</th><th class="n">文件</th><th class="n">失败率</th><th class="n">重写率</th><th class="n">验证密度</th><th class="n">token/行</th><th class="n">告警</th></tr></thead><tbody></tbody></table>
+        <table id="prodTable"><thead><tr><th>成员</th><th class="n" title="新增行−删除行;衡量实际沉淀的代码量">净产出</th><th class="n" title="去重后的改动文件数">文件</th><th class="n" title="AI 编辑失败占比;持续偏高=上下文过时或库太大。参考区间:&lt;10% 正常,≥30% 关注">失败率</th><th class="n" title="每写10行删几行;高=反复推倒。参考区间:&lt;30% 健康,≥80% 大面积回滚">重写率</th><th class="n" title="每次编辑配套的 test/lint 命令数;0=从不验证。参考区间:0.1-0.8 健康">验证密度</th><th class="n" title="净产出每行的输出token;成本效率,仅做横向对比与自身趋势,无绝对好坏">token/行</th><th class="n" title="空转/错误循环/失败爆发三类(见下方告警面板)">告警</th></tr></thead><tbody></tbody></table>
         <div id="prodZero" style="padding:6px 12px;font-size:11px;color:var(--orange)"></div>
         <div id="prodDetail" style="padding:8px 12px;display:none"></div>
-        <div class="workspace-panel-head" style="border-top:1px solid var(--border)"><strong>项目分布</strong></div>
+        <div class="workspace-panel-head" style="border-top:1px solid var(--border)"><strong title="按会话自动识别的项目,可配别名规则">项目分布</strong></div>
         <table id="projTable"><thead><tr><th>项目</th><th class="n">成员</th><th class="n">文件</th><th class="n">净产出</th></tr></thead><tbody></tbody></table>
-        <div class="workspace-panel-head" style="border-top:1px solid var(--border)"><strong>空转 / 循环告警</strong><button type="button" class="detail-reset" onclick="markProdAlerts()" style="margin-left:auto">全部已读</button></div>
+        <div class="workspace-panel-head" style="border-top:1px solid var(--border)"><strong title="规则见设置;峰值 token/同类错误/失败率触发">空转 / 循环告警</strong><button type="button" class="detail-reset" onclick="markProdAlerts()" style="margin-left:auto">全部已读</button></div>
         <table id="prodAlertTable"><thead><tr><th>时间</th><th>成员</th><th>类型</th><th>说明</th></tr></thead><tbody></tbody></table>
       </div>
     </div></section>
@@ -8243,11 +8244,18 @@ async function loadProduction(){
     document.getElementById('workspaceCountProd').textContent=s.rows.length;
     document.getElementById('prodSummary').textContent='净产出 '+s.rows.reduce((x,r)=>x+r.net_lines,0).toLocaleString('zh-CN')+' 行 · '+s.rows.length+' 人有产出';
     const tb=document.querySelector('#prodTable tbody');
-    tb.innerHTML=s.rows.map(r=>'<tr data-key="'+ph(r.user_key)+'" style="cursor:pointer">'
+    // 阈值着色(参考区间,与成员个人页同口径):失败率 <10 绿/≥30 橙;重写率 <30 绿/≥80 橙;验证密度 =0 橙/0.1-0.8 绿;token/行与净产出不参与着色。
+    tb.innerHTML=s.rows.map(r=>{
+      const fr=r.fail_rate*100,rr=r.rewrite_rate*100,vd=r.verify_density;
+      const failC=fr>=30?' style="color:var(--orange)"':(fr<10?' style="color:var(--green)"':'');
+      const rwC=rr>=80?' style="color:var(--orange)"':(rr<30?' style="color:var(--green)"':'');
+      const vdC=vd===0?' style="color:var(--orange)"':((vd>=0.1&&vd<=0.8)?' style="color:var(--green)"':'');
+      return '<tr data-key="'+ph(r.user_key)+'" style="cursor:pointer">'
       +'<td>'+ph(r.user_name)+'</td><td class="n">'+fmtT(r.net_lines)+'</td><td class="n">'+(r.files||0)+'</td>'
-      +'<td class="n">'+(r.fail_rate*100).toFixed(0)+'%</td><td class="n">'+(r.rewrite_rate*100).toFixed(0)+'%</td>'
-      +'<td class="n">'+r.verify_density.toFixed(1)+'</td><td class="n">'+(r.token_per_line==null?'—':fmtT(Math.round(r.token_per_line)))+'</td>'
-      +'<td class="n">'+((s.alertCounts&&s.alertCounts[r.user_key]>0)?'<span class="pill-warn">'+s.alertCounts[r.user_key]+'</span>':'')+'</td></tr>').join('')
+      +'<td class="n"'+failC+'>'+fr.toFixed(0)+'%</td><td class="n"'+rwC+'>'+rr.toFixed(0)+'%</td>'
+      +'<td class="n"'+vdC+'>'+vd.toFixed(1)+'</td><td class="n">'+(r.token_per_line==null?'—':fmtT(Math.round(r.token_per_line)))+'</td>'
+      +'<td class="n">'+((s.alertCounts&&s.alertCounts[r.user_key]>0)?'<span class="pill-warn">'+s.alertCounts[r.user_key]+'</span>':'')+'</td></tr>';
+    }).join('')
       ||'<tr><td colspan="8" class="empty">该周期无产出数据</td></tr>';
     tb.querySelectorAll('tr[data-key]').forEach(tr=>tr.addEventListener('click',()=>loadProdDetail(tr.dataset.key,range)));
     document.getElementById('prodZero').innerHTML=s.zeroOutput.length
@@ -8288,6 +8296,8 @@ async function markProdAlerts(){
   loadProduction();
 }
 document.getElementById('workspace-tab-production').addEventListener('click',()=>{if(!prodLoaded){prodLoaded=true;loadProduction()}});
+// 指标口径速览:点击「指标口径」展开/收起一行小字
+document.getElementById('prodMetricHelp').addEventListener('click',()=>{const b=document.getElementById('prodMetricHelpBody');b.style.display=(b.style.display==='none'?'':'none')});
 // ── 等值成本 tab(懒加载:首次切到该 tab 才拉数据)──
 let costsLoaded=false;
 async function loadCosts(){

@@ -387,6 +387,7 @@ function deriveClusters(fileGroups) {
     return [{ label: lastTwoLabel(descendChain(root, [])), groups }];
   }
   const clusters = [], local = [];
+  local.push(...root.items);   // 挂根条目(噪声空段/裸文件名)必须落桶,不得随分簇丢失
   for (const kid of kids) {
     const ratio = root.weight > 0 ? kid.weight / root.weight : 0;
     if (ratio >= SPLIT_RATIO) clusters.push({ label: lastTwoLabel(descendChain(kid, [kid.seg])), groups: subtreeItems(kid) });

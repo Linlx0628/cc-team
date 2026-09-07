@@ -730,6 +730,8 @@ table{border-collapse:collapse;width:100%;margin:8px 0}th,td{border:1px solid #e
 <li>失败率 = 文件类编辑 outcome=error 占比；重写率 = Σdel ÷ Σadd；验证密度 = (test+lint 命令) ÷ 编辑次数</li>
 <li>token/行 = output_tokens ÷ 净产出（联 usage_daily）</li>
 <li>成本 = Σ(tokens × 单价/1M)，缓存按用户模型权重混合折算，cacheRead≈cacheWrite÷12.5（Claude 牌价比例）</li>
-<li>仅统计结构化指标，不存储任何代码内容；Codex 协议为指标子集（shell/apply_patch）</li></ul>
+<li>仅统计结构化指标，不存储任何代码内容；Codex 协议为指标子集（shell/apply_patch）</li>
+<li>成本：启用峰谷（peak 时段）后按小时表分档计价，小时表启用日前的缺口按基础价回填；缓存部分按日表混合折算（小时表无缓存列）</li>
+<li>项目分布：按会话主导子树推导（自动识别仓库根，剔除 .claude/.git/node_modules 等噪声），可配正则别名规则</li></ul>
 </body></html>`;
 }

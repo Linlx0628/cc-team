@@ -315,17 +315,176 @@ export function productionSummary(db, { from, to }) {
   return { rows, zeroOutput };
 }
 
-export function productionProjects(db, { from, to }) {
-  // 项目 = 绝对路径取去掉根后的前两段(proj/app);相对路径取首段;无分隔归(根)
-  return db.prepare(`
-    SELECT CASE
-        WHEN file_path LIKE '/%' THEN printf('%s/%s', substr(file_path, 2, instr(substr(file_path, 2) || '/', '/') - 1), substr(substr(file_path, instr(substr(file_path, 2), '/') + 2), 1, instr(substr(file_path, instr(substr(file_path, 2), '/') + 2) || '/', '/') - 1))
-        WHEN instr(file_path, '/') > 0 THEN substr(file_path, 1, instr(file_path || '/', '/') - 1)
-        ELSE '(根)' END AS project,
-      COUNT(DISTINCT user_key) AS users, COUNT(DISTINCT file_path) AS files,
-      SUM(lines_add) AS lines_add, SUM(lines_del) AS lines_del, COUNT(*) AS edits
+// —— 项目识别精准化:路径清洗 + 会话主导子树推导(纯函数,无 db 访问)——
+// 噪声目录:路径含任一段(大小写不敏感)即整条弃置,不参与项目推导(配置/依赖/系统目录)
+const NOISE_SEGMENTS = new Set([".claude", ".git", "node_modules", "appdata"]);
+const HOME_MARKERS = new Set(["users", "home"]);   // /Users/<name>、/home/<name>;root 家目录即 /root 本身
+const LOCAL_LABEL = "(本地配置)";
+const DESCEND_RATIO = 0.6;   // 最重孩子 ≥60% 节点权重 → 下沉
+const SPLIT_RATIO = 0.2;     // 根级无主导时,≥20% 孩子各自成簇(多仓库会话各得标签)
+const MAX_DEPTH = 8;         // 下沉深度上限
+
+// 返回清洗后的段数组;含噪声段返回 null(调用方按弃置处理,权重仍随会话主导标签并入)
+export function cleanFilePath(p) {
+  const segs = String(p ?? "").replace(/\\/g, "/").split("/").filter(s => s && s !== ".");
+  for (const s of segs) if (NOISE_SEGMENTS.has(s.toLowerCase())) return null;
+  const out = segs.filter(s => !/^[a-zA-Z]:$/.test(s));              // 剥盘符段
+  if (out.length) {
+    const h = out[0].toLowerCase();
+    if (HOME_MARKERS.has(h) && out.length > 1) out.splice(0, 2);     // 家目录标记 + 紧随用户名段
+    else if (h === "root") out.splice(0, 1);
+  }
+  return out;
+}
+
+// 带权目录 trie:文件权重记入其全部祖先目录节点(文件本身不成节点——标签是项目不是文件);
+// 条目挂最深目录节点(无目录段挂根,随 (本地配置)/主导标签处置)
+function buildProjectTrie(groups) {
+  const root = { children: new Map(), weight: 0, items: [] };
+  for (const g of groups) {
+    root.weight += g.weight;
+    let node = root;
+    for (const d of g.dirs) {
+      let c = node.children.get(d);
+      if (!c) { c = { children: new Map(), weight: 0, items: [], seg: d }; node.children.set(d, c); }
+      c.weight += g.weight;
+      node = c;
+    }
+    node.items.push(g);
+  }
+  return root;
+}
+const lastTwoLabel = (path) => path.length ? path.slice(-2).join("/") : LOCAL_LABEL;
+
+// 自 node 沿 ≥60% 主链下沉(深度 ≤MAX_DEPTH),返回路径段
+function descendChain(node, path) {
+  while (path.length < MAX_DEPTH) {
+    let top = null;
+    for (const c of node.children.values()) if (!top || c.weight > top.weight) top = c;
+    if (!top || node.weight <= 0 || top.weight / node.weight < DESCEND_RATIO) break;
+    node = top; path.push(top.seg);
+  }
+  return path;
+}
+function subtreeItems(node, out = []) {
+  for (const g of node.items) out.push(g);
+  for (const c of node.children.values()) subtreeItems(c, out);
+  return out;
+}
+
+// fileGroups=[{segments,weight,...}] → 簇 [{label, groups}]:
+// 根级最重孩子 ≥60% → 单主导,全量并入主链末端标签;否则 ≥20% 孩子各自成簇(多仓库会话各得标签),
+// <20% 与无目录项挂 (本地配置)。标签 = 主导子树路径末两段(不足取全部)。
+function deriveClusters(fileGroups) {
+  const groups = (Array.isArray(fileGroups) ? fileGroups : []).map(g => {
+    const segments = Array.isArray(g?.segments) ? g.segments : [];
+    return { ...g, segments, dirs: segments.slice(0, -1), weight: Number(g?.weight) || 0 };
+  });
+  const root = buildProjectTrie(groups);
+  const kids = [...root.children.values()].sort((a, b) => b.weight - a.weight);
+  const rootRatio = kids.length && root.weight > 0 ? kids[0].weight / root.weight : 0;
+  if (!kids.length || rootRatio >= DESCEND_RATIO) {
+    return [{ label: lastTwoLabel(descendChain(root, [])), groups }];
+  }
+  const clusters = [], local = [];
+  for (const kid of kids) {
+    const ratio = root.weight > 0 ? kid.weight / root.weight : 0;
+    if (ratio >= SPLIT_RATIO) clusters.push({ label: lastTwoLabel(descendChain(kid, [kid.seg])), groups: subtreeItems(kid) });
+    else local.push(...subtreeItems(kid));
+  }
+  if (local.length || !clusters.length) clusters.push({ label: LOCAL_LABEL, groups: local });
+  return clusters;
+}
+
+export function deriveProjectLabel(fileGroups) {
+  return deriveClusters(fileGroups).map(c => c.label);
+}
+
+// 绝对路径:以 / 或盘符(含 UNC \\)开头
+const ABS_PATH_RE = /^(\/|[a-zA-Z]:[\\/]|\\\\)/;
+// 单文件会话:绝对路径取清洗后目录前两段(不足取全部);相对路径首段即项目根
+function singleFileLabel(fp) {
+  const segs = cleanFilePath(fp) || [];
+  if (!segs.length) return LOCAL_LABEL;
+  if (!ABS_PATH_RE.test(String(fp))) return segs[0];
+  const dir = segs.slice(0, -1);
+  return dir.length ? dir.slice(0, 2).join("/") : LOCAL_LABEL;
+}
+
+// 别名先套用(正则 test 标签,首个命中生效)再按名聚合:users 并集去重,files/lines/edits 求和;非法正则静默跳过
+export function applyProjectAliases(rows, aliases) {
+  const rules = [];
+  for (const a of Array.isArray(aliases) ? aliases : []) {
+    if (!a || typeof a.pattern !== "string" || !a.pattern) continue;
+    try { rules.push({ re: new RegExp(a.pattern), name: typeof a.name === "string" && a.name ? a.name : a.pattern }); } catch { /* 非法正则跳过 */ }
+  }
+  const merged = new Map();
+  for (const r of Array.isArray(rows) ? rows : []) {
+    if (!r || typeof r !== "object") continue;
+    let name = String(r.project ?? "");
+    for (const rule of rules) if (rule.re.test(name)) { name = rule.name; break; }
+    let m = merged.get(name);
+    if (!m) merged.set(name, m = { project: name, user_keys: [], users: 0, files: 0, lines_add: 0, lines_del: 0, edits: 0 });
+    if (Array.isArray(r.user_keys)) { const seen = new Set(m.user_keys); for (const u of r.user_keys) seen.add(u); m.user_keys = [...seen]; }
+    else m.users += Number(r.users) || 0;
+    m.files += Number(r.files) || 0;
+    m.lines_add += Number(r.lines_add) || 0;
+    m.lines_del += Number(r.lines_del) || 0;
+    m.edits += Number(r.edits) || 0;
+  }
+  return [...merged.values()].map(m => ({ ...m, users: m.user_keys.length || m.users }));
+}
+
+export function productionProjects(db, { from, to, aliases } = {}) {
+  // 会话为归组单位:同会话文件集合共同推导项目;session NULL 归 '' 桶。权重 = Σ(lines_add+lines_del)
+  const rows = db.prepare(`
+    SELECT session, file_path, user_key,
+      SUM(lines_add) AS la, SUM(lines_del) AS ld, COUNT(*) AS edits
     FROM tool_events WHERE date(time,'+8 hours') BETWEEN ? AND ? AND file_path IS NOT NULL
-    GROUP BY project ORDER BY lines_add DESC LIMIT 50`).all(from, to);
+    GROUP BY session, file_path, user_key`).all(from, to);
+  const sessions = new Map();
+  for (const r of rows) {
+    const key = r.session || "";
+    let byFile = sessions.get(key);
+    if (!byFile) sessions.set(key, byFile = new Map());
+    let f = byFile.get(r.file_path);
+    if (!f) byFile.set(r.file_path, f = { users: new Set(), la: 0, ld: 0, edits: 0 });
+    f.users.add(r.user_key); f.la += r.la || 0; f.ld += r.ld || 0; f.edits += r.edits || 0;
+  }
+  const acc = new Map();   // 标签 → 聚合(users/files 按集合去重,与旧 COUNT DISTINCT 口径一致)
+  for (const byFile of sessions.values()) {
+    let clusters;
+    if (byFile.size === 1) {
+      const [fp, stat] = [...byFile.entries()][0];
+      clusters = [{ label: singleFileLabel(fp), groups: [{ stat, path: fp }] }];
+    } else {
+      const groups = [];
+      for (const [fp, stat] of byFile) {
+        const segments = cleanFilePath(fp);
+        groups.push({ segments: segments || [], weight: stat.la + stat.ld, stat, path: fp });   // 噪声 → 空段挂根,随主导标签并入
+      }
+      clusters = deriveClusters(groups);
+    }
+    for (const { label, groups } of clusters) {
+      let a = acc.get(label);
+      if (!a) acc.set(label, a = { users: new Set(), paths: new Set(), lines_add: 0, lines_del: 0, edits: 0 });
+      for (const g of groups) {
+        for (const u of g.stat.users) a.users.add(u);
+        a.paths.add(g.path);
+        a.lines_add += g.stat.la; a.lines_del += g.stat.ld; a.edits += g.stat.edits;
+      }
+    }
+  }
+  // 无别名 = 按标签聚合透传;有别名 = 改名后再按名合并(users 并集、files/lines/edits 求和)
+  const out = applyProjectAliases([...acc.entries()].map(([label, a]) => ({
+    project: label, user_keys: [...a.users], files: a.paths.size,
+    lines_add: a.lines_add, lines_del: a.lines_del, edits: a.edits,
+  })), aliases || []);
+  return out.map(r => ({
+    project: r.project,
+    users: Array.isArray(r.user_keys) ? r.user_keys.length : (Number(r.users) || 0),
+    files: r.files, lines_add: r.lines_add, lines_del: r.lines_del, edits: r.edits,
+  })).sort((a, b) => b.lines_add - a.lines_add).slice(0, 50);
 }
 
 export function productionUserDetail(db, userKey, { from, to }) {

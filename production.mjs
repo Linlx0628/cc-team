@@ -372,9 +372,50 @@ export function resolveRate(rates, model) {
   if (keys.length) return rates[keys[0]];
   return rates["*"] || null;
 }
-export function computeCosts(db, rates, { from, to }) {
-  const models = db.prepare(`SELECT profile, user_key, model, SUM(input_tokens) i, SUM(output_tokens) o
-    FROM usage_daily_model WHERE date BETWEEN ? AND ? GROUP BY profile, user_key, model`).all(from, to);
+
+// —— 峰谷时段:与 server.mjs normalizePeakHours/isInPeakHours 互为拷贝(production 不得 import server,防循环),fixture 同步防漂移 ——
+const PEAK_TIME_RE = /^([01]\d|2[0-3]):([0-5]\d)$/;
+function parsePeakTimeMinutes(t) {
+  if (typeof t !== "string") return null;
+  const m = PEAK_TIME_RE.exec(t.trim());
+  if (!m) return null;
+  return parseInt(m[1], 10) * 60 + parseInt(m[2], 10);
+}
+export function normalizeCostPeakHours(raw) {
+  if (!Array.isArray(raw)) return [];
+  const out = [];
+  for (const item of raw) {
+    if (!item || typeof item !== "object") continue;
+    const start = parsePeakTimeMinutes(item.start);
+    const end = parsePeakTimeMinutes(item.end);
+    if (start === null || end === null || start === end) continue;
+    const norm = { start: item.start.trim(), end: item.end.trim() };
+    if (!out.some(r => r.start === norm.start && r.end === norm.end)) out.push(norm);
+  }
+  return out;
+}
+// hour 为 '00'-'23' 字符串,按 h×60 起始分钟判定;start 含、end 不含,end < start 为跨午夜
+export function hourIsPeak(hour, peakHours) {
+  if (!Array.isArray(peakHours) || peakHours.length === 0) return false;
+  if (typeof hour !== "string" || !/^\d{1,2}$/.test(hour)) return false;
+  const h = Number(hour);
+  if (h > 23) return false;
+  const minutes = h * 60;
+  for (const r of peakHours) {
+    const start = parsePeakTimeMinutes(r?.start);
+    const end = parsePeakTimeMinutes(r?.end);
+    if (start === null || end === null || start === end) continue;
+    if (start < end) {
+      if (minutes >= start && minutes < end) return true;
+    } else if (minutes >= start || minutes < end) {   // 跨午夜
+      return true;
+    }
+  }
+  return false;
+}
+
+export function computeCosts(db, rates, { from, to, peakHours } = {}) {
+  const peak = normalizeCostPeakHours(peakHours);
   const caches = db.prepare(`SELECT profile, user_key, SUM(cache_creation) cc, SUM(cache_read) cr
     FROM usage_daily WHERE date BETWEEN ? AND ? GROUP BY profile, user_key`).all(from, to);
   const byUser = new Map(), unpricedSet = new Set();
@@ -383,15 +424,58 @@ export function computeCosts(db, rates, { from, to }) {
     if (!byUser.has(k)) byUser.set(k, { profile, user_key: user, user_name: null, model_cost: 0, cache_cost: 0, models: [], in_weighted_rate: 0, in_total: 0, cc: 0, cr: 0 });
     return byUser.get(k);
   };
-  for (const m of models) {
-    const b = bucket(m.profile, m.user_key);
-    const r = resolveRate(rates, m.model);
-    const c = r ? (m.i * r.input + m.o * r.output) / 1e6 : 0;
-    if (!r) unpricedSet.add(m.model);
-    b.model_cost += c;
-    b.models.push({ model: m.model, input_tokens: m.i, output_tokens: m.o, cost: +c.toFixed(4), priced: !!r });
-    b.in_total += m.i;
-    if (r) b.in_weighted_rate += m.i * (r.cacheWrite ?? 0);   // 以 input 为权重累积,稍后求 blended
+  if (peak.length === 0) {
+    // —— 基础路径:未配峰谷时与既有实现逐字一致(回归锚)——
+    const models = db.prepare(`SELECT profile, user_key, model, SUM(input_tokens) i, SUM(output_tokens) o
+      FROM usage_daily_model WHERE date BETWEEN ? AND ? GROUP BY profile, user_key, model`).all(from, to);
+    for (const m of models) {
+      const b = bucket(m.profile, m.user_key);
+      const r = resolveRate(rates, m.model);
+      const c = r ? (m.i * r.input + m.o * r.output) / 1e6 : 0;
+      if (!r) unpricedSet.add(m.model);
+      b.model_cost += c;
+      b.models.push({ model: m.model, input_tokens: m.i, output_tokens: m.o, cost: +c.toFixed(4), priced: !!r });
+      b.in_total += m.i;
+      if (r) b.in_weighted_rate += m.i * (r.cacheWrite ?? 0);   // 以 input 为权重累积,稍后求 blended
+    }
+  } else {
+    // —— 峰谷路径:小时表按 hourIsPeak 分档计价(峰价 r.peakInput ?? r.input / r.peakOutput ?? r.output,
+    //    未设或 null 回落基础价,显式 0 生效);同时读日表,按 (profile,date,user_key,model) 对齐,
+    //    缺口 max(0, 日Σ−时Σ) 按基础价回填,in/out 总量与日表守恒 ——
+    const hourlyRows = db.prepare(`SELECT profile, date, user_key, hour, model, SUM(input_tokens) i, SUM(output_tokens) o
+      FROM usage_hourly_model WHERE date BETWEEN ? AND ? GROUP BY profile, date, user_key, hour, model`).all(from, to);
+    const dailyRows = db.prepare(`SELECT profile, date, user_key, model, SUM(input_tokens) i, SUM(output_tokens) o
+      FROM usage_daily_model WHERE date BETWEEN ? AND ? GROUP BY profile, date, user_key, model`).all(from, to);
+    const modelAggs = new Map();    // profile|user_key|model → 聚合条目(小时分档 + 缺口回填合并)
+    const hourlyByDay = new Map();  // profile|date|user_key|model → 当日小时表合计(算缺口用)
+    const addCost = (b, model, i, o, peakSlot) => {
+      const r = resolveRate(rates, model);
+      if (!r) unpricedSet.add(model);
+      const c = r ? (i * (peakSlot ? (r.peakInput ?? r.input) : r.input)
+                  + o * (peakSlot ? (r.peakOutput ?? r.output) : r.output)) / 1e6 : 0;
+      b.model_cost += c;
+      const mk = b.profile + "|" + b.user_key + "|" + model;
+      let agg = modelAggs.get(mk);
+      if (!agg) modelAggs.set(mk, agg = { b, model, input_tokens: 0, output_tokens: 0, cost: 0, priced: true });
+      agg.input_tokens += i; agg.output_tokens += o; agg.cost += c;
+      if (!r) agg.priced = false;
+      b.in_total += i;
+      if (r) b.in_weighted_rate += i * (r.cacheWrite ?? 0);
+    };
+    for (const m of hourlyRows) {
+      const dk = m.profile + "|" + m.date + "|" + m.user_key + "|" + m.model;
+      const cur = hourlyByDay.get(dk) || { i: 0, o: 0 };
+      cur.i += m.i; cur.o += m.o; hourlyByDay.set(dk, cur);
+      addCost(bucket(m.profile, m.user_key), m.model, m.i, m.o, hourIsPeak(m.hour, peak));
+    }
+    for (const d of dailyRows) {
+      const h = hourlyByDay.get(d.profile + "|" + d.date + "|" + d.user_key + "|" + d.model) || { i: 0, o: 0 };
+      const gapIn = Math.max(0, d.i - h.i), gapOut = Math.max(0, d.o - h.o);
+      if (gapIn || gapOut) addCost(bucket(d.profile, d.user_key), d.model, gapIn, gapOut, false);   // 缺口按基础价
+    }
+    for (const agg of modelAggs.values()) {
+      agg.b.models.push({ model: agg.model, input_tokens: agg.input_tokens, output_tokens: agg.output_tokens, cost: +agg.cost.toFixed(4), priced: agg.priced });
+    }
   }
   for (const c of caches) {
     const b = bucket(c.profile, c.user_key);
@@ -432,9 +516,9 @@ function esc(s) {
 const pct = (x) => x == null ? "—" : (x * 100).toFixed(0) + "%";
 const num = (x) => x == null ? "—" : Number(x).toLocaleString("zh-CN");
 
-const ALERT_KIND_LABEL = { idle_burn: "空转消耗", error_loop: "错误循环", edit_failure_burst: "失败爆发" };
+export const ALERT_KIND_LABEL = { idle_burn: "空转消耗", error_loop: "错误循环", edit_failure_burst: "失败爆发" };
 // 库里 detail 存的是 JSON 串;报告里翻译成人类话,解析失败退回原文(调用侧统一 esc)
-function alertDetailText(kind, detail) {
+export function alertDetailText(kind, detail) {
   let d = {};
   try { d = JSON.parse(detail || "{}") || {}; } catch {}
   if (kind === "idle_burn") return `近一小时消耗 ${num(d.output_tokens ?? 0)} output tokens,无任何文件产出`;

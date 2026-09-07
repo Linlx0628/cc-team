@@ -72,8 +72,9 @@ export function createProductionTracker({ db, getConfig, log = console.log, now 
       }
     })();
   }
-  const DEFAULT_ALERTS = { idleHourTokens: 100000, loopWindowMinutes: 10, loopCount: 3,
-    burstWindowMinutes: 30, burstMinEdits: 10, burstFailRate: 0.5, cooldownMinutes: 30 };
+  const DEFAULT_ALERTS = { idleHourTokens: 100000, loopWindowMinutes: 10, loopCount: 5,
+    burstWindowMinutes: 30, burstMinEdits: 10, burstFailRate: 0.5, cooldownMinutes: 30,
+    errorLoopCooldownMinutes: 60, loopExcludedKinds: ["tool_error"] };
   let lastPruneDate = null;
   function alertCooldownKey(kind, user) { return kind + ":" + user; }
   function scanAlerts(thresholds = {}, now = Date.now()) {
@@ -95,13 +96,18 @@ export function createProductionTracker({ db, getConfig, log = console.log, now 
       insert.run(new Date(now).toISOString(), u.user_key, u.user_name, "idle_burn", JSON.stringify({ hour: hourKey, output_tokens: u.o }));
       fired.push({ kind: "idle_burn", user_key: u.user_key, user_name: u.user_name, detail: `近一小时消耗 ${u.o.toLocaleString("zh-CN")} output tokens,无任何文件产出` });
     }
-    // 2) error_loop:窗口内同 error_kind 次数 ≥ loopCount
+    // 2) error_loop:窗口内同 error_kind 次数 ≥ loopCount;有成功文件编辑(进展)不上报;可配置剔除杂音 kind
     const cutoffLoop = new Date(now - cfg.loopWindowMinutes * 60_000).toISOString();
+    const progressed = new Set(db.prepare(`SELECT DISTINCT user_key FROM tool_events WHERE outcome='ok' AND ${FILE_SQL} AND time>=?`).all(cutoffLoop).map(r => r.user_key));
+    const exKinds = Array.isArray(cfg.loopExcludedKinds) ? cfg.loopExcludedKinds.filter(k => k) : [];
+    const exClause = exKinds.length ? ` AND error_kind NOT IN (${exKinds.map(() => "?").join(",")})` : "";
     const loops = db.prepare(`SELECT user_key, MAX(COALESCE(NULLIF(user_name,''),user_key)) user_name, error_kind, COUNT(*) c
-      FROM tool_events WHERE outcome='error' AND error_kind IS NOT NULL AND time>=?
-      GROUP BY user_key, error_kind HAVING c >= ?`).all(cutoffLoop, cfg.loopCount);
+      FROM tool_events WHERE outcome='error' AND error_kind IS NOT NULL AND time>=?${exClause}
+      GROUP BY user_key, error_kind HAVING c >= ?`).all(cutoffLoop, ...exKinds, cfg.loopCount);
+    const errLoopCooldownMs = (cfg.errorLoopCooldownMinutes || cfg.cooldownMinutes) * 60_000;
     for (const l of loops) {
-      if (recentAlert.get("error_loop", l.user_key, new Date(now - cfg.cooldownMinutes * 60_000).toISOString()).n) continue;
+      if (progressed.has(l.user_key)) continue;
+      if (recentAlert.get("error_loop", l.user_key, new Date(now - errLoopCooldownMs).toISOString()).n) continue;
       insert.run(new Date(now).toISOString(), l.user_key, l.user_name, "error_loop", JSON.stringify({ error_kind: l.error_kind, count: l.c }));
       fired.push({ kind: "error_loop", user_key: l.user_key, user_name: l.user_name, detail: `${cfg.loopWindowMinutes} 分钟内同类错误「${l.error_kind}」×${l.c},疑似循环` });
     }

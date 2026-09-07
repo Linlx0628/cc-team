@@ -3650,7 +3650,15 @@ function attachRequestLogger(res, clientState, reqLog) {
 const NOTIFY_FAILURE_ACTIONS = new Set(["ratelimit.mark", "failover.switch", "breaker.open"]);
 const NOTIFY_RECOVERY_ACTIONS = new Set(["ratelimit.expire", "failover.recover", "breaker.closed"]);
 const NOTIFY_TIMEOUT_MS = 5000;
-const notifyCooldown = new Map(); // action → last sent timestamp
+
+// Per-head failure incidents. All alert/recovery events of one failover-group
+// head collapse into a single open→close lifecycle, so a stuck scheme cannot
+// push an alert+recovery pair every cycle. A head is identified by its profile
+// name (see normalizeIncidentKey). Process restart clears the map — same as the
+// old cooldown — and a still-failing head simply opens a fresh incident after
+// restart (one extra alert, acceptable).
+const notifyIncidents = new Map(); // head → { openedAt }
+let notifyLastPushAt = 0;          // global "time since any push" floor for minIntervalSeconds
 
 function beijingTimeString() {
   return new Date().toLocaleString("zh-CN", { timeZone: "Asia/Shanghai", hour12: false });
@@ -3705,26 +3713,74 @@ const NOTIFY_SENDERS = [
   } },
 ];
 
-// Fire-and-forget dispatch with a per-action cooldown. Synchronous entry, async
-// fan-out; all channel failures are logged, never surfaced.
+// Map an audit event to the failover-group head it belongs to.
+//   ratelimit.mark/expire, breaker.open/closed → target is already the head name
+//   failover.switch/recover → target may be "Head → Member"; the head is the left
+//                             side (failover.recover already passes a bare head).
+// Returns null when no head can be derived; such an event falls back to the old
+// always-push path (no incident bookkeeping) so a parse miss never drops a real
+// notification.
+function normalizeIncidentKey(action, target) {
+  const t = String(target || "").trim();
+  if (!t) return null;
+  const failoverAction = action === "failover.switch" || action === "failover.recover";
+  const head = (failoverAction && t.includes("→")) ? t.slice(0, t.indexOf("→")).trim() : t;
+  return head || null;
+}
+
+// Fire-and-forget dispatch. Synchronous entry, async fan-out; all channel
+// failures are logged, never surfaced.
+//
+// Incident semantics (per failover-group head):
+//   failure  → no open incident for the head: open one and push an alert.
+//              already open: silent (no push, no refresh) — the dedupe that stops
+//              the alert+recover pair spam.
+//   expire   → NEVER pushes and never closes an incident: ratelimit.expire is only
+//              the 120s fallback window elapsing, not a real recovery. A genuine
+//              recovery is the head serving traffic again (failover.recover) or the
+//              breaker closing (breaker.closed).
+//   recover  → closes the head's open incident (if any) and pushes a recovery when
+//              cfg.notifyRecovery !== false. A recovery with no open incident is an
+//              orphan (e.g. after a restart) and is not pushed.
+// minIntervalSeconds is ONE global floor between any two pushes (not a per-action
+// lock): incidents already dedupe per head, so the floor only stops a simultaneous
+// multi-head burst. The registry is still updated when the floor suppresses the
+// push, so a burst does not leave silent incidents stuck open.
 function notifyAuditEvent(row) {
   const cfg = config.notifier || {};
   if (!cfg.enabled) return;
   const action = row.action;
   const isFailure = NOTIFY_FAILURE_ACTIONS.has(action);
   const isRecovery = NOTIFY_RECOVERY_ACTIONS.has(action);
-  if (!isFailure && !(isRecovery && cfg.notifyRecovery !== false)) return;
+  if (!isFailure && !isRecovery) return;
 
-  const rawInterval = Number(cfg.minIntervalSeconds);
-  const intervalMs = Math.max(0, (Number.isFinite(rawInterval) ? rawInterval : 300) * 1000);
-  const last = notifyCooldown.get(action) || 0;
-  if (Date.now() - last < intervalMs) return;
-  notifyCooldown.set(action, Date.now());
+  let incidentKey = normalizeIncidentKey(action, row.target);
+  if (isFailure) {
+    if (incidentKey) {
+      if (notifyIncidents.has(incidentKey)) return; // already open → silent
+      notifyIncidents.set(incidentKey, { openedAt: Date.now() });
+    }
+  } else {
+    // Recovery action. ratelimit.expire is a FALSE recovery (fallback window
+    // elapsing, not the head serving again) — never notify, never close.
+    if (action === "ratelimit.expire") return;
+    if (incidentKey) {
+      if (!notifyIncidents.delete(incidentKey)) return; // orphan recovery → silent
+    }
+    if (cfg.notifyRecovery === false) return;           // close incident but keep quiet
+  }
 
   const prefix = isFailure ? "【网关告警】" : "【网关恢复】";
   const msg = `${prefix} ${row.target || action}\n${row.detail || ""}\n—— ${beijingTimeString()}（token-monitor）`;
   const channels = NOTIFY_SENDERS.filter((s) => s.enabled(cfg));
   if (!channels.length) return;
+
+  const rawInterval = Number(cfg.minIntervalSeconds);
+  const intervalMs = Math.max(0, (Number.isFinite(rawInterval) ? rawInterval : 300) * 1000);
+  const now = Date.now();
+  if (now - notifyLastPushAt < intervalMs) return;      // global floor (not per-action)
+  notifyLastPushAt = now;
+
   for (const s of channels) {
     s.send(cfg, msg)
       .then(() => console.log(`[通知] 已推送 ${s.channel}: ${action} ${row.target}`))

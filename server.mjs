@@ -1399,6 +1399,9 @@ function initDb() {
       requests INTEGER DEFAULT 0, input_tokens INTEGER DEFAULT 0, output_tokens INTEGER DEFAULT 0,
       PRIMARY KEY (profile, date, user_key, hour, model)
     );
+    -- 峰谷成本走小时表按 date 范围扫描,主键前缀 (profile,date,...) 不带 profile 前导时用不上
+    CREATE INDEX IF NOT EXISTS idx_usage_hourly_model_date ON usage_hourly_model(date);
+    CREATE INDEX IF NOT EXISTS idx_usage_daily_model_date ON usage_daily_model(date);
     CREATE TABLE IF NOT EXISTS errors (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       profile TEXT NOT NULL, time TEXT NOT NULL,
@@ -10648,7 +10651,7 @@ const server = http.createServer((req, res) => {
     try {
       const { from, to } = rangeFromTo(new URL(req.url, "http://localhost").searchParams.get("range") || "7d");
       res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
-      res.end(JSON.stringify({ rows: productionProjects(db, { from, to }) }));
+      res.end(JSON.stringify({ rows: productionProjects(db, { from, to, aliases: (config.productionTracking || {}).projectAliases || [] }) }));
     } catch (err) {
       if (!res.headersSent) {
         res.writeHead(err.statusCode || 500, { "Content-Type": "application/json; charset=utf-8" });
@@ -10702,8 +10705,13 @@ const server = http.createServer((req, res) => {
     if (!checkAuth(req)) { res.writeHead(401); res.end("Unauthorized"); return; }
     try {
       const { from, to } = rangeFromTo(new URL(req.url, "http://localhost").searchParams.get("range") || "7d");
+      const peakHours = normalizePeakHours((config.productionTracking || {}).costPeakHours || []);
       res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
-      res.end(JSON.stringify({ ...computeCosts(db, config.costRates || DEFAULT_COST_RATES, { from, to }), rateNote: "USD/1M tokens,参考牌价折算,非实际账单" }));
+      res.end(JSON.stringify({
+        ...computeCosts(db, config.costRates || DEFAULT_COST_RATES, { from, to, peakHours }),
+        peak: { enabled: peakHours.length > 0, hours: peakHours, inPeakNow: isInPeakHours(peakHours) },
+        rateNote: "USD/1M tokens,参考牌价折算,非实际账单",
+      }));
     } catch (err) {
       if (!res.headersSent) {
         res.writeHead(err.statusCode || 500, { "Content-Type": "application/json; charset=utf-8" });
@@ -10723,8 +10731,8 @@ const server = http.createServer((req, res) => {
       const { from, to } = rangeFromTo(u.searchParams.get("range") || "7d");
       const html = buildReportHTML({
         summary: productionSummary(db, { from, to }),
-        projects: productionProjects(db, { from, to }),
-        costs: computeCosts(db, config.costRates || DEFAULT_COST_RATES, { from, to }),
+        projects: productionProjects(db, { from, to, aliases: (config.productionTracking || {}).projectAliases || [] }),
+        costs: computeCosts(db, config.costRates || DEFAULT_COST_RATES, { from, to, peakHours: (config.productionTracking || {}).costPeakHours || [] }),
         health: contextHealth(db, { from, to }),
         alerts: productionAlerts(db, { from, to }),
         from, to,
@@ -10763,13 +10771,29 @@ const server = http.createServer((req, res) => {
         const p = config.productionTracking || {};
         if (typeof body.productionTracking.enabled === "boolean") p.enabled = body.productionTracking.enabled;
         if (typeof body.productionTracking.storeFilePaths === "boolean") p.storeFilePaths = body.productionTracking.storeFilePaths;
+        // 峰谷时段复用配额峰谷的 normalizePeakHours(同款 HH:MM 校验/去重);空数组 = 关闭峰谷计价
+        if (Array.isArray(body.productionTracking.costPeakHours)) p.costPeakHours = normalizePeakHours(body.productionTracking.costPeakHours);
+        if (Array.isArray(body.productionTracking.projectAliases)) {
+          const aliases = [];
+          for (const a of body.productionTracking.projectAliases) {
+            if (!a || typeof a !== "object" || typeof a.pattern !== "string") continue;
+            try { new RegExp(a.pattern); } catch { continue; }   // 非法正则整条丢弃
+            aliases.push({ pattern: a.pattern, name: String(a.name ?? "").slice(0, 64) });
+          }
+          p.projectAliases = aliases;
+        }
         config.productionTracking = p;
       }
       if (body.costRates && typeof body.costRates === "object") {
         const clean = {};
+        // 峰价可留空(null = 回落基础价)或显式 0(峰时段免费);空串/null → null,其余钳到 ≥0
+        const peakPrice = (x) => (("" + x === "" || x == null) ? null : Math.max(0, Number(x) || 0));
         for (const [m, r] of Object.entries(body.costRates)) {
           if (!r || typeof r !== "object") continue;
-          clean[m] = { input: +r.input || 0, output: +r.output || 0, cacheWrite: +r.cacheWrite || 0, cacheRead: +r.cacheRead || 0 };
+          clean[m] = {
+            input: +r.input || 0, output: +r.output || 0, cacheWrite: +r.cacheWrite || 0, cacheRead: +r.cacheRead || 0,
+            peakInput: peakPrice(r.peakInput), peakOutput: peakPrice(r.peakOutput),
+          };
         }
         config.costRates = clean;
       }

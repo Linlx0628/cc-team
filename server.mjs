@@ -5127,7 +5127,12 @@ function proxyRequest(req, res) {
           const reqHeaders = { ...req.headers, host: cruntime.upstreamUrl.host, "content-length": cbody.length };
           console.log(`── 请求开始 ── ${reqTag} ${getUserName(apiKey, cruntime)} [${reqSource}] 模型=${originalModel}${originalModel !== creqModel ? "→" + creqModel : ""}${csuffix ? ` [${csuffix}]` : ""} ──`);
           if (realKey !== apiKey) {
+            // Rewrite BOTH auth conventions so a tool that also sends the virtual
+            // key in x-api-key (e.g. ZCode sends VK in both authorization and
+            // x-api-key) doesn't leak the jx- virtual key upstream. Anthropic-style
+            // upstreams read x-api-key first and would 401 on the malformed key.
             reqHeaders["authorization"] = `Bearer ${realKey}`;
+            reqHeaders["x-api-key"] = realKey;
             console.log(`${reqTag} [映射] ${getUserName(apiKey, cruntime)} 虚拟key=${apiKey.slice(0,8)}**** 请求模型=${originalModel}${originalModel !== creqModel ? " → 实际=" + creqModel : ""}`);
           }
           delete reqHeaders["connection"];

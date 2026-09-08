@@ -5156,10 +5156,18 @@ function proxyRequest(req, res) {
           proxyPhase = isStreamRequest ? "streaming-proxy" : "json-proxy";
           const timeout = isStreamRequest ? gProxy.streamTimeout : gProxy.timeout;
 
+          // responsesPath can differ per profile (e.g. Volcano uses base+/responses
+          // while most others use base+/v1/responses). The default entry's strippedUrl
+          // is built from the group HEAD's responsesPath, so it must NOT be reused for
+          // a failover member — rebuild it from this candidate's own responsesPath.
+          const candStrippedUrl = protocol === "responses"
+            ? (cruntime.responsesPath || "/v1/responses") + (req.url.includes("?") ? req.url.slice(req.url.indexOf("?")) : "")
+            : strippedUrl;
+
           if (isStreamRequest) {
-            await handleStreamingProxy(req, res, cbody, reqHeaders, apiKey, creqModel, timeout, reqSource, cruntime, csuffix, strippedUrl, clientState);
+            await handleStreamingProxy(req, res, cbody, reqHeaders, apiKey, creqModel, timeout, reqSource, cruntime, csuffix, candStrippedUrl, clientState);
           } else {
-            await handleJsonProxy(req, res, cbody, reqHeaders, apiKey, creqModel, timeout, reqSource, cruntime, csuffix, strippedUrl, clientState);
+            await handleJsonProxy(req, res, cbody, reqHeaders, apiKey, creqModel, timeout, reqSource, cruntime, csuffix, candStrippedUrl, clientState);
           }
           served = true;
           servedBy = cand.name;

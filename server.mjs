@@ -6568,10 +6568,10 @@ ${s.profiles.map(p => `<option value="${escHtml(p.suffix)}" ${p.suffix === initi
 </table>
 </div>
 <div class="note" style="margin-top:6px">全局禁用的用户灰色显示。真实Key必填才能使用此方案。</div>
-<div style="margin-top:16px;display:flex;justify-content:flex-end;gap:8px;padding-bottom:8px">
+</div>
+<div style="flex-shrink:0;display:flex;justify-content:flex-end;gap:8px;padding:12px 20px;border-top:1px solid var(--border);background:var(--surface);border-radius:0 0 8px 8px">
 <button type="button" class="btn btn-outline btn-sm" onclick="closeUserModal()">取消</button>
 <button type="button" class="btn btn-primary btn-sm" onclick="saveUsers()">保存全部</button>
-</div>
 </div>
 </div>
 </div>

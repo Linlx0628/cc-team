@@ -2260,6 +2260,9 @@ function getAvailableDefaultProfiles(apiKey) {
     // is offered again — allowRequest() then performs the half-open transition.
     if (!runtime.breaker.isAvailable()) continue;
     if (!canUseProfile(apiKey, runtime)) continue;
+    // 超级用户借 key 转发：组内一个真实Key都没有的方案不进候选，避免借不到 key
+    // 时虚拟Key泄漏到上游（普通用户已被 canUseProfile 保证有 key）。
+    if (isSuperUser(apiKey, runtime) && !hasProfileRealKey(apiKey, runtime) && !borrowProfileRealKey(runtime)) continue;
     out.push({ name, suffix, runtime });
   }
   return out;
@@ -2280,6 +2283,8 @@ function getAvailableResponsesProfiles(apiKey) {
     if (isRateLimited(name)) continue;
     if (!runtime.breaker.isAvailable()) continue;
     if (!canUseProfile(apiKey, runtime)) continue;
+    // 同上：超级用户借用路径下，无任何真实Key的方案不进候选。
+    if (isSuperUser(apiKey, runtime) && !hasProfileRealKey(apiKey, runtime) && !borrowProfileRealKey(runtime)) continue;
     out.push({ name, suffix, runtime });
   }
   return out;
@@ -2779,13 +2784,34 @@ function hasProfileRealKey(apiKey, _rt) {
   return !!(pu.key && String(pu.key).trim());
 }
 
+// 超级用户：全局用户表里 superUser=true 的虚拟Key，可绕过方案分配与限制直连。
+// 兼容旧字段名 admin（首次上线版本的叫法）。
+function isSuperUser(apiKey, _rt) {
+  const gu = getGlobalUser(apiKey, _rt);
+  return !!(gu && (gu.superUser || gu.admin));
+}
+
+// 从方案已分配的用户里借一个可用的真实Key（跳过禁用与空值，兼容双格式）。
+// 仅超级用户借用路径会走到这里；找不到返回 null，调用方须拒绝转发。
+function borrowProfileRealKey(_rt) {
+  const runtime = _rt || rt;
+  if (!runtime || !runtime.users) return null;
+  for (const pu of Object.values(runtime.users)) {
+    if (pu && typeof pu === "object" && pu.disabled) continue;
+    const key = typeof pu === "string" ? pu : (pu.key || "");
+    if (key && String(key).trim()) return key;
+  }
+  return null;
+}
+
 function canUseProfile(apiKey, _rt) {
   const runtime = _rt || rt;
   if (!runtime) return { allowed: false, reason: "Profile not found" };
   const key = resolveUserKey(apiKey, runtime);
   const gu = getGlobalUser(key, runtime);
   if (!gu) return { allowed: false, reason: "Unknown API key" };
-  if (!hasProfileRealKey(key, runtime)) return { allowed: false, reason: `User is not allowed to use profile "${runtime.profileName}"` };
+  // 超级用户豁免方案分配限制（禁用/过期检查保持在其后，失效超级用户仍被拒）。
+  if (!isSuperUser(apiKey, runtime) && !hasProfileRealKey(key, runtime)) return { allowed: false, reason: `User is not allowed to use profile "${runtime.profileName}"` };
   if (checkUserDisabled(key, runtime)) return { allowed: false, reason: "User is disabled." };
   if (checkKeyExpired(key, runtime)) return { allowed: false, reason: "API key has expired. Please contact your administrator." };
   return { allowed: true, userKey: key };
@@ -4902,11 +4928,12 @@ function proxyRequest(req, res) {
   // Group members (default-profile-group with ≥2 entries) are reachable only via the
   // protocol's /v1 entry, which fails over across the group. Reject direct /<suffix>/...
   // access so users can't bypass failover to pin an expensive on-demand profile.
+  // Super users (global user superUser=true) are exempt and may direct-connect any profile.
   const dpg = protocol === "responses"
     ? (Array.isArray(config.responsesProfileGroup) ? config.responsesProfileGroup : [])
     : (Array.isArray(config.defaultProfileGroup) ? config.defaultProfileGroup : []);
   const groupEntryPath = protocol === "responses" ? "/v1/responses" : "/v1/messages";
-  if (config.restrictGroupSuffix !== false && !resolvedProfile.isDefaultEntry && dpg.length >= 2 && dpg.includes(runtime.profileName)) {
+  if (config.restrictGroupSuffix !== false && !isSuperUser(apiKey, runtime) && !resolvedProfile.isDefaultEntry && dpg.length >= 2 && dpg.includes(runtime.profileName)) {
     if (protocol === "responses") {
       sendOpenAiError(res, 403, "group_member_restricted", `方案 "${runtime.profileName}" 是 Responses 方案组成员，请通过 /v1/responses 入口使用（系统按 failover 顺序自动调度）。`);
     } else {
@@ -5123,7 +5150,20 @@ function proxyRequest(req, res) {
 
         try {
           proxyPhase = "upstream-connect";
-          const realKey = getRealKey(apiKey, cruntime);
+          let realKey = getRealKey(apiKey, cruntime);
+          if (realKey === apiKey && isSuperUser(apiKey, cruntime)) {
+            // 超级用户未在该方案分配真实Key：借用方案上已有的key转发。
+            // 借不到（方案一个真实Key都没有）时明确拒绝，绝不把虚拟Key发往上游。
+            const borrowed = borrowProfileRealKey(cruntime);
+            if (!borrowed) {
+              lastFailure = { kind: "no_real_key", status: 403,
+                err: new Error(`方案 "${cruntime.profileName}" 未配置任何可用真实Key，无法为超级用户转发请求。请先在设置中为该方案分配真实Key。`),
+                runtime: cruntime, suffix: csuffix };
+              if (!isLastCandidate) continue;
+              break;
+            }
+            realKey = borrowed;
+          }
           const reqHeaders = { ...req.headers, host: cruntime.upstreamUrl.host, "content-length": cbody.length };
           console.log(`── 请求开始 ── ${reqTag} ${getUserName(apiKey, cruntime)} [${reqSource}] 模型=${originalModel}${originalModel !== creqModel ? "→" + creqModel : ""}${csuffix ? ` [${csuffix}]` : ""} ──`);
           if (realKey !== apiKey) {
@@ -5722,6 +5762,7 @@ function getPublicSettings() {
       username: v.username || "",
       expiresAt: v.expiresAt || "",
       disabled: !!v.disabled,
+      superUser: !!(v.superUser || v.admin),
     };
   }
   const profileAssignments = {};
@@ -5843,12 +5884,14 @@ ${rateLabel}
     const username = isObj ? (v.username || "") : (typeof v === "string" ? v : "");
     const expiresAt = isObj ? (v.expiresAt || "") : "";
     const disabled = isObj ? !!v.disabled : false;
+    const superUser = isObj ? !!(v.superUser || v.admin) : false;
     return `<tr>
 <td><code style="font-size:11px;color:var(--accent);user-select:all;cursor:pointer" title="点击复制" onclick="navigator.clipboard.writeText('${escJs(k)}')">${escHtml(k)}</code></td>
 <td><input type="text" name="gu_un_${escHtml(k)}" value="${escHtml(username)}" style="width:100%;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:4px 8px;border-radius:4px;font-size:12px" placeholder="用户名"></td>
 <td><input type="datetime-local" name="gu_ex_${escHtml(k)}" value="${escHtml(expiresAt)}" onclick="openDateTimePicker(this)" style="width:100%;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:3px 6px;border-radius:4px;font-size:11px;font-family:monospace" title="留空=永不过期"></td>
-<td><label style="display:inline-flex;align-items:center;gap:4px;margin:0;cursor:pointer"><input type="checkbox" name="gu_dis_${escHtml(k)}" ${disabled ? "checked" : ""} style="width:auto;accent-color:var(--red)"><span style="font-size:11px;color:${disabled ? "var(--red)" : "var(--dim)"}">${disabled ? "已禁用" : "正常"}</span></label></td>
-<td><button type="button" onclick="deleteGlobalUser('${escJs(k)}')" style="background:#fff2f0;color:var(--red);border:1px solid #f1c8c2;padding:2px 8px;border-radius:4px;cursor:pointer;font-size:11px">删除</button></td></tr>`;
+<td><label style="display:inline-flex;align-items:center;gap:4px;margin:0;cursor:pointer;white-space:nowrap"><input type="checkbox" name="gu_dis_${escHtml(k)}" ${disabled ? "checked" : ""} style="width:auto;accent-color:var(--red)"><span style="font-size:11px;color:${disabled ? "var(--red)" : "var(--dim)"}">${disabled ? "已禁用" : "正常"}</span></label></td>
+<td><label style="display:inline-flex;align-items:center;gap:4px;margin:0;cursor:pointer;white-space:nowrap" title="超级用户：可直连任意方案并借用其真实Key，不受限制策略约束"><input type="checkbox" name="gu_su_${escHtml(k)}" ${superUser ? "checked" : ""} style="width:auto;accent-color:var(--accent)"><span style="font-size:11px;color:${superUser ? "var(--accent)" : "var(--dim)"}">${superUser ? "不限" : "常规"}</span></label></td>
+<td><button type="button" onclick="deleteGlobalUser('${escJs(k)}')" style="background:#fff2f0;color:var(--red);border:1px solid #f1c8c2;padding:2px 8px;border-radius:4px;cursor:pointer;font-size:11px;white-space:nowrap">删除</button></td></tr>`;
   }).join("");
 
   // Profile user rows (key assignment): real key + disable only. Quota lives in
@@ -5866,7 +5909,7 @@ ${rateLabel}
 <td><code style="font-size:11px;color:var(--accent)">${escHtml(k)}</code></td>
 <td>${escHtml(username)}</td>
 <td><input type="text" name="pu_rk_${escHtml(k)}" value="${escHtml(realKey)}" style="width:100%;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:4px 8px;border-radius:4px;font-size:12px;font-family:monospace" placeholder="真实Key (必填)"></td>
-<td><label style="display:inline-flex;align-items:center;gap:4px;margin:0;cursor:pointer"><input type="checkbox" name="pu_dis_${escHtml(k)}" ${profileDisabled ? "checked" : ""} style="width:auto;accent-color:var(--orange)"><span style="font-size:11px;color:${profileDisabled ? "var(--orange)" : "var(--dim)"}">${profileDisabled ? "已禁用" : "正常"}</span></label></td></tr>`;
+<td><label style="display:inline-flex;align-items:center;gap:4px;margin:0;cursor:pointer;white-space:nowrap"><input type="checkbox" name="pu_dis_${escHtml(k)}" ${profileDisabled ? "checked" : ""} style="width:auto;accent-color:var(--orange)"><span style="font-size:11px;color:${profileDisabled ? "var(--orange)" : "var(--dim)"}">${profileDisabled ? "已禁用" : "正常"}</span></label></td></tr>`;
   }).join("");
 
   const peakAliasesText = formatModelAliasesInput(s.peakModelAliases || {});
@@ -6502,24 +6545,28 @@ ${(() => {
 <div class="modal-hd"><h3>用户管理</h3><button class="modal-close" onclick="closeUserModal()">关闭</button></div>
 <div class="modal-body">
 <h4 style="font-size:13px;color:var(--accent);margin:0 0 8px">全局用户信息</h4>
-<table id="globalUsersTable">
-<thead><tr><th>虚拟 Key</th><th>用户名称</th><th style="width:160px">失效时间</th><th style="width:80px">全局禁用</th><th style="width:60px">操作</th></tr></thead>
+<div style="overflow-x:auto">
+<table id="globalUsersTable" style="min-width:780px">
+<thead><tr><th>虚拟 Key</th><th>用户名称</th><th style="width:160px">失效时间</th><th style="width:80px">全局禁用</th><th style="width:80px">超级用户</th><th style="width:70px">操作</th></tr></thead>
 <tbody>${globalUserRows}</tbody>
 </table>
+</div>
 <div style="margin:12px 0 4px;display:flex;gap:8px;align-items:center">
 <button type="button" class="btn btn-outline btn-sm" onclick="addGlobalUser()">添加用户</button>
 <span class="note">虚拟Key自动生成（jx-开头24位随机码），点击可复制。失效时间留空=永不过期。</span>
 </div>
-<h4 style="font-size:13px;color:var(--accent);margin:16px 0 8px;display:flex;align-items:center;justify-content:space-between;gap:12px">
+<h4 style="font-size:13px;color:var(--accent);margin:16px 0 8px;display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap">
 <span>方案真实Key分配 <span style="font-size:11px;color:var(--dim);font-weight:400">（按方案独立授权）</span></span>
-<select id="userProfileSel" onchange="switchUserProfile(this.value)" style="width:220px;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:5px 8px;border-radius:4px;font-size:12px">
+<select id="userProfileSel" onchange="switchUserProfile(this.value)" style="width:auto;min-width:200px;max-width:100%;flex:0 1 auto;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:5px 8px;border-radius:4px;font-size:12px">
 ${s.profiles.map(p => `<option value="${escHtml(p.suffix)}" ${p.suffix === initialSuffix ? "selected" : ""}>${escHtml(p.name)} /${escHtml(p.suffix)}${p.isDefault ? " · 默认入口" : ""}</option>`).join("")}
 </select>
 </h4>
+<div style="overflow-x:auto">
 <table id="profileUsersTable">
 <thead><tr><th>虚拟 Key</th><th>用户名称</th><th>真实 Key</th><th style="width:80px">方案禁用</th></tr></thead>
 <tbody>${profileUserRows}</tbody>
 </table>
+</div>
 <div class="note" style="margin-top:6px">全局禁用的用户灰色显示。真实Key必填才能使用此方案。</div>
 <div style="margin-top:16px;display:flex;justify-content:flex-end;gap:8px;padding-bottom:8px">
 <button type="button" class="btn btn-outline btn-sm" onclick="closeUserModal()">取消</button>
@@ -7360,7 +7407,7 @@ function renderProfileUsers(suffix){
       +'<td><code style="font-size:11px;color:var(--accent)">'+h(k)+'</code></td>'
       +'<td>'+h(username)+'</td>'
       +'<td><input type="text" name="pu_rk_'+h(k)+'" value="'+h(realKey)+'" style="width:100%;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:4px 8px;border-radius:4px;font-size:12px;font-family:monospace" placeholder="真实Key (留空=不可用此方案)"></td>'
-      +'<td><label style="display:inline-flex;align-items:center;gap:4px;margin:0;cursor:pointer"><input type="checkbox" name="pu_dis_'+h(k)+'" '+(profileDisabled?'checked':'')+' style="width:auto;accent-color:var(--orange)"><span style="font-size:11px;color:'+(profileDisabled?'var(--orange)':'var(--dim)')+'">'+(profileDisabled?'已禁用':'正常')+'</span></label></td></tr>';
+      +'<td><label style="display:inline-flex;align-items:center;gap:4px;margin:0;cursor:pointer;white-space:nowrap"><input type="checkbox" name="pu_dis_'+h(k)+'" '+(profileDisabled?'checked':'')+' style="width:auto;accent-color:var(--orange)"><span style="font-size:11px;color:'+(profileDisabled?'var(--orange)':'var(--dim)')+'">'+(profileDisabled?'已禁用':'正常')+'</span></label></td></tr>';
   }).join('');
 }
 function switchUserProfile(suffix){renderProfileUsers(suffix)}
@@ -7374,8 +7421,9 @@ async function saveUsers(){
     const unInput=tr.querySelector('input[name^="gu_un_"]');
     const exInput=tr.querySelector('input[name^="gu_ex_"]');
     const disInput=tr.querySelector('input[name^="gu_dis_"]');
+    const adInput=tr.querySelector('input[name^="gu_su_"]');
     if(!vk||!unInput)return;
-    users.push({key:vk,username:unInput.value||vk.slice(0,8),expiresAt:exInput?exInput.value:'',disabled:disInput?disInput.checked:false});
+    users.push({key:vk,username:unInput.value||vk.slice(0,8),expiresAt:exInput?exInput.value:'',disabled:disInput?disInput.checked:false,superUser:adInput?adInput.checked:false});
   });
   const ptbody=document.querySelector("#profileUsersTable tbody");
   const prows=ptbody.querySelectorAll("tr");
@@ -7473,10 +7521,11 @@ function addGlobalUser(){
   tr.innerHTML='<td><code style="font-size:11px;color:var(--accent);user-select:all">'+vk+'</code><input type="hidden" name="gu_new_'+vk+'" value="'+vk+'"></td>'
     +'<td><input type="text" name="gu_un_new_'+vk+'" placeholder="用户名" style="width:100%;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:4px 8px;border-radius:4px;font-size:12px"></td>'
     +'<td><input type="datetime-local" name="gu_ex_new_'+vk+'" onclick="openDateTimePicker(this)" style="width:100%;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:3px 6px;border-radius:4px;font-size:11px"></td>'
-    +'<td><label style="display:inline-flex;align-items:center;gap:4px;margin:0;cursor:pointer"><input type="checkbox" name="gu_dis_new_'+vk+'" style="width:auto;accent-color:var(--red)"><span style="font-size:11px;color:var(--dim)">正常</span></label></td>'
-    +'<td><button type="button" onclick="this.closest(\\'tr\\').remove()" style="background:#fff2f0;color:var(--red);border:1px solid #f1c8c2;padding:2px 8px;border-radius:4px;cursor:pointer;font-size:11px">删除</button></td>';
+    +'<td><label style="display:inline-flex;align-items:center;gap:4px;margin:0;cursor:pointer;white-space:nowrap"><input type="checkbox" name="gu_dis_new_'+vk+'" style="width:auto;accent-color:var(--red)"><span style="font-size:11px;color:var(--dim)">正常</span></label></td>'
+    +'<td><label style="display:inline-flex;align-items:center;gap:4px;margin:0;cursor:pointer;white-space:nowrap" title="超级用户：可直连任意方案并借用其真实Key，不受限制策略约束"><input type="checkbox" name="gu_su_new_'+vk+'" style="width:auto;accent-color:var(--accent)"><span style="font-size:11px;color:var(--dim)">常规</span></label></td>'
+    +'<td><button type="button" onclick="this.closest(\\'tr\\').remove()" style="background:#fff2f0;color:var(--red);border:1px solid #f1c8c2;padding:2px 8px;border-radius:4px;cursor:pointer;font-size:11px;white-space:nowrap">删除</button></td>';
   tbody.appendChild(tr);
-  SETTINGS.globalUsers[vk]={username:'',expiresAt:'',disabled:false};
+  SETTINGS.globalUsers[vk]={username:'',expiresAt:'',disabled:false,superUser:false};
   for(const p of SETTINGS.profiles){if(!SETTINGS.profileAssignments[p.suffix])SETTINGS.profileAssignments[p.suffix]={}}
   renderProfileUsers(document.getElementById('userProfileSel').value);
 }
@@ -7656,7 +7705,11 @@ function refreshBridgeSelect(profile){
   const sel=document.getElementById('imgBridgeModel');
   if(!sel)return;
   const aliases=profile.modelAliases||{},mms=profile.modelMultimodal||{};
-  const keep=sel.value;
+  // Seed from THIS profile's saved helper, not the DOM's current value. The page
+  // renders the select for the default profile, then repopulates it per-profile on
+  // switch; reading sel.value here would carry the previous/default profile's model
+  // over (blank or stale) instead of the one the edited profile actually stores.
+  const keep=(profile.imageBridge&&profile.imageBridge.model)||'';
   const options=Object.keys(aliases).filter(a=>mms[a]!==false).map(a=>'<option value="'+String(aliases[a]).replace(/"/g,'&quot;')+'"'+(String(aliases[a])===keep?' selected':'')+'>'+a+' → '+String(aliases[a]).replace(/</g,'&lt;')+'</option>').join('');
   sel.innerHTML='<option value="">未选择</option>'+options;
   if(keep&&![...sel.options].some(o=>o.value===keep))sel.value='';
@@ -7850,6 +7903,22 @@ th{text-align:left;padding:8px 12px;font-weight:550;font-size:10px;color:var(--d
 td{padding:8px 12px;font-size:11px;border-bottom:1px solid #ecece8;white-space:nowrap}tr:last-child td{border-bottom:0}tbody tr:hover td{background:#fafaf7}
 .n{font-variant-numeric:tabular-nums;text-align:right}.hl{color:var(--accent);font-weight:600}
 .rank{display:inline-block;width:20px;color:var(--dim);font-variant-numeric:tabular-nums}code{font-family:var(--font-mono);color:var(--accent);font-size:11px}.empty{color:var(--dim);padding:24px;text-align:center;font-size:12px}
+/* 配额倍率 卡片看板 */
+.rate-cards{min-height:80px}.rate-empty{padding:24px 12px;text-align:center;font-size:12px;color:var(--dim)}
+.rate-card{display:grid;grid-template-columns:120px 1fr auto;align-items:center;gap:0 14px;padding:9px 12px;border-bottom:1px solid var(--border)}.rate-card:hover{background:#fafaf7}
+.rate-zero{opacity:.55}
+.rate-bar{height:12px;background:var(--surface-subtle);border-radius:3px;overflow:hidden;min-width:0}.rate-bar>i{display:block;height:100%;background:var(--dim2);border-radius:3px}.rate-custom .rate-bar>i{background:var(--accent)}
+.rate-main{min-width:0}.rate-topline{display:flex;align-items:center;gap:7px;min-width:0}
+.rate-name{font-size:13px;font-weight:650;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.rate-tag{font-size:9px;color:var(--accent);border:1px solid var(--accent);border-radius:3px;padding:0 3px;flex-shrink:0}.rate-profn{font-size:10px;color:var(--dim);flex-shrink:0}.rate-drift{font-size:10px;color:var(--dim);flex-shrink:0}
+.rate-alias{margin-top:3px;display:flex;flex-wrap:wrap;gap:4px 0;min-width:0}.rate-alias .pk{font-style:normal;font-size:8px;color:var(--orange);margin-left:1px}.rate-noalias{font-size:10px;color:var(--dim2)}
+.rate-side{display:flex;align-items:center;gap:12px}.rate-nums{display:flex;flex-direction:column;align-items:flex-end;gap:2px}
+.rate-today{font-size:16px;font-weight:650;font-variant-numeric:tabular-nums;line-height:1}.rate-req{font-size:10px;color:var(--dim);font-variant-numeric:tabular-nums}
+.rate-chip{display:inline-flex;align-items:baseline;gap:2px;font-size:11px;font-weight:650;border:1px solid;border-radius:5px;padding:2px 6px;font-variant-numeric:tabular-nums;white-space:nowrap}.rate-chip .pk{font-style:normal;font-size:8px;opacity:.8}
+.rate-pill{display:inline-flex;align-items:center;gap:5px;font-size:10px;color:var(--dim);margin-left:10px}.rate-pill .dot{width:7px;height:7px;border-radius:50%;flex-shrink:0}.rate-pill b{font-weight:650}
+.rate-detail{border-top:1px solid var(--border)}
+.rate-detail>summary{list-style:none;cursor:pointer;padding:9px 12px;font-size:11px;color:var(--dim);display:flex;align-items:center;gap:7px}.rate-detail>summary::-webkit-details-marker{display:none}.rate-detail>summary::before{content:"";display:inline-block;width:7px;height:7px;border-right:1.5px solid var(--dim);border-bottom:1.5px solid var(--dim);transform:rotate(-45deg);transition:transform .18s}.rate-detail[open]>summary::before{transform:rotate(45deg)}.rate-detail>summary:hover{background:#fafaf7;color:var(--text)}.rate-detail-hint{font-size:9px;color:var(--dim2);font-weight:400}.rate-detail-body{overflow:auto;border-top:1px solid var(--border)}
+@media(max-width:560px){.rate-card{grid-template-columns:80px 1fr auto;gap:0 8px}.rate-today{font-size:14px}.rate-chip{padding:1px 5px}.rate-pill{margin-left:8px}}
 @media(min-width:1280px) and (min-height:800px){.dashboard-shell{padding:12px 18px;grid-template-rows:46px 68px auto minmax(440px,1fr);gap:8px}.command-bar{height:46px}.controls{flex-wrap:nowrap}.data-workspace{min-height:0}}
 @media(max-width:1279px), (max-height:799px){.dashboard-shell{height:auto}.chart-workspace{grid-template-rows:repeat(3,280px);max-height:none}.data-workspace{height:auto;min-height:440px}.workspace-panel{min-height:400px}.workspace-panel.active{display:flex}}
 @media(max-width:820px){.command-bar{align-items:flex-start;flex-direction:column;position:static;background:transparent;padding-top:0}.command-brand{width:100%;flex-wrap:wrap}.meta{order:3;width:100%;white-space:normal}.controls{width:100%}.metric-strip{grid-template-columns:repeat(3,1fr)}.chart-workspace{grid-template-columns:1fr;grid-template-rows:repeat(6,240px)}.chart-trend,.chart-users,.chart-models,.chart-hourly,.chart-hmodel,.chart-profile{grid-column:1;grid-row:auto}.detail-tools{grid-template-columns:1fr 1fr}.detail-search{grid-column:1/-1}.detail-reset{width:100%}}
@@ -7916,7 +7985,15 @@ td{padding:8px 12px;font-size:11px;border-bottom:1px solid #ecece8;white-space:n
     </div></section>
     <section id="workspace-panel-rates" role="tabpanel" aria-labelledby="workspace-tab-rates" class="workspace-panel" hidden><div class="workspace-panel-inner">
       <div class="workspace-panel-head"><strong>配额倍率</strong><span class="workspace-panel-summary" id="rateBoardContext"></span></div>
-      <div class="workspace-panel-scroll"><table id="rateBoardTable"><thead><tr><th>模型</th><th>方案</th><th>别名</th><th class="n">当前倍率</th><th class="n">高峰</th><th class="n">低谷</th><th class="n">今日实际</th><th class="n">今日计入</th><th class="n">今日请求</th></tr></thead><tbody id="rateBoardBody"></tbody></table></div>
+      <div class="workspace-panel-scroll">
+        <div class="rate-cards" id="rateBoardCards"></div>
+        <details class="rate-detail" id="rateBoardDetail">
+          <summary>配置明细<span class="rate-detail-hint">每 方案×模型 的峰/谷倍率与今日实际、计入</span></summary>
+          <div class="rate-detail-body">
+            <table id="rateBoardTable"><thead><tr><th>模型</th><th>方案</th><th>别名</th><th>峰/谷</th><th class="n">今日实际</th><th class="n">今日计入</th><th class="n">今日请求</th></tr></thead><tbody id="rateBoardBody"></tbody></table>
+          </div>
+        </details>
+      </div>
     </div></section>
     <section id="workspace-panel-errors" role="tabpanel" aria-labelledby="workspace-tab-errors" class="workspace-panel" hidden><div id="errorSec">
       <div class="workspace-panel-head"><span class="sec-toggle" id="errorSecIcon"></span><strong>错误记录</strong><span id="errorCount" style="font-size:10px;color:var(--red)"></span><span class="workspace-panel-summary" id="errorHint">暂无错误</span><button id="clearErrors" class="clear-btn">清除</button></div>
@@ -8034,40 +8111,107 @@ function renderWorkspaceSummaries(){
   const board=Array.isArray(D.modelRateBoard)?D.modelRateBoard:[];
   document.getElementById("workspaceCountRates").textContent=board.filter(r=>r.custom).length;
 }
+// Fold a model's aliases + peak-aliases (across all its profiles) into compact
+// chips; the tail collapses to "+N". Peak-only aliases carry a 峰 marker.
+function rateAliasChips(entries){
+  const seen=new Set(),list=[];
+  for(const r of entries){
+    for(const a of r.aliases){const k='A'+a;if(seen.has(k))continue;seen.add(k);list.push({t:a,pk:false});}
+    for(const a of r.peakAliases){const k='P'+a;if(seen.has(k))continue;seen.add(k);list.push({t:a,pk:true});}
+  }
+  if(!list.length)return '<span class="rate-noalias">未被别名引用</span>';
+  const shown=list.slice(0,3);
+  const dots=shown.map(x=>'<span class="chip" title="'+escH(x.t)+(x.pk?'（高峰别名）':'')+'">'+escH(x.t)+(x.pk?'<i class="pk">峰</i>':'')+'</span>').join(' ');
+  const rest=list.length-shown.length;
+  return dots+(rest>0?' <span class="chip chip-more" title="'+escH(list.slice(3).map(x=>x.t+(x.pk?'(峰)':'')).join(', '))+'">+'+rest+'</span>':'');
+}
 // Model rate board. The chart above can only plot one number per model, so the
-// answer to "which model is draining quota" lives here: configured peak/off-peak
-// side by side with what today actually cost.
+// answer to "which model is draining quota" lives here. Primary view is a ranked
+// bar list of today's weighted quota by model (the number an admin is checking);
+// a collapsed detail table keeps the precise per (profile × model) peak/off-peak
+// rates for verifying overrides.
 function renderRateBoard(){
-  const body=document.getElementById("rateBoardBody"),ctx=document.getElementById("rateBoardContext");
-  if(!body)return;
+  const body=document.getElementById("rateBoardBody"),
+        cards=document.getElementById("rateBoardCards"),
+        ctx=document.getElementById("rateBoardContext");
+  if(!cards||!body)return;
   const rows=Array.isArray(D.modelRateBoard)?D.modelRateBoard:[];
-  if(!rows.length){body.innerHTML='<tr><td colspan="9" class="empty">暂无模型 — 先在设置页配置模型别名</td></tr>';if(ctx)ctx.textContent="";return}
-  const inPeak=rows[0].inPeak;
+  const emptyMsg='暂无模型 — 先在设置页配置模型别名';
+  if(!rows.length){
+    body.innerHTML='<tr><td colspan="7" class="empty">'+emptyMsg+'</td></tr>';
+    cards.innerHTML='<div class="rate-empty">'+emptyMsg+'</div>';
+    if(ctx)ctx.textContent="";
+    return;
+  }
   const customCount=rows.filter(r=>r.custom).length;
   const totalRaw=rows.reduce((s,r)=>s+r.todayRaw,0),totalW=rows.reduce((s,r)=>s+r.todayWeighted,0);
+  // 顶部摘要（pill 行）：时段 + 单独定价数 + 今日综合倍率 + 实际→计入
   if(ctx){
+    const inPeak=rows[0].inPeak;
+    const segColor=inPeak?'var(--orange)':'var(--green)';
     const blended=totalRaw>0?Math.round(totalW/totalRaw*100)/100:null;
-    ctx.innerHTML='当前 <b style="color:'+(inPeak?'var(--orange)':'var(--green)')+'">'+(inPeak?'高峰时段':'低谷时段')+'</b>'
-      +' · '+customCount+'/'+rows.length+' 个模型单独定价'
-      +(blended!=null?' · 今日综合 ×'+blended+'（实际 '+fmtTk(totalRaw)+' → 计入 '+fmtTk(totalW)+'）':'');
+    ctx.innerHTML='<span class="rate-pill"><i class="dot" style="background:'+segColor+'"></i><b style="color:'+segColor+'">'+(inPeak?'高峰时段':'低谷时段')+'</b></span>'
+      +'<span class="rate-pill">'+customCount+'/'+rows.length+' 单独定价</span>'
+      +(blended!=null?'<span class="rate-pill">今日综合 ×'+blended+'</span>':'')
+      +(blended!=null?'<span class="rate-pill">实际 '+fmtTk(totalRaw)+' → 计入 '+fmtTk(totalW)+'</span>':'');
   }
-  body.innerHTML=rows.map(r=>{
+  // ① 主视图：按 model 聚合（同模型跨方案合并），按今日计入降序
+  const byModel=new Map();
+  for(const r of rows){
+    let m=byModel.get(r.model);
+    if(!m){m={model:r.model,todayWeighted:0,todayRaw:0,todayRequests:0,entries:[],custom:false};byModel.set(r.model,m);}
+    m.todayWeighted+=r.todayWeighted;m.todayRaw+=r.todayRaw;m.todayRequests+=r.todayRequests;
+    m.entries.push(r);if(r.custom)m.custom=true;
+  }
+  const models=[...byModel.values()].sort((a,b)=>b.todayWeighted-a.todayWeighted||b.todayRaw-a.todayRaw||a.model.localeCompare(b.model));
+  const maxW=Math.max(0,...models.map(m=>m.todayWeighted));
+  cards.innerHTML=models.map(m=>{
+    const hasTraffic=m.todayWeighted>0;
+    // Dominant profile today → its current effective rate drives the chip.
+    const dom=m.entries.sort((a,b)=>b.todayWeighted-a.todayWeighted)[0];
+    const rate=dom.rate;
+    const pct=maxW>0?Math.max(2,Math.round(m.todayWeighted/maxW*100)):0;
+    const profileTip=m.entries.map(r=>escH(r.profile)+'：峰×'+r.peak+' / 谷×'+r.offPeak+(r.custom?'（单独定价）':'')).join('　');
     // Realised ratio can differ from the configured rate: the day may straddle a
     // peak boundary, or a rate may have been changed mid-day. Flag it rather than
     // hiding it — a mismatch is information, not an error.
+    const realised=m.todayRaw>0?Math.round(m.todayWeighted/m.todayRaw*100)/100:null;
+    const drift=realised!=null&&Math.abs(realised-rate)>0.001;
+    const rateCol=rate>1?'var(--orange)':rate<1?'var(--green)':'var(--text)';
+    const chip='<span class="rate-chip" style="color:'+rateCol+';border-color:'+rateCol+'" title="'+profileTip+'">'
+      +(rate===1?'×1':'×'+rate+'<i class="pk">'+(dom.inPeak||rows[0].inPeak?'峰':'谷')+'</i>')+'</span>';
+    const customTag=m.custom?' <span class="rate-tag">单独定价</span>':'';
+    const profTag=m.entries.length>1?' <span class="rate-profn">'+m.entries.length+' 方案</span>':'';
+    const driftNote=drift?'<span class="rate-drift" title="今日实际计权比例与当前倍率不同：跨了高峰边界或期间调整过倍率">实收 ×'+realised+'</span>':'';
+    return '<div class="rate-card'+(m.custom?' rate-custom':'')+(hasTraffic?'':' rate-zero')+'" title="'+profileTip+'">'
+      +'<div class="rate-bar"><i style="width:'+pct+'%"></i></div>'
+      +'<div class="rate-main">'
+        +'<div class="rate-topline"><b class="rate-name">'+escH(m.model)+'</b>'+customTag+profTag+driftNote+'</div>'
+        +'<div class="rate-alias">'+rateAliasChips(m.entries)+'</div>'
+      +'</div>'
+      +'<div class="rate-side">'
+        +'<div class="rate-nums"><span class="rate-today hl">'+(hasTraffic?fmtTk(m.todayWeighted):'–')+'</span><span class="rate-req">'+(hasTraffic?m.todayRequests+' 请求':'无今日用量')+'</span></div>'
+        +chip
+      +'</div>'
+      +'</div>';
+  }).join("");
+  // ② 配置明细表（可折叠，每 方案×模型 精确峰/谷）
+  body.innerHTML=rows.map(r=>{
     const realised=r.todayRaw>0?Math.round(r.todayWeighted/r.todayRaw*100)/100:null;
-    const drift=realised!=null&&realised!==r.rate;
+    const drift=realised!=null&&Math.abs(realised-r.rate)>0.001;
     const rateCol=r.rate>1?'var(--orange)':r.rate<1?'var(--green)':'var(--text)';
     const aliasText=[...r.aliases,...r.peakAliases.map(a=>a+'(峰)')].join(', ')||'<span style="color:var(--dim)">未被别名引用</span>';
+    const peakCell='<span'+(r.inPeak?' style="font-weight:650"':' style="color:var(--dim)"')+'>峰×'+r.peak+'</span>';
+    const offCell='<span'+(!r.inPeak?' style="font-weight:650"':' style="color:var(--dim)"')+'>谷×'+r.offPeak+'</span>';
     return '<tr'+(r.custom?' style="background:rgba(47,110,80,.035)"':'')+'>'
-      +'<td><b>'+escH(r.model)+'</b>'+(r.custom?' <span style="font-size:9px;color:var(--accent);border:1px solid var(--accent);border-radius:3px;padding:0 3px">单独定价</span>':' <span style="font-size:9px;color:var(--dim)">默认</span>')+'</td>'
+      +'<td><b>'+escH(r.model)+'</b>'+(r.custom?' <span class="rate-tag">单独定价</span>':'')+'</td>'
       +'<td style="font-size:11px;color:var(--dim)">'+escH(r.profile)+'</td>'
-      +'<td style="font-size:11px;color:var(--blue)">'+aliasText+'</td>'
+      +'<td style="font-size:11px;color:var(--blue);max-width:300px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="'+escH(aliasText.replace(/<[^>]*>/g,''))+'">'+aliasText+'</td>'
       +'<td class="n"><b style="color:'+rateCol+'">×'+r.rate+'</b>'
-        +(drift?' <span style="font-size:10px;color:var(--dim)" title="今日实际计权比例与当前倍率不同：跨了高峰边界或期间调整过倍率">实收 ×'+realised+'</span>':'')+'</td>'
-      +'<td class="n"'+(inPeak?' style="font-weight:600"':' style="color:var(--dim)"')+'>×'+r.peak+'</td>'
-      +'<td class="n"'+(!inPeak?' style="font-weight:600"':' style="color:var(--dim)"')+'>×'+r.offPeak+'</td>'
-      +'<td class="n">'+(r.todayRaw?fmtTk(r.todayRaw):'-')+'</td>'
+        +(drift?' <span style="font-size:9px;color:var(--dim)" title="今日实际计权比例与当前倍率不同：跨了高峰边界或期间调整过倍率">实收 ×'+realised+'</span>':'')
+        +'<div style="font-size:9px;color:var(--dim);margin-top:1px">'+peakCell+' / '+offCell+'</div>'
+      +'</td>'
+      +'<td class="n" style="color:var(--dim)">'+(r.todayRaw?fmtTk(r.todayRaw):'-')+'</td>'
       +'<td class="n hl">'+(r.todayWeighted?fmtTk(r.todayWeighted):'-')+'</td>'
       +'<td class="n">'+(r.todayRequests||'-')+'</td>'
       +'</tr>';
@@ -9844,13 +9988,14 @@ function applySettings(formData) {
   // Update global users
   const newGlobalUsers = {};
   for (const [k, v] of Object.entries(formData)) {
-    // Existing global users: gu_un_<vk>, gu_ex_<vk>, gu_dis_<vk>
+    // Existing global users: gu_un_<vk>, gu_ex_<vk>, gu_dis_<vk>, gu_su_<vk>
     if (k.startsWith("gu_un_") && !k.startsWith("gu_un_new_")) {
       const vk = k.slice(6);
       newGlobalUsers[vk] = {
         username: v || vk.slice(0, 8),
         expiresAt: formData["gu_ex_" + vk] || null,
         disabled: formData["gu_dis_" + vk] === "on",
+        superUser: formData["gu_su_" + vk] === "on",
       };
     }
     // New global users: gu_new_<vk> (hidden input with vk value)
@@ -9860,6 +10005,7 @@ function applySettings(formData) {
         username: formData["gu_un_new_" + vk] || vk.slice(0, 8),
         expiresAt: formData["gu_ex_new_" + vk] || null,
         disabled: formData["gu_dis_new_" + vk] === "on",
+        superUser: formData["gu_su_new_" + vk] === "on",
       };
     }
   }
@@ -11406,7 +11552,7 @@ const server = http.createServer((req, res) => {
         const newGlobalUsers = {};
         for (const u of users) {
           if (!u.key) continue;
-          newGlobalUsers[u.key] = { username: u.username || u.key.slice(0, 8), expiresAt: u.expiresAt || null, disabled: !!u.disabled };
+          newGlobalUsers[u.key] = { username: u.username || u.key.slice(0, 8), expiresAt: u.expiresAt || null, disabled: !!u.disabled, superUser: !!u.superUser };
         }
         config.users = { ...newGlobalUsers };
         // Determine which profile to update users for
@@ -11454,10 +11600,14 @@ const server = http.createServer((req, res) => {
         const added = Object.keys(newGlobalUsers).filter(k => !prevGlobalUsers[k]).length;
         const removed = Object.keys(prevGlobalUsers).filter(k => !newGlobalUsers[k]).length;
         const disabledGlobal = Object.entries(newGlobalUsers).filter(([k, v]) => v.disabled && !(prevGlobalUsers[k] || {}).disabled).length;
+        const suOn = Object.entries(newGlobalUsers).filter(([k, v]) => v.superUser && !((prevGlobalUsers[k] || {}).superUser)).length;
+        const suOff = Object.entries(newGlobalUsers).filter(([k, v]) => !v.superUser && ((prevGlobalUsers[k] || {}).superUser)).length;
         const parts = [];
         if (added) parts.push(`新增用户 ${added} 名`);
         if (removed) parts.push(`删除用户 ${removed} 名`);
         if (disabledGlobal) parts.push(`全局禁用 ${disabledGlobal} 名`);
+        if (suOn) parts.push(`设为超级用户 ${suOn} 名`);
+        if (suOff) parts.push(`取消超级用户 ${suOff} 名`);
         if (changes.length) parts.push(changes.slice(0, 12).join("；") + (changes.length > 12 ? ` 等 ${changes.length} 项变更` : ""));
         recordAdminAudit(req, "user.save", `/${targetSuffix}`, `保存用户管理（方案 /${targetSuffix}）：${parts.length ? parts.join("；") : "无实质变化"}`);
         res.writeHead(200, { "Content-Type": "application/json" });

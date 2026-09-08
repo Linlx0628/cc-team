@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>CC Team - 团队 AI 编码用量网关</title>
-<meta name="description" content="CC Team 是轻量的团队 AI 编码 API 网关，提供透明代理、用量监控、配额管理和多方案接入。">
+<meta name="description" content="CC Team 是轻量的团队 AI 编码 API 网关，同时支持 Claude Code（Anthropic Messages）与 Codex（OpenAI Responses），提供透明代理、用量监控、峰谷配额倍率、产出质量分析与多方案接入。">
 <link rel="icon" type="image/svg+xml" href="logo/favicon.svg">
 <link rel="stylesheet" href="style.css">
 </head>
@@ -26,9 +26,9 @@
   <section class="hero" id="hero">
     <div class="container hero-grid">
       <div class="hero-copy">
-        <p class="eyebrow">Single file gateway for AI coding teams</p>
+        <p class="eyebrow">Dual-protocol gateway for AI coding teams</p>
         <h1>CC Team</h1>
-        <p class="hero-lede">团队 AI 编码用量网关。一个 Node.js 进程处理透明代理、Token 统计、成员配额和多上游方案接入。</p>
+        <p class="hero-lede">团队 AI 编码用量网关。一个 Node.js 进程同时服务 Claude Code 与 Codex，处理透明转发、Token 统计、峰谷配额倍率、产出质量分析和多上游方案接入。</p>
         <div class="hero-actions">
           <a href="#deploy" class="btn btn-primary">快速部署</a>
           <a href="https://github.com/Linlx0628/cc-team" target="_blank" rel="noreferrer" class="btn btn-secondary">查看源码</a>
@@ -72,33 +72,48 @@
       <div class="feature-grid">
         <article>
           <p class="label">代理</p>
-          <h3>透明转发</h3>
-          <p>请求和响应保持原样，网关只处理虚拟 Key 映射、路由、配额与统计。</p>
+          <h3>双协议接入</h3>
+          <p>Claude Code 走 Anthropic Messages（<code>/v1/messages</code>），Codex 走 OpenAI Responses（<code>/v1/responses</code>）。两种协议的方案完全隔离，各自路由、各自 failover，互不接管。</p>
         </article>
         <article>
           <p class="label">密钥</p>
           <h3>成员隔离</h3>
-          <p>每个成员使用自己的 <code>jx-</code> 虚拟 Key，真实上游 Key 不暴露。</p>
+          <p>每位成员使用独立的 <code>jx-</code> 虚拟 Key，真实上游 Key 不暴露。把一个链接发给成员，即可按页面指引一键完成 Codex 接入。</p>
+        </article>
+        <article>
+          <p class="label">配额</p>
+          <h3>峰谷倍率</h3>
+          <p>方案级与成员级每日配额，北京时间零点重置。高峰/低谷按时段计权扣额，还可按模型单独定价，低谷与廉价模型自动更省额度。</p>
+        </article>
+        <article>
+          <p class="label">稳定性</p>
+          <h3>熔断与回切</h3>
+          <p>连续上游失败自动熔断并切换备选方案；冷却结束后自动探测回切，冷却时间指数退避。粘性会话把同一会话粘在同一方案上，保住缓存亲和。</p>
         </article>
         <article>
           <p class="label">监控</p>
           <h3>用量可视化</h3>
-          <p>按成员、模型、日期和小时查看 Token 消耗，管理员和个人页面分开呈现。</p>
+          <p>按成员、方案、模型、日期和小时统计 Token 用量。全部方案视图下配额按方案展开成一列列卡片，一屏看清各方案额度占用；个人页附 GitHub 风格年度使用日历。</p>
         </article>
         <article>
-          <p class="label">配额</p>
-          <h3>每日限额</h3>
-          <p>支持方案级和成员级配额，自动增长额度可覆盖高强度使用场景。</p>
+          <p class="label">质量</p>
+          <h3>产出质量工作区</h3>
+          <p>从工具调用流量提取净产出、失败率、重写率与 token 效率，项目自动识别。仅统计结构化指标，不存储任何代码内容；一键导出自包含 HTML 周期报告。</p>
         </article>
         <article>
-          <p class="label">客户端</p>
-          <h3>Claude Code 专用</h3>
-          <p>围绕 Anthropic Messages 请求路径设计，别名、配额和统计行为保持一致。</p>
+          <p class="label">成本</p>
+          <h3>等值成本</h3>
+          <p>Token 按可编辑的参考牌价折算 USD，按成员与方案统计，支持峰谷分时计价。空转与错误循环实时告警，直达已配置的通知渠道。</p>
         </article>
         <article>
-          <p class="label">稳定性</p>
-          <h3>熔断与限流</h3>
-          <p>连续上游失败自动熔断，配合并发和分钟级限流降低异常消耗。</p>
+          <p class="label">成员</p>
+          <h3>签到与加量</h3>
+          <p>每日签到随机奖励 token 进入当日临时加量；加量申请即时推送管理员，后台一键发放或驳回。图片识别桥接让纯文本模型也能"看"图。</p>
+        </article>
+        <article>
+          <p class="label">通知</p>
+          <h3>事件推送</h3>
+          <p>限流、熔断、failover 切换等故障与恢复事件实时推送到飞书、钉钉、企业微信、Server酱、Bark。全部管理操作记入审计日志，虚拟 Key 一律脱敏。</p>
         </article>
       </div>
     </div>
@@ -118,14 +133,19 @@
           </div>
           <pre class="code-block"><code>docker pull linlx/cc-team:latest
 
+mkdir -p cc-team-data/backups
+curl -fsSL https://raw.githubusercontent.com/Linlx0628/cc-team/master/config.example.json \
+  -o cc-team-data/config.json
+touch cc-team-data/data.db
+
 docker run -d \
   -p 6789:6789 \
-  -v cc-team-config:/app \
+  -v "$PWD/cc-team-data/config.json:/app/config.json" \
+  -v "$PWD/cc-team-data/data.db:/app/data.db" \
+  -v "$PWD/cc-team-data/backups:/app/backups" \
   --name cc-team \
-  linlx/cc-team:latest
-
-docker exec -it cc-team vi /app/config.json
-docker restart cc-team</code></pre>
+  linlx/cc-team:latest</code></pre>
+          <p class="deploy-note">升级容器时保留 <code>cc-team-data/</code> 目录即可，不要把卷挂到整个 <code>/app</code>。</p>
         </article>
         <article class="deploy-card">
           <div class="deploy-title">
@@ -139,12 +159,21 @@ cd cc-team
 
 # Windows
 start.bat</code></pre>
+          <p class="deploy-note">打开 <code>http://localhost:6789/settings</code> 完成上游、模型和成员配置。</p>
         </article>
       </div>
-      <div class="connect-card">
-        <h3>客户端接入</h3>
-        <pre class="code-block"><code>export ANTHROPIC_BASE_URL="http://localhost:6789"
+      <div class="connect-grid">
+        <div class="connect-card">
+          <h3>接入 Claude Code</h3>
+          <p>默认方案使用无后缀地址；指定方案时在地址中加入方案后缀（如 <code>/glm</code>），所有方案同时在线。</p>
+          <pre class="code-block"><code>export ANTHROPIC_BASE_URL="http://localhost:6789"
 export ANTHROPIC_API_KEY="jx-your-virtual-key"</code></pre>
+        </div>
+        <div class="connect-card">
+          <h3>接入 Codex</h3>
+          <p>成员打开 <code>http://&lt;服务器&gt;:6789/setup/&lt;虚拟Key&gt;</code>，按页面指引一键脚本或复制配置；模型目录由方案的别名自动生成。</p>
+          <pre class="code-block"><code>curl -fsSL "http://&lt;服务器&gt;:6789/api/codex-setup/jx-your-virtual-key" | sh</code></pre>
+        </div>
       </div>
     </div>
   </section>
@@ -158,15 +187,15 @@ export ANTHROPIC_API_KEY="jx-your-virtual-key"</code></pre>
       <div class="architecture">
         <div>
           <p class="label">Clients</p>
-          <strong>Claude Code</strong>
+          <strong>Claude Code &amp; Codex</strong>
         </div>
         <div>
           <p class="label">CC Team gateway</p>
-          <strong>路由, 统计, 配额, 别名, 熔断, 日志</strong>
+          <strong>双协议路由, 统计, 配额倍率, 熔断, 审计, 通知</strong>
         </div>
         <div>
           <p class="label">Upstreams</p>
-          <strong>Anthropic Messages 兼容上游</strong>
+          <strong>Anthropic Messages / OpenAI Responses 兼容上游</strong>
         </div>
       </div>
       <div class="page-links">

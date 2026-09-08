@@ -360,7 +360,17 @@ function buildProjectTrie(groups) {
   }
   return root;
 }
-const lastTwoLabel = (path) => path.length ? path.slice(-2).join("/") : LOCAL_LABEL;
+// 仓库根名:项目标签 = 仓库根目录名(单名字),不含尾部源码子目录。判定「进入仓库内容」
+// 的首个源码子目录,取其上一级即仓库根;无源码子目录则取最深目录。名册只收录几乎不可能
+// 作为仓库根的名字(src/tests/node_modules/...),避免把 app/docs 等真仓库根误判成源码层。
+const SOURCE_DIRS = new Set(["src","source","lib","libs","tests","test","spec","e2e","__tests__","fixtures","node_modules","build","dist","out","public","bin","target","coverage","vendor",".git",".github",".vscode",".idea",".claude",".next",".nuxt",".venv"].map(s=>s.toLowerCase()));
+function repoNameLabel(dirs){
+  const d = Array.isArray(dirs) ? dirs.filter(Boolean) : [];
+  if (!d.length) return LOCAL_LABEL;
+  let rootIdx = d.length - 1;
+  for (let i = 0; i < d.length; i++) if (SOURCE_DIRS.has(String(d[i]).toLowerCase())) { rootIdx = Math.max(0, i - 1); break; }
+  return d[rootIdx] || LOCAL_LABEL;
+}
 
 // 自 node 沿 ≥60% 主链下沉(深度 ≤MAX_DEPTH),返回路径段
 function descendChain(node, path) {
@@ -390,13 +400,13 @@ function deriveClusters(fileGroups) {
   const kids = [...root.children.values()].sort((a, b) => b.weight - a.weight);
   const rootRatio = kids.length && root.weight > 0 ? kids[0].weight / root.weight : 0;
   if (!kids.length || rootRatio >= DESCEND_RATIO) {
-    return [{ label: lastTwoLabel(descendChain(root, [])), groups }];
+    return [{ label: repoNameLabel(descendChain(root, [])), groups }];
   }
   const clusters = [], local = [];
   local.push(...root.items);   // 挂根条目(噪声空段/裸文件名)必须落桶,不得随分簇丢失
   for (const kid of kids) {
     const ratio = root.weight > 0 ? kid.weight / root.weight : 0;
-    if (ratio >= SPLIT_RATIO) clusters.push({ label: lastTwoLabel(descendChain(kid, [kid.seg])), groups: subtreeItems(kid) });
+    if (ratio >= SPLIT_RATIO) clusters.push({ label: repoNameLabel(descendChain(kid, [kid.seg])), groups: subtreeItems(kid) });
     else local.push(...subtreeItems(kid));
   }
   if (local.length || !clusters.length) clusters.push({ label: LOCAL_LABEL, groups: local });
@@ -414,8 +424,7 @@ function singleFileLabel(fp) {
   const segs = cleanFilePath(fp) || [];
   if (!segs.length) return LOCAL_LABEL;
   if (!ABS_PATH_RE.test(String(fp))) return segs[0];
-  const dir = segs.slice(0, -1);
-  return dir.length ? dir.slice(0, 2).join("/") : LOCAL_LABEL;
+  return repoNameLabel(segs.slice(0, -1));   // 去掉文件名段,取仓库根名
 }
 
 // 别名先套用(正则 test 标签,首个命中生效)再按名聚合:users 并集去重,files/lines/edits 求和;非法正则静默跳过

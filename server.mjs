@@ -6276,7 +6276,7 @@ ${((() => { const qa = stmts.quotaAdjustRecent.all(); return qa.length > 0 ? `<h
 <div class="alias-head rate" style="grid-template-columns:2fr 1fr 1fr 1fr 1fr 1fr 1fr auto"><span>模型名</span><span>输入</span><span>输出</span><span>缓存写</span><span>缓存读</span><span>高峰In</span><span>高峰Out</span><span></span></div>
 <div id="costRateRows"></div>
 <div style="display:flex;align-items:center;gap:10px;margin-top:8px">
-<button type="button" class="btn btn-outline btn-sm" onclick="addRateRow('', {input:0,output:0,cacheWrite:0,cacheRead:0})">＋添加模型价格</button>
+<button type="button" class="btn btn-outline btn-sm" onclick="addCostRateRow('', {input:0,output:0,cacheWrite:0,cacheRead:0})">＋添加模型价格</button>
 <button type="button" class="btn btn-primary btn-sm" onclick="saveProdSettings()">保存</button>
 <span class="note" id="prodSettingsMsg" style="margin:0"></span>
 </div>
@@ -7648,7 +7648,7 @@ try{if(sessionStorage.getItem('tm_return_pool_view')==='1'){sessionStorage.remov
 document.addEventListener("keydown",e=>{if(e.key==="Enter"&&e.target.tagName!=="TEXTAREA"&&e.target.tagName!=="INPUT")e.preventDefault()});
 // ─── 产出与成本设置(参考牌价表 + 产出解析开关;走 /api/production/settings,独立于 settings-save 表单)───
 const INITIAL_PROD=${JSON.stringify({ productionTracking: Object.assign({ enabled: true, storeFilePaths: true, costPeakHours: [], projectAliases: [] }, config.productionTracking || {}), costRates: config.costRates || DEFAULT_COST_RATES }).replace(/</g, "\\x3c")};
-function rateRow(m,r,i){
+function costRateRow(m,r,i){
   return '<div data-i="'+i+'" style="display:flex;gap:6px;margin:4px 0;align-items:center">'
     +'<input class="cr-model" value="'+h(m)+'" placeholder="模型名(支持前缀)" style="flex:2;min-width:0">'
     +'<input class="cr-in" type="number" step="0.01" min="0" value="'+Number(r.input||0)+'" placeholder="输入" style="flex:1;min-width:0">'
@@ -7659,7 +7659,7 @@ function rateRow(m,r,i){
     +'<input class="cr-pout" type="number" step="0.01" min="0" value="'+(r.peakOutput==null?'':r.peakOutput)+'" placeholder="峰Out" style="flex:1;min-width:0">'
     +'<button type="button" class="btn btn-outline btn-sm" onclick="this.parentElement.remove()">删</button></div>';
 }
-function addRateRow(m,r){document.getElementById('costRateRows').insertAdjacentHTML('beforeend',rateRow(m,r,document.querySelectorAll('#costRateRows > div').length))}
+function addCostRateRow(m,r){document.getElementById('costRateRows').insertAdjacentHTML('beforeend',costRateRow(m,r,document.querySelectorAll('#costRateRows > div').length))}
 // ─── costPeakList:峰谷计价时段编辑器(行 = 时/分×2 select,样式同 profile 的高峰时段编辑器)───
 // 收集后随 saveProdSettings 走 /api/production/settings;select 无 name,不混入 settings-save 表单。
 function costPeakOpt(n,sel){var out='';for(var i=0;i<n;i++){var v=String(i).padStart(2,'0');out+='<option value="'+v+'"'+(v===sel?' selected':'')+'>'+v+'</option>'}return out}
@@ -7714,8 +7714,8 @@ function saveProdSettings(){
   document.getElementById('projectAliasText').value=(INITIAL_PROD.productionTracking.projectAliases||[]).map(a=>a.pattern+'='+a.name).join('\\n');
   const rates=INITIAL_PROD.costRates||{};
   const names=Object.keys(rates);
-  if(names.length){names.forEach(m=>addRateRow(m,rates[m]))}
-  else{addRateRow('',{input:0,output:0,cacheWrite:0,cacheRead:0})}
+  if(names.length){names.forEach(m=>addCostRateRow(m,rates[m]))}
+  else{addCostRateRow('',{input:0,output:0,cacheWrite:0,cacheRead:0})}
 })();
 </script>
 </body></html>`;

@@ -9693,17 +9693,23 @@ function applySettings(formData) {
   setMeta("lastQuotaEval", ""); // Reset eval date so new config takes effect immediately
 
   // Check-in reward range & quota-request weekly cap (member gamification).
-  // Unchecked boxes submit nothing, so absence means OFF for both toggles.
-  if (!config.checkIn) config.checkIn = {};
-  config.checkIn.enabled = formData.checkInEnabled === "on";
-  const ciMin = parseInt(formData.checkInMin, 10);
-  const ciMax = parseInt(formData.checkInMax, 10);
-  if (Number.isFinite(ciMin) && ciMin >= 0) config.checkIn.minTokens = ciMin;
-  if (Number.isFinite(ciMax) && ciMax >= 0) config.checkIn.maxTokens = Math.max(ciMax, config.checkIn.minTokens || 0);
-  if (!config.quotaRequest) config.quotaRequest = {};
-  config.quotaRequest.enabled = formData.quotaRequestEnabled === "on";
-  const qrWk = parseInt(formData.quotaRequestWeeklyLimit, 10);
-  if (Number.isFinite(qrWk) && qrWk >= 0 && qrWk <= 1000) config.quotaRequest.weeklyLimit = qrWk;
+  // These live ONLY on the 全局数据管理 (global) form. Unchecked boxes submit
+  // nothing, so absence means OFF — but only for a global save. isGlobalOnlySave
+  // separates the two settings forms: the profile form (#settingsForm) carries
+  // profileName and must never clobber these toggles, otherwise saving any
+  // profile setting silently disables 每日签到 and 加量申请.
+  if (isGlobalOnlySave) {
+    if (!config.checkIn) config.checkIn = {};
+    config.checkIn.enabled = formData.checkInEnabled === "on";
+    const ciMin = parseInt(formData.checkInMin, 10);
+    const ciMax = parseInt(formData.checkInMax, 10);
+    if (Number.isFinite(ciMin) && ciMin >= 0) config.checkIn.minTokens = ciMin;
+    if (Number.isFinite(ciMax) && ciMax >= 0) config.checkIn.maxTokens = Math.max(ciMax, config.checkIn.minTokens || 0);
+    if (!config.quotaRequest) config.quotaRequest = {};
+    config.quotaRequest.enabled = formData.quotaRequestEnabled === "on";
+    const qrWk = parseInt(formData.quotaRequestWeeklyLimit, 10);
+    if (Number.isFinite(qrWk) && qrWk >= 0 && qrWk <= 1000) config.quotaRequest.weeklyLimit = qrWk;
+  }
 
   // Restrict default-group members to /v1 only (block direct /<suffix>/... access).
   // Default ON (undefined → enabled) to prevent bypassing failover to on-demand profiles.

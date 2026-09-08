@@ -6049,7 +6049,7 @@ ${errDiv}
 <div><label>URL 后缀 <span style="font-size:11px;color:var(--dim);font-weight:400">(所有方案必填)</span></label><input type="text" name="suffix" id="suffixInput" value="${escHtml(initialSuffix)}" placeholder="如: glm" oninput="updateAccessUrl()"></div>
 </div>
 <div class="row" id="responsesPathRow" style="${initialProfile.protocol === "responses" ? "" : "display:none"}">
-<div><label>Responses 出站端点 <span style="font-size:11px;color:var(--dim);font-weight:400">仅 Responses(Codex) 方案</span></label><input type="text" name="responsesPath" value="${escHtml(initialProfile.responsesPath || "/v1/responses")}" placeholder="/v1/responses 或 /responses"><span class="note">网关会把这个端点拼到上游地址后（多数上游用 /v1/responses；火山 Coding Plan 用 /responses）。</span></div>
+<div><label>Responses 出站端点 <span style="font-size:11px;color:var(--dim);font-weight:400">仅 Responses(Codex) 方案</span></label><input type="text" name="responsesPath" id="responsesPathInput" value="${escHtml(initialProfile.responsesPath || "/v1/responses")}" placeholder="/v1/responses 或 /responses"><span class="note">网关会把这个端点拼到上游地址后（多数上游用 /v1/responses；火山 Coding Plan 用 /responses）。</span></div>
 </div>
 <div class="note" id="accessUrlPreview" style="margin-top:8px;color:var(--green)">接入地址: http://&lt;host&gt;:6789/v1</div>
 <div class="presets">
@@ -7249,6 +7249,9 @@ async function editProfile(n){
   // upstreams fold cache hits into input_tokens) — hide it on Anthropic profiles.
   const cqF=document.getElementById('cacheReadQuotaField');if(cqF)cqF.style.display=(p.protocol==='responses')?'':'none';
   const cqN=document.getElementById('cacheReadQuotaNote');if(cqN)cqN.style.display=(p.protocol==='responses')?'':'none';
+  // Responses outbound endpoint is Responses-profile-only (hidden on Anthropic).
+  const rpF=document.getElementById('responsesPathRow');if(rpF)rpF.style.display=(p.protocol==='responses')?'':'none';
+  const rpI=document.getElementById('responsesPathInput');if(rpI)rpI.value=p.responsesPath||'/v1/responses';
   const bt=fm.querySelector('select[name="billingType"]');if(bt)bt.value=p.billingType||'on_demand';
   renderPeakHoursRows(p.peakHours||[]);
   refreshBridgeSelect(p);

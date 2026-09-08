@@ -871,6 +871,7 @@ function listProfiles() {
     isDefault: !!config.profiles[name].isDefault,
     billingType: config.profiles[name].billingType || "on_demand",
     upstream: config.profiles[name].upstream,
+    responsesPath: config.profiles[name].responsesPath || "/v1/responses",
     userCount: Object.keys(config.profiles[name].users || {}).length,
     allowedModels: config.profiles[name].allowedModels || [],
     modelAliases: getConfigurableModelAliases(config.profiles[name]),
@@ -1024,6 +1025,7 @@ function createProfileRuntime(profileName, profile) {
     profileName,
     suffix: normalizeProfileSuffix(profile.suffix),
     protocol: normalizeProfileProtocol(profile.protocol),
+    responsesPath: profile.responsesPath || "/v1/responses",
     isDefault: !!profile.isDefault,
     billingType: profile.billingType || "on_demand",
     quotaPool: resolvePoolName(profileName),
@@ -2912,7 +2914,6 @@ function handleLocalModelsRequest(req, res, inbound) {
 // responses-protocol profile or fail with a clear cross-protocol error.
 function resolveResponsesProfile(inbound, url) {
   const query = url.includes("?") ? url.slice(url.indexOf("?")) : "";
-  const strippedUrl = "/v1/responses" + query;
   if (inbound.suffix) {
     const runtime = runtimes[inbound.suffix];
     if (!runtime) return { error: `Unknown profile suffix "${inbound.suffix}"` };
@@ -2921,10 +2922,16 @@ function resolveResponsesProfile(inbound, url) {
         error: `方案 "${runtime.profileName}" 是 Anthropic Messages 方案，不能通过 /v1/responses 访问。请为 Codex 创建 protocol 为 responses 的方案。`,
       };
     }
+    // responsesPath is the upstream-relative endpoint segment the gateway should
+    // post the Responses body to. Almost every provider exposes base + "/v1/responses",
+    // but some (e.g. Volcano Coding Plan) expose base + "/responses"; allowing it to
+    // override per-profile lets those upstreams work without touching the client path.
+    const strippedUrl = (runtime.responsesPath || "/v1/responses") + query;
     return { suffix: inbound.suffix, runtime, strippedUrl, isDefaultEntry: false };
   }
   const runtime = getResponsesDefaultRuntime();
   if (!runtime) return { noResponsesProfile: true };
+  const strippedUrl = (runtime.responsesPath || "/v1/responses") + query;
   return { suffix: runtime.suffix, runtime, strippedUrl, isDefaultEntry: true };
 }
 
@@ -6041,6 +6048,9 @@ ${errDiv}
 <div><label>上游 API 地址<span class="req">*</span></label><input type="text" name="upstream" value="${s.upstream}" placeholder="https://open.bigmodel.cn/api/anthropic"></div>
 <div><label>URL 后缀 <span style="font-size:11px;color:var(--dim);font-weight:400">(所有方案必填)</span></label><input type="text" name="suffix" id="suffixInput" value="${escHtml(initialSuffix)}" placeholder="如: glm" oninput="updateAccessUrl()"></div>
 </div>
+<div class="row" id="responsesPathRow" style="${initialProfile.protocol === "responses" ? "" : "display:none"}">
+<div><label>Responses 出站端点 <span style="font-size:11px;color:var(--dim);font-weight:400">仅 Responses(Codex) 方案</span></label><input type="text" name="responsesPath" value="${escHtml(initialProfile.responsesPath || "/v1/responses")}" placeholder="/v1/responses 或 /responses"><span class="note">网关会把这个端点拼到上游地址后（多数上游用 /v1/responses；火山 Coding Plan 用 /responses）。</span></div>
+</div>
 <div class="note" id="accessUrlPreview" style="margin-top:8px;color:var(--green)">接入地址: http://&lt;host&gt;:6789/v1</div>
 <div class="presets">
   <span style="font-size:11px;color:var(--dim);line-height:24px">快速填充：</span>
@@ -6542,6 +6552,10 @@ ${s.profiles.map(p => `<option value="${escHtml(p.suffix)}" ${p.suffix === initi
 </select>
 <div class="note" id="newProfileProtocolNote">Claude Code 走 /v1/messages；Codex 走 /v1/responses。两种协议的方案完全隔离。</div>
 <label>上游 API 地址<span class="req">*</span></label><input type="text" id="newProfileUpstream" value="${escHtml(initialProfile.upstream || s.upstream || "")}" placeholder="https://open.bigmodel.cn/api/anthropic">
+<div id="newProfileResponsesPathBlock" style="display:none">
+<label>Responses 出站端点</label><input type="text" id="newProfileResponsesPath" value="/v1/responses" placeholder="/v1/responses 或 /responses">
+<div class="note">默认 /v1/responses；热点：火山 Coding Plan 是 /responses。</div>
+</div>
 <label>所属额度池</label>
 <select id="newProfilePool">
   <option value="">＋ 新建额度池（与方案同名，独立额度）</option>
@@ -7250,6 +7264,7 @@ function updateNewProfileProtocolHint(){
   var isResp=document.getElementById('newProfileProtocol').value==='responses';
   document.getElementById('newProfileUpstream').placeholder=isResp?'https://open.bigmodel.cn/api/v1':'https://open.bigmodel.cn/api/anthropic';
   document.getElementById('newProfileProtocolNote').textContent=isResp?'Codex 走 /v1/responses，上游必须是原生 Responses 端点（如智谱 /api/v1）。':'Claude Code 走 /v1/messages；Codex 走 /v1/responses。两种协议的方案完全隔离。';
+  document.getElementById('newProfileResponsesPathBlock').style.display=isResp?'':'none';
 }
 async function createProfile(){
   const name=document.getElementById('newProfileName').value.trim();
@@ -7259,7 +7274,8 @@ async function createProfile(){
   if(!name||!suffix||!upstream){alert('方案名称、URL 后缀和上游 API 地址必填');return}
   const r=await fetch('/api/profile/save',{method:'POST',headers:csrfHeaders({'Content-Type':'application/json'}),body:JSON.stringify({
     profile:name,suffix:suffix,upstream:upstream,
-    protocol:protocol,quotaPool:document.getElementById('newProfilePool')?.value||''
+    protocol:protocol,quotaPool:document.getElementById('newProfilePool')?.value||'',
+    responsesPath:protocol==='responses'?(document.getElementById('newProfileResponsesPath').value||'').trim():''
   })});
   if(r.ok)toastThen('方案已创建 — 点击左侧方案配置模型别名',()=>location.reload());else{const e=await r.json();alert('创建失败: '+e.error)}
 }
@@ -9590,6 +9606,14 @@ function applySettings(formData) {
     console.log(`[CONFIG] Upstream updated: ${editingProfile.upstream}`);
   }
 
+  // Responses outbound endpoint segment (default "/v1/responses"). Only
+  // meaningful for responses-protocol profiles; the form hides the field for
+  // anthropic profiles, so absence here means "don't touch".
+  if (formData.responsesPath !== undefined && normalizeProfileProtocol(editingProfile.protocol) === "responses") {
+    const v = String(formData.responsesPath).trim().replace(/\/+$/, "");
+    editingProfile.responsesPath = v ? (v.startsWith("/") ? v : `/${v}`) : undefined;
+  }
+
   if (formData.suffix !== undefined) {
     const nextSuffix = validateProfileSuffix(formData.suffix, editingProfileName);
     const oldSuffix = editingProfile.suffix;
@@ -10306,7 +10330,7 @@ const server = http.createServer((req, res) => {
     if (!checkCsrf(req)) { res.writeHead(403); res.end("CSRF validation failed"); return; }
     readBody(req).then(buf => {
       try {
-        const { profile, upstream, allowedModels, suffix, modelAliases, billingType, protocol, quotaPool } = JSON.parse(buf.toString());
+        const { profile, upstream, allowedModels, suffix, modelAliases, billingType, protocol, quotaPool, responsesPath } = JSON.parse(buf.toString());
         const name = (profile || "").trim();
         if (!name) throw new Error("Profile name required");
         if (config.profiles[name]) throw new Error(`方案 "${name}" 已存在`);
@@ -10341,6 +10365,7 @@ const server = http.createServer((req, res) => {
           suffix: sfx,
           protocol: proto,
           isDefault: false,
+          responsesPath: proto === "responses" && responsesPath ? String(responsesPath).trim() : undefined,
           billingType: validBilling,
           quotaPool: poolName,
           peakHours: [],

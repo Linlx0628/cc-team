@@ -507,6 +507,18 @@ function normalizeQuotaRate(value) {
   return Math.round(Math.min(QUOTA_RATE_MAX, Math.max(0, n)) * 100) / 100;
 }
 
+// Cache-hit quota share (per profile). Responses/OpenAI upstreams report cached
+// reads INSIDE input_tokens (cached_tokens is the subset); this is the fraction
+// of that cache-read slice that still counts toward quota. 0 = mirror Anthropic
+// (cache hits free — the default), 1 = legacy (cache billed in full), 0..1 =
+// partial. A no-op on anthropic-protocol profiles, whose input_tokens never
+// contain cache reads in the first place.
+function normalizeCacheReadQuotaRate(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n) || n <= 0) return 0;
+  return Math.round(Math.min(1, Math.max(0, n)) * 100) / 100;
+}
+
 // Per-model overrides, keyed by the REAL upstream model name (not the alias):
 // { "glm-5.3-flash": { peak: 0.3, offPeak: 0.15 } }
 // Real model names are what recordUsage receives from the upstream response and
@@ -872,6 +884,7 @@ function listProfiles() {
     peakQuotaRate: normalizeQuotaRate(config.profiles[name].peakQuotaRate),
     offPeakQuotaRate: normalizeQuotaRate(config.profiles[name].offPeakQuotaRate),
     modelQuotaRates: normalizeModelQuotaRates(config.profiles[name].modelQuotaRates),
+    cacheReadQuotaRate: normalizeCacheReadQuotaRate(config.profiles[name].cacheReadQuotaRate),
     configured: !!config.profiles[name].upstream,
     inDefaultGroup: group.includes(name),
     groupOrder: group.indexOf(name),
@@ -1023,6 +1036,7 @@ function createProfileRuntime(profileName, profile) {
     peakQuotaRate: normalizeQuotaRate(profile.peakQuotaRate),
     offPeakQuotaRate: normalizeQuotaRate(profile.offPeakQuotaRate),
     modelQuotaRates: normalizeModelQuotaRates(profile.modelQuotaRates),
+    cacheReadQuotaRate: normalizeCacheReadQuotaRate(profile.cacheReadQuotaRate),
     peakModelAliases: normalizeModelAliases(profile.peakModelAliases || {}),
     globalUsers: { ...(config.users || {}) },
     breaker: new CircuitBreaker({
@@ -1063,6 +1077,9 @@ function reloadAllRuntimes() {
   for (const rt of Object.values(runtimes)) rt.agent.destroy();
   initAllRuntimes();
   syncDefaultRuntime();
+  // Pooled-usage prepared statements are cached per member count; drop them so a
+  // code/config reload re-prepares with the current column set (e.g. cache_read).
+  pooledUsageStmts.clear();
 }
 
 // Global proxy settings (shared across profiles)
@@ -1982,7 +1999,7 @@ const RATE_LIMIT_META_KEY = "rateLimitState";
 
 class RateLimitedError extends Error {
   constructor(resumeAt, source, message) {
-    super(message || `rate limited until ${new Date(resumeAt).toISOString()}`);
+    super(message || `rate limited until ${beijingTimeString(new Date(resumeAt))}`);
     this.name = "RateLimitedError";
     this.isRateLimited = true;
     this.resumeAt = resumeAt;
@@ -2005,7 +2022,7 @@ function markRateLimited(profileName, resumeAtMs, source) {
   // limited, every subsequent 429 just refreshes the same state.
   if (!prev || Date.now() >= prev.resumeAt) {
     recordAudit("system", "ratelimit.mark", profileName,
-      `方案 "${profileName}" 被上游限流（来源: ${source || "unknown"}），暂停至 ${new Date(resumeAtMs).toISOString()}，后续请求自动切换到备选方案`);
+      `方案 "${profileName}" 被上游限流（来源: ${source || "unknown"}），暂停至 ${beijingTimeString(new Date(resumeAtMs))}，后续请求自动切换到备选方案`);
   }
 }
 
@@ -2981,7 +2998,20 @@ function recordUsage(apiKey, usage, model, suffix, _rt) {
   // the rate comes from the completion instant (same convention as cnHour()
   // above), so a request spanning a peak boundary is priced by where it finished.
   const rate = currentQuotaRate(runtime, new Date(), m);
-  const weighted = Math.round((inp + out) * rate);
+  // Cache-hit accounting, aligned to the Anthropic protocol. Anthropic upstreams
+  // report cache reads SEPARATELY and never inside input_tokens, so their quota
+  // basis is already cache-free. Responses/OpenAI upstreams fold the cache-hit
+  // slice INTO input_tokens — before this, a Codex replay loop paid full price
+  // for ~95% cache hits on every turn. Strip that slice from the quota basis
+  // (mirroring Anthropic) unless the profile opts back in via cacheReadQuotaRate
+  // (>0 keeps a fraction billable). inp/cacheC/cacheR/out are still stored raw,
+  // so stats/trends show true tokens; only the quota currency (weighted) changes.
+  // Guard: strip only when cacheR is a positive subset of inp — an upstream that
+  // already returns cache-excluded input (cacheR > inp) is treated as aligned.
+  const includedCache = (runtime?.protocol === "responses" && cacheR > 0 && cacheR <= inp) ? cacheR : 0;
+  const cacheReadQuotaRate = runtime?.cacheReadQuotaRate ?? 0;
+  const billableInp = inp - includedCache + Math.round(includedCache * cacheReadQuotaRate);
+  const weighted = Math.round((billableInp + out) * rate);
 
   const p = { profile: sfx, key, name: getUserName(key, runtime), inp, out, cacheC, cacheR, m, tokenTotal: inp + out, weighted, today, hour, now: new Date().toISOString() };
   const tx = db.transaction(() => {
@@ -3002,11 +3032,12 @@ function recordUsage(apiKey, usage, model, suffix, _rt) {
 // distinct pool size, not one per call.
 const pooledUsageStmts = new Map();
 function pooledUsageForQuota(suffixes, date, key) {
-  if (!suffixes.length) return { used: 0, raw: 0 };
+  if (!suffixes.length) return { used: 0, raw: 0, cr: 0 };
   let stmt = pooledUsageStmts.get(suffixes.length);
   if (!stmt) {
     const holes = suffixes.map(() => "?").join(",");
-    stmt = db.prepare(`SELECT COALESCE(SUM(weighted_tokens),0) AS used, COALESCE(SUM(input_tokens+output_tokens),0) AS raw
+    stmt = db.prepare(`SELECT COALESCE(SUM(weighted_tokens),0) AS used, COALESCE(SUM(input_tokens+output_tokens),0) AS raw,
+      COALESCE(SUM(cache_read),0) AS cr
       FROM usage_daily WHERE date=? AND user_key=? AND profile IN (${holes})`);
     pooledUsageStmts.set(suffixes.length, stmt);
   }
@@ -3064,13 +3095,26 @@ function checkTokenQuota(apiKey, suffix, _rt, model = null) {
   const pool = getPoolByName(poolName);
   const poolLabel = pool?.label || poolName;
 
+  // Cache-hit display context: whether EVERY pool member is a responses/OpenAI
+  // profile — i.e. cache reads arrive INSIDE input_tokens and are excluded from
+  // the quota basis by default (cacheReadQuotaRate). Only then may the UI state
+  // "缓存命中不计入配额" truthfully instead of folding the gap into the generic
+  // 倍率 wording. A mixed anthropic+responses pool stays conservative (false).
+  const poolRts = suffixes.map((s) => runtimes[s]).filter(Boolean);
+  const poolAllResponses = poolRts.length > 0 && poolRts.every((r) => r.protocol === "responses");
+  const cacheRead = row.cr || 0;
+  const cacheInInput = poolAllResponses;
+  const cacheReadQuotaRate = poolAllResponses
+    ? Math.min(...poolRts.map((r) => (r.cacheReadQuotaRate != null ? r.cacheReadQuotaRate : 0)))
+    : 0;
+
   // Per-user pool quota overrides the pool-wide quota
   const userQuota = getUserPoolQuota(poolName, key);
   const poolQuota = getPoolQuota(poolName);
   const baseLimit = userQuota > 0 ? userQuota : poolQuota;
   const bonus = op.bonus > 0 ? op.bonus : 0;
   const shared = suffixes.length > 1;
-  const meta = { rawUsed, discounted, rate, rateIsDefault, inPeak, model, pool: poolName, poolLabel, poolProfiles: suffixes, poolShared: shared };
+  const meta = { rawUsed, discounted, rate, rateIsDefault, inPeak, model, cacheRead, cacheInInput, cacheReadQuotaRate, pool: poolName, poolLabel, poolProfiles: suffixes, poolShared: shared };
 
   if (baseLimit <= 0) {
     return { allowed: true, limit: 0, used, remaining: Infinity, source: "无限制", bonus: 0, resetApplied: !!baseline, ...meta };
@@ -3107,6 +3151,11 @@ function quotaExceededMessage(quota, runtime, usageUrl) {
   if (skew !== 0) {
     lines.push(`实际 token ${quota.rawUsed.toLocaleString()}，` +
       (skew > 0 ? `已抵扣 ${skew.toLocaleString()}` : `已加收 ${(-skew).toLocaleString()}`));
+  }
+  if (quota.cacheInInput && (quota.cacheRead || 0) > 0 && (quota.cacheReadQuotaRate ?? 0) < 1) {
+    lines.push((quota.cacheReadQuotaRate > 0
+      ? `缓存命中 ${quota.cacheRead.toLocaleString()} 按 ×${quota.cacheReadQuotaRate} 计入`
+      : `缓存命中 ${quota.cacheRead.toLocaleString()} 不计入配额（Responses 已对齐 Anthropic 口径）`));
   }
   if (weighted) {
     const slot = quota.inPeak ? "高峰" : "低谷";
@@ -3660,8 +3709,8 @@ const NOTIFY_TIMEOUT_MS = 5000;
 const notifyIncidents = new Map(); // head → { openedAt }
 let notifyLastPushAt = 0;          // global "time since any push" floor for minIntervalSeconds
 
-function beijingTimeString() {
-  return new Date().toLocaleString("zh-CN", { timeZone: "Asia/Shanghai", hour12: false });
+function beijingTimeString(d = new Date()) {
+  return new Date(d).toLocaleString("zh-CN", { timeZone: "Asia/Shanghai", hour12: false });
 }
 
 function postHttpRequest(url, { body, contentType, timeoutMs = NOTIFY_TIMEOUT_MS } = {}) {
@@ -3887,7 +3936,7 @@ function getProfilePersonalUsage(apiKey, suffix, runtime) {
   return {
     profile: runtime.profileName,
     profileSuffix: suffix,
-    quota: { type: quota.source, limit: quota.limit, used: quota.used, remaining: quota.remaining, autoAdjusted: quotaAutoAdjusted, bonus: quota.bonus || 0, resetApplied: !!quota.resetApplied, rawUsed: quota.rawUsed, discounted: quota.discounted, rate: quota.rate, rateIsDefault: true, inPeak: quota.inPeak, nextRateChange: nextRateChangeHint(runtime), pool: quota.pool, poolLabel: quota.poolLabel, poolProfiles: quota.poolProfiles || [], poolShared: !!quota.poolShared },
+    quota: { type: quota.source, limit: quota.limit, used: quota.used, remaining: quota.remaining, autoAdjusted: quotaAutoAdjusted, bonus: quota.bonus || 0, resetApplied: !!quota.resetApplied, rawUsed: quota.rawUsed, discounted: quota.discounted, rate: quota.rate, rateIsDefault: true, inPeak: quota.inPeak, nextRateChange: nextRateChangeHint(runtime), cacheRead: quota.cacheRead, cacheInInput: !!quota.cacheInInput, cacheReadQuotaRate: quota.cacheReadQuotaRate, pool: quota.pool, poolLabel: quota.poolLabel, poolProfiles: quota.poolProfiles || [], poolShared: !!quota.poolShared },
     // Price list for the current slot: every alias the user can call, with the
     // rate it costs right now. This is the answer to "为什么我的额度掉得这么快" —
     // the user can see which model is expensive BEFORE spending on it.
@@ -4041,6 +4090,9 @@ function getAggregatedPersonalUsage(apiKey, availableProfiles) {
       discounted: quota.discounted,
       rate: quota.rate,
       inPeak: quota.inPeak,
+      cacheRead: quota.cacheRead,
+      cacheInInput: !!quota.cacheInInput,
+      cacheReadQuotaRate: quota.cacheReadQuotaRate,
       nextRateChange: nextRateChangeHint(runtime),
     });
   }
@@ -5147,9 +5199,9 @@ function proxyRequest(req, res) {
           } else if (lastFailure.kind === "rate-limit") {
             const retryAfter = Math.max(1, Math.ceil((lastFailure.err.resumeAt - Date.now()) / 1000));
             sendOpenAiError(res, 429, "rate_limit_exceeded",
-              `所有可用方案均已限额，最早 ${new Date(lastFailure.err.resumeAt).toISOString()} 恢复。`,
+              `所有可用方案均已限额，最早 ${beijingTimeString(new Date(lastFailure.err.resumeAt))} 恢复。`,
               { "Retry-After": String(retryAfter) });
-            recordError(apiKey, 429, `all profiles rate-limited until ${new Date(lastFailure.err.resumeAt).toISOString()}`, req.url, reqModel, lastFailure.suffix, lastFailure.runtime);
+            recordError(apiKey, 429, `all profiles rate-limited until ${beijingTimeString(new Date(lastFailure.err.resumeAt))}`, req.url, reqModel, lastFailure.suffix, lastFailure.runtime);
           } else {
             const status = lastFailure.status;
             const label = status === 504 ? "Gateway Timeout" : status === 502 ? "Bad Gateway" : "Request Error";
@@ -5184,8 +5236,8 @@ function proxyRequest(req, res) {
         } else if (lastFailure.kind === "rate-limit") {
           const retryAfter = Math.max(1, Math.ceil((lastFailure.err.resumeAt - Date.now()) / 1000));
           res.writeHead(429, { "Content-Type": "application/json", "Retry-After": String(retryAfter) });
-          res.end(JSON.stringify({ type: "error", error: { type: "rate_limit_error", message: `所有可用方案均已限额，最早 ${new Date(lastFailure.err.resumeAt).toISOString()} 恢复。` } }));
-          recordError(apiKey, 429, `all profiles rate-limited until ${new Date(lastFailure.err.resumeAt).toISOString()}`, req.url, reqModel, lastFailure.suffix, lastFailure.runtime);
+          res.end(JSON.stringify({ type: "error", error: { type: "rate_limit_error", message: `所有可用方案均已限额，最早 ${beijingTimeString(new Date(lastFailure.err.resumeAt))} 恢复。` } }));
+          recordError(apiKey, 429, `all profiles rate-limited until ${beijingTimeString(new Date(lastFailure.err.resumeAt))}`, req.url, reqModel, lastFailure.suffix, lastFailure.runtime);
         } else {
           const status = lastFailure.status;
           const label = status === 504 ? "Gateway Timeout" : status === 502 ? "Bad Gateway" : "Request Error";
@@ -6087,9 +6139,12 @@ ${(() => {
 <input type="number" name="peakQuotaRate" id="peakQuotaRateInput" value="${initialProfile.peakQuotaRate ?? 1}" min="0" max="${QUOTA_RATE_MAX}" step="0.05" style="width:120px"></div>
 <div><label>低谷时段倍率</label>
 <input type="number" name="offPeakQuotaRate" id="offPeakQuotaRateInput" value="${initialProfile.offPeakQuotaRate ?? 1}" min="0" max="${QUOTA_RATE_MAX}" step="0.05" style="width:120px"></div>
+<div id="cacheReadQuotaField" style="${initialProfile.protocol === "responses" ? "" : "display:none"}"><label>缓存命中计入比例</label>
+<input type="number" name="cacheReadQuotaRate" id="cacheReadQuotaRateInput" value="${initialProfile.cacheReadQuotaRate ?? 0}" min="0" max="1" step="0.05" style="width:120px"></div>
 </div>
 <div class="note" id="quotaRateHint" style="margin-top:8px"></div>
 <div class="note" style="margin-top:6px">1.0 = 按实际 token 计入配额；0.5 = 该时段消耗只扣一半额度。建议以「高峰期 Coding Plan 方案 = 1.0」为基准：套餐方案低谷可设 0.5，按量计费方案设 1.5~2.0 反映真实成本。<b>修改只影响之后的请求，已产生的消耗不会重算。</b></div>
+<div class="note" id="cacheReadQuotaNote" style="margin-top:4px;${initialProfile.protocol === "responses" ? "" : "display:none"}">「缓存命中计入比例」仅对 <b>Responses/Codex 方案</b>生效——这类上游把缓存命中折在 input_tokens 里；0 = 缓存命中不计入配额（默认，与 Anthropic 方案口径一致）；1 = 按旧行为全额计入；0.x = 按比例计入。Anthropic 方案的 input_tokens 本不含缓存读（缓存读单列、不进配额），无需此设置。</div>
 
 <label style="margin-top:16px">按模型单独定价（可选，覆盖上方默认倍率）</label>
 <div class="alias-toolbar">
@@ -6888,8 +6943,9 @@ function auditCatTag(c){
   return '';
 }
 function auditTime(iso){
-  const d=new Date(iso);function p(n){return String(n).padStart(2,'0')}
-  return d.getFullYear()+'-'+p(d.getMonth()+1)+'-'+p(d.getDate())+' '+p(d.getHours())+':'+p(d.getMinutes())+':'+p(d.getSeconds());
+  // 存储是 UTC ISO;展示一律北京时间(+8h 后取 UTC 字段,不依赖浏览器时区)。
+  const d=new Date(new Date(iso).getTime()+8*3600000);function p(n){return String(n).padStart(2,'0')}
+  return d.getUTCFullYear()+'-'+p(d.getUTCMonth()+1)+'-'+p(d.getUTCDate())+' '+p(d.getUTCHours())+':'+p(d.getUTCMinutes())+':'+p(d.getUTCSeconds());
 }
 async function loadAuditLog(reset){
   const status=document.getElementById('auditStatus');
@@ -7174,6 +7230,11 @@ async function editProfile(n){
   updatePoolSummary();
   const pqr=document.getElementById('peakQuotaRateInput');if(pqr)pqr.value=(p.peakQuotaRate??1);
   const oqr=document.getElementById('offPeakQuotaRateInput');if(oqr)oqr.value=(p.offPeakQuotaRate??1);
+  const cqr=document.getElementById('cacheReadQuotaRateInput');if(cqr)cqr.value=(p.cacheReadQuotaRate??0);
+  // cacheReadQuotaRate only means something on Responses/Codex profiles (OpenAI
+  // upstreams fold cache hits into input_tokens) — hide it on Anthropic profiles.
+  const cqF=document.getElementById('cacheReadQuotaField');if(cqF)cqF.style.display=(p.protocol==='responses')?'':'none';
+  const cqN=document.getElementById('cacheReadQuotaNote');if(cqN)cqN.style.display=(p.protocol==='responses')?'':'none';
   const bt=fm.querySelector('select[name="billingType"]');if(bt)bt.value=p.billingType||'on_demand';
   renderPeakHoursRows(p.peakHours||[]);
   refreshBridgeSelect(p);
@@ -7871,6 +7932,11 @@ const escH=s=>String(s??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"
 const fmtT=n=>n.toLocaleString("zh-CN");
 const fmtTk=n=>{if(n>=1e6)return(n/1e6).toFixed(1)+"M";if(n>=1e3)return(n/1e3).toFixed(1)+"k";return n.toString()};
 function fmtBJ(iso){if(!iso)return"-";const d=new Date(iso);const utc=d.getTime()+d.getTimezoneOffset()*60000;return new Date(utc+8*3600000).toLocaleString("zh-CN")};
+// Beijing wall-clock from a UTC/ISO instant: bjClock = MM-DD HH:mm (short,
+// used by the alert table); bjDateStr = YYYY-MM-DD Beijing day (for comparing
+// instants stored as UTC against a Beijing-date key).
+function bjClock(iso){if(!iso)return"-";const d=new Date(new Date(iso).getTime()+8*3600000);const p=n=>String(n).padStart(2,'0');return p(d.getUTCMonth()+1)+'-'+p(d.getUTCDate())+' '+p(d.getUTCHours())+':'+p(d.getUTCMinutes())}
+function bjDateStr(iso){if(!iso)return"";return new Date(new Date(iso).getTime()+8*3600000).toISOString().slice(0,10)}
 function ago(iso){if(!iso)return"-";const d=Date.now()-new Date(iso).getTime();const m=Math.floor(d/6e4);if(m<1)return"刚刚";if(m<60)return m+"分钟前";const h=Math.floor(m/60);if(h<24)return h+"小时前";return Math.floor(h/24)+"天前"}
 function wk(s){const d=new Date(s),day=d.getDay()||7,mon=new Date(d);mon.setDate(d.getDate()-day+1);return mon.toISOString().slice(0,10)}
 function grp(daily,p){const g={};for(const[day,ud]of Object.entries(daily)){const k=p==="week"?wk(day):p==="month"?day.slice(0,7):p==="year"?day.slice(0,4):day;if(!g[k])g[k]={};for(const[u,s]of Object.entries(ud)){if(!g[k][u])g[k][u]={inputTokens:0,outputTokens:0,requests:0,cacheCreationTokens:0,cacheReadTokens:0};g[k][u].inputTokens+=s.inputTokens;g[k][u].outputTokens+=s.outputTokens;g[k][u].requests+=s.requests;g[k][u].cacheCreationTokens+=(s.cacheCreationTokens||0);g[k][u].cacheReadTokens+=(s.cacheReadTokens||0)}}return g}
@@ -8130,7 +8196,7 @@ function render(){
   const us=Object.values(D.users),allTokens=us.reduce((s,u)=>s+totalTokens(u),0),tr=us.reduce((s,u)=>s+u.totalRequests,0);
   const td=new Date(Date.now()+8*36e5).toISOString().slice(0,10),tdd=(D.daily||{})[td]||{};
   const todayTokens=Object.values(tdd).reduce((s,d)=>s+totalTokens(d),0),tR=Object.values(tdd).reduce((s,d)=>s+d.requests,0);
-  document.getElementById("cards").innerHTML=c("今日用量",todayTokens,"var(--accent)",1)+c("今日请求",tR,"var(--blue)",1)+c("总用量",allTokens,"var(--green)",1)+c("总请求",tr,"var(--orange)",1)+c("今日错误",(Array.isArray(D.errors)?D.errors:[]).filter(e=>e.time&&e.time.startsWith(td)).length,"var(--red)",1);
+  document.getElementById("cards").innerHTML=c("今日用量",todayTokens,"var(--accent)",1)+c("今日请求",tR,"var(--blue)",1)+c("总用量",allTokens,"var(--green)",1)+c("总请求",tr,"var(--orange)",1)+c("今日错误",(Array.isArray(D.errors)?D.errors:[]).filter(e=>e.time&&bjDateStr(e.time)===td).length,"var(--red)",1);
   runCountUps(document.getElementById("cards"));
   const psb=document.getElementById("profileSummaryBody"),profiles=Array.isArray(D.profileSummaries)?D.profileSummaries:[];
   const fmtResume=function(iso){const d=new Date(new Date(iso).getTime()+8*3600000);const p=n=>String(n).padStart(2,'0');const now=new Date(Date.now()+8*3600000);const hm=p(d.getUTCHours())+':'+p(d.getUTCMinutes());if(d.getUTCFullYear()===now.getUTCFullYear()&&d.getUTCMonth()===now.getUTCMonth()&&d.getUTCDate()===now.getUTCDate())return hm;if(Date.UTC(d.getUTCFullYear(),d.getUTCMonth(),d.getUTCDate())-Date.UTC(now.getUTCFullYear(),now.getUTCMonth(),now.getUTCDate())===86400000)return '明天 '+hm;return (d.getUTCFullYear()===now.getUTCFullYear()?'':d.getUTCFullYear()+'-')+p(d.getUTCMonth()+1)+'-'+p(d.getUTCDate())+' '+hm};
@@ -8322,7 +8388,7 @@ async function loadProduction(){
       '<tr><td><div>'+ph(r.project)+'</div><span class="prod-bar" style="width:'+Math.max(2,Math.round(((r.lines_add||0)-(r.lines_del||0))/projMax*100))+'%" title="净产出占比 '+Math.round(((r.lines_add||0)-(r.lines_del||0))/projMax*100)+'%"></span></td><td class="n">'+r.users+'</td><td class="n">'+r.files+'</td><td class="n">'+fmtT((r.lines_add||0)-(r.lines_del||0))+'</td></tr>').join('')
       ||'<tr><td colspan="4" class="empty">该周期无数据</td></tr>';
     document.querySelector('#prodAlertTable tbody').innerHTML=(a.rows||[]).map(r=>
-      '<tr'+(r.seen?' style="color:var(--dim)"':'')+'><td>'+ph(r.time.slice(5,16).replace('T',' '))+'</td><td>'+ph(r.user_name)+'</td><td>'+ph(r.kindLabel||r.kind)+'</td><td style="white-space:normal">'+ph(r.detailText||r.detail)+'</td></tr>').join('')
+      '<tr'+(r.seen?' style="color:var(--dim)"':'')+'><td>'+ph(bjClock(r.time))+'</td><td>'+ph(r.user_name)+'</td><td>'+ph(r.kindLabel||r.kind)+'</td><td style="white-space:normal">'+ph(r.detailText||r.detail)+'</td></tr>').join('')
       ||'<tr><td colspan="4" class="empty">无告警</td></tr>';
   }catch(e){document.getElementById('prodSummary').textContent='加载失败: '+e.message}
 }
@@ -9034,7 +9100,7 @@ function qrBadge(s){
   if(s==='rejected')return '<span class="qr-badge rejected">已驳回</span>';
   return '';
 }
-function fmtQrTime(iso){const d=new Date(iso);const p=n=>String(n).padStart(2,'0');return (d.getMonth()+1)+'-'+p(d.getDate())+' '+p(d.getHours())+':'+p(d.getMinutes())}
+function fmtQrTime(iso){const d=new Date(new Date(iso).getTime()+8*3600000);const p=n=>String(n).padStart(2,'0');return (d.getUTCMonth()+1)+'-'+p(d.getUTCDate())+' '+p(d.getUTCHours())+':'+p(d.getUTCMinutes())}
 function renderQuotaRequest(){
   const btn=document.getElementById('qrBtn'),qr=D.quotaRequest;
   if(!btn)return;
@@ -9201,7 +9267,13 @@ function rateTag(q){
 function rateFootnote(q){
   if(q.rawUsed==null||q.rawUsed===q.used)return'';
   const delta=q.rawUsed-q.used;
-  return '<div style="margin-top:6px;font-size:10px;color:var(--dim)">实际 '+fmtTk(q.rawUsed)+' · '+(delta>0?'已抵扣 '+fmtTk(delta):'已加收 '+fmtTk(-delta))+'</div>';
+  let cacheBit='';
+  if(q.cacheInInput&&(q.cacheRead||0)>0&&(q.cacheReadQuotaRate??0)<1){
+    cacheBit=(q.cacheReadQuotaRate>0)
+      ?' · 缓存命中 '+fmtTk(q.cacheRead)+' 仅按 ×'+q.cacheReadQuotaRate+' 计入'
+      :' · 缓存命中 '+fmtTk(q.cacheRead)+' 不计入配额';
+  }
+  return '<div style="margin-top:6px;font-size:10px;color:var(--dim)">实际 '+fmtTk(q.rawUsed)+' · '+(delta>0?'已抵扣 '+fmtTk(delta):'已加收 '+fmtTk(-delta))+cacheBit+'</div>';
 }
 function renderQNotice(q){
   const el=document.getElementById('qNotice');
@@ -9214,15 +9286,27 @@ function renderQNotice(q){
     const slot=q.rate===null?'':(q.inPeak?'高峰':'低谷');
     const delta=q.rawUsed-q.used;
     const nx=q.nextRateChange;
-    // Lead with the realised effect (how much was written off), not the nominal
-    // rate: with per-model rates the day is a blend and the single default rate
-    // would not reconcile with the numbers below it.
-    const realised=q.rawUsed>0?Math.round(q.used/q.rawUsed*100)/100:null;
-    html+='<div class="qnotice bonus show"><span class="qi">率</span><div><b>配额倍率生效中</b> — '
-      +'今日实际使用 <b>'+fmtT(q.rawUsed)+'</b> tokens，'
-      +(delta>0?'已为你抵扣 <span class="hl">'+fmtTk(delta)+'</span> 额度':'额外加收 <span class="hl">'+fmtTk(-delta)+'</span> 额度')
-      +'（计入配额 '+fmtT(q.used)+(realised!=null?'，综合 ×'+realised:'')+'）。'
-      +(q.rate!==null&&q.rate!==undefined?'当前'+slot+'时段默认 ×'+q.rate+'，各模型倍率见下方价目表。':'当前各方案倍率不同，上列为合计值。')
+    const k=q.cacheReadQuotaRate??0;
+    const cacheFree=q.cacheInInput&&(q.cacheRead||0)>0&&k<1;
+    const cachePhrase=cacheFree
+      ?'其中缓存命中 <span class="hl">'+fmtTk(q.cacheRead)+'</span> '+(k>0?'按 ×'+k+' 计入配额':'不计入配额')
+      :'';
+    const ratePhrase=(q.rate!==null&&q.rate!==undefined&&q.rate!==1)
+      ?'未命中输入与输出按当前'+slot+'时段默认 ×'+q.rate+' 计权，各模型倍率见下方价目表。'
+      :'';
+    // Lead with the realised effect, not the nominal rate: with per-model rates
+    // the day is a blend and the single default rate would not reconcile with the
+    // numbers below it. Cache-hit exclusion (Responses/Codex) is stated as its own
+    // clause so it is never misread as a multiplier.
+    const explain=[];
+    if(cachePhrase)explain.push(cachePhrase);
+    if(ratePhrase)explain.push(ratePhrase);
+    html+='<div class="qnotice bonus show"><span class="qi">折</span><div><b>计权折算生效</b> — '
+      +'今日实际使用 <b>'+fmtT(q.rawUsed)+'</b> tokens（输入+输出）'
+      +(q.cacheInInput&&(q.cacheRead||0)>0?'，含缓存命中 <b>'+fmtT(q.cacheRead)+'</b>':'')
+      +'，计入配额 <b>'+fmtT(q.used)+'</b>'
+      +(delta>0?'，已为你减免 <span class="hl">'+fmtTk(delta)+'</span> 额度':'，额外加收 <span class="hl">'+fmtTk(-delta)+'</span> 额度')
+      +(explain.length?'。'+explain.join('；'):'')
       +(nx?'<b>'+nx.at+'</b> 后转入'+(nx.toPeak?'高峰':'低谷')+'。':'')
       +'</div></div>';
   }
@@ -9265,11 +9349,15 @@ function renderProfileQuotas(){
         +((r.rawUsed!=null&&r.rawUsed!==r.used)?' · <span>实际 '+fmtTk(r.rawUsed)+'</span> <span>'+(r.rawUsed>r.used?'已抵扣 '+fmtTk(r.rawUsed-r.used):'已加收 '+fmtTk(r.used-r.rawUsed))+'</span>':'')
         +(r.nextRateChange?'<br><span>'+r.nextRateChange.at+' 后转入'+(r.nextRateChange.toPeak?'高峰':'低谷')+' ×'+r.nextRateChange.rate+'</span>':'')
         +'</div>';
+    const cacheTxt=(r.cacheInInput&&(r.cacheRead||0)>0&&((r.cacheReadQuotaRate??0)<1))
+      ?'<div style="margin-top:4px;font-size:10px;color:var(--dim)">缓存命中 '+fmtTk(r.cacheRead)+((r.cacheReadQuotaRate>0)?' 按 ×'+r.cacheReadQuotaRate+' 计入':' 不计入配额')+'</div>'
+      :'';
     return '<div class="pq '+cls+'">'
       +'<div class="pq-hd"><div style="min-width:0"><div class="pq-name">'+esc(r.profile)+'</div><div class="pq-sfx">/'+esc(r.suffix)+'</div></div>'
       +'<div class="pq-pct" style="color:'+col+'">'+(free?'不限':r.pct+'%')+'</div></div>'
       +(free?'':hpBar(r.pct,16))
       +nums
+      +cacheTxt
       +'<div class="pq-tags">'+tags.join('')+'</div>'
       +'</div>';
   }).join('');
@@ -9334,9 +9422,14 @@ function render(){
     }).join("");
   }
   const note=document.getElementById('modelTableNote');
-  note.innerHTML=anyWeighted
-    ?'「实际 Token」是真实消耗，「计入配额」是按倍率折算后从每日额度里扣掉的数额。倍率列为今日实际计权比例，跨高峰边界或期间调整过倍率时会落在两档之间。'
-    :'当前所有模型倍率均为 1.0，实际消耗与计入配额相同。';
+  const qq=D.quota||{};
+  const cacheClause=(qq.cacheInInput&&(qq.cacheRead||0)>0&&((qq.cacheReadQuotaRate??0)<1))
+    ?' <span style="white-space:nowrap">Responses 链路缓存命中 '+fmtTk(qq.cacheRead)+' 已剔除、不计入配额。</span>'
+    :'';
+  note.innerHTML=(anyWeighted
+    ?'「实际 Token」是真实消耗，「计入配额」是按配额口径（各模型倍率；Responses/Codex 链路再剔除缓存命中）折算后从每日额度里扣掉的数额。倍率列为今日实际计权比例，跨高峰边界或期间调整过倍率时会落在两档之间。'
+    :'当前没有倍率或缓存规则造成差异，实际消耗与计入配额相同。')
+    +cacheClause;
   renderRateCard();
   renderCheckin();
   renderQuotaRequest();
@@ -9469,6 +9562,8 @@ function quotaRateChangeText(beforeJson, afterJson) {
     const b = normalizeQuotaRate(before[field]), a = normalizeQuotaRate(after[field]);
     if (b !== a) bits.push(`${label} ${b}→${a}`);
   }
+  const cb = normalizeCacheReadQuotaRate(before.cacheReadQuotaRate), ca = normalizeCacheReadQuotaRate(after.cacheReadQuotaRate);
+  if (cb !== ca) bits.push(`缓存命中计入 ${cb}→${ca}`);
   // Per-model overrides: report added / removed / changed models by name, since a
   // bare "modelQuotaRates" field name tells the reader nothing about the impact.
   const mb = normalizeModelQuotaRates(before.modelQuotaRates), ma = normalizeModelQuotaRates(after.modelQuotaRates);
@@ -9561,6 +9656,12 @@ function applySettings(formData) {
   }
   if (!isGlobalOnlySave && formData.offPeakQuotaRate !== undefined) {
     editingProfile.offPeakQuotaRate = normalizeQuotaRate(formData.offPeakQuotaRate);
+  }
+  // Cache-hit quota share (Responses/Codex profiles only): 0 = cache hits free
+  // (mirror Anthropic — default), 1 = legacy full billing. Absent from the form
+  // submit → leave the profile's setting untouched.
+  if (!isGlobalOnlySave && formData.cacheReadQuotaRate !== undefined) {
+    editingProfile.cacheReadQuotaRate = normalizeCacheReadQuotaRate(formData.cacheReadQuotaRate);
   }
   // Per-model rate rows: mr_model_N / mr_peak_N / mr_off_N, gated on the hidden
   // mrPresent marker so a submit that deleted every row still clears the overrides

@@ -681,6 +681,9 @@ function esc(s) {
 }
 const pct = (x) => x == null ? "—" : (x * 100).toFixed(0) + "%";
 const num = (x) => x == null ? "—" : Number(x).toLocaleString("zh-CN");
+// 存储层时刻是 UTC ISO;报表是给人看的,统一显示北京时间(timeZone 显式指定,
+// 与运行服务器的时区无关)。
+const bjTimeStr = (iso) => new Date(iso).toLocaleString("zh-CN", { timeZone: "Asia/Shanghai", hour12: false });
 
 export const ALERT_KIND_LABEL = { idle_burn: "空转消耗", error_loop: "错误循环", edit_failure_burst: "失败爆发" };
 // 库里 detail 存的是 JSON 串;报告里翻译成人类话,解析失败退回原文(调用侧统一 esc)
@@ -714,7 +717,7 @@ export function buildReportHTML({ summary, projects, costs, health, alerts, from
     : "";
   const costHtml = renderRows(costs && costs.rows, r => `<tr><td>${esc(r.user_name)}<span class="note">（${esc(r.profile)}）</span></td>
     <td class="n">$${Number(r.model_cost).toFixed(4)}</td><td class="n">$${Number(r.cache_cost).toFixed(4)}</td><td class="n"><b>$${Number(r.total_cost).toFixed(4)}</b></td></tr>`, 4);
-  const alertHtml = renderRows(alerts, a => `<tr><td>${esc(a.time)}</td><td>${esc(a.user_name)}</td>
+  const alertHtml = renderRows(alerts, a => `<tr><td>${esc(bjTimeStr(a.time))}</td><td>${esc(a.user_name)}</td>
     <td>${esc(ALERT_KIND_LABEL[a.kind] || a.kind)}</td><td>${esc(alertDetailText(a.kind, a.detail))}</td>
     <td>${a.seen ? "已读" : "未读"}</td></tr>`, 5);
   const healthHtml = renderRows(health, r => `<tr><td>${esc(r.user_name)}</td>

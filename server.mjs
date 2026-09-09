@@ -6775,8 +6775,10 @@ let editingProfileName="${escJs(initialProfile.name || '')}";
 function updateAccessUrl(){
   const sfx=document.getElementById('suffixInput').value.trim();
   const p=SETTINGS.profiles.find(x=>x.name===editingProfileName);
-  const defaultNote=p&&p.isDefault?' <span style="color:var(--green)">默认入口也可用 http://&lt;host&gt;:6789/v1</span>':'';
-  document.getElementById('accessUrlPreview').innerHTML='接入地址: http://&lt;host&gt;:6789/'+h(sfx)+'/v1/messages'+defaultNote;
+  const isResponses=p&&p.protocol==='responses';
+  const entry=isResponses?'/v1/responses':'/v1/messages';
+  const defaultNote=p&&p.isDefault?' <span style="color:var(--green)">默认入口也可用 http://&lt;host&gt;:6789'+entry+'</span>':'';
+  document.getElementById('accessUrlPreview').innerHTML='接入地址: http://&lt;host&gt;:6789/'+h(sfx)+entry+defaultNote;
 }
 updateAccessUrl();
 // ─── Peak hours editor (recurring daily ranges driving peak model aliases) ───

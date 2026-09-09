@@ -677,8 +677,8 @@ export function contextHealth(db, { from, to }) {
   for (const r of rows) {
     const denom = (r.cr || 0) + (r.i || 0);
     r.ratio = denom ? (r.cr || 0) / denom : 0;
-    r.advice = r.ratio >= 0.8 ? "缓存命中率优秀,会话结构良好"
-      : r.ratio >= 0.5 ? "缓存命中率良好;减少频繁切换会话可进一步提升"
+    r.advice = r.ratio >= 0.9 ? "缓存命中率优秀,会话结构良好"
+      : r.ratio >= 0.8 ? "缓存命中率良好;长会话尽量连续使用、减少频繁切换可进一步提升"
       : "缓存命中率偏低:长会话尽量连续使用、避免反复粘贴大段上下文";
   }
   return rows;

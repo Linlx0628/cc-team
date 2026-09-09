@@ -9662,11 +9662,11 @@ let calRz;window.addEventListener('resize',function(){clearTimeout(calRz);calRz=
       const edits=d.days.reduce((x,y)=>x+y.edits,0);
       const errs=d.days.reduce((x,y)=>x+y.errs,0);
       const failPct=edits?Math.round(errs*100/edits):0;
-      // 阈值着色:失败率 <10% 绿 / 10-30% 默认 / ≥30% 橙;缓存命中率 ≥80% 绿。
+      // 阈值着色:失败率 <10% 绿 / 10-30% 默认 / ≥30% 橙;缓存命中率 ≥90% 绿 / 80-90% 黄 / <80% 红。
       // .card .v 的 color 带 !important,着色要落在内层 span 上才会生效。
       const failColor=failPct>=30?'color:var(--orange)':(failPct<10?'color:var(--green)':'');
       const hitPct=d.health?Math.round(d.health.ratio*100):0;
-      const hitColor=hitPct>=80?'color:var(--green)':'';
+      const hitColor=hitPct>=90?'color:var(--green)':(hitPct>=80?'color:var(--yellow)':'color:var(--red)');
       const val=(v,c)=>'<div class="v">'+(c?'<span style="'+c+'">'+v+'</span>':v)+'</div>';
       document.getElementById('prodMeMetrics').innerHTML=
         '<div class="card"><div class="l">净产出(行)</div>'+val(net.toLocaleString('zh-CN'))+'</div>'+

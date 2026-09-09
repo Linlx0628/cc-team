@@ -5862,6 +5862,8 @@ ${peakLabel}
 ${rateLabel}
 <div class="pl-actions">
   ${!isHead ? '<button class="pl-activate" onclick="event.stopPropagation();setDefaultProfile(\'' + escJs(p.name) + '\',\'' + (isResponses ? "responses" : "anthropic") + '\')">设为默认入口</button>' : ''}
+  ${'<button class="pl-activate" onclick="event.stopPropagation();cloneProfile(\'' + escJs(p.name) + '\')">复制</button>'}
+  ${'<button class="pl-activate" onclick="event.stopPropagation();renameProfile(\'' + escJs(p.name) + '\')">重命名</button>'}
   ${!p.isDefault ? '<button class="pl-delete" onclick="event.stopPropagation();deleteProfile(\'' + escJs(p.name) + '\')">删除</button>' : ''}
 </div></div>`;
   };
@@ -7350,6 +7352,18 @@ async function deleteProfile(n){
   if(!confirm('确定删除方案 "'+n+'"？'))return;
   const r=await fetch('/api/profile/delete',{method:'POST',headers:csrfHeaders({'Content-Type':'application/json'}),body:JSON.stringify({profile:n})});
   if(r.ok)toastThen('方案已删除',()=>location.reload());else{const e=await r.json();alert('删除失败: '+e.error)}
+}
+async function renameProfile(n){
+  const nn=prompt('新的方案名称（后缀 /xxx 与用量统计不受影响）',n);
+  if(!nn)return;
+  const name=nn.trim();
+  if(!name||name===n)return;
+  const r=await fetch('/api/profile/rename',{method:'POST',headers:csrfHeaders({'Content-Type':'application/json'}),body:JSON.stringify({profile:n,name:name})});
+  if(r.ok)toastThen('方案已重命名',()=>location.reload());else{const e=await r.json().catch(()=>({}));alert('重命名失败: '+(e.error||''))}
+}
+async function cloneProfile(n){
+  const r=await fetch('/api/profile/clone',{method:'POST',headers:csrfHeaders({'Content-Type':'application/json'}),body:JSON.stringify({profile:n})});
+  if(r.ok)toastThen('方案已复制（用户与真实Key不复制）',()=>location.reload());else{const e=await r.json().catch(()=>({}));alert('复制失败: '+(e.error||''))}
 }
 async function saveDefaultGroup(group){
   const r=await fetch('/api/profile/default-group',{method:'POST',headers:csrfHeaders({'Content-Type':'application/json'}),body:JSON.stringify({group:group,protocol:'anthropic'})});
@@ -10584,6 +10598,120 @@ const server = http.createServer((req, res) => {
         console.log(`[PROFILE] Deleted profile "${profile}"`);
         recordAdminAudit(req, "profile.delete", profile, `删除方案 "${profile}"（后缀 /${p ? p.suffix : "?"}）`);
         res.end(JSON.stringify({ ok: true }));
+      } catch (err) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: err.message }));
+      }
+    }).catch(() => {
+      res.writeHead(413); res.end("Request too large");
+    });
+    return;
+  }
+
+  // Profile: rename. The name is the config key and both failover groups store
+  // membership by name, so a rename moves the key and rewrites every reference
+  // in one pass. SQLite usage/stats are keyed by suffix and stay untouched.
+  if (req.method === "POST" && req.url === "/api/profile/rename") {
+    if (!checkAuth(req)) { res.writeHead(401); res.end("Unauthorized"); return; }
+    if (!checkCsrf(req)) { res.writeHead(403); res.end("CSRF validation failed"); return; }
+    readBody(req).then(buf => {
+      try {
+        const { profile, name } = JSON.parse(buf.toString());
+        const newName = String(name || "").trim();
+        if (!config.profiles[profile]) throw new Error(`Profile "${profile}" not found`);
+        if (!newName) throw new Error("新名称不能为空");
+        if (newName.length > 40) throw new Error("名称过长（最多 40 字）");
+        if (newName === profile) throw new Error("名称未变化");
+        if (config.profiles[newName]) throw new Error(`方案 "${newName}" 已存在`);
+        const p = config.profiles[profile];
+        // Move the key in place, preserving the profiles' insertion order.
+        const moved = {};
+        for (const [k, v] of Object.entries(config.profiles)) moved[k === profile ? newName : k] = v;
+        config.profiles = moved;
+        // Rewrite group memberships stored by name.
+        for (const key of ["defaultProfileGroup", "responsesProfileGroup"]) {
+          if (Array.isArray(config[key])) config[key] = config[key].map(n => (n === profile ? newName : n));
+        }
+        // Auto-pool case: an empty quotaPool means the pool is named after the
+        // profile — pin it to the existing pool key so the rename doesn't orphan
+        // the old pool and silently create a fresh unlimited one. An explicitly
+        // named pool keeps its key; only a matching display label is refreshed.
+        const oldPoolKey = normalizeQuotaPoolName(profile);
+        if (!normalizeQuotaPoolName(p.quotaPool)) {
+          if (oldPoolKey && config.quotaPools?.[oldPoolKey]) p.quotaPool = oldPoolKey;
+        }
+        if (oldPoolKey && config.quotaPools?.[oldPoolKey]?.label === profile) {
+          config.quotaPools[oldPoolKey].label = newName;
+        }
+        // Carry any in-flight rate-limit cooldown over to the new name.
+        if (rateLimitState[profile]) {
+          rateLimitState[newName] = rateLimitState[profile];
+          delete rateLimitState[profile];
+          persistRateLimitState();
+        }
+        saveConfig(config);
+        reloadAllRuntimes();
+        console.log(`[PROFILE] Renamed profile "${profile}" → "${newName}"`);
+        recordAdminAudit(req, "profile.rename", newName, `方案 "${profile}" 重命名为 "${newName}"（后缀 /${p.suffix || "?"} 不变）`);
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: true, oldName: profile, newName }));
+      } catch (err) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: err.message }));
+      }
+    }).catch(() => {
+      res.writeHead(413); res.end("Request too large");
+    });
+    return;
+  }
+
+  // Profile: clone. 1:1 copy of every config field except users/real keys
+  // (always empty) and default/group placement (clone starts unassigned). The
+  // clone shares the source's quota pool — the pool is part of the copied info.
+  if (req.method === "POST" && req.url === "/api/profile/clone") {
+    if (!checkAuth(req)) { res.writeHead(401); res.end("Unauthorized"); return; }
+    if (!checkCsrf(req)) { res.writeHead(403); res.end("CSRF validation failed"); return; }
+    readBody(req).then(buf => {
+      try {
+        const { profile } = JSON.parse(buf.toString());
+        const src = config.profiles[profile];
+        if (!src) throw new Error(`Profile "${profile}" not found`);
+        // Name: "<原名>复制", de-duplicated with 复制2/复制3…; keep within the
+        // same 40-char cap the rename endpoint enforces.
+        let base = profile;
+        if (base.length + 2 > 40) base = base.slice(0, 38);
+        let newName = `${base}复制`;
+        for (let i = 2; config.profiles[newName]; i++) newName = `${base}复制${i}`;
+        // Suffix: "<原后缀>-copy", truncated to the 2-20 char rule, de-duplicated
+        // with -copy2/-copy3…; fall through stricter truncation as needed.
+        const srcSfx = normalizeProfileSuffix(src.suffix) || "copy";
+        const srcBase = srcSfx.replace(/-copy\d*$/, "");
+        let newSuffix = "";
+        outer:
+        for (const shorten of [0, 2, 4, 6]) {
+          const stem = srcBase.slice(0, Math.max(2, srcBase.length - shorten));
+          for (let i = 1; i < 100; i++) {
+            const extra = i === 1 ? "-copy" : `-copy${i}`;
+            const cand = `${stem}${extra}`.slice(-20);
+            if (cand.length < 2) break outer;
+            if (!PROFILE_SUFFIX_RE.test(cand) || RESERVED_SUFFIXES.has(cand)) continue;
+            if (Object.values(config.profiles).some(p => normalizeProfileSuffix(p.suffix) === cand)) continue;
+            newSuffix = cand;
+            break outer;
+          }
+        }
+        if (!newSuffix) throw new Error("无法为克隆方案生成可用的 URL 后缀，请手动新建");
+        const clone = JSON.parse(JSON.stringify(src));
+        clone.users = {};
+        clone.isDefault = false;
+        clone.suffix = newSuffix;
+        config.profiles[newName] = clone;
+        saveConfig(config);
+        reloadAllRuntimes();
+        console.log(`[PROFILE] Cloned profile "${profile}" → "${newName}" (suffix: ${newSuffix})`);
+        recordAdminAudit(req, "profile.clone", newName, `复制方案 "${profile}" → "${newName}"（后缀 /${newSuffix}，共享额度池 ${clone.quotaPool || "无"}，不复制用户）`);
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: true, profile: newName, suffix: newSuffix }));
       } catch (err) {
         res.writeHead(400, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ error: err.message }));

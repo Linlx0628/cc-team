@@ -10635,14 +10635,11 @@ const server = http.createServer((req, res) => {
         }
         // Auto-pool case: an empty quotaPool means the pool is named after the
         // profile — pin it to the existing pool key so the rename doesn't orphan
-        // the old pool and silently create a fresh unlimited one. An explicitly
-        // named pool keeps its key; only a matching display label is refreshed.
+        // the old pool and silently create a fresh unlimited one. Pool names and
+        // display labels are the pool's own identity and never follow the rename.
         const oldPoolKey = normalizeQuotaPoolName(profile);
         if (!normalizeQuotaPoolName(p.quotaPool)) {
           if (oldPoolKey && config.quotaPools?.[oldPoolKey]) p.quotaPool = oldPoolKey;
-        }
-        if (oldPoolKey && config.quotaPools?.[oldPoolKey]?.label === profile) {
-          config.quotaPools[oldPoolKey].label = newName;
         }
         // Carry any in-flight rate-limit cooldown over to the new name.
         if (rateLimitState[profile]) {

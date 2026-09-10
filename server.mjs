@@ -14,7 +14,7 @@ import { cnNow, cnDate, cnHour, secondsUntilNextCnMidnight, cnWeekStartIso, cnDa
 import { parsePeakTimeMinutes, normalizePeakHours, isInPeakHours, formatPeakHoursSummary } from "./lib/schedule.mjs";
 import { sanitizeJson } from "./lib/sanitize.mjs";
 import { buildStatements } from "./lib/db.mjs";
-import { QUOTA_RATE_MAX, normalizeQuotaRate, normalizeCacheReadQuotaRate, normalizeModelQuotaRates, lookupModelQuotaRate, currentQuotaRate, nextRateChangeHint, QUOTA_POOL_NAME_MAX, normalizeQuotaPoolName, canonicalJson, shortDigest, applyStickyReorder, buildPoolResolver } from "./lib/quota.mjs";
+import { QUOTA_RATE_MAX, normalizeQuotaRate, normalizeCacheReadQuotaRate, normalizeModelQuotaRates, lookupModelQuotaRate, currentQuotaRate, nextRateChangeHint, QUOTA_POOL_NAME_MAX, normalizeQuotaPoolName, canonicalJson, shortDigest, applyStickyReorder, buildPoolResolver, quotaExceededMessage, quotaErrorDetail, buildQuotaCore } from "./lib/quota.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -884,7 +884,7 @@ function reloadAllRuntimes() {
   syncDefaultRuntime();
   // Pooled-usage prepared statements are cached per member count; drop them so a
   // code/config reload re-prepares with the current column set (e.g. cache_read).
-  pooledUsageStmts.clear();
+  clearPooledUsageCache();
 }
 
 // Global proxy settings (shared across profiles)
@@ -2734,32 +2734,8 @@ function recordUsage(apiKey, usage, model, suffix, _rt) {
 // Pooled usage. Membership changes at runtime (config edits), so the IN clause
 // is built per member count and the prepared statement cached — one statement per
 // distinct pool size, not one per call.
-const pooledUsageStmts = new Map();
-function pooledUsageForQuota(suffixes, date, key) {
-  if (!suffixes.length) return { used: 0, raw: 0, cr: 0 };
-  let stmt = pooledUsageStmts.get(suffixes.length);
-  if (!stmt) {
-    const holes = suffixes.map(() => "?").join(",");
-    stmt = db.prepare(`SELECT COALESCE(SUM(weighted_tokens),0) AS used, COALESCE(SUM(input_tokens+output_tokens),0) AS raw,
-      COALESCE(SUM(cache_read),0) AS cr
-      FROM usage_daily WHERE date=? AND user_key=? AND profile IN (${holes})`);
-    pooledUsageStmts.set(suffixes.length, stmt);
-  }
-  return stmt.get(date, key, ...suffixes);
-}
-
-function getPoolQuota(poolName) {
-  const pool = getPoolByName(poolName);
-  if (!pool || !pool.dailyTokenLimit) return 0;
-  return pool.dailyTokenLimit;
-}
-
-function getUserPoolQuota(poolName, userKey) {
-  const pool = getPoolByName(poolName);
-  const pu = pool?.users?.[userKey];
-  if (!pu || typeof pu !== "object" || !pu.dailyTokenLimit) return 0;
-  return pu.dailyTokenLimit;
-}
+const { pooledUsageForQuota, getPoolQuota, getUserPoolQuota, clearPooledUsageCache } =
+  buildQuotaCore({ db, getPoolByName });
 
 function checkTokenQuota(apiKey, suffix, _rt, model = null) {
   const runtime = _rt || rt;
@@ -2837,47 +2813,8 @@ function checkTokenQuota(apiKey, suffix, _rt, model = null) {
   };
 }
 
-// Quota-exceeded text shared by both protocol branches. With no weighting in play
-// (rate 1.0, weighted == raw) it degrades to the original one-liner; otherwise it
-// also reports the real token count, the delta written off (or added), and — most
-// usefully — when the rate next changes, so the user knows when relief arrives
-// instead of only that they are blocked.
-function quotaExceededMessage(quota, runtime, usageUrl) {
-  const skew = quota.rawUsed != null ? quota.rawUsed - quota.used : 0;
-  const weighted = skew !== 0 || (quota.rate !== undefined && quota.rate !== 1);
-  // Naming the pool matters when it is shared: a user blocked in Codex needs to
-  // learn that Claude Code traffic is drawing from the same allowance.
-  const poolNote = quota.poolShared && quota.poolLabel
-    ? `（额度池「${quota.poolLabel}」，${quota.poolProfiles.length} 个方案共用）` : "";
-  const lines = [weighted
-    ? `今日配额已用尽：${quota.used.toLocaleString()} / ${quota.limit.toLocaleString()}（计权）${poolNote}`
-    : `今日Token额度已用完。已用: ${quota.used.toLocaleString()}, 限额: ${quota.limit.toLocaleString()}。${poolNote}`];
-  if (skew !== 0) {
-    lines.push(`实际 token ${quota.rawUsed.toLocaleString()}，` +
-      (skew > 0 ? `已抵扣 ${skew.toLocaleString()}` : `已加收 ${(-skew).toLocaleString()}`));
-  }
-  if (quota.cacheInInput && (quota.cacheRead || 0) > 0 && (quota.cacheReadQuotaRate ?? 0) < 1) {
-    lines.push((quota.cacheReadQuotaRate > 0
-      ? `缓存命中 ${quota.cacheRead.toLocaleString()} 按 ×${quota.cacheReadQuotaRate} 计入`
-      : `缓存命中 ${quota.cacheRead.toLocaleString()} 不计入配额（Responses 已对齐 Anthropic 口径）`));
-  }
-  if (weighted) {
-    const slot = quota.inPeak ? "高峰" : "低谷";
-    const hint = nextRateChangeHint(runtime, new Date(), quota.model);
-    lines.push(`当前${runtime?.profileName ? ` ${runtime.profileName}` : ""} ${slot} ×${quota.rate}` +
-      (quota.model && !quota.rateIsDefault ? `（${quota.model} 单独定价）` : "") +
-      (hint ? ` · ${hint.at} 后转入${hint.toPeak ? "高峰" : "低谷"} ×${hint.rate}` : ""));
-  }
-  lines.push(`额度将于北京时间次日凌晨重置。查看用量详情: ${usageUrl}`);
-  return lines.join("\n");
-}
-
-function quotaErrorDetail(quota) {
-  const skew = quota.rawUsed != null ? quota.rawUsed - quota.used : 0;
-  const poolNote = quota.poolShared ? ` pool=${quota.pool}(${quota.poolProfiles.join("+")})` : "";
-  const extra = skew !== 0 ? `, raw ${quota.rawUsed} (${skew > 0 ? "-" : "+"}${Math.abs(skew)} @×${quota.rate})` : "";
-  return `quota_exceeded: ${quota.used}/${quota.limit}${extra}${poolNote}`;
-}
+// Quota-exceeded text shared by both protocol branches, and the audit/log detail
+// line — both now in lib/quota.mjs (pure string builders over the quota payload).
 
 // ─── Auto Quota Adjustment ─────────────────────────────────────────────────
 function evaluateAutoQuotaAdjustments() {

@@ -10,6 +10,9 @@ import Database from "better-sqlite3";
 import { initProductionDb, createProductionTracker, rangeFromTo, productionSummary, productionUserDetail,
   productionProjects, productionAlerts, markAlertSeen, pruneProductionData, DEFAULT_COST_RATES,
   computeCosts, contextHealth, buildReportHTML, ALERT_KIND_LABEL, alertDetailText } from "./production.mjs";
+import { cnNow, cnDate, cnHour, secondsUntilNextCnMidnight, cnWeekStartIso, cnDayStartIso } from "./lib/time.mjs";
+import { parsePeakTimeMinutes, normalizePeakHours, isInPeakHours, formatPeakHoursSummary } from "./lib/schedule.mjs";
+import { sanitizeJson } from "./lib/sanitize.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -447,35 +450,10 @@ function normalizeQuotaPoolName(value) {
   }
 })();
 
-// Peak hours: per-profile recurring daily time ranges. Format: [{start:"HH:mm",
-// end:"HH:mm"}]; end < start means the range crosses midnight (e.g. 22:00-02:00).
-// Drives two things: the peak model aliases, and the peak/off-peak quota rate.
-const PEAK_TIME_RE = /^([01]\d|2[0-3]):([0-5]\d)$/;
-
-function parsePeakTimeMinutes(t) {
-  if (typeof t !== "string") return null;
-  const m = PEAK_TIME_RE.exec(t.trim());
-  if (!m) return null;
-  return parseInt(m[1], 10) * 60 + parseInt(m[2], 10);
-}
-
-function normalizePeakHours(raw) {
-  if (!Array.isArray(raw)) return [];
-  const out = [];
-  for (const item of raw) {
-    if (!item || typeof item !== "object") continue;
-    const start = parsePeakTimeMinutes(item.start);
-    const end = parsePeakTimeMinutes(item.end);
-    if (start === null || end === null || start === end) continue;
-    const norm = { start: item.start.trim(), end: item.end.trim() };
-    if (!out.some(r => r.start === norm.start && r.end === norm.end)) out.push(norm);
-  }
-  return out;
-}
-
 // 等值成本的峰时段直接复用各方案已配的 peakHours（GLM 高峰在下午、DeepSeek 在上午+下午，
 // 一份全局时段无法适配所有模型）。key 与用量表 profile 列一致（normalizeProfileSuffix 后缀），
 // computeCosts 按用量行归属方案取峰段；已删除/改名方案的历史用量取不到 → 基础价（可接受降级）。
+// 峰值解析/判定见 ./lib/schedule.mjs。
 function profilePeakHoursMap() {
   const out = {};
   for (const p of Object.values(config.profiles || {})) {
@@ -483,30 +461,6 @@ function profilePeakHoursMap() {
     if (sfx) out[sfx] = normalizePeakHours(p.peakHours);
   }
   return out;
-}
-
-// Peak ranges are interpreted in Beijing time (UTC+8) regardless of host/container
-// timezone, matching the daily-quota reset convention (cnNow). `date` is an instant;
-// `new Date()` also works — the +8h shift below does the conversion.
-function isInPeakHours(ranges, date = new Date()) {
-  if (!Array.isArray(ranges) || ranges.length === 0) return false;
-  const minutes = ((date.getTime() + 8 * 3600000) % 86400000) / 60000;
-  for (const r of ranges) {
-    const start = parsePeakTimeMinutes(r.start);
-    const end = parsePeakTimeMinutes(r.end);
-    if (start === null || end === null || start === end) continue;
-    if (start < end) {
-      if (minutes >= start && minutes < end) return true;
-    } else if (minutes >= start || minutes < end) { // crosses midnight
-      return true;
-    }
-  }
-  return false;
-}
-
-function formatPeakHoursSummary(ranges) {
-  if (!Array.isArray(ranges) || ranges.length === 0) return "";
-  return ranges.map(r => `${r.start}-${r.end}`).join(", ");
 }
 
 // ─── Quota Rate (peak / off-peak weighting) ──────────────────────────────────
@@ -1323,17 +1277,7 @@ function recordLoginSuccess(ip) {
 }
 
 // ─── Input Sanitization ──────────────────────────────────────────────────────
-const DANGEROUS_KEYS = new Set(["__proto__", "constructor", "prototype"]);
-function sanitizeJson(obj) {
-  if (obj === null || typeof obj !== "object") return obj;
-  if (Array.isArray(obj)) return obj.map(sanitizeJson);
-  const clean = {};
-  for (const [k, v] of Object.entries(obj)) {
-    if (DANGEROUS_KEYS.has(k)) continue;
-    clean[k] = typeof v === "object" && v !== null ? sanitizeJson(v) : v;
-  }
-  return clean;
-}
+// DANGEROUS_KEYS / sanitizeJson 已迁至 ./lib/sanitize.mjs。
 
 function readBody(req, maxSize = 1_000_000) {
   return new Promise((resolve, reject) => {
@@ -3045,14 +2989,7 @@ function usageHasTokens(usage = {}) {
 }
 
 // ─── Timezone Helpers (UTC+8 北京时间) ────────────────────────────────────────
-function cnNow(now = Date.now()) { return new Date(now + 8 * 3600000); }
-function cnDate() { return cnNow().toISOString().slice(0, 10); }
-function cnHour() { return cnNow().toISOString().slice(11, 13); }
-function secondsUntilNextCnMidnight(now = Date.now()) {
-  const shifted = new Date(now + 8 * 3600000);
-  const nextShiftedMidnight = Date.UTC(shifted.getUTCFullYear(), shifted.getUTCMonth(), shifted.getUTCDate() + 1);
-  return Math.max(1, Math.ceil((nextShiftedMidnight - 8 * 3600000 - now) / 1000));
-}
+// cnNow/cnDate/cnHour/secondsUntilNextCnMidnight 已迁至 ./lib/time.mjs。
 
 function recordUsage(apiKey, usage, model, suffix, _rt) {
   const runtime = _rt || runtimes[normalizeProfileSuffix(suffix)] || rt;
@@ -3547,19 +3484,7 @@ function performCheckIn(apiKey, ip) {
 
 // Week window starts Monday 00:00 Beijing time — the same clock the quota
 // system counts days in. Returns an ISO timestamp usable in >= comparisons.
-function cnWeekStartIso(nowMs = Date.now()) {
-  const shifted = cnNow(nowMs);
-  const dow = (shifted.getUTCDay() + 6) % 7; // Monday = 0
-  const mondayShiftedMidnight = Date.UTC(shifted.getUTCFullYear(), shifted.getUTCMonth(), shifted.getUTCDate() - dow);
-  return new Date(mondayShiftedMidnight - 8 * 3600000).toISOString();
-}
-
-// Today 00:00 Beijing as ISO — anchors the fixed "one submission per day" rule.
-function cnDayStartIso(nowMs = Date.now()) {
-  const shifted = cnNow(nowMs);
-  const dayStart = Date.UTC(shifted.getUTCFullYear(), shifted.getUTCMonth(), shifted.getUTCDate());
-  return new Date(dayStart - 8 * 3600000).toISOString();
-}
+// cnWeekStartIso / cnDayStartIso 已迁至 ./lib/time.mjs。
 
 function quotaRequestWeeklyLimit() {
   return Math.max(0, Number.isInteger(config.quotaRequest?.weeklyLimit) ? config.quotaRequest.weeklyLimit : 3);

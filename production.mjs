@@ -427,31 +427,9 @@ function singleFileLabel(fp) {
   return repoNameLabel(segs.slice(0, -1));   // 去掉文件名段,取仓库根名
 }
 
-// 别名先套用(正则 test 标签,首个命中生效)再按名聚合:users 并集去重,files/lines/edits 求和;非法正则静默跳过
-export function applyProjectAliases(rows, aliases) {
-  const rules = [];
-  for (const a of Array.isArray(aliases) ? aliases : []) {
-    if (!a || typeof a.pattern !== "string" || !a.pattern) continue;
-    try { rules.push({ re: new RegExp(a.pattern), name: typeof a.name === "string" && a.name ? a.name : a.pattern }); } catch { /* 非法正则跳过 */ }
-  }
-  const merged = new Map();
-  for (const r of Array.isArray(rows) ? rows : []) {
-    if (!r || typeof r !== "object") continue;
-    let name = String(r.project ?? "");
-    for (const rule of rules) if (rule.re.test(name)) { name = rule.name; break; }
-    let m = merged.get(name);
-    if (!m) merged.set(name, m = { project: name, user_keys: [], users: 0, files: 0, lines_add: 0, lines_del: 0, edits: 0 });
-    if (Array.isArray(r.user_keys)) { const seen = new Set(m.user_keys); for (const u of r.user_keys) seen.add(u); m.user_keys = [...seen]; }
-    else m.users += Number(r.users) || 0;
-    m.files += Number(r.files) || 0;
-    m.lines_add += Number(r.lines_add) || 0;
-    m.lines_del += Number(r.lines_del) || 0;
-    m.edits += Number(r.edits) || 0;
-  }
-  return [...merged.values()].map(m => ({ ...m, users: m.user_keys.length || m.users }));
-}
+// 别名归并已移除:项目表直接按会话推导的标签聚合展示。
 
-export function productionProjects(db, { from, to, aliases } = {}) {
+export function productionProjects(db, { from, to } = {}) {
   // 会话为归组单位:同会话文件集合共同推导项目;session NULL 归 '' 桶。权重 = Σ(lines_add+lines_del)
   const rows = db.prepare(`
     SELECT session, file_path, user_key,
@@ -491,15 +469,11 @@ export function productionProjects(db, { from, to, aliases } = {}) {
       }
     }
   }
-  // 无别名 = 按标签聚合透传;有别名 = 改名后再按名合并(users 并集、files/lines/edits 求和)
-  const out = applyProjectAliases([...acc.entries()].map(([label, a]) => ({
-    project: label, user_keys: [...a.users], files: a.paths.size,
-    lines_add: a.lines_add, lines_del: a.lines_del, edits: a.edits,
-  })), aliases || []);
-  return out.map(r => ({
-    project: r.project,
-    users: Array.isArray(r.user_keys) ? r.user_keys.length : (Number(r.users) || 0),
-    files: r.files, lines_add: r.lines_add, lines_del: r.lines_del, edits: r.edits,
+  // 按标签聚合透传(users 按集合并集去重)
+  return [...acc.entries()].map(([label, a]) => ({
+    project: label,
+    users: a.users.size,
+    files: a.paths.size, lines_add: a.lines_add, lines_del: a.lines_del, edits: a.edits,
   })).sort((a, b) => b.lines_add - a.lines_add).slice(0, 50);
 }
 
@@ -589,17 +563,23 @@ export function hourIsPeak(hour, peakHours) {
   return false;
 }
 
-export function computeCosts(db, rates, { from, to, peakHours } = {}) {
-  const peak = normalizeCostPeakHours(peakHours);
+export function computeCosts(db, rates, { from, to, profilePeakHours } = {}) {
+  // 峰时段按方案注入(server 调用侧组装 profile→peakHours 映射,此处不 import server 防循环):
+  // 每条用量按其归属方案的高峰时段判档;未配峰的方案/未知方案 = 空数组 = 全天基础价。
+  const peakByProfile = new Map(Object.entries(
+    profilePeakHours && typeof profilePeakHours === "object" ? profilePeakHours : {}
+  ).map(([k, v]) => [k, normalizeCostPeakHours(v)]));
+  const anyPeak = [...peakByProfile.values()].some(p => p.length > 0);
+  const peakOf = (profile) => peakByProfile.get(profile) || [];
   const caches = db.prepare(`SELECT profile, user_key, SUM(cache_creation) cc, SUM(cache_read) cr
     FROM usage_daily WHERE date BETWEEN ? AND ? GROUP BY profile, user_key`).all(from, to);
   const byUser = new Map(), unpricedSet = new Set();
   const bucket = (profile, user) => {
     const k = profile + "|" + user;
-    if (!byUser.has(k)) byUser.set(k, { profile, user_key: user, user_name: null, model_cost: 0, cache_cost: 0, models: [], in_weighted_rate: 0, in_total: 0, cc: 0, cr: 0 });
+    if (!byUser.has(k)) byUser.set(k, { profile, user_key: user, user_name: null, model_cost: 0, cache_cost: 0, models: [], in_weighted_rate: 0, in_total: 0, cc: 0, cr: 0, cache_hourly: 0, cc_hourly: 0, cr_hourly: 0 });
     return byUser.get(k);
   };
-  if (peak.length === 0) {
+  if (!anyPeak) {
     // —— 基础路径:未配峰谷时与既有实现逐字一致(回归锚)——
     const models = db.prepare(`SELECT profile, user_key, model, SUM(input_tokens) i, SUM(output_tokens) o
       FROM usage_daily_model WHERE date BETWEEN ? AND ? GROUP BY profile, user_key, model`).all(from, to);
@@ -615,20 +595,30 @@ export function computeCosts(db, rates, { from, to, peakHours } = {}) {
     }
   } else {
     // —— 峰谷路径:小时表按 hourIsPeak 分档计价(峰价 r.peakInput ?? r.input / r.peakOutput ?? r.output,
-    //    未设或 null 回落基础价,显式 0 生效);同时读日表,按 (profile,date,user_key,model) 对齐,
-    //    缺口 max(0, 日Σ−时Σ) 按基础价回填,in/out 总量与日表守恒 ——
-    const hourlyRows = db.prepare(`SELECT profile, date, user_key, hour, model, SUM(input_tokens) i, SUM(output_tokens) o
+    //    未设或 null 回落基础价,显式 0 生效),判档用各归属方案自己的峰时段;
+    //    缓存写/读同样按档计价(peakCacheWrite/peakCacheRead ?? 基础缓存价);
+    //    同时读日表,按 (profile,date,user_key,model) 对齐,缺口 max(0, 日Σ−时Σ) 按基础价回填,
+    //    in/out 总量与日表守恒;缓存缺口(小时表启用前无分时缓存)走尾部混合价回填 ——
+    const hourlyRows = db.prepare(`SELECT profile, date, user_key, hour, model, SUM(input_tokens) i, SUM(output_tokens) o,
+        SUM(cache_creation) cc, SUM(cache_read) cr
       FROM usage_hourly_model WHERE date BETWEEN ? AND ? GROUP BY profile, date, user_key, hour, model`).all(from, to);
     const dailyRows = db.prepare(`SELECT profile, date, user_key, model, SUM(input_tokens) i, SUM(output_tokens) o
       FROM usage_daily_model WHERE date BETWEEN ? AND ? GROUP BY profile, date, user_key, model`).all(from, to);
     const modelAggs = new Map();    // profile|user_key|model → 聚合条目(小时分档 + 缺口回填合并)
     const hourlyByDay = new Map();  // profile|date|user_key|model → 当日小时表合计(算缺口用)
-    const addCost = (b, model, i, o, peakSlot) => {
+    const addCost = (b, model, i, o, peakSlot, cc = 0, cr = 0) => {
       const r = resolveRate(rates, model);
       if (!r) unpricedSet.add(model);
       const c = r ? (i * (peakSlot ? (r.peakInput ?? r.input) : r.input)
                   + o * (peakSlot ? (r.peakOutput ?? r.output) : r.output)) / 1e6 : 0;
       b.model_cost += c;
+      // 缓存按模型精确牌价分档计价;无牌价模型缓存计 0(与模型成本口径一致),尾部缺口用混合价补
+      if (r) {
+        const cw = peakSlot ? (r.peakCacheWrite ?? r.cacheWrite) : (r.cacheWrite ?? 0);
+        const crRate = peakSlot ? (r.peakCacheRead ?? r.cacheRead) : (r.cacheRead ?? (r.cacheWrite || 0) / 12.5);
+        b.cache_hourly += (cc * (cw || 0) + cr * (crRate || 0)) / 1e6;
+      }
+      b.cc_hourly += cc; b.cr_hourly += cr;
       const mk = b.profile + "|" + b.user_key + "|" + model;
       let agg = modelAggs.get(mk);
       if (!agg) modelAggs.set(mk, agg = { b, model, input_tokens: 0, output_tokens: 0, cost: 0, priced: true });
@@ -641,7 +631,7 @@ export function computeCosts(db, rates, { from, to, peakHours } = {}) {
       const dk = m.profile + "|" + m.date + "|" + m.user_key + "|" + m.model;
       const cur = hourlyByDay.get(dk) || { i: 0, o: 0 };
       cur.i += m.i; cur.o += m.o; hourlyByDay.set(dk, cur);
-      addCost(bucket(m.profile, m.user_key), m.model, m.i, m.o, hourIsPeak(m.hour, peak));
+      addCost(bucket(m.profile, m.user_key), m.model, m.i, m.o, hourIsPeak(m.hour, peakOf(m.profile)), m.cc || 0, m.cr || 0);
     }
     for (const d of dailyRows) {
       const h = hourlyByDay.get(d.profile + "|" + d.date + "|" + d.user_key + "|" + d.model) || { i: 0, o: 0 };
@@ -662,26 +652,46 @@ export function computeCosts(db, rates, { from, to, peakHours } = {}) {
     b.user_name = names.length ? names[0].name : b.user_key;
     const bw = b.in_total ? b.in_weighted_rate / b.in_total : 0;          // blended cacheWrite
     const br = bw / 12.5;                                                  // Claude 家族 cacheRead=cacheWrite×0.08 的近似;统一用 write/12.5
-    b.cache_cost = (b.cc * bw + b.cr * br) / 1e6;
+    // 缓存结算:小时表分档部分已按模型精确牌价计入 cache_hourly;
+    // 缺口(日表 − 小时表,含小时表启用前的历史)按混合价回填 → 基础路径与旧实现逐位一致
+    const gapCC = Math.max(0, b.cc - b.cc_hourly), gapCR = Math.max(0, b.cr - b.cr_hourly);
+    b.cache_cost = b.cache_hourly + (gapCC * bw + gapCR * br) / 1e6;
     b.total_cost = +(b.model_cost + b.cache_cost).toFixed(4);
     b.model_cost = +b.model_cost.toFixed(4); b.cache_cost = +b.cache_cost.toFixed(4);
     return b;
   }).sort((a, b) => b.total_cost - a.total_cost);
   return { rows, unpriced: [...unpricedSet] };
 }
-export function contextHealth(db, { from, to }) {
-  const rows = db.prepare(`SELECT ud.user_key, MAX(COALESCE(u.name, ud.user_key)) user_name,
+export function contextHealth(db, { from, to, responsesProfiles }) {
+  // 命中率 = 缓存读 / (缓存读 + 输入),分母不含输出、不含缓存写入。
+  // Anthropic 协议 input_tokens 本不含缓存读,公式即标准口径。
+  // Responses/Codex 协议把缓存命中折进 input_tokens(cached_tokens 是其子集),
+  // 此时若照搬公式,缓存读会被分母算两遍、命中率被系统性压低(纯缓存上限 50%)。
+  // responsesProfiles 传入这类方案的 profile 后缀集合,把它们的分母减去缓存读。
+  // 按 (user_key, profile) 分组以便逐方案判断协议,再按 user 聚合。
+  const rows = db.prepare(`SELECT ud.user_key, ud.profile,
+      MAX(COALESCE(u.name, ud.user_key)) user_name,
       SUM(ud.cache_read) cr, SUM(ud.input_tokens) i
     FROM usage_daily ud LEFT JOIN users u ON u.user_key=ud.user_key
-    WHERE ud.date BETWEEN ? AND ? GROUP BY ud.user_key`).all(from, to);
+    WHERE ud.date BETWEEN ? AND ? GROUP BY ud.user_key, ud.profile`).all(from, to);
+  const acc = new Map(); // user_key -> { user_name, cr, i(原始,供展示), denomI(口径修正后) }
   for (const r of rows) {
-    const denom = (r.cr || 0) + (r.i || 0);
-    r.ratio = denom ? (r.cr || 0) / denom : 0;
-    r.advice = r.ratio >= 0.9 ? "缓存命中率优秀,会话结构良好"
-      : r.ratio >= 0.8 ? "缓存命中率良好;长会话尽量连续使用、减少频繁切换可进一步提升"
-      : "缓存命中率偏低:长会话尽量连续使用、避免反复粘贴大段上下文";
+    let a = acc.get(r.user_key);
+    if (!a) { a = { user_name: r.user_name, cr: 0, i: 0, denomI: 0 }; acc.set(r.user_key, a); }
+    const cr = r.cr || 0, i = r.i || 0;
+    a.cr += cr; a.i += i;
+    a.denomI += responsesProfiles?.has(r.profile) ? Math.max(0, i - cr) : i;
   }
-  return rows;
+  const out = [];
+  for (const [user_key, a] of acc) {
+    const denom = a.cr + a.denomI;
+    a.ratio = denom ? a.cr / denom : 0;
+    a.advice = a.ratio >= 0.9 ? "缓存命中率优秀,会话结构良好"
+      : a.ratio >= 0.8 ? "缓存命中率良好;长会话尽量连续使用、减少频繁切换可进一步提升"
+      : "缓存命中率偏低:长会话尽量连续使用、避免反复粘贴大段上下文";
+    out.push({ user_key, user_name: a.user_name, cr: a.cr, i: a.i, ratio: a.ratio, advice: a.advice });
+  }
+  return out;
 }
 
 // —— Task 9: 报告导出(自包含单文件 HTML,零外部依赖)——
@@ -749,7 +759,7 @@ table{border-collapse:collapse;width:100%;margin:8px 0}th,td{border:1px solid #e
 <li>token/行 = output_tokens ÷ 净产出（联 usage_daily）</li>
 <li>成本 = Σ(tokens × 单价/1M)，缓存按用户模型权重混合折算，cacheRead≈cacheWrite÷12.5（Claude 牌价比例）</li>
 <li>仅统计结构化指标，不存储任何代码内容；Codex 协议为指标子集（shell/apply_patch）</li>
-<li>成本：启用峰谷（peak 时段）后按小时表分档计价，小时表启用日前的缺口按基础价回填；缓存部分按日表混合折算（小时表无缓存列）</li>
-<li>项目分布：按会话主导子树推导（自动识别仓库根，剔除 .claude/.git/node_modules 等噪声），可配正则别名规则</li></ul>
+<li>成本：高峰判档复用各方案（profile）设置里的高峰时段，方案未设高峰按全天基础价；按小时表分档计价，小时表启用日前的缺口按基础价回填；缓存按小时表分时缓存列分档计价（分时缓存启用前的缺口按日表混合价回填）</li>
+<li>项目分布：按会话主导子树推导（自动识别仓库根，剔除 .claude/.git/node_modules 等噪声）</li></ul>
 </body></html>`;
 }

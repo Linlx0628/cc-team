@@ -106,6 +106,11 @@ function saveConfig(cfg) {
 }
 
 const config = loadConfig();
+// 废弃键提示:等值成本峰时段已改为复用各方案的 peakHours,旧全局配置静默失效。
+// 只提示不自动迁移(峰时段语义随方案,无法机械换算);下次保存产出设置时遗留键会被物理清除。
+if (((config.productionTracking || {}).costPeakHours || []).length > 0) {
+  console.log("[CONFIG] productionTracking.costPeakHours 已废弃:等值成本峰时段现复用各方案设置里的高峰时段,请到方案设置中配置");
+}
 const { port } = config;
 const dashboardPassword = config.dashboardPassword || "";
 const dataPath = path.join(__dirname, "data.json");
@@ -464,6 +469,18 @@ function normalizePeakHours(raw) {
     if (start === null || end === null || start === end) continue;
     const norm = { start: item.start.trim(), end: item.end.trim() };
     if (!out.some(r => r.start === norm.start && r.end === norm.end)) out.push(norm);
+  }
+  return out;
+}
+
+// 等值成本的峰时段直接复用各方案已配的 peakHours（GLM 高峰在下午、DeepSeek 在上午+下午，
+// 一份全局时段无法适配所有模型）。key 与用量表 profile 列一致（normalizeProfileSuffix 后缀），
+// computeCosts 按用量行归属方案取峰段；已删除/改名方案的历史用量取不到 → 基础价（可接受降级）。
+function profilePeakHoursMap() {
+  const out = {};
+  for (const p of Object.values(config.profiles || {})) {
+    const sfx = normalizeProfileSuffix(p.suffix);
+    if (sfx) out[sfx] = normalizePeakHours(p.peakHours);
   }
   return out;
 }
@@ -1025,6 +1042,8 @@ function createProfileRuntime(profileName, profile) {
     profileName,
     suffix: normalizeProfileSuffix(profile.suffix),
     protocol: normalizeProfileProtocol(profile.protocol),
+    toolPatternCompat: normalizeToolPatternCompat(profile.toolPatternCompat),
+    toolPatternsActive: computeToolPatternsActive(profile, upstreamUrl),
     responsesPath: profile.responsesPath || "/v1/responses",
     isDefault: !!profile.isDefault,
     billingType: profile.billingType || "on_demand",
@@ -1062,6 +1081,14 @@ function initAllRuntimes() {
     }
   }
   console.log(`[RUNTIME] Initialized ${Object.keys(runtimes).length} profile(s): ${Object.values(runtimes).map(r => `"${r.profileName}"(${JSON.stringify(r.suffix)})`).join(", ")}`);
+}
+// 命中率计算要区分协议:Responses/Codex 的 input_tokens 含缓存读,Anthropic 不含。
+// 给 contextHealth 传「将其 input_tokens 视为含缓存的 profile 后缀集合」。
+// runtimes 的 key 与 usage_daily.profile 同用 normalizeProfileSuffix 规约,可直接比对。
+function responsesProfileSet() {
+  const s = new Set();
+  for (const [suffix, runtime] of Object.entries(runtimes)) if (runtime?.protocol === "responses") s.add(suffix);
+  return s;
 }
 
 function reloadProfileRuntime(profileName) {
@@ -1416,6 +1443,7 @@ function initDb() {
       profile TEXT NOT NULL, date TEXT NOT NULL, user_key TEXT NOT NULL,
       hour TEXT NOT NULL, model TEXT NOT NULL,
       requests INTEGER DEFAULT 0, input_tokens INTEGER DEFAULT 0, output_tokens INTEGER DEFAULT 0,
+      cache_creation INTEGER DEFAULT 0, cache_read INTEGER DEFAULT 0,
       PRIMARY KEY (profile, date, user_key, hour, model)
     );
     -- 峰谷成本走小时表按 date 范围扫描,主键前缀 (profile,date,...) 不带 profile 前导时用不上
@@ -1538,6 +1566,28 @@ function initDb() {
     console.log("[MIGRATE] quota_requests.pool added");
   }
 
+  // ── Column migration: usage_hourly_model cache tokens (per-model cache peak pricing) ──
+  // Peak-cost pricing needs cache_creation/cache_read at (hour, model) grain so the
+  // hourly path can price cache writes/reads at peak vs base rates. Historical rows
+  // are NOT backfilled — no hourly cache data was ever recorded. Cache columns read
+  // as 0 for old rows, which falls into computeCosts' gap formula and prices that
+  // cache at the daily blended base rate, exactly matching the pre-migration behavior.
+  const hmCols = db.prepare("PRAGMA table_info(usage_hourly_model)").all().map(c => c.name);
+  if (hmCols.length > 0 && (!hmCols.includes("cache_creation") || !hmCols.includes("cache_read"))) {
+    const backup = backupDatabaseSync("hourly-model-cache-migration");
+    if (backup) console.log(`[MIGRATE] Pre-migration backup: ${path.basename(backup)}`);
+    const tx = db.transaction(() => {
+      if (!hmCols.includes("cache_creation")) {
+        db.exec("ALTER TABLE usage_hourly_model ADD COLUMN cache_creation INTEGER DEFAULT 0");
+      }
+      if (!hmCols.includes("cache_read")) {
+        db.exec("ALTER TABLE usage_hourly_model ADD COLUMN cache_read INTEGER DEFAULT 0");
+      }
+    });
+    tx();
+    console.log("[MIGRATE] usage_hourly_model cache_creation/cache_read added (no backfill)");
+  }
+
   // ── Table migration: quota_daily_ops keyed by pool instead of profile ──
   // Manual daily ops (bonus / reset baseline) have to follow the allowance, which
   // now belongs to the pool: a bonus granted on one profile would otherwise leave
@@ -1620,10 +1670,11 @@ function initDb() {
       requests=requests+1, input_tokens=input_tokens+@inp, output_tokens=output_tokens+@out,
       cache_creation=cache_creation+@cacheC, cache_read=cache_read+@cacheR,
       weighted_tokens=weighted_tokens+@weighted`);
-  stmts.upsertHourlyModel = db.prepare(`INSERT INTO usage_hourly_model (profile,date,user_key,hour,model,requests,input_tokens,output_tokens)
-    VALUES (@profile,@today,@key,@hour,@m,1,@inp,@out)
+  stmts.upsertHourlyModel = db.prepare(`INSERT INTO usage_hourly_model (profile,date,user_key,hour,model,requests,input_tokens,output_tokens,cache_creation,cache_read)
+    VALUES (@profile,@today,@key,@hour,@m,1,@inp,@out,@cacheC,@cacheR)
     ON CONFLICT(profile,date,user_key,hour,model) DO UPDATE SET
-    requests=requests+1, input_tokens=input_tokens+@inp, output_tokens=output_tokens+@out`);
+    requests=requests+1, input_tokens=input_tokens+@inp, output_tokens=output_tokens+@out,
+    cache_creation=cache_creation+@cacheC, cache_read=cache_read+@cacheR`);
   stmts.insertError = db.prepare(`INSERT INTO errors (profile,time,user_name,user_key,status_code,error,path,model)
     VALUES (@profile,@time,@userName,@key,@statusCode,@error,@path,@model)`);
   stmts.pruneErrors = db.prepare(`DELETE FROM errors WHERE time < ?`);
@@ -4788,6 +4839,150 @@ async function describeImageViaHelper(b64, helperModel, runtime, clientState, pr
   }
 }
 
+// ─── Tool-schema compat: strip regex patterns the upstream can't compile ───
+// Zhipu GLM's tool-schema validator rejects requests whose tool `pattern`
+// fields use regex it cannot compile, with error 1210 "API 调用参数有误" for
+// the WHOLE request. Empirically (2026-09) the toxic constructs are Unicode
+// property classes (`\p{Cc}`…) — lookarounds compile fine there, but RE2-based
+// validators reject those, so both classes are stripped conservatively.
+// Claude Code ≥2.1.266 ships an "Artifact" tool whose schema carries such
+// patterns, so every interactive request would fail against such upstreams.
+// Patterns are optional validation hints; a background probe re-enables
+// pass-through once the upstream learns to accept them.
+const UNSUPPORTED_PATTERN_RE = /\\[pP]\{|\(\?[=!]/;   // \p{ \P{ (?= (?! (?<= (?<!
+
+// Recursively drop `pattern` fields using constructs the upstream can't
+// compile. Returns count removed.
+function stripUnsupportedPatternsNode(node) {
+  let removed = 0;
+  if (Array.isArray(node)) {
+    for (const item of node) removed += stripUnsupportedPatternsNode(item);
+  } else if (node && typeof node === "object") {
+    if (typeof node.pattern === "string" && UNSUPPORTED_PATTERN_RE.test(node.pattern)) {
+      delete node.pattern;
+      removed++;
+    }
+    for (const key of Object.keys(node)) {
+      if (key !== "pattern") removed += stripUnsupportedPatternsNode(node[key]);
+    }
+  }
+  return removed;
+}
+
+// Rewrite a parsed request body in place, stripping lookaround patterns from
+// every tool schema (Anthropic `input_schema` and OpenAI `parameters` shapes).
+// Returns the number of patterns removed (0 → nothing worth re-serializing).
+function stripUnsupportedToolPatterns(parsed) {
+  if (!Array.isArray(parsed?.tools)) return 0;
+  let removed = 0;
+  for (const tool of parsed.tools) {
+    if (!tool || typeof tool !== "object") continue;
+    const schema = tool.input_schema ?? tool.parameters;
+    if (schema && typeof schema === "object") removed += stripUnsupportedPatternsNode(schema);
+  }
+  return removed;
+}
+
+function normalizeToolPatternCompat(v) {
+  return v === "always" || v === "off" ? v : "auto";
+}
+
+// Initial stripping decision for a profile: "always"/"off" follow the config
+// verbatim; "auto" (default) strips only for third-party Anthropic-compatible
+// upstreams — Anthropic's own API compiles lookarounds fine — and the probe
+// below refines that over time.
+function computeToolPatternsActive(profile, upstreamUrl) {
+  const mode = normalizeToolPatternCompat(profile.toolPatternCompat);
+  if (mode === "always") return true;
+  if (mode === "off") return false;
+  if (normalizeProfileProtocol(profile.protocol) !== "anthropic") return false;
+  const host = upstreamUrl.hostname;
+  return !(host === "api.anthropic.com" || host.endsWith(".anthropic.com"));
+}
+
+const TOOL_PATTERN_PROBE_DELAY_MS = Math.max(0, Number(process.env.TOOL_PATTERN_PROBE_DELAY_MS) || 30000);
+const TOOL_PATTERN_PROBE_INTERVAL_MS = Math.max(60000, Number(process.env.TOOL_PATTERN_PROBE_INTERVAL_MS) || 6 * 3600 * 1000);
+
+function toolPatternProbeBody(model) {
+  return {
+    model, max_tokens: 64, stream: false,
+    messages: [{ role: "user", content: "ping" }],
+    tools: [{
+      name: "gateway_compat_probe",
+      description: "Gateway reachability probe; never meaningful to call.",
+      // Same construct that breaks real traffic (Zhipu rejects `\p{…}` classes
+      // with 1210) so the probe verdict matches live behaviour.
+      input_schema: {
+        type: "object",
+        properties: { path: { type: "string", pattern: "^(?!__.*__$)[^\\p{Cc}\\p{Cf}\\p{Zl}\\p{Zp}]{1,200}$" } },
+        required: [],
+      },
+    }],
+  };
+}
+
+// Ask the upstream whether it accepts a lookaround pattern: true = accepted,
+// false = rejected with Zhipu-style 1210, null = inconclusive (network error,
+// auth failure, other status) — inconclusive leaves current behaviour as is.
+function probeToolPatternSupport(rt) {
+  return new Promise((resolve) => {
+    const realKey = getRealKeyFromProfile(config.profiles[rt.profileName] || {});
+    const model = (rt.allowedModels && rt.allowedModels[0]) || Object.values(rt.modelAliases || {})[0];
+    if (!realKey || !model) { resolve(null); return; }
+    const body = Buffer.from(JSON.stringify(toolPatternProbeBody(model)));
+    const transport = rt.upstreamUrl.protocol === "https:" ? https : http;
+    const req = transport.request({
+      hostname: rt.upstreamUrl.hostname,
+      port: rt.upstreamUrl.port || (rt.upstreamUrl.protocol === "https:" ? 443 : 80),
+      path: rt.upstreamUrl.pathname.replace(/\/$/, "") + "/v1/messages",
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "content-length": body.length,
+        authorization: `Bearer ${realKey}`,
+        "x-api-key": realKey,
+        "anthropic-version": "2023-06-01",
+      },
+      agent: rt.agent,
+    }, (res) => {
+      const chunks = [];
+      res.on("data", (c) => chunks.push(c));
+      res.on("end", () => {
+        const text = Buffer.concat(chunks).toString();
+        if (res.statusCode === 200) resolve(true);
+        else if (res.statusCode === 400 && text.includes("1210")) resolve(false);
+        else resolve(null);
+      });
+    });
+    req.setTimeout(15000, () => req.destroy(new Error("probe timeout")));
+    req.on("error", () => resolve(null));
+    req.write(body);
+    req.end();
+  });
+}
+
+async function runToolPatternProbe(rt) {
+  if (rt.protocol !== "anthropic" || rt.toolPatternCompat !== "auto") return;
+  const supported = await probeToolPatternSupport(rt);
+  if (supported === null) return;
+  if (supported && rt.toolPatternsActive) {
+    rt.toolPatternsActive = false;
+    console.log(`[工具兼容] 方案「${rt.profileName}」: 探测到上游已支持这些 pattern 特性，恢复完整工具定义`);
+  } else if (!supported && !rt.toolPatternsActive) {
+    rt.toolPatternsActive = true;
+    console.log(`[工具兼容] 方案「${rt.profileName}」: 探测到上游拒绝此类 pattern(1210)，重新启用剔除`);
+  } else {
+    console.log(`[工具兼容] 方案「${rt.profileName}」: 探测完成，上游${supported ? "已支持" : "仍不支持此类 pattern"}，剔除保持${rt.toolPatternsActive ? "开启" : "关闭"}`);
+  }
+}
+
+function scheduleToolPatternProbes() {
+  const first = setTimeout(() => { for (const rt of Object.values(runtimes)) runToolPatternProbe(rt); }, TOOL_PATTERN_PROBE_DELAY_MS);
+  const timer = setInterval(() => { for (const rt of Object.values(runtimes)) runToolPatternProbe(rt); }, TOOL_PATTERN_PROBE_INTERVAL_MS);
+  first.unref?.();
+  timer.unref?.();
+}
+
 // Resolve the real upstream key for a profile config (used by the bridge helper
 // call which bypasses the normal virtual-key mapping for a synthetic request).
 function getRealKeyFromProfile(profileCfg) {
@@ -5181,6 +5376,22 @@ function proxyRequest(req, res) {
 
           const isStreamRequest = (req.headers["accept"] || "").includes("text/event-stream") ||
             (function() { try { return JSON.parse(cbody.toString()).stream; } catch { return false; } })();
+
+          // Tool-schema compat: some upstream validators (GLM 1210) reject the
+          // whole request when a tool schema carries lookaround regex. Runs
+          // before the image bridge so the bridge re-serializes the stripped
+          // body, never resurrecting a removed pattern.
+          if (cruntime.toolPatternsActive && cbody.includes('"tools"')) {
+            try {
+              const strippedBody = JSON.parse(cbody.toString());
+              const removedPatterns = stripUnsupportedToolPatterns(strippedBody);
+              if (removedPatterns > 0) {
+                cbody = Buffer.from(JSON.stringify(strippedBody));
+                reqHeaders["content-length"] = cbody.length;
+                console.log(`${reqTag} [工具兼容] ${getUserName(apiKey, cruntime)} 剔除 ${removedPatterns} 处上游不支持的 pattern model=${creqModel}`);
+              }
+            } catch {}
+          }
 
           // Image-recognition bridge (both protocols): non-multimodal aliases
           // with images are rewritten into helper-model descriptions before the
@@ -6329,27 +6540,19 @@ ${((() => { const qa = stmts.quotaAdjustRecent.all(); return qa.length > 0 ? `<h
 </div>
 </form>
 
-<h2 id="costRatesCard">产出与成本设置 <span style="font-size:11px;color:var(--dim);font-weight:400">全局生效,不随方案切换;价格表驱动「等值成本」工作区</span></h2>
+<h2 id="costRatesCard">产出与成本设置 <span style="font-size:11px;color:var(--dim);font-weight:400">牌价全局生效,不随方案切换;价格表驱动「等值成本」工作区</span></h2>
 <div class="section">
 <label style="display:flex;align-items:center;gap:6px;cursor:pointer"><input type="checkbox" id="prodTrackingToggle" style="width:auto"> 启用产出解析<span class="note" style="margin:0">仅统计结构化指标,不存储代码内容</span></label>
 <label style="display:flex;align-items:center;gap:6px;cursor:pointer;margin-top:8px"><input type="checkbox" id="prodPathToggle" style="width:auto"> 记录文件路径<span class="note" style="margin:0">关闭则仅保留扩展名</span></label>
-<label style="margin-top:14px;display:block">等值成本高峰时段(按北京时间,命中时走下方「高峰In/Out」牌价;不设 = 全天按基础价)</label>
-<div id="costPeakList"></div>
-<div style="display:flex;align-items:center;gap:10px;margin-top:6px">
-<button type="button" class="btn btn-outline btn-sm" onclick="addCostPeakRow('','')">＋添加时段</button>
-<span class="note" style="margin:0">结束早于开始 = 跨零点(如 22:00-06:00)</span>
-</div>
 <label style="margin-top:14px">模型参考牌价(USD / 1M tokens) — 支持前缀匹配,如 claude-sonnet 覆盖所有 claude-sonnet-* 变体</label>
-<div class="alias-head rate" style="grid-template-columns:2fr 1fr 1fr 1fr 1fr 1fr 1fr auto"><span>模型名</span><span>输入</span><span>输出</span><span>缓存写</span><span>缓存读</span><span>高峰In</span><span>高峰Out</span><span></span></div>
+<div class="alias-head rate" style="grid-template-columns:2fr 1fr 1fr 1fr 1fr 1fr 1fr 1fr 1fr auto"><span>模型名</span><span>输入</span><span>输出</span><span>缓存写</span><span>缓存读</span><span>高峰In</span><span>高峰Out</span><span>峰缓存写</span><span>峰缓存读</span><span></span></div>
 <div id="costRateRows"></div>
 <div style="display:flex;align-items:center;gap:10px;margin-top:8px">
 <button type="button" class="btn btn-outline btn-sm" onclick="addCostRateRow('', {input:0,output:0,cacheWrite:0,cacheRead:0})">＋添加模型价格</button>
 <button type="button" class="btn btn-primary btn-sm" onclick="saveProdSettings()">保存</button>
 <span class="note" id="prodSettingsMsg" style="margin:0"></span>
 </div>
-<div class="note">牌价用于把 token 用量折算为等值美元成本(参考牌价,非实际账单)。未配置价格的模型计 0 并在「等值成本」工作区列出,可在此补充。价格为查询时现算,修改后全部历史立即按新价重算;高峰价留空 = 同基础价,建议时段用整点。</div>
-<label style="margin-top:14px;display:block">项目名归并(每行一条 <span style="font-family:var(--font-mono)">正则=显示名</span>,按首个命中归并)</label>
-<textarea id="projectAliasText" rows="4" placeholder="正则=显示名,每行一条" style="resize:vertical"></textarea>
+<div class="note">牌价用于把 token 用量折算为等值美元成本(参考牌价,非实际账单)。未配置价格的模型计 0 并在「等值成本」工作区列出,可在此补充。价格为查询时现算,修改后全部历史立即按新价重算。高峰判档复用各方案设置里的「高峰时段」(按北京时间),方案未设高峰 = 该方案全天按基础价;各高峰价(高峰In/Out、峰缓存写/读)留空 = 同基础价,显式 0 = 峰时段免费。</div>
 </div>
 
 <h2>旧数据导入</h2>
@@ -6462,6 +6665,7 @@ ${(() => {
     ${shared ? `<span class="tag" style="background:rgba(180,35,24,.08);color:var(--red)">${p.profiles.length} 个方案共用</span>` : ''}
     ${empty ? `<span class="tag" style="background:#faf5e6;color:var(--orange)">无成员方案</span>` : ''}</div>
     <div style="display:flex;align-items:center;gap:8px">
+      <button type="button" class="btn btn-outline btn-sm" onclick="renamePoolLabel('${escJs(p.name)}','${escJs(p.label)}')" title="修改显示名（池 key 不变，方案绑定不受影响）">重命名</button>
       <label style="font-size:12px;color:var(--dim);margin:0">池级每日限额</label>
       <input type="number" data-poollimit="${escHtml(p.name)}" value="${p.dailyTokenLimit ?? ""}" min="0" step="100000" placeholder="不限制" style="width:150px;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:5px 8px;border-radius:4px;font-size:12px">
       ${empty ? `<button type="button" class="btn btn-danger btn-sm" onclick="deletePool('${escJs(p.name)}')" title="删除此空池及其配额配置">删除</button>` : `<button type="button" class="btn btn-outline btn-sm" disabled title="先在方案编辑页把成员移到其他池，空池才能删除">删除</button>`}
@@ -6956,6 +7160,23 @@ async function savePoolQuota(poolName){
   if(!r.ok){alert('保存失败: '+(data&&data.error?data.error:r.status));return}
   rememberPoolViewForReload();
   toastThen('额度池「'+(data.pool?data.pool.label:poolName)+'」已保存',()=>location.reload());
+}
+// Rename a pool's display label only — the pool key (name) never changes, so
+// member profile bindings and per-user limits are untouched (body omits them).
+async function renamePoolLabel(poolName,currentLabel){
+  const nn=prompt('新的额度池显示名（池 key '+poolName+' 不变，方案绑定与配额不受影响）',currentLabel);
+  if(!nn)return;
+  const label=nn.trim();
+  if(!label||label===currentLabel)return;
+  let r,data;
+  try{
+    r=await fetch('/api/quota-pool/save',{method:'POST',headers:csrfHeaders({'Content-Type':'application/json'}),
+      body:JSON.stringify({pool:poolName,label})});
+    data=await r.json();
+  }catch(err){alert('重命名失败: '+err.message);return}
+  if(!r.ok){alert('重命名失败: '+(data&&data.error?data.error:r.status));return}
+  rememberPoolViewForReload();
+  toastThen('额度池已重命名为「'+(data.pool?data.pool.label:label)+'」',()=>location.reload());
 }
 // Open the temporary-quota modal for a user from the pool view, using the pool's
 // representative profile suffix so /api/quota/daily-op resolves the same pool.
@@ -7747,7 +7968,8 @@ try{if(sessionStorage.getItem('tm_return_pool_view')==='1'){sessionStorage.remov
 })();
 document.addEventListener("keydown",e=>{if(e.key==="Enter"&&e.target.tagName!=="TEXTAREA"&&e.target.tagName!=="INPUT")e.preventDefault()});
 // ─── 产出与成本设置(参考牌价表 + 产出解析开关;走 /api/production/settings,独立于 settings-save 表单)───
-const INITIAL_PROD=${JSON.stringify({ productionTracking: Object.assign({ enabled: true, storeFilePaths: true, costPeakHours: [], projectAliases: [] }, config.productionTracking || {}), costRates: config.costRates || DEFAULT_COST_RATES }).replace(/</g, "\\x3c")};
+// 峰时段复用各方案设置里的「高峰时段」,此处不再单独配置;项目名归并功能已移除。
+const INITIAL_PROD=${JSON.stringify({ productionTracking: Object.assign({ enabled: true, storeFilePaths: true }, config.productionTracking || {}), costRates: config.costRates || DEFAULT_COST_RATES }).replace(/</g, "\\x3c")};
 function costRateRow(m,r,i){
   return '<div data-i="'+i+'" style="display:flex;gap:6px;margin:4px 0;align-items:center">'
     +'<input class="cr-model" value="'+h(m)+'" placeholder="模型名(支持前缀)" style="flex:2;min-width:0">'
@@ -7757,61 +7979,30 @@ function costRateRow(m,r,i){
     +'<input class="cr-cr" type="number" step="0.01" min="0" value="'+Number(r.cacheRead||0)+'" placeholder="缓存读" style="flex:1;min-width:0">'
     +'<input class="cr-pin" type="number" step="0.01" min="0" value="'+(r.peakInput==null?'':r.peakInput)+'" placeholder="峰In" style="flex:1;min-width:0">'
     +'<input class="cr-pout" type="number" step="0.01" min="0" value="'+(r.peakOutput==null?'':r.peakOutput)+'" placeholder="峰Out" style="flex:1;min-width:0">'
+    +'<input class="cr-pcw" type="number" step="0.01" min="0" value="'+(r.peakCacheWrite==null?'':r.peakCacheWrite)+'" placeholder="峰缓存写" style="flex:1;min-width:0">'
+    +'<input class="cr-pcr" type="number" step="0.01" min="0" value="'+(r.peakCacheRead==null?'':r.peakCacheRead)+'" placeholder="峰缓存读" style="flex:1;min-width:0">'
     +'<button type="button" class="btn btn-outline btn-sm" onclick="this.parentElement.remove()">删</button></div>';
 }
 function addCostRateRow(m,r){document.getElementById('costRateRows').insertAdjacentHTML('beforeend',costRateRow(m,r,document.querySelectorAll('#costRateRows > div').length))}
-// ─── costPeakList:峰谷计价时段编辑器(行 = 时/分×2 select,样式同 profile 的高峰时段编辑器)───
-// 收集后随 saveProdSettings 走 /api/production/settings;select 无 name,不混入 settings-save 表单。
-function costPeakOpt(n,sel){var out='';for(var i=0;i<n;i++){var v=String(i).padStart(2,'0');out+='<option value="'+v+'"'+(v===sel?' selected':'')+'>'+v+'</option>'}return out}
-function addCostPeakRow(start,end){
-  const list=document.getElementById('costPeakList');if(!list)return;
-  const sVal=/^\\d{2}:\\d{2}$/.test(start||'')?start:'09:00';
-  const eVal=/^\\d{2}:\\d{2}$/.test(end||'')?end:'12:00';
-  const selStyle='width:auto;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:3px 6px;border-radius:4px;font-size:12px';
-  const [sh,sm]=sVal.split(':'),[eh,em]=eVal.split(':');
-  const sel=function(k,n,v,label){return '<select data-cp="'+k+'" aria-label="'+label+'" style="'+selStyle+'">'+costPeakOpt(n,v)+'</select>'};
-  list.insertAdjacentHTML('beforeend','<div style="display:flex;align-items:center;gap:6px;margin-bottom:6px">'
-    +sel('sh',24,sh,'高峰开始时')+':'+sel('sm',60,sm,'高峰开始分')
-    +' <span style="color:var(--dim)">至</span> '
-    +sel('eh',24,eh,'高峰结束时')+':'+sel('em',60,em,'高峰结束分')
-    +' <button type="button" class="btn btn-outline btn-sm" onclick="this.parentElement.remove()">删除</button></div>');
-}
-function collectCostPeakHours(){
-  return Array.prototype.map.call(document.querySelectorAll('#costPeakList > div'),function(row){
-    const q=function(k){const s=row.querySelector('select[data-cp="'+k+'"]');return s?s.value:'00'};
-    return {start:q('sh')+':'+q('sm'),end:q('eh')+':'+q('em')};
-  });
-}
-function parseProjectAliasText(){
-  // 每行 pattern=name:按第一个 = 切,两端 trim,空段整行跳过(服务端再校验正则合法性)
-  return (document.getElementById('projectAliasText').value||'').split('\\n').map(function(line){
-    const i=line.indexOf('=');if(i<1)return null;
-    const pattern=line.slice(0,i).trim(),name=line.slice(i+1).trim();
-    if(!pattern||!name)return null;
-    return {pattern:pattern,name:name};
-  }).filter(Boolean);
-}
 function saveProdSettings(){
   const costRates={};
   document.querySelectorAll('#costRateRows > div').forEach(row=>{
     const m=row.querySelector('.cr-model').value.trim();if(!m)return;
     costRates[m]={input:+row.querySelector('.cr-in').value||0,output:+row.querySelector('.cr-out').value||0,
       cacheWrite:+row.querySelector('.cr-cw').value||0,cacheRead:+row.querySelector('.cr-cr').value||0,
-      peakInput:row.querySelector('.cr-pin').value.trim(),peakOutput:row.querySelector('.cr-pout').value.trim()};
+      peakInput:row.querySelector('.cr-pin').value.trim(),peakOutput:row.querySelector('.cr-pout').value.trim(),
+      peakCacheWrite:row.querySelector('.cr-pcw').value.trim(),peakCacheRead:row.querySelector('.cr-pcr').value.trim()};
   });
   const msg=document.getElementById('prodSettingsMsg');
   msg.textContent='保存中...';
   fetch('/api/production/settings',{method:'POST',headers:csrfHeaders({'Content-Type':'application/json'}),
-    body:JSON.stringify({productionTracking:{enabled:document.getElementById('prodTrackingToggle').checked,storeFilePaths:document.getElementById('prodPathToggle').checked,
-      costPeakHours:collectCostPeakHours(),projectAliases:parseProjectAliasText()},costRates:costRates})})
+    body:JSON.stringify({productionTracking:{enabled:document.getElementById('prodTrackingToggle').checked,storeFilePaths:document.getElementById('prodPathToggle').checked},costRates:costRates})})
     .then(r=>r.json()).then(()=>{msg.textContent='已保存';setTimeout(()=>location.reload(),600)})
     .catch(e=>{msg.textContent='保存失败: '+e.message});
 }
 (function(){
   document.getElementById('prodTrackingToggle').checked=INITIAL_PROD.productionTracking.enabled!==false;
   document.getElementById('prodPathToggle').checked=INITIAL_PROD.productionTracking.storeFilePaths!==false;
-  (INITIAL_PROD.productionTracking.costPeakHours||[]).forEach(r=>addCostPeakRow(r.start,r.end));
-  document.getElementById('projectAliasText').value=(INITIAL_PROD.productionTracking.projectAliases||[]).map(a=>a.pattern+'='+a.name).join('\\n');
   const rates=INITIAL_PROD.costRates||{};
   const names=Object.keys(rates);
   if(names.length){names.forEach(m=>addCostRateRow(m,rates[m]))}
@@ -8021,7 +8212,7 @@ td{padding:8px 12px;font-size:11px;border-bottom:1px solid #ecece8;white-space:n
         <table id="prodTable"><thead><tr><th>成员</th><th class="n" title="新增行−删除行;衡量实际沉淀的代码量">净产出</th><th class="n" title="去重后的改动文件数">文件</th><th class="n" title="AI 编辑失败占比;持续偏高=上下文过时或库太大。参考区间:&lt;10% 正常,≥30% 关注">失败率</th><th class="n" title="每写10行删几行;高=反复推倒。参考区间:&lt;30% 健康,≥80% 大面积回滚">重写率</th><th class="n" title="每次编辑配套的 test/lint 命令数;0=从不验证。参考区间:0.1-0.8 健康">验证密度</th><th class="n" title="净产出每行的输出token;成本效率,仅做横向对比与自身趋势,无绝对好坏">token/行</th><th class="n" title="空转/错误循环/失败爆发三类(见下方告警面板)">告警</th></tr></thead><tbody></tbody></table>
         <div id="prodZero" style="padding:6px 12px;font-size:11px;color:var(--orange)"></div>
         <div id="prodDetail" style="padding:8px 12px;display:none"></div>
-        <div class="workspace-panel-head" style="border-top:1px solid var(--border)"><strong title="按会话自动识别的项目,可配别名规则">项目分布</strong></div>
+        <div class="workspace-panel-head" style="border-top:1px solid var(--border)"><strong title="按会话自动识别的项目(仓库根聚类)">项目分布</strong></div>
         <table id="projTable"><thead><tr><th>项目</th><th class="n">成员</th><th class="n">文件</th><th class="n">净产出</th></tr></thead><tbody></tbody></table>
         <div class="workspace-panel-head" style="border-top:1px solid var(--border)"><strong title="规则见设置;峰值 token/同类错误/失败率触发">空转 / 循环告警</strong><button type="button" class="detail-reset" onclick="markProdAlerts()" style="margin-left:auto">全部已读</button></div>
         <table id="prodAlertTable"><thead><tr><th>时间</th><th>成员</th><th>类型</th><th>说明</th></tr></thead><tbody></tbody></table>
@@ -8624,9 +8815,11 @@ async function loadCosts(){
       ||'<tr><td colspan="5" class="empty">该周期无用量</td></tr>';
     const pk=c.peak||{},badge=document.getElementById('costPeakBadge');
     badge.className='';badge.textContent='';
-    if(pk.enabled){
-      const hours=(pk.hours||[]).map(h=>ph(h.start)+'-'+ph(h.end)).join(', ');
-      if(pk.inPeakNow){badge.className='pill-warn';badge.textContent='高峰 '+hours+' 生效中';}
+    // 峰时段按方案展示:任一配置了峰时段的方案正处于高峰 → 高亮;否则显示低谷
+    const pps=pk.profiles||[];
+    if(pps.length){
+      const inPeak=pps.filter(p=>p.inPeakNow);
+      if(inPeak.length){badge.className='pill-warn';badge.textContent='高峰生效中: '+inPeak.map(p=>ph(p.name)).join('、');}
       else{badge.className='pill-ok';badge.textContent='低谷时段';}
     }
     document.getElementById('unpricedNote').innerHTML=c.unpriced.length?'未配置价格:'+c.unpriced.map(u=>'<span class="chip chip-warn">'+ph(u)+'</span>').join('')+'(在设置页补充)':'';
@@ -9672,7 +9865,7 @@ let calRz;window.addEventListener('resize',function(){clearTimeout(calRz);calRz=
         '<div class="card"><div class="l">净产出(行)</div>'+val(net.toLocaleString('zh-CN'))+'</div>'+
         '<div class="card"><div class="l">编辑次数</div>'+val(edits)+'</div>'+
         '<div class="card"><div class="l">失败率</div>'+val(failPct+'%',failColor)+'</div>'+
-        (d.health?'<div class="card"><div class="l">缓存命中率</div>'+val(hitPct+'%',hitColor)+(d.health.advice?'<div style="font-size:10px;color:var(--dim);margin-top:6px;line-height:1.5">'+ph(d.health.advice)+'</div>':'')+'</div>':'');
+        (d.health?'<div class="card"><div class="l">缓存命中率 <span style="font-size:9px;color:var(--dim);font-weight:400">近7天</span></div>'+val(hitPct+'%',hitColor)+(d.health.advice?'<div style="font-size:10px;color:var(--dim);margin-top:6px;line-height:1.5">'+ph(d.health.advice)+'</div>':'')+'</div>':'');
       document.getElementById('prodMeTrend').textContent='日趋势:'+(d.days.map(x=>x.date.slice(5)+':'+(x.la-x.ld)+'行').join(' · ')||'暂无');
       document.getElementById('prodMeLangs').innerHTML='语言分布:'+(d.languages.length?d.languages.map(l=>'<span style="display:inline-block;font-size:10px;color:var(--dim);border:1px solid var(--border-strong);border-radius:9px;padding:1px 8px;margin:0 4px 4px 0">'+ph(l.ext||'其他')+' +'+l.la+'</span>').join(''):'暂无');
     })
@@ -10982,7 +11175,7 @@ const server = http.createServer((req, res) => {
     if (!checkCsrf(req)) { res.writeHead(403); res.end("CSRF validation failed"); return; }
     readBody(req).then(buf => {
       try {
-        const { pool: poolNameRaw, dailyTokenLimit, users } = JSON.parse(buf.toString());
+        const { pool: poolNameRaw, dailyTokenLimit, users, label } = JSON.parse(buf.toString());
         const poolName = normalizeQuotaPoolName(poolNameRaw);
         const pool = getPoolByName(poolName);
         if (!poolName || !pool) throw new Error(`额度池 "${poolNameRaw || ""}" 不存在`);
@@ -10994,8 +11187,19 @@ const server = http.createServer((req, res) => {
 
         const prevPoolLimit = pool.dailyTokenLimit ?? null;
         const prevUsers = { ...(pool.users || {}) };
-        const nextPoolLimit = normLimit(dailyTokenLimit);
+        // Limit only moves when the body carries it — a label-only rename must
+        // not silently reset the pool limit (label is display-only; the pool
+        // key `name` never changes, so member profiles keep their binding).
+        const nextPoolLimit = dailyTokenLimit === undefined ? prevPoolLimit : normLimit(dailyTokenLimit);
         pool.dailyTokenLimit = nextPoolLimit;
+
+        // Display label edit: optional, empty/whitespace keeps the current one.
+        let prevLabel = pool.label || poolName;
+        let nextLabel = prevLabel;
+        if (typeof label === "string" && label.trim()) {
+          nextLabel = label.trim().slice(0, QUOTA_POOL_NAME_MAX);
+          pool.label = nextLabel;
+        }
 
         const userChanges = [];
         if (users && typeof users === "object") {
@@ -11016,6 +11220,7 @@ const server = http.createServer((req, res) => {
 
         const parts = [];
         if (prevPoolLimit !== nextPoolLimit) parts.push(`池级 ${prevPoolLimit ? prevPoolLimit.toLocaleString() : "不限"} → ${nextPoolLimit ? nextPoolLimit.toLocaleString() : "不限"}`);
+        if (prevLabel !== nextLabel) parts.push(`显示名「${prevLabel}」→「${nextLabel}」`);
         if (userChanges.length) parts.push(userChanges.slice(0, 12).join("；") + (userChanges.length > 12 ? ` 等 ${userChanges.length} 项` : ""));
         recordAdminAudit(req, "quotaPool.save", pool.label || poolName, `保存额度池「${pool.label || poolName}」${parts.length ? "：" + parts.join("；") : "（无变化）"}`);
 
@@ -11218,7 +11423,7 @@ const server = http.createServer((req, res) => {
     try {
       const { from, to } = rangeFromTo(new URL(req.url, "http://localhost").searchParams.get("range") || "7d");
       const s = productionSummary(db, { from, to });
-      s.health = contextHealth(db, { from, to });
+      s.health = contextHealth(db, { from, to, responsesProfiles: responsesProfileSet() });
       s.range = { from, to };
       // 未读告警按 user 计数(初始 0 再累计 seen=0),供工作区表格末列展示
       s.alertCounts = Object.fromEntries(s.rows.map(r => [r.user_key, 0]));
@@ -11255,7 +11460,7 @@ const server = http.createServer((req, res) => {
     try {
       const { from, to } = rangeFromTo(new URL(req.url, "http://localhost").searchParams.get("range") || "7d");
       res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
-      res.end(JSON.stringify({ rows: productionProjects(db, { from, to, aliases: (config.productionTracking || {}).projectAliases || [] }) }));
+      res.end(JSON.stringify({ rows: productionProjects(db, { from, to }) }));
     } catch (err) {
       if (!res.headersSent) {
         res.writeHead(err.statusCode || 500, { "Content-Type": "application/json; charset=utf-8" });
@@ -11311,11 +11516,16 @@ const server = http.createServer((req, res) => {
     if (!checkAuth(req)) { res.writeHead(401); res.end("Unauthorized"); return; }
     try {
       const { from, to } = rangeFromTo(new URL(req.url, "http://localhost").searchParams.get("range") || "7d");
-      const peakHours = normalizePeakHours((config.productionTracking || {}).costPeakHours || []);
+      const peakMap = profilePeakHoursMap();
       res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+      // 峰时段复用各方案设置;前端徽标按方案展示当前是否在峰内
+      const peakProfiles = Object.entries(config.profiles || {}).map(([name, p]) => {
+        const hours = normalizePeakHours(p.peakHours);
+        return { name, suffix: normalizeProfileSuffix(p.suffix), hours, inPeakNow: isInPeakHours(hours) };
+      }).filter(x => x.suffix && x.hours.length);
       res.end(JSON.stringify({
-        ...computeCosts(db, config.costRates || DEFAULT_COST_RATES, { from, to, peakHours }),
-        peak: { enabled: peakHours.length > 0, hours: peakHours, inPeakNow: isInPeakHours(peakHours) },
+        ...computeCosts(db, config.costRates || DEFAULT_COST_RATES, { from, to, profilePeakHours: peakMap }),
+        peak: { enabled: peakProfiles.length > 0, profiles: peakProfiles },
         rateNote: "USD/1M tokens,参考牌价折算,非实际账单",
       }));
     } catch (err) {
@@ -11337,9 +11547,9 @@ const server = http.createServer((req, res) => {
       const { from, to } = rangeFromTo(u.searchParams.get("range") || "7d");
       const html = buildReportHTML({
         summary: productionSummary(db, { from, to }),
-        projects: productionProjects(db, { from, to, aliases: (config.productionTracking || {}).projectAliases || [] }),
-        costs: computeCosts(db, config.costRates || DEFAULT_COST_RATES, { from, to, peakHours: (config.productionTracking || {}).costPeakHours || [] }),
-        health: contextHealth(db, { from, to }),
+        projects: productionProjects(db, { from, to }),
+        costs: computeCosts(db, config.costRates || DEFAULT_COST_RATES, { from, to, profilePeakHours: profilePeakHoursMap() }),
+        health: contextHealth(db, { from, to, responsesProfiles: responsesProfileSet() }),
         alerts: productionAlerts(db, { from, to }),
         from, to,
       });
@@ -11377,17 +11587,11 @@ const server = http.createServer((req, res) => {
         const p = config.productionTracking || {};
         if (typeof body.productionTracking.enabled === "boolean") p.enabled = body.productionTracking.enabled;
         if (typeof body.productionTracking.storeFilePaths === "boolean") p.storeFilePaths = body.productionTracking.storeFilePaths;
-        // 峰谷时段复用配额峰谷的 normalizePeakHours(同款 HH:MM 校验/去重);空数组 = 关闭峰谷计价
-        if (Array.isArray(body.productionTracking.costPeakHours)) p.costPeakHours = normalizePeakHours(body.productionTracking.costPeakHours);
-        if (Array.isArray(body.productionTracking.projectAliases)) {
-          const aliases = [];
-          for (const a of body.productionTracking.projectAliases) {
-            if (!a || typeof a !== "object" || typeof a.pattern !== "string") continue;
-            try { new RegExp(a.pattern); } catch { continue; }   // 非法正则整条丢弃
-            aliases.push({ pattern: a.pattern, name: String(a.name ?? "").slice(0, 64) });
-          }
-          p.projectAliases = aliases;
-        }
+        // 全局成本峰时段(costPeakHours)与项目名归并(projectAliases)已废弃:
+        // 前者复用各方案的 peakHours,后者功能整体移除。旧 config 里的遗留键在此物理清除,
+        // 读取侧无任何消费方,未保存前也天然被忽略。
+        delete p.costPeakHours;
+        delete p.projectAliases;
         config.productionTracking = p;
       }
       if (body.costRates && typeof body.costRates === "object") {
@@ -11399,6 +11603,7 @@ const server = http.createServer((req, res) => {
           clean[m] = {
             input: +r.input || 0, output: +r.output || 0, cacheWrite: +r.cacheWrite || 0, cacheRead: +r.cacheRead || 0,
             peakInput: peakPrice(r.peakInput), peakOutput: peakPrice(r.peakOutput),
+            peakCacheWrite: peakPrice(r.peakCacheWrite), peakCacheRead: peakPrice(r.peakCacheRead),
           };
         }
         config.costRates = clean;
@@ -11864,7 +12069,7 @@ const server = http.createServer((req, res) => {
       const { from, to } = rangeFromTo(new URL(req.url, "http://localhost").searchParams.get("range") || "7d");
       const key = resolveUserKey(apiKey, rt);
       const detail = productionUserDetail(db, key, { from, to });
-      const health = contextHealth(db, { from, to }).find(h => h.user_key === key) || null;
+      const health = contextHealth(db, { from, to, responsesProfiles: responsesProfileSet() }).find(h => h.user_key === key) || null;
       res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
       res.end(JSON.stringify({ ...detail, health }));
     } catch (err) {
@@ -11937,6 +12142,7 @@ server.listen(port, "0.0.0.0", () => {
   console.log(`[团队AI Coding监控] Profiles: ${Object.values(runtimes).map(r => `"${r.profileName}"(${JSON.stringify(r.suffix)})→${r.upstream.replace("https://","").replace("http://","").split("/")[0]}`).join(", ")}`);
   console.log(`[团队AI Coding监控] Settings: http://localhost:${port}/settings`);
   console.log(`[团队AI Coding监控] Users: ${Object.values(rt?.globalUsers || {}).map(u => u.username || "").join(", ")}`);
+  scheduleToolPatternProbes();
 });
 
 // Server timeouts

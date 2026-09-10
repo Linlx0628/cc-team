@@ -14,7 +14,7 @@ import { cnNow, cnDate, cnHour, secondsUntilNextCnMidnight, cnWeekStartIso, cnDa
 import { parsePeakTimeMinutes, normalizePeakHours, isInPeakHours, formatPeakHoursSummary } from "./lib/schedule.mjs";
 import { sanitizeJson } from "./lib/sanitize.mjs";
 import { buildStatements } from "./lib/db.mjs";
-import { QUOTA_RATE_MAX, normalizeQuotaRate, normalizeCacheReadQuotaRate, normalizeModelQuotaRates, lookupModelQuotaRate, currentQuotaRate, nextRateChangeHint, QUOTA_POOL_NAME_MAX, normalizeQuotaPoolName, canonicalJson, shortDigest, applyStickyReorder } from "./lib/quota.mjs";
+import { QUOTA_RATE_MAX, normalizeQuotaRate, normalizeCacheReadQuotaRate, normalizeModelQuotaRates, lookupModelQuotaRate, currentQuotaRate, nextRateChangeHint, QUOTA_POOL_NAME_MAX, normalizeQuotaPoolName, canonicalJson, shortDigest, applyStickyReorder, buildPoolResolver } from "./lib/quota.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -649,85 +649,10 @@ function getProfileNameBySuffix(suffix) {
 // A profile always belongs to exactly one pool. A dangling reference (hand-edited
 // config, deleted pool) must not silently become "unlimited" — that would remove
 // every limit without a word — so it is repaired into an empty pool and logged.
-function resolvePoolName(profileName) {
-  const profile = config.profiles?.[profileName];
-  if (!profile) return "";
-  const name = normalizeQuotaPoolName(profile.quotaPool);
-  if (name && config.quotaPools?.[name]) return name;
-  const fallback = normalizeQuotaPoolName(profileName) || "pool";
-  if (!config.quotaPools) config.quotaPools = {};
-  if (!config.quotaPools[fallback]) {
-    config.quotaPools[fallback] = { label: profileName, dailyTokenLimit: null, users: {} };
-    console.warn(`[QuotaPool] 方案 "${profileName}" 指向不存在的额度池 "${name}"，已自动重建空池 "${fallback}"（不限额）`);
-  }
-  profile.quotaPool = fallback;
-  return fallback;
-}
-
-function getPoolByName(name) {
-  const pool = config.quotaPools?.[normalizeQuotaPoolName(name)];
-  if (!pool) return null;
-  if (!pool.users || typeof pool.users !== "object") pool.users = {};
-  return pool;
-}
-
-// Pool that a profile suffix draws from, plus its name — the pair every quota
-// lookup needs.
-function getPoolForSuffix(suffix) {
-  const sfx = normalizeProfileSuffix(suffix);
-  const profileName = getProfileNameBySuffix(sfx);
-  if (!profileName) return { name: "", pool: null };
-  const name = resolvePoolName(profileName);
-  return { name, pool: getPoolByName(name) };
-}
-
-// Every profile suffix drawing from a pool. This is what turns a per-profile
-// usage table into a pooled total.
-function getPoolSuffixes(poolName) {
-  const name = normalizeQuotaPoolName(poolName);
-  const out = [];
-  for (const profileName of Object.keys(config.profiles || {})) {
-    if (resolvePoolName(profileName) !== name) continue;
-    const sfx = normalizeProfileSuffix(config.profiles[profileName].suffix);
-    if (sfx) out.push(sfx);
-  }
-  return out;
-}
-
-function listQuotaPools() {
-  return Object.entries(config.quotaPools || {}).map(([name, pool]) => {
-    const members = Object.keys(config.profiles || {}).filter(p => resolvePoolName(p) === name);
-    // Every user who has a real key on ANY member profile — the editable pool
-    // view lists these (including ones with no limit yet), not just the ones who
-    // already have a limit.
-    const memberUsers = {};
-    for (const memberName of members) {
-      for (const [uk, u] of Object.entries(config.profiles[memberName]?.users || {})) {
-        const hasKey = typeof u === "string" ? !!u : !!(u && u.key);
-        if (!hasKey) continue;
-        if (!memberUsers[uk]) memberUsers[uk] = {
-          username: (config.users?.[uk]?.username) || uk.slice(0, 8),
-          dailyTokenLimit: (pool.users?.[uk]?.dailyTokenLimit) ?? null,
-        };
-      }
-    }
-    return {
-      name,
-      label: pool.label || name,
-      dailyTokenLimit: pool.dailyTokenLimit ?? null,
-      userLimits: Object.fromEntries(Object.entries(pool.users || {})
-        .filter(([, v]) => v && v.dailyTokenLimit != null)
-        .map(([k, v]) => [k, v.dailyTokenLimit])),
-      memberUsers,
-      profiles: members.map(name2 => ({
-        name: name2,
-        suffix: normalizeProfileSuffix(config.profiles[name2].suffix),
-        protocol: normalizeProfileProtocol(config.profiles[name2].protocol),
-        billingType: config.profiles[name2].billingType || "on_demand",
-      })),
-    };
-  });
-}
+// 实现已在 lib/quota.mjs 的 buildPoolResolver 工厂；此处注入 config 与它依赖的
+// 名/协议/后缀归一化函数，闭包实时读同一 config 引用。
+const { resolvePoolName, getPoolByName, getPoolForSuffix, getPoolSuffixes, listQuotaPools } =
+  buildPoolResolver({ config, getProfileNameBySuffix, normalizeProfileSuffix, normalizeProfileProtocol });
 
 function listProfiles() {
   const group = Array.isArray(config.defaultProfileGroup) ? config.defaultProfileGroup : [];

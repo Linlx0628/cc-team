@@ -3419,11 +3419,15 @@ function toolPatternProbeBody(model) {
     tools: [{
       name: "gateway_compat_probe",
       description: "Gateway reachability probe; never meaningful to call.",
-      // Same construct that breaks real traffic (Zhipu rejects `\p{…}` classes
-      // with 1210) so the probe verdict matches live behaviour.
+      // Byte-identical to the harshest pattern real traffic carries (the
+      // Artifact title regex). Covers both the `\p{…}` classes Zhipu rejects
+      // with 1210 AND the in-class escapes (`"` `\\` `.` `/` `[` `\]`) that
+      // DeepSeek-style validators reject as "is not a \"regex\"". A probe on
+      // the subset once false-flagged DeepSeek as accepting, letting live tool
+      // schemas through unstripped to a 400.
       input_schema: {
         type: "object",
-        properties: { path: { type: "string", pattern: "^(?!__.*__$)[^\\p{Cc}\\p{Cf}\\p{Zl}\\p{Zp}]{1,200}$" } },
+        properties: { path: { type: "string", pattern: "^(?!__.*__$)[^\\p{Cc}\\p{Cf}\\p{Zl}\\p{Zp}\"\\\\./[\\]]{1,200}$" } },
         required: [],
       },
     }],
@@ -3431,8 +3435,9 @@ function toolPatternProbeBody(model) {
 }
 
 // Ask the upstream whether it accepts a lookaround pattern: true = accepted,
-// false = rejected with Zhipu-style 1210, null = inconclusive (network error,
-// auth failure, other status) — inconclusive leaves current behaviour as is.
+// false = rejected (Zhipu-style 1210 or DeepSeek-style `is not a "regex"`),
+// null = inconclusive (network error, auth failure, other status) —
+// inconclusive leaves current behaviour as is.
 function probeToolPatternSupport(rt) {
   return new Promise((resolve) => {
     const realKey = getRealKeyFromProfile(config.profiles[rt.profileName] || {});
@@ -3459,7 +3464,7 @@ function probeToolPatternSupport(rt) {
       res.on("end", () => {
         const text = Buffer.concat(chunks).toString();
         if (res.statusCode === 200) resolve(true);
-        else if (res.statusCode === 400 && text.includes("1210")) resolve(false);
+        else if (res.statusCode === 400 && (text.includes("1210") || /is not a .{0,16}regex/i.test(text))) resolve(false);
         else resolve(null);
       });
     });

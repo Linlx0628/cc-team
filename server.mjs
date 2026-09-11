@@ -23,6 +23,7 @@ import { buildCodexModelCatalog, buildCodexSetupScript, buildCodexSetupScriptWin
 import { createStatsReader } from "./lib/stats.mjs";
 import { createSettingsWriter } from "./lib/settings-write.mjs";
 import { createUsageReader } from "./lib/personal-usage.mjs";
+import { createNotifier } from "./lib/notifier.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -1532,7 +1533,7 @@ const RATE_LIMIT_META_KEY = "rateLimitState";
 
 class RateLimitedError extends Error {
   constructor(resumeAt, source, message) {
-    super(message || `rate limited until ${beijingTimeString(new Date(resumeAt))}`);
+    super(message || `rate limited until ${notifierApi.beijingTimeString(new Date(resumeAt))}`);
     this.name = "RateLimitedError";
     this.isRateLimited = true;
     this.resumeAt = resumeAt;
@@ -1555,7 +1556,7 @@ function markRateLimited(profileName, resumeAtMs, source) {
   // limited, every subsequent 429 just refreshes the same state.
   if (!prev || Date.now() >= prev.resumeAt) {
     recordAudit("system", "ratelimit.mark", profileName,
-      `方案 "${profileName}" 被上游限流（来源: ${source || "unknown"}），暂停至 ${beijingTimeString(new Date(resumeAtMs))}，后续请求自动切换到备选方案`);
+      `方案 "${profileName}" 被上游限流（来源: ${source || "unknown"}），暂停至 ${notifierApi.beijingTimeString(new Date(resumeAtMs))}，后续请求自动切换到备选方案`);
   }
 }
 
@@ -1865,7 +1866,7 @@ function pushProductionAlert(a) {
   if (Date.now() - (prodNotifyCooldown.get(key) || 0) < 60_000) return;
   prodNotifyCooldown.set(key, Date.now());
   const names = { idle_burn: "空转消耗", error_loop: "错误循环", edit_failure_burst: "编辑失败爆发" };
-  const msg = `【产出告警】${names[a.kind] || a.kind} · ${a.user_name || a.user_key}\n${a.detail || ""}\n—— ${beijingTimeString()}（token-monitor）`;
+  const msg = `【产出告警】${names[a.kind] || a.kind} · ${a.user_name || a.user_key}\n${a.detail || ""}\n—— ${notifierApi.beijingTimeString()}（token-monitor）`;
   for (const s of NOTIFY_SENDERS.filter(s => s.enabled(cfg))) {
     s.send(cfg, msg).then(() => console.log(`[通知] 已推送 ${s.channel}: 产出告警 ${a.kind}`))
       .catch(err => console.error(`[通知] ${s.channel} 推送失败: ${err.message}`));
@@ -2517,7 +2518,7 @@ function recordAudit(actor, action, target, detail, ip, category) {
     stmts.trimAudit.run();
     // Best-effort push of system failure/recovery events; must never affect the
     // audit write or the caller, so it is fully guarded.
-    try { notifyAuditEvent({ time, actor, action: String(action || "unknown"), target: String(target || ""), detail: String(detail || "") }); }
+    try { notifierApi.notifyAuditEvent({ time, actor, action: String(action || "unknown"), target: String(target || ""), detail: String(detail || "") }); }
     catch (err) { console.error("[通知] 分发失败:", err.message); }
   } catch (err) {
     console.error("[审计] 写入失败:", err.message);
@@ -2738,7 +2739,7 @@ function notifyQuotaRequest(info) {
   if (!cfg.enabled) return;
   const channels = NOTIFY_SENDERS.filter(s => s.enabled(cfg));
   if (!channels.length) return;
-  const msg = `【加量申请】${info.username}\n申请额度池：${info.pool}\n理由：${info.reason}\n请到 设置 → 加量申请 处理（该成员本周已处理 ${info.handledThisWeek}/${info.weeklyLimit} 次）\n—— ${beijingTimeString()}（token-monitor）`;
+  const msg = `【加量申请】${info.username}\n申请额度池：${info.pool}\n理由：${info.reason}\n请到 设置 → 加量申请 处理（该成员本周已处理 ${info.handledThisWeek}/${info.weeklyLimit} 次）\n—— ${notifierApi.beijingTimeString()}（token-monitor）`;
   for (const s of channels) {
     s.send(cfg, msg)
       .then(() => console.log(`[通知] 已推送 ${s.channel}: 加量申请 ${info.username}`))
@@ -2866,184 +2867,6 @@ function attachRequestLogger(res, clientState, reqLog) {
 }
 
 
-// ─── System-Event Notifier (webhook push) ─────────────────────────────────────
-// Pushes failure/recovery audit events to IM bots and phone-push channels.
-// Best-effort and fully async: never blocks the proxy, never throws, and never
-// records audits of its own (a notify failure must not spawn another notify).
-const NOTIFY_FAILURE_ACTIONS = new Set(["ratelimit.mark", "failover.switch", "breaker.open"]);
-const NOTIFY_RECOVERY_ACTIONS = new Set(["ratelimit.expire", "failover.recover", "breaker.closed"]);
-const NOTIFY_TIMEOUT_MS = 5000;
-
-// Per-head failure incidents. All alert/recovery events of one failover-group
-// head collapse into a single open→close lifecycle, so a stuck scheme cannot
-// push an alert+recovery pair every cycle. A head is identified by its profile
-// name (see normalizeIncidentKey). Process restart clears the map — same as the
-// old cooldown — and a still-failing head simply opens a fresh incident after
-// restart (one extra alert, acceptable).
-const notifyIncidents = new Map(); // head → { openedAt }
-let notifyLastPushAt = 0;          // global "time since any push" floor for minIntervalSeconds
-
-function beijingTimeString(d = new Date()) {
-  return new Date(d).toLocaleString("zh-CN", { timeZone: "Asia/Shanghai", hour12: false });
-}
-
-function postHttpRequest(url, { body, contentType, timeoutMs = NOTIFY_TIMEOUT_MS } = {}) {
-  return new Promise((resolve, reject) => {
-    let target;
-    try { target = new URL(url); } catch (err) { reject(new Error("URL 无效")); return; }
-    const mod = target.protocol === "https:" ? https : http;
-    const payload = body == null ? null : Buffer.from(body);
-    const req = mod.request(target, {
-      method: "POST",
-      headers: {
-        ...(contentType ? { "content-type": contentType } : {}),
-        ...(payload ? { "content-length": payload.length } : {}),
-      },
-      timeout: timeoutMs,
-    }, (res) => {
-      const chunks = [];
-      res.on("data", (c) => chunks.push(c));
-      res.on("end", () => {
-        const text = Buffer.concat(chunks).toString();
-        if (res.statusCode >= 200 && res.statusCode < 300) resolve(text);
-        else reject(new Error(`HTTP ${res.statusCode}: ${text.slice(0, 120)}`));
-      });
-    });
-    req.on("timeout", () => { req.destroy(new Error("请求超时")); });
-    req.on("error", reject);
-    if (payload) req.write(payload);
-    req.end();
-  });
-}
-
-// Each sender returns a Promise resolving on channel acceptance.
-const NOTIFY_SENDERS = [
-  { channel: "飞书", enabled: (n) => !!String(n.feishuWebhook || "").trim(), send: (n, msg) =>
-    postHttpRequest(n.feishuWebhook, { body: JSON.stringify({ msg_type: "text", content: { text: msg } }), contentType: "application/json" }) },
-  { channel: "钉钉", enabled: (n) => !!String(n.dingtalkWebhook || "").trim(), send: (n, msg) =>
-    postHttpRequest(n.dingtalkWebhook, { body: JSON.stringify({ msgtype: "text", text: { content: msg } }), contentType: "application/json" }) },
-  { channel: "企业微信", enabled: (n) => !!String(n.wecomWebhook || "").trim(), send: (n, msg) =>
-    postHttpRequest(n.wecomWebhook, { body: JSON.stringify({ msgtype: "text", text: { content: msg } }), contentType: "application/json" }) },
-  { channel: "Server酱", enabled: (n) => !!String(n.serverchanSendKey || "").trim(), send: (n, msg) => {
-    const key = String(n.serverchanSendKey).trim();
-    const form = `title=${encodeURIComponent(msg.split("\n")[0])}&desp=${encodeURIComponent(msg)}`;
-    return postHttpRequest(`https://sctapi.ftqq.com/${encodeURIComponent(key)}.send`, { body: form, contentType: "application/x-www-form-urlencoded" });
-  } },
-  { channel: "Bark", enabled: (n) => !!String(n.barkDeviceKey || "").trim(), send: (n, msg) => {
-    const base = String(n.barkServer || "").trim().replace(/\/+$/, "") || "https://api.day.app";
-    const key = encodeURIComponent(String(n.barkDeviceKey).trim());
-    return postHttpRequest(`${base}/${key}`, { body: JSON.stringify({ body: msg, group: "token-monitor" }), contentType: "application/json" });
-  } },
-];
-
-// Map an audit event to the failover-group head it belongs to.
-//   ratelimit.mark/expire, breaker.open/closed → target is already the head name
-//   failover.switch/recover → target may be "Head → Member"; the head is the left
-//                             side (failover.recover already passes a bare head).
-// Returns null when no head can be derived; such an event falls back to the old
-// always-push path (no incident bookkeeping) so a parse miss never drops a real
-// notification.
-function normalizeIncidentKey(action, target) {
-  const t = String(target || "").trim();
-  if (!t) return null;
-  const failoverAction = action === "failover.switch" || action === "failover.recover";
-  const head = (failoverAction && t.includes("→")) ? t.slice(0, t.indexOf("→")).trim() : t;
-  return head || null;
-}
-
-// Fire-and-forget dispatch. Synchronous entry, async fan-out; all channel
-// failures are logged, never surfaced.
-//
-// Incident semantics (per failover-group head):
-//   failure  → no open incident for the head: open one and push an alert.
-//              already open: silent (no push, no refresh) — the dedupe that stops
-//              the alert+recover pair spam.
-//   expire   → NEVER pushes and never closes an incident: ratelimit.expire is only
-//              the 120s fallback window elapsing, not a real recovery. A genuine
-//              recovery is the head serving traffic again (failover.recover) or the
-//              breaker closing (breaker.closed).
-//   recover  → closes the head's open incident (if any) and pushes a recovery when
-//              cfg.notifyRecovery !== false. A recovery with no open incident is an
-//              orphan (e.g. after a restart) and is not pushed.
-// minIntervalSeconds is ONE global floor between any two pushes (not a per-action
-// lock): incidents already dedupe per head, so the floor only stops a simultaneous
-// multi-head burst. The registry is still updated when the floor suppresses the
-// push, so a burst does not leave silent incidents stuck open.
-function notifyAuditEvent(row) {
-  const cfg = config.notifier || {};
-  if (!cfg.enabled) return;
-  const action = row.action;
-  const isFailure = NOTIFY_FAILURE_ACTIONS.has(action);
-  const isRecovery = NOTIFY_RECOVERY_ACTIONS.has(action);
-  if (!isFailure && !isRecovery) return;
-
-  let incidentKey = normalizeIncidentKey(action, row.target);
-  if (isFailure) {
-    if (incidentKey) {
-      if (notifyIncidents.has(incidentKey)) return; // already open → silent
-      notifyIncidents.set(incidentKey, { openedAt: Date.now() });
-    }
-  } else {
-    // Recovery action. ratelimit.expire is a FALSE recovery (fallback window
-    // elapsing, not the head serving again) — never notify, never close.
-    if (action === "ratelimit.expire") return;
-    if (incidentKey) {
-      if (!notifyIncidents.delete(incidentKey)) return; // orphan recovery → silent
-    }
-    if (cfg.notifyRecovery === false) return;           // close incident but keep quiet
-  }
-
-  const prefix = isFailure ? "【网关告警】" : "【网关恢复】";
-  const msg = `${prefix} ${row.target || action}\n${row.detail || ""}\n—— ${beijingTimeString()}（token-monitor）`;
-  const channels = NOTIFY_SENDERS.filter((s) => s.enabled(cfg));
-  if (!channels.length) return;
-
-  const rawInterval = Number(cfg.minIntervalSeconds);
-  const intervalMs = Math.max(0, (Number.isFinite(rawInterval) ? rawInterval : 300) * 1000);
-  const now = Date.now();
-  if (now - notifyLastPushAt < intervalMs) return;      // global floor (not per-action)
-  notifyLastPushAt = now;
-
-  for (const s of channels) {
-    s.send(cfg, msg)
-      .then(() => console.log(`[通知] 已推送 ${s.channel}: ${action} ${row.target}`))
-      .catch((err) => console.error(`[通知] ${s.channel} 推送失败: ${err.message}`));
-  }
-}
-
-// Send a test message to every configured channel of the given (possibly
-// unsaved) config; resolves with per-channel results for the UI.
-async function sendNotifierTest(cfg) {
-  const msg = `[token-monitor] 通知测试成功\n渠道连通性验证通过。系统故障/恢复事件（限流、failover 切换、熔断）将推送到此处。\n—— ${beijingTimeString()}`;
-  const channels = NOTIFY_SENDERS.filter((s) => s.enabled(cfg));
-  const results = await Promise.all(channels.map(async (s) => {
-    try { await s.send(cfg, msg); return { channel: s.channel, ok: true }; }
-    catch (err) { return { channel: s.channel, ok: false, error: err.message }; }
-  }));
-  return results;
-}
-
-function sanitizeNotifierConfig(input) {
-  const src = input && typeof input === "object" ? input : {};
-  const url = (v) => {
-    const s = String(v || "").trim();
-    if (!s) return "";
-    if (!/^https?:\/\/[^\s]+$/.test(s)) throw new Error(`无效的 Webhook 地址: "${s.slice(0, 80)}"`);
-    return s;
-  };
-  const parsedInterval = parseInt(src.minIntervalSeconds, 10);
-  return {
-    enabled: !!src.enabled,
-    minIntervalSeconds: Math.min(86400, Math.max(0, Number.isFinite(parsedInterval) ? parsedInterval : 300)),
-    notifyRecovery: src.notifyRecovery !== false,
-    feishuWebhook: url(src.feishuWebhook),
-    dingtalkWebhook: url(src.dingtalkWebhook),
-    wecomWebhook: url(src.wecomWebhook),
-    serverchanSendKey: String(src.serverchanSendKey || "").trim().slice(0, 120),
-    barkServer: src.barkServer ? url(src.barkServer) : "",
-    barkDeviceKey: String(src.barkDeviceKey || "").trim().slice(0, 200),
-  };
-}
 
 // ─── API Proxy ───────────────────────────────────────────────────────────────
 function getApiKey(req) {
@@ -4263,9 +4086,9 @@ function proxyRequest(req, res) {
           } else if (lastFailure.kind === "rate-limit") {
             const retryAfter = Math.max(1, Math.ceil((lastFailure.err.resumeAt - Date.now()) / 1000));
             sendOpenAiError(res, 429, "rate_limit_exceeded",
-              `所有可用方案均已限额，最早 ${beijingTimeString(new Date(lastFailure.err.resumeAt))} 恢复。`,
+              `所有可用方案均已限额，最早 ${notifierApi.beijingTimeString(new Date(lastFailure.err.resumeAt))} 恢复。`,
               { "Retry-After": String(retryAfter) });
-            recordError(apiKey, 429, `all profiles rate-limited until ${beijingTimeString(new Date(lastFailure.err.resumeAt))}`, req.url, reqModel, lastFailure.suffix, lastFailure.runtime);
+            recordError(apiKey, 429, `all profiles rate-limited until ${notifierApi.beijingTimeString(new Date(lastFailure.err.resumeAt))}`, req.url, reqModel, lastFailure.suffix, lastFailure.runtime);
           } else {
             const status = lastFailure.status;
             const label = status === 504 ? "Gateway Timeout" : status === 502 ? "Bad Gateway" : "Request Error";
@@ -4300,8 +4123,8 @@ function proxyRequest(req, res) {
         } else if (lastFailure.kind === "rate-limit") {
           const retryAfter = Math.max(1, Math.ceil((lastFailure.err.resumeAt - Date.now()) / 1000));
           res.writeHead(429, { "Content-Type": "application/json", "Retry-After": String(retryAfter) });
-          res.end(JSON.stringify({ type: "error", error: { type: "rate_limit_error", message: `所有可用方案均已限额，最早 ${beijingTimeString(new Date(lastFailure.err.resumeAt))} 恢复。` } }));
-          recordError(apiKey, 429, `all profiles rate-limited until ${beijingTimeString(new Date(lastFailure.err.resumeAt))}`, req.url, reqModel, lastFailure.suffix, lastFailure.runtime);
+          res.end(JSON.stringify({ type: "error", error: { type: "rate_limit_error", message: `所有可用方案均已限额，最早 ${notifierApi.beijingTimeString(new Date(lastFailure.err.resumeAt))} 恢复。` } }));
+          recordError(apiKey, 429, `all profiles rate-limited until ${notifierApi.beijingTimeString(new Date(lastFailure.err.resumeAt))}`, req.url, reqModel, lastFailure.suffix, lastFailure.runtime);
         } else {
           const status = lastFailure.status;
           const label = status === 504 ? "Gateway Timeout" : status === 502 ? "Bad Gateway" : "Request Error";
@@ -4903,6 +4726,14 @@ const USAGE_DEPS = {
   getPoolForSuffix,
 };
 const usageApi = createUsageReader(USAGE_DEPS);
+
+// 系统事件通知(lib/notifier.mjs)依赖注入对象。全部稳定绑定, 按值捕获。
+const NOTIFIER_DEPS = {
+  http,
+  https,
+  config,
+};
+const notifierApi = createNotifier(NOTIFIER_DEPS);
 const server = http.createServer((req, res) => {
   // Security headers for all responses
   res.setHeader("X-Content-Type-Options", "nosniff");
@@ -6342,7 +6173,7 @@ const server = http.createServer((req, res) => {
     if (!checkCsrf(req)) { res.writeHead(403); res.end("CSRF validation failed"); return; }
     readBody(req, 20_000).then(buf => {
       try {
-        const next = sanitizeNotifierConfig(JSON.parse(buf.toString()));
+        const next = notifierApi.sanitizeNotifierConfig(JSON.parse(buf.toString()));
         config.notifier = next;
         saveConfig(config);
         recordAdminAudit(req, "notifier.save", "全局", `保存通知设置（${next.enabled ? "已启用" : "已停用"}，冷却 ${next.minIntervalSeconds}s，恢复通知 ${next.notifyRecovery ? "开" : "关"}）`);
@@ -6367,14 +6198,14 @@ const server = http.createServer((req, res) => {
     readBody(req, 20_000).then(buf => {
       (async () => {
         try {
-          const cfg = sanitizeNotifierConfig(JSON.parse(buf.toString()));
-          const anyChannel = NOTIFY_SENDERS.some((s) => s.enabled(cfg));
+          const cfg = notifierApi.sanitizeNotifierConfig(JSON.parse(buf.toString()));
+          const anyChannel = notifierApi.NOTIFY_SENDERS.some((s) => s.enabled(cfg));
           if (!anyChannel) {
             res.writeHead(400, { "Content-Type": "application/json" });
             res.end(JSON.stringify({ error: "请至少填写一个通知渠道" }));
             return;
           }
-          const results = await sendNotifierTest(cfg);
+          const results = await notifierApi.sendNotifierTest(cfg);
           recordAdminAudit(req, "notifier.test", "全局", `测试通知推送：${results.map(r => `${r.channel} ${r.ok ? "成功" : "失败"}`).join("、")}`);
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ ok: true, results }));

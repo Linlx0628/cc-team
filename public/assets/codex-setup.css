@@ -1,0 +1,21 @@
+/* public/assets/codex-setup.css —— codex-setup 页面专属样式。
+   在共享 theme.css 之后加载，页面规则可覆盖主题。跨页强缓存(?v= 内容版本号)。 */
+body{padding:28px clamp(18px,3vw,44px) 48px}
+body>div{max-width:880px;margin-left:auto;margin-right:auto}
+.top{margin-bottom:14px;padding-bottom:18px;border-bottom:1px solid var(--border)}.top-brand{display:flex;align-items:center;gap:14px}
+.top h1{font-size:26px;font-weight:650;margin-bottom:6px}.top .sub{font-size:12px;color:var(--dim)}
+.host-row{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:16px;font-size:13px}
+.host-row code{font-size:11px;color:var(--dim)}
+#hostInput{font-size:13px;background:var(--surface);color:var(--text);border:1px solid var(--border);border-radius:5px;padding:7px 10px;width:240px;font-family:var(--font-mono)}
+.tabs{display:flex;gap:6px;margin-bottom:14px}
+.tabs button{font-size:13px;font-weight:600;padding:8px 16px;border:1px solid var(--border);border-radius:6px;background:var(--surface);color:var(--dim);cursor:pointer}
+.tabs button.on{border-color:var(--accent);background:var(--accent-soft);color:var(--accent)}
+.panel{display:none}.panel.on{display:block}
+.box{background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:16px;margin-bottom:14px}
+.box h3{font-size:13px;font-weight:650;margin-bottom:10px}
+.box ol{padding-left:20px;margin:0}.box li{font-size:13px;line-height:2}
+pre{position:relative;background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:14px;font-size:11.5px;line-height:1.6;overflow-x:auto;white-space:pre;font-family:var(--font-mono);margin:0 0 12px}
+.copy-btn{position:absolute;top:8px;right:8px;font-size:11px;border:1px solid var(--border);background:var(--surface);color:var(--text);padding:3px 10px;border-radius:4px;cursor:pointer}
+.copy-btn:hover{border-color:var(--accent);color:var(--accent)}
+.note{font-size:11px;color:var(--dim);line-height:1.7}
+.warn{background:#fff7e6;border:1px solid #ffe1a6;color:#a1662f;padding:8px 12px;border-radius:5px;font-size:12px;margin-top:10px}

@@ -1,0 +1,8 @@
+/* public/assets/landing.css —— landing 页面专属样式。
+   在共享 theme.css 之后加载，页面规则可覆盖主题。跨页强缓存(?v= 内容版本号)。 */
+body{display:flex;justify-content:center;align-items:center;min-height:100vh;padding:24px;margin:0}
+.wrap{width:100%;max-width:440px}.brand{margin-bottom:22px}.brand .t{font-size:24px;font-weight:650;margin-bottom:7px}.brand .s{font-size:13px;color:var(--dim)}.brand-row{display:flex;align-items:center;gap:12px}.brand-logo{width:38px;height:38px;flex:none}
+.term{background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:26px}.term .hd{font-size:13px;font-weight:600;margin-bottom:18px;color:var(--text)}
+.term label{display:block;font-size:12px;font-weight:550;color:var(--dim);margin-bottom:6px}.term input{width:100%;padding:11px 12px;background:var(--surface);border:1px solid var(--border-strong);border-radius:5px;color:var(--text);font-size:14px;font-family:var(--font-mono);outline:none;margin-bottom:18px}.term input:focus{border-color:var(--accent)}
+.term button{width:100%;padding:11px 12px;background:var(--text);color:#fff;border:none;border-radius:5px;font-size:13px;font-weight:600;cursor:pointer}.term button:hover{background:#33332f}
+.note{font-size:12px;color:var(--dim);text-align:center;margin-top:14px}.note code{color:var(--accent);font-family:var(--font-mono)}

@@ -26,6 +26,7 @@ import { createUsageReader } from "./lib/personal-usage.mjs";
 import { createNotifier } from "./lib/notifier.mjs";
 import { getApiKey, makeClientAbortError, isClientAbortError, createClientAbortState, markClientAborted, addClientAbortListener, setActiveUpstreamRequest, throwIfClientAborted, sleepWithClientAbort, jitter, buildUpstreamPath } from "./lib/proxy-helpers.mjs";
 import { createVisionBridge } from "./lib/vision-bridge.mjs";
+import { createToolPatternCompat } from "./lib/tool-pattern-compat.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -638,6 +639,17 @@ function listProfiles() {
 // ─── Per-Profile Runtime Manager ────────────────────────────────────────────
 const runtimes = {}; // suffix → runtime object
 
+// 工具 pattern 兼容(lib/tool-pattern-compat.mjs)依赖注入对象。位置是硬要求: 紧接着的
+// initAllRuntimes() 在模块加载期就会构造运行期对象并读兼容开关, 工厂实例是 const(暂时性
+// 死区), 若放到文件末尾的其它 DEPS 区会直接抛 ReferenceError。
+const TOOL_PATTERN_DEPS = {
+  config,
+  runtimes,
+  normalizeProfileProtocol,
+  getRealKeyFromProfile,
+};
+const toolPatternApi = createToolPatternCompat(TOOL_PATTERN_DEPS);
+
 function createUpstreamAgent(upstreamUrl) {
   return upstreamUrl.protocol === "https:"
     ? new https.Agent({ keepAlive: true, maxSockets: 50, maxFreeSockets: 10, timeout: 120000, scheduling: "fifo", rejectUnauthorized: true })
@@ -650,8 +662,8 @@ function createProfileRuntime(profileName, profile) {
     profileName,
     suffix: normalizeProfileSuffix(profile.suffix),
     protocol: normalizeProfileProtocol(profile.protocol),
-    toolPatternCompat: normalizeToolPatternCompat(profile.toolPatternCompat),
-    toolPatternsActive: computeToolPatternsActive(profile, upstreamUrl),
+    toolPatternCompat: toolPatternApi.normalizeToolPatternCompat(profile.toolPatternCompat),
+    toolPatternsActive: toolPatternApi.computeToolPatternsActive(profile, upstreamUrl),
     // Real `pattern` strings seen on this profile's live traffic, used by the
     // probe so it tests the upstream against evidence, not just a guess.
     toolPatternSamples: new Set(),
@@ -2871,228 +2883,6 @@ function attachRequestLogger(res, clientState, reqLog) {
   res.on("close", () => { if (!res.writableEnded) write(true); });
 }
 
-// ─── Tool-schema compat: strip regex patterns the upstream can't compile ───
-// Zhipu GLM's tool-schema validator rejects requests whose tool `pattern`
-// fields use regex it cannot compile, with error 1210 "API 调用参数有误" for
-// the WHOLE request. Empirically (2026-09) the toxic constructs are Unicode
-// property classes (`\p{Cc}`…) — lookarounds compile fine there, but RE2-based
-// validators reject those, so both classes are stripped conservatively.
-// Claude Code ≥2.1.266 ships an "Artifact" tool whose schema carries such
-// patterns, so every interactive request would fail against such upstreams.
-// Patterns are optional validation hints; a background probe re-enables
-// pass-through once the upstream learns to accept them.
-const UNSUPPORTED_PATTERN_RE = /\\[pP]\{|\(\?[=!]/;   // \p{ \P{ (?= (?! (?<= (?<!
-
-// Recursively drop `pattern` fields using constructs the upstream can't
-// compile. Returns count removed.
-function stripUnsupportedPatternsNode(node) {
-  let removed = 0;
-  if (Array.isArray(node)) {
-    for (const item of node) removed += stripUnsupportedPatternsNode(item);
-  } else if (node && typeof node === "object") {
-    if (typeof node.pattern === "string" && UNSUPPORTED_PATTERN_RE.test(node.pattern)) {
-      delete node.pattern;
-      removed++;
-    }
-    for (const key of Object.keys(node)) {
-      if (key !== "pattern") removed += stripUnsupportedPatternsNode(node[key]);
-    }
-  }
-  return removed;
-}
-
-// Rewrite a parsed request body in place, stripping lookaround patterns from
-// every tool schema (Anthropic `input_schema` and OpenAI `parameters` shapes).
-// Returns the number of patterns removed (0 → nothing worth re-serializing).
-function stripUnsupportedToolPatterns(parsed) {
-  if (!Array.isArray(parsed?.tools)) return 0;
-  let removed = 0;
-  for (const tool of parsed.tools) {
-    if (!tool || typeof tool !== "object") continue;
-    const schema = tool.input_schema ?? tool.parameters;
-    if (schema && typeof schema === "object") removed += stripUnsupportedPatternsNode(schema);
-  }
-  return removed;
-}
-
-// How upstreams word a tool-schema `pattern` rejection. Zhipu GLM answers error
-// code 1210 ("API 调用参数有误") for the whole request; DeepSeek/OpenAI-style
-// validators say the value "is not a \"regex\"" / "Invalid schema for function".
-const TOOL_PATTERN_REJECTION_RE = /1210|is not a .{0,16}regex|invalid schema for function/i;
-
-function isToolPatternRejection(statusCode, text) {
-  return statusCode === 400 && TOOL_PATTERN_REJECTION_RE.test(text || "");
-}
-
-// Visit every `pattern` string in a schema tree.
-function eachPatternNode(node, fn) {
-  if (Array.isArray(node)) {
-    for (const item of node) eachPatternNode(item, fn);
-    return;
-  }
-  if (!node || typeof node !== "object") return;
-  if (typeof node.pattern === "string") fn(node.pattern);
-  for (const key of Object.keys(node)) {
-    if (key !== "pattern") eachPatternNode(node[key], fn);
-  }
-}
-
-// The `pattern` strings a request's tool schemas carry (Anthropic `input_schema`
-// and OpenAI `parameters` shapes).
-function collectToolPatterns(parsed) {
-  const patterns = [];
-  if (!Array.isArray(parsed?.tools)) return patterns;
-  for (const tool of parsed.tools) {
-    if (!tool || typeof tool !== "object") continue;
-    eachPatternNode(tool.input_schema ?? tool.parameters, (p) => patterns.push(p));
-  }
-  return patterns;
-}
-
-const TOOL_PATTERN_SAMPLE_MAX = 5;
-
-// Remember the real patterns live traffic carries so the probe can ask the
-// upstream about *evidence* instead of one hard-coded guess — a construct our
-// own UNSUPPORTED_PATTERN_RE does not recognise is exactly what a fixed probe
-// cannot anticipate. Only strippable patterns are worth remembering (stripping
-// is the only remedy we have), and only the first few, so the probe payload
-// stays small.
-function rememberToolPatterns(runtime, parsed) {
-  const samples = runtime.toolPatternSamples;
-  if (!samples || samples.size >= TOOL_PATTERN_SAMPLE_MAX) return;
-  for (const p of collectToolPatterns(parsed)) {
-    if (samples.size >= TOOL_PATTERN_SAMPLE_MAX) break;
-    if (UNSUPPORTED_PATTERN_RE.test(p)) samples.add(p);
-  }
-}
-
-// Live self-heal: a 400 that names a tool-schema regex problem while the probe
-// currently believes this upstream accepts patterns means the probe was wrong
-// (it cannot foresee every construct real traffic carries). Rather than hand
-// that 400 to the user, turn stripping on and resend the SAME request with the
-// patterns removed. Returns the replacement body, or null when no heal applies.
-function tryToolPatternSelfHeal(body, reqHeaders, statusCode, text, runtime) {
-  if (!runtime || runtime.toolPatternsActive) return null;
-  if (runtime.toolPatternCompat !== "auto") return null;   // explicit modes are the user's call
-  if (!isToolPatternRejection(statusCode, text)) return null;
-  let parsed;
-  try { parsed = JSON.parse(body.toString()); } catch { return null; }
-  rememberToolPatterns(runtime, parsed);
-  const removed = stripUnsupportedToolPatterns(parsed);
-  if (removed === 0) return null;   // nothing we could have stripped — not our failure
-  const next = Buffer.from(JSON.stringify(parsed));
-  reqHeaders["content-length"] = next.length;
-  runtime.toolPatternsActive = true;
-  console.log(`[工具兼容] 方案「${runtime.profileName}」: 上游以 pattern 拒绝真实请求(状态 ${statusCode})，已即时启用剔除并重发同一请求，剔除 ${removed} 处`);
-  return next;
-}
-
-function normalizeToolPatternCompat(v) {
-  return v === "always" || v === "off" ? v : "auto";
-}
-
-// Initial stripping decision for a profile: "always"/"off" follow the config
-// verbatim; "auto" (default) strips only for third-party Anthropic-compatible
-// upstreams — Anthropic's own API compiles lookarounds fine — and the probe
-// below refines that over time.
-function computeToolPatternsActive(profile, upstreamUrl) {
-  const mode = normalizeToolPatternCompat(profile.toolPatternCompat);
-  if (mode === "always") return true;
-  if (mode === "off") return false;
-  if (normalizeProfileProtocol(profile.protocol) !== "anthropic") return false;
-  const host = upstreamUrl.hostname;
-  return !(host === "api.anthropic.com" || host.endsWith(".anthropic.com"));
-}
-
-const TOOL_PATTERN_PROBE_DELAY_MS = Math.max(0, Number(process.env.TOOL_PATTERN_PROBE_DELAY_MS) || 30000);
-// Floored at 1s so an explicit override is honoured (tests observe the
-// learn-then-replay cycle at that cadence) while a typo still cannot make a
-// profile hammer its upstream once per request.
-const TOOL_PATTERN_PROBE_INTERVAL_MS = Math.max(1000, Number(process.env.TOOL_PATTERN_PROBE_INTERVAL_MS) || 6 * 3600 * 1000);
-
-// Ask the upstream whether it accepts the patterns. The built-in `path` pattern
-// is byte-identical to the harshest pattern real traffic carries (Claude Code's
-// Artifact title regex): it covers the `\p{…}` classes Zhipu rejects with 1210 AND
-// the in-class escapes (`"` `\\` `.` `/` `[` `]`) that DeepSeek-style validators
-// reject as "is not a \"regex\"". The `sample*` properties replay patterns this
-// profile's live traffic actually carried, so an upstream that accepts the guess
-// but rejects a real pattern is still reported as rejecting.
-function toolPatternProbeBody(model, samples = []) {
-  // The built-in pattern stands in for the harshest construct real traffic carries.
-  const builtin = "^(?!__.*__$)[^\\p{Cc}\\p{Cf}\\p{Zl}\\p{Zp}\"\\\\./[\\]]{1,200}$";
-  const properties = { path: { type: "string", pattern: builtin } };
-  const extra = [...(samples || [])].filter((pat) => pat && pat !== builtin).slice(0, TOOL_PATTERN_SAMPLE_MAX);
-  extra.forEach((pat, i) => { properties["sample" + i] = { type: "string", pattern: pat }; });
-  return {
-    model, max_tokens: 64, stream: false,
-    messages: [{ role: "user", content: "ping" }],
-    tools: [{
-      name: "gateway_compat_probe",
-      description: "Gateway reachability probe; never meaningful to call.",
-      input_schema: { type: "object", properties, required: [] },
-    }],
-  };
-}
-
-function probeToolPatternSupport(rt) {
-  return new Promise((resolve) => {
-    const realKey = getRealKeyFromProfile(config.profiles[rt.profileName] || {});
-    const model = (rt.allowedModels && rt.allowedModels[0]) || Object.values(rt.modelAliases || {})[0];
-    if (!realKey || !model) { resolve(null); return; }
-    const body = Buffer.from(JSON.stringify(toolPatternProbeBody(model, [...(rt.toolPatternSamples || [])])));
-    const transport = rt.upstreamUrl.protocol === "https:" ? https : http;
-    const req = transport.request({
-      hostname: rt.upstreamUrl.hostname,
-      port: rt.upstreamUrl.port || (rt.upstreamUrl.protocol === "https:" ? 443 : 80),
-      path: rt.upstreamUrl.pathname.replace(/\/$/, "") + "/v1/messages",
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        "content-length": body.length,
-        authorization: `Bearer ${realKey}`,
-        "x-api-key": realKey,
-        "anthropic-version": "2023-06-01",
-      },
-      agent: rt.agent,
-    }, (res) => {
-      const chunks = [];
-      res.on("data", (c) => chunks.push(c));
-      res.on("end", () => {
-        const text = Buffer.concat(chunks).toString();
-        if (res.statusCode === 200) resolve(true);
-        else if (isToolPatternRejection(res.statusCode, text)) resolve(false);
-        else resolve(null);
-      });
-    });
-    req.setTimeout(15000, () => req.destroy(new Error("probe timeout")));
-    req.on("error", () => resolve(null));
-    req.write(body);
-    req.end();
-  });
-}
-
-async function runToolPatternProbe(rt) {
-  if (rt.protocol !== "anthropic" || rt.toolPatternCompat !== "auto") return;
-  const supported = await probeToolPatternSupport(rt);
-  if (supported === null) return;
-  if (supported && rt.toolPatternsActive) {
-    rt.toolPatternsActive = false;
-    console.log(`[工具兼容] 方案「${rt.profileName}」: 探测到上游已支持这些 pattern 特性，恢复完整工具定义`);
-  } else if (!supported && !rt.toolPatternsActive) {
-    rt.toolPatternsActive = true;
-    console.log(`[工具兼容] 方案「${rt.profileName}」: 探测到上游拒绝此类 pattern(1210)，重新启用剔除`);
-  } else {
-    console.log(`[工具兼容] 方案「${rt.profileName}」: 探测完成，上游${supported ? "已支持" : "仍不支持此类 pattern"}，剔除保持${rt.toolPatternsActive ? "开启" : "关闭"}`);
-  }
-}
-
-function scheduleToolPatternProbes() {
-  const first = setTimeout(() => { for (const rt of Object.values(runtimes)) runToolPatternProbe(rt); }, TOOL_PATTERN_PROBE_DELAY_MS);
-  const timer = setInterval(() => { for (const rt of Object.values(runtimes)) runToolPatternProbe(rt); }, TOOL_PATTERN_PROBE_INTERVAL_MS);
-  first.unref?.();
-  timer.unref?.();
-}
-
 // Resolve the real upstream key for a profile config (used by the bridge helper
 // call which bypasses the normal virtual-key mapping for a synthetic request).
 function getRealKeyFromProfile(profileCfg) {
@@ -3494,8 +3284,8 @@ function proxyRequest(req, res) {
           if (cruntime.toolPatternsActive && cbody.includes('"tools"')) {
             try {
               const strippedBody = JSON.parse(cbody.toString());
-              rememberToolPatterns(cruntime, strippedBody);   // 供探针复考(必须在剔除前)
-              const removedPatterns = stripUnsupportedToolPatterns(strippedBody);
+              toolPatternApi.rememberToolPatterns(cruntime, strippedBody);   // 供探针复考(必须在剔除前)
+              const removedPatterns = toolPatternApi.stripUnsupportedToolPatterns(strippedBody);
               if (removedPatterns > 0) {
                 cbody = Buffer.from(JSON.stringify(strippedBody));
                 reqHeaders["content-length"] = cbody.length;
@@ -3701,7 +3491,7 @@ async function handleJsonProxy(req, res, body, reqHeaders, apiKey, reqModel, tim
       // real request just got rejected over one — strip and resend instead of
       // handing the user a 400 they cannot act on.
       if (!healUsed) {
-        const healed = tryToolPatternSelfHeal(body, reqHeaders, upRes.statusCode, text, runtime);
+        const healed = toolPatternApi.tryToolPatternSelfHeal(body, reqHeaders, upRes.statusCode, text, runtime);
         if (healed) { body = healed; healUsed = true; continue; }
       }
 
@@ -3901,7 +3691,7 @@ async function streamUpstreamOnce(req, res, body, reqHeaders, apiKey, reqModel, 
         let errBuf = "";
         upRes.on("data", (c) => { errBuf += c.toString(); });
         upRes.on("end", () => {
-          const healed = !clientGone && tryToolPatternSelfHeal(body, reqHeaders, upRes.statusCode, errBuf, runtime);
+          const healed = !clientGone && toolPatternApi.tryToolPatternSelfHeal(body, reqHeaders, upRes.statusCode, errBuf, runtime);
           if (healed) {
             const retry = new Error("tool-pattern resend");
             retry.toolPatternRetry = true;
@@ -6126,7 +5916,7 @@ server.listen(port, "0.0.0.0", () => {
   console.log(`[团队AI Coding监控] Profiles: ${Object.values(runtimes).map(r => `"${r.profileName}"(${JSON.stringify(r.suffix)})→${r.upstream.replace("https://","").replace("http://","").split("/")[0]}`).join(", ")}`);
   console.log(`[团队AI Coding监控] Settings: http://localhost:${port}/settings`);
   console.log(`[团队AI Coding监控] Users: ${Object.values(rt?.globalUsers || {}).map(u => u.username || "").join(", ")}`);
-  scheduleToolPatternProbes();
+  toolPatternApi.scheduleToolPatternProbes();
 });
 
 // Server timeouts

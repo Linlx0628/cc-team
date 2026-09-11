@@ -651,6 +651,9 @@ function createProfileRuntime(profileName, profile) {
     protocol: normalizeProfileProtocol(profile.protocol),
     toolPatternCompat: normalizeToolPatternCompat(profile.toolPatternCompat),
     toolPatternsActive: computeToolPatternsActive(profile, upstreamUrl),
+    // Real `pattern` strings seen on this profile's live traffic, used by the
+    // probe so it tests the upstream against evidence, not just a guess.
+    toolPatternSamples: new Set(),
     responsesPath: profile.responsesPath || "/v1/responses",
     isDefault: !!profile.isDefault,
     billingType: profile.billingType || "on_demand",
@@ -3392,6 +3395,78 @@ function stripUnsupportedToolPatterns(parsed) {
   return removed;
 }
 
+// How upstreams word a tool-schema `pattern` rejection. Zhipu GLM answers error
+// code 1210 ("API 调用参数有误") for the whole request; DeepSeek/OpenAI-style
+// validators say the value "is not a \"regex\"" / "Invalid schema for function".
+const TOOL_PATTERN_REJECTION_RE = /1210|is not a .{0,16}regex|invalid schema for function/i;
+
+function isToolPatternRejection(statusCode, text) {
+  return statusCode === 400 && TOOL_PATTERN_REJECTION_RE.test(text || "");
+}
+
+// Visit every `pattern` string in a schema tree.
+function eachPatternNode(node, fn) {
+  if (Array.isArray(node)) {
+    for (const item of node) eachPatternNode(item, fn);
+    return;
+  }
+  if (!node || typeof node !== "object") return;
+  if (typeof node.pattern === "string") fn(node.pattern);
+  for (const key of Object.keys(node)) {
+    if (key !== "pattern") eachPatternNode(node[key], fn);
+  }
+}
+
+// The `pattern` strings a request's tool schemas carry (Anthropic `input_schema`
+// and OpenAI `parameters` shapes).
+function collectToolPatterns(parsed) {
+  const patterns = [];
+  if (!Array.isArray(parsed?.tools)) return patterns;
+  for (const tool of parsed.tools) {
+    if (!tool || typeof tool !== "object") continue;
+    eachPatternNode(tool.input_schema ?? tool.parameters, (p) => patterns.push(p));
+  }
+  return patterns;
+}
+
+const TOOL_PATTERN_SAMPLE_MAX = 5;
+
+// Remember the real patterns live traffic carries so the probe can ask the
+// upstream about *evidence* instead of one hard-coded guess — a construct our
+// own UNSUPPORTED_PATTERN_RE does not recognise is exactly what a fixed probe
+// cannot anticipate. Only strippable patterns are worth remembering (stripping
+// is the only remedy we have), and only the first few, so the probe payload
+// stays small.
+function rememberToolPatterns(runtime, parsed) {
+  const samples = runtime.toolPatternSamples;
+  if (!samples || samples.size >= TOOL_PATTERN_SAMPLE_MAX) return;
+  for (const p of collectToolPatterns(parsed)) {
+    if (samples.size >= TOOL_PATTERN_SAMPLE_MAX) break;
+    if (UNSUPPORTED_PATTERN_RE.test(p)) samples.add(p);
+  }
+}
+
+// Live self-heal: a 400 that names a tool-schema regex problem while the probe
+// currently believes this upstream accepts patterns means the probe was wrong
+// (it cannot foresee every construct real traffic carries). Rather than hand
+// that 400 to the user, turn stripping on and resend the SAME request with the
+// patterns removed. Returns the replacement body, or null when no heal applies.
+function tryToolPatternSelfHeal(body, reqHeaders, statusCode, text, runtime) {
+  if (!runtime || runtime.toolPatternsActive) return null;
+  if (runtime.toolPatternCompat !== "auto") return null;   // explicit modes are the user's call
+  if (!isToolPatternRejection(statusCode, text)) return null;
+  let parsed;
+  try { parsed = JSON.parse(body.toString()); } catch { return null; }
+  rememberToolPatterns(runtime, parsed);
+  const removed = stripUnsupportedToolPatterns(parsed);
+  if (removed === 0) return null;   // nothing we could have stripped — not our failure
+  const next = Buffer.from(JSON.stringify(parsed));
+  reqHeaders["content-length"] = next.length;
+  runtime.toolPatternsActive = true;
+  console.log(`[工具兼容] 方案「${runtime.profileName}」: 上游以 pattern 拒绝真实请求(状态 ${statusCode})，已即时启用剔除并重发同一请求，剔除 ${removed} 处`);
+  return next;
+}
+
 function normalizeToolPatternCompat(v) {
   return v === "always" || v === "off" ? v : "auto";
 }
@@ -3410,40 +3485,41 @@ function computeToolPatternsActive(profile, upstreamUrl) {
 }
 
 const TOOL_PATTERN_PROBE_DELAY_MS = Math.max(0, Number(process.env.TOOL_PATTERN_PROBE_DELAY_MS) || 30000);
-const TOOL_PATTERN_PROBE_INTERVAL_MS = Math.max(60000, Number(process.env.TOOL_PATTERN_PROBE_INTERVAL_MS) || 6 * 3600 * 1000);
+// Floored at 1s so an explicit override is honoured (tests observe the
+// learn-then-replay cycle at that cadence) while a typo still cannot make a
+// profile hammer its upstream once per request.
+const TOOL_PATTERN_PROBE_INTERVAL_MS = Math.max(1000, Number(process.env.TOOL_PATTERN_PROBE_INTERVAL_MS) || 6 * 3600 * 1000);
 
-function toolPatternProbeBody(model) {
+// Ask the upstream whether it accepts the patterns. The built-in `path` pattern
+// is byte-identical to the harshest pattern real traffic carries (Claude Code's
+// Artifact title regex): it covers the `\p{…}` classes Zhipu rejects with 1210 AND
+// the in-class escapes (`"` `\\` `.` `/` `[` `]`) that DeepSeek-style validators
+// reject as "is not a \"regex\"". The `sample*` properties replay patterns this
+// profile's live traffic actually carried, so an upstream that accepts the guess
+// but rejects a real pattern is still reported as rejecting.
+function toolPatternProbeBody(model, samples = []) {
+  // The built-in pattern stands in for the harshest construct real traffic carries.
+  const builtin = "^(?!__.*__$)[^\\p{Cc}\\p{Cf}\\p{Zl}\\p{Zp}\"\\\\./[\\]]{1,200}$";
+  const properties = { path: { type: "string", pattern: builtin } };
+  const extra = [...(samples || [])].filter((pat) => pat && pat !== builtin).slice(0, TOOL_PATTERN_SAMPLE_MAX);
+  extra.forEach((pat, i) => { properties["sample" + i] = { type: "string", pattern: pat }; });
   return {
     model, max_tokens: 64, stream: false,
     messages: [{ role: "user", content: "ping" }],
     tools: [{
       name: "gateway_compat_probe",
       description: "Gateway reachability probe; never meaningful to call.",
-      // Byte-identical to the harshest pattern real traffic carries (the
-      // Artifact title regex). Covers both the `\p{…}` classes Zhipu rejects
-      // with 1210 AND the in-class escapes (`"` `\\` `.` `/` `[` `\]`) that
-      // DeepSeek-style validators reject as "is not a \"regex\"". A probe on
-      // the subset once false-flagged DeepSeek as accepting, letting live tool
-      // schemas through unstripped to a 400.
-      input_schema: {
-        type: "object",
-        properties: { path: { type: "string", pattern: "^(?!__.*__$)[^\\p{Cc}\\p{Cf}\\p{Zl}\\p{Zp}\"\\\\./[\\]]{1,200}$" } },
-        required: [],
-      },
+      input_schema: { type: "object", properties, required: [] },
     }],
   };
 }
 
-// Ask the upstream whether it accepts a lookaround pattern: true = accepted,
-// false = rejected (Zhipu-style 1210 or DeepSeek-style `is not a "regex"`),
-// null = inconclusive (network error, auth failure, other status) —
-// inconclusive leaves current behaviour as is.
 function probeToolPatternSupport(rt) {
   return new Promise((resolve) => {
     const realKey = getRealKeyFromProfile(config.profiles[rt.profileName] || {});
     const model = (rt.allowedModels && rt.allowedModels[0]) || Object.values(rt.modelAliases || {})[0];
     if (!realKey || !model) { resolve(null); return; }
-    const body = Buffer.from(JSON.stringify(toolPatternProbeBody(model)));
+    const body = Buffer.from(JSON.stringify(toolPatternProbeBody(model, [...(rt.toolPatternSamples || [])])));
     const transport = rt.upstreamUrl.protocol === "https:" ? https : http;
     const req = transport.request({
       hostname: rt.upstreamUrl.hostname,
@@ -3464,7 +3540,7 @@ function probeToolPatternSupport(rt) {
       res.on("end", () => {
         const text = Buffer.concat(chunks).toString();
         if (res.statusCode === 200) resolve(true);
-        else if (res.statusCode === 400 && (text.includes("1210") || /is not a .{0,16}regex/i.test(text))) resolve(false);
+        else if (isToolPatternRejection(res.statusCode, text)) resolve(false);
         else resolve(null);
       });
     });
@@ -3898,6 +3974,7 @@ function proxyRequest(req, res) {
           if (cruntime.toolPatternsActive && cbody.includes('"tools"')) {
             try {
               const strippedBody = JSON.parse(cbody.toString());
+              rememberToolPatterns(cruntime, strippedBody);   // 供探针复考(必须在剔除前)
               const removedPatterns = stripUnsupportedToolPatterns(strippedBody);
               if (removedPatterns > 0) {
                 cbody = Buffer.from(JSON.stringify(strippedBody));
@@ -4089,12 +4166,24 @@ function proxyRequest(req, res) {
 async function handleJsonProxy(req, res, body, reqHeaders, apiKey, reqModel, timeout, reqSource, _rt, suffix, strippedUrl, clientState) {
   const runtime = _rt || rt;
   let lastError = null;
+  // A tool-schema self-heal resend is not a retry of the same request (the body
+  // changed), so it gets one extra pass beyond maxRetries rather than competing
+  // with them. At most one heal per request.
+  let healUsed = false;
 
-  for (let attempt = 0; attempt <= gProxy.maxRetries; attempt++) {
+  for (let attempt = 0; attempt <= gProxy.maxRetries + (healUsed ? 1 : 0); attempt++) {
     try {
       throwIfClientAborted(clientState);
       const upRes = await sendUpstream(body, strippedUrl || req.url, req.method, reqHeaders, timeout, runtime, clientState);
       const text = upRes.body.toString();
+
+      // Live self-heal: the probe said this upstream accepts tool patterns but a
+      // real request just got rejected over one — strip and resend instead of
+      // handing the user a 400 they cannot act on.
+      if (!healUsed) {
+        const healed = tryToolPatternSelfHeal(body, reqHeaders, upRes.statusCode, text, runtime);
+        if (healed) { body = healed; healUsed = true; continue; }
+      }
 
       // Record success to circuit breaker for non-5xx responses
       if (upRes.statusCode < 500) {
@@ -4186,7 +4275,7 @@ async function handleJsonProxy(req, res, body, reqHeaders, apiKey, reqModel, tim
   }
 }
 
-async function handleStreamingProxy(req, res, body, reqHeaders, apiKey, reqModel, timeout, reqSource, _rt, suffix, strippedUrl, clientState) {
+async function streamUpstreamOnce(req, res, body, reqHeaders, apiKey, reqModel, timeout, reqSource, _rt, suffix, strippedUrl, clientState) {
   const runtime = _rt || rt;
   throwIfClientAborted(clientState);
   const opts = {
@@ -4286,14 +4375,29 @@ async function handleStreamingProxy(req, res, body, reqHeaders, apiKey, reqModel
       }
 
       if (upRes.statusCode >= 400) {
-        res.writeHead(upRes.statusCode, h);
+        // Buffer the error body whole and write nothing yet: a 400 that is really
+        // a tool-pattern rejection must be rewound and resent (see
+        // tryToolPatternSelfHeal) instead of reaching the client as a failure.
         let errBuf = "";
-        upRes.on("data", (c) => { if (clientGone) return; errBuf += c.toString(); res.write(c); });
+        upRes.on("data", (c) => { errBuf += c.toString(); });
         upRes.on("end", () => {
+          const healed = !clientGone && tryToolPatternSelfHeal(body, reqHeaders, upRes.statusCode, errBuf, runtime);
+          if (healed) {
+            const retry = new Error("tool-pattern resend");
+            retry.toolPatternRetry = true;
+            retry.body = healed;
+            safeReject(retry);
+            upReq.destroy();
+            return;
+          }
           recordError(apiKey, upRes.statusCode, errBuf.slice(0, 200), req.url, reqModel, suffix, runtime);
           if (upRes.statusCode >= 500) runtime.breaker.recordFailure();
           else if (upRes.statusCode < 500) runtime.breaker.recordSuccess();
-          if (!clientGone) res.end();
+          if (!clientGone) {
+            res.writeHead(upRes.statusCode, h);
+            if (errBuf) res.write(errBuf);
+            res.end();
+          }
           safeResolve();
         });
         return;
@@ -4470,6 +4574,24 @@ async function handleStreamingProxy(req, res, body, reqHeaders, apiKey, reqModel
     upReq.write(body);
     upReq.end();
   });
+}
+
+// Stream proxy entry point. Owns the tool-schema self-heal: when the single
+// upstream attempt rewinds because the upstream rejected a tool pattern the
+// probe thought it accepted, that attempt left nothing written to the client, so
+// the SAME request can be resent once with the patterns stripped.
+async function handleStreamingProxy(req, res, body, reqHeaders, apiKey, reqModel, timeout, reqSource, _rt, suffix, strippedUrl, clientState) {
+  let healUsed = false;
+  for (;;) {
+    try {
+      await streamUpstreamOnce(req, res, body, reqHeaders, apiKey, reqModel, timeout, reqSource, _rt, suffix, strippedUrl, clientState);
+      return;
+    } catch (err) {
+      if (!err?.toolPatternRetry || healUsed) throw err;
+      healUsed = true;
+      body = err.body;
+    }
+  }
 }
 
 // ─── Settings API Helpers ─────────────────────────────────────────────────────

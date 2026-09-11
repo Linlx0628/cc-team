@@ -24,6 +24,7 @@ import { createStatsReader } from "./lib/stats.mjs";
 import { createSettingsWriter } from "./lib/settings-write.mjs";
 import { createUsageReader } from "./lib/personal-usage.mjs";
 import { createNotifier } from "./lib/notifier.mjs";
+import { getApiKey, makeClientAbortError, isClientAbortError, createClientAbortState, markClientAborted, addClientAbortListener, setActiveUpstreamRequest, throwIfClientAborted, sleepWithClientAbort, jitter, buildUpstreamPath } from "./lib/proxy-helpers.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -2868,114 +2869,6 @@ function attachRequestLogger(res, clientState, reqLog) {
 
 
 
-// ─── API Proxy ───────────────────────────────────────────────────────────────
-function getApiKey(req) {
-  const a = req.headers["authorization"];
-  if (a && a.startsWith("Bearer ")) return a.slice(7);
-  return req.headers["x-api-key"] || "unknown";
-}
-
-function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
-
-function makeClientAbortError(reason = "client disconnected") {
-  const err = new Error(`Client disconnected: ${reason}`);
-  err.code = "CLIENT_ABORT";
-  err.isClientAbort = true;
-  return err;
-}
-
-function isClientAbortError(err) {
-  return !!(err?.isClientAbort || err?.code === "CLIENT_ABORT");
-}
-
-function createClientAbortState() {
-  return {
-    aborted: false,
-    reason: "",
-    // A set, not one slot: the image bridge fires several helper calls in
-    // parallel and every in-flight one must die when the client hangs up.
-    upstreamRequests: new Set(),
-    listeners: new Set(),
-  };
-}
-
-function markClientAborted(state, reason) {
-  if (!state || state.aborted) return;
-  state.aborted = true;
-  state.reason = reason || "unknown";
-  for (const upReq of [...state.upstreamRequests]) {
-    if (!upReq.destroyed) upReq.destroy(makeClientAbortError(state.reason));
-  }
-  for (const listener of [...state.listeners]) {
-    try { listener(state.reason); } catch {}
-  }
-}
-
-function addClientAbortListener(state, listener) {
-  if (!state) return () => {};
-  if (state.aborted) {
-    listener(state.reason);
-    return () => {};
-  }
-  state.listeners.add(listener);
-  return () => state.listeners.delete(listener);
-}
-
-function setActiveUpstreamRequest(state, upReq) {
-  if (!state) return () => {};
-  state.upstreamRequests.add(upReq);
-  if (state.aborted && !upReq.destroyed) {
-    upReq.destroy(makeClientAbortError(state.reason));
-  }
-  return () => { state.upstreamRequests.delete(upReq); };
-}
-
-function throwIfClientAborted(state) {
-  if (state?.aborted) throw makeClientAbortError(state.reason);
-}
-
-function sleepWithClientAbort(ms, state) {
-  if (!state) return sleep(ms);
-  return new Promise((resolve, reject) => {
-    if (state.aborted) {
-      reject(makeClientAbortError(state.reason));
-      return;
-    }
-    let done = false;
-    let cleanup = () => {};
-    const timer = setTimeout(() => {
-      if (done) return;
-      done = true;
-      cleanup();
-      resolve();
-    }, ms);
-    cleanup = addClientAbortListener(state, (reason) => {
-      if (done) return;
-      done = true;
-      clearTimeout(timer);
-      cleanup();
-      reject(makeClientAbortError(reason));
-    });
-  });
-}
-
-// Jitter: ±25% random variation
-function jitter(ms) {
-  const half = ms * 0.25;
-  return ms + (Math.random() * half * 2 - half);
-}
-
-function buildUpstreamPath(reqUrl, runtime) {
-  const upstreamPath = runtime.upstreamUrl.pathname.replace(/\/$/, "");
-  // Smart path concatenation: avoid double /v1 when upstream already contains it
-  if (upstreamPath && reqUrl.startsWith("/v1/")) {
-    if (upstreamPath.endsWith("/v1")) {
-      return upstreamPath + reqUrl.slice(3); // /v1 + /messages -> /v1/messages
-    }
-    return upstreamPath + reqUrl;
-  }
-  return upstreamPath + reqUrl;
-}
 
 // ─── 图片识别桥接（vision bridge）───────────────────────────────────────────
 // 目标别名不支持视觉时，先用方案指定的辅助模型把图片转成文字描述，再替换

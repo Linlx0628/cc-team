@@ -1,0 +1,31 @@
+/* public/assets/theme.css —— 全部服务端渲染页面共享的编辑浅色主题(UI_THEME)与 toast 样式(TOAST_CSS)。
+   各页面以 <link> 引用(先于页面自身 <style>，保持级联顺序)，跨页强缓存(?v= 内容版本号)。 */
+:root{
+  color-scheme:light;
+  --canvas:#f7f7f3;--surface:#ffffff;--surface-subtle:#f1f1ec;--surface-hover:#ecece7;
+  --bg:var(--canvas);--bg2:var(--surface-subtle);--card:var(--surface);--card2:var(--surface);
+  --text:#181816;--dim:#686863;--dim2:#92928c;--border:#deded8;--border-strong:#c7c7c0;
+  --accent:#2f6e50;--accent-soft:#e7efe9;--blue:#456b5a;--green:#2f6e50;
+  --yellow:#956400;--orange:#9a6700;--red:#b42318;
+  --font-body:-apple-system,BlinkMacSystemFont,"SF Pro Text","PingFang SC","Microsoft YaHei","Segoe UI",sans-serif;
+  --font-mono:"SFMono-Regular",Consolas,"Liberation Mono",monospace;
+}
+*{margin:0;padding:0;box-sizing:border-box}
+html{background:var(--canvas);scroll-behavior:smooth}
+body{font-family:var(--font-body);font-weight:400;font-size:14px;background:var(--canvas);color:var(--text);min-height:100vh;line-height:1.5;letter-spacing:0}
+button,input,select,textarea{font:inherit;letter-spacing:0}
+button,a,input,select,textarea{transition:border-color .18s ease,background-color .18s ease,color .18s ease,opacity .18s ease,transform .18s ease}
+button:active,.btn:active{transform:translateY(1px)}
+:focus-visible{outline:3px solid rgba(47,110,80,.2);outline-offset:2px}
+::selection{background:#dbe8df;color:var(--text)}
+.led{display:inline-block;width:7px;height:7px;border-radius:50%;vertical-align:middle;background:var(--dim2);margin-right:7px}
+.led.on{background:var(--green)}.led.warn{background:var(--orange)}.led.err{background:var(--red)}
+.quota-progress{display:inline-block;width:92px;height:6px;vertical-align:middle;overflow:hidden;border-radius:2px;background:var(--surface-subtle);margin-left:7px}
+.quota-progress>i{display:block;height:100%;background:var(--green)}
+.quota-progress.warn>i{background:var(--orange)}.quota-progress.crit>i{background:var(--red)}
+@media (prefers-reduced-motion:reduce){*,*::before,*::after{scroll-behavior:auto!important;transition:none!important}}
+
+#toastWrap{position:fixed;top:18px;left:50%;transform:translateX(-50%);z-index:99999;display:flex;flex-direction:column;align-items:center;gap:8px;pointer-events:none}
+.toast{background:var(--green);color:#fff;padding:9px 18px;border-radius:6px;font-size:13px;font-weight:550;box-shadow:0 6px 18px rgba(0,0,0,.16);opacity:0;transform:translateY(-8px);transition:opacity .25s ease,transform .25s ease;max-width:80vw}
+.toast.show{opacity:1;transform:translateY(0)}
+@media (prefers-reduced-motion:reduce){.toast{transition:none}}

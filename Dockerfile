@@ -9,6 +9,8 @@ COPY package.json package-lock.json ./
 RUN npm ci --omit=dev
 
 COPY server.mjs production.mjs ./
+COPY lib/ lib/
+COPY public/ public/
 COPY config.example.json ./config.example.json
 
 COPY docker-entrypoint.sh /docker-entrypoint.sh

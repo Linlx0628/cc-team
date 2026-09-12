@@ -13,7 +13,7 @@ COPY lib/ lib/
 COPY public/ public/
 COPY config.example.json ./config.example.json
 
-COPY docker-entrypoint.sh /docker-entrypoint.sh
+COPY docker/docker-entrypoint.sh /docker-entrypoint.sh
 RUN chmod +x /docker-entrypoint.sh
 
 EXPOSE 6789

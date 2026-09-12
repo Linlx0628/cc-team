@@ -1,0 +1,24 @@
+# Pinned so moving this file into docker/ does not rename the compose project
+# (the project name otherwise defaults to the directory holding this file, which
+# would turn the network into docker_default and strand any running stack).
+name: token-monitor
+
+services:
+  cc-team:
+    # This file lives in docker/, so the compose project directory is docker/ —
+    # both the build context and the bind mounts below are resolved from there and
+    # must climb one level to reach the repo root. Run it with:
+    #   docker compose -f docker/docker-compose.yml up -d
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: cc-team
+    ports:
+      - "6789:6789"
+    volumes:
+      - ../config.json:/app/config.json
+      - ../data.db:/app/data.db
+      # Kept only for the one-time data.json -> data.db migration on first boot.
+      # After confirming the migration log, this line can be removed.
+      - ../data.json:/app/data.json
+    restart: unless-stopped

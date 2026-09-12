@@ -13,3 +13,6 @@ data.db-wal
 config.json
 start.sh
 start.bat
+# 运行期产物,不参与构建,但会随上下文一起打包上传(backups 约 9M,logs 约 1M)
+backups
+logs

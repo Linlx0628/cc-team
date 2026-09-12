@@ -18,7 +18,9 @@ services:
     volumes:
       - ../config.json:/app/config.json
       - ../data.db:/app/data.db
-      # Kept only for the one-time data.json -> data.db migration on first boot.
-      # After confirming the migration log, this line can be removed.
-      - ../data.json:/app/data.json
+      # data.json 挂载已移除:它是首启 data.json -> data.db 一次性迁移用的,迁移早已完成。
+      # 留着反而致命 —— 挂载源不存在时 Docker 会在宿主侧建一个同名**目录**,
+      # entrypoint 的 `echo '{}' > /app/data.json` 随即报 "Is a directory",
+      # 在 set -e 下脚本退出,restart: unless-stopped 让它无限重启。
+      # 容器内路径仍是 /app/data.json,entrypoint 会自行创建普通文件,无需挂载。
     restart: unless-stopped

@@ -1885,7 +1885,7 @@ function pushProductionAlert(a) {
   prodNotifyCooldown.set(key, Date.now());
   const names = { idle_burn: "空转消耗", error_loop: "错误循环", edit_failure_burst: "编辑失败爆发" };
   const msg = `【产出告警】${names[a.kind] || a.kind} · ${a.user_name || a.user_key}\n${a.detail || ""}\n—— ${notifierApi.beijingTimeString()}（token-monitor）`;
-  for (const s of NOTIFY_SENDERS.filter(s => s.enabled(cfg))) {
+  for (const s of notifierApi.NOTIFY_SENDERS.filter(s => s.enabled(cfg))) {
     s.send(cfg, msg).then(() => console.log(`[通知] 已推送 ${s.channel}: 产出告警 ${a.kind}`))
       .catch(err => console.error(`[通知] ${s.channel} 推送失败: ${err.message}`));
   }
@@ -2755,7 +2755,7 @@ function updateQuotaRequest(id, status, note) {
 function notifyQuotaRequest(info) {
   const cfg = config.notifier || {};
   if (!cfg.enabled) return;
-  const channels = NOTIFY_SENDERS.filter(s => s.enabled(cfg));
+  const channels = notifierApi.NOTIFY_SENDERS.filter(s => s.enabled(cfg));
   if (!channels.length) return;
   const msg = `【加量申请】${info.username}\n申请额度池：${info.pool}\n理由：${info.reason}\n请到 设置 → 加量申请 处理（该成员本周已处理 ${info.handledThisWeek}/${info.weeklyLimit} 次）\n—— ${notifierApi.beijingTimeString()}（token-monitor）`;
   for (const s of channels) {

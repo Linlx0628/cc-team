@@ -3,7 +3,7 @@ Chart.defaults.color='#686863';Chart.defaults.font.family='-apple-system,BlinkMa
 // 共用）的客户端逻辑。页面内联引导脚本先注入以下全局再加载本文件：
 //   VK（虚拟 key）/ toast() 及 UI_HELPERS 提供的辅助函数
 // 其余数据均由本文件运行时经 /api/my-usage 拉取，文件可长期强缓存（?v= 内容版本号）。
-let D=null,C={h:null,t:null},currentProfile='all',PROTO='';
+let D=null,C={h:null,t:null},currentProfile='all',PROTO='',SECTION='overview';
 const fmtT=n=>n.toLocaleString("zh-CN");
 // Profile names come from admin-authored config; this page renders them into
 // markup, so escape here rather than trusting them.
@@ -185,7 +185,15 @@ async function load(){
     if(currentProfile==='all'&&PROTO)qs.push('protocol='+PROTO);
     const r=await fetch('/api/my-usage?'+qs.join('&'),{headers:{'Authorization':'Bearer '+VK}});
     if(!r.ok){document.getElementById('meta').textContent='认证失败';return}
-    D=await r.json();render();
+    D=await r.json();
+    // 纯 innerHTML 的部分(头部、KPI 卡、各方案配额、价目表)不依赖面板宽度,隐藏时也照刷。
+    renderChrome();
+    renderProfileQuotas();
+    renderRateCard();
+    // 图表与使用日历按容器宽度绘制:面板隐藏时宽度为 0,建图会得到一张空白图、
+    // 日历会落到 9px 下限。所以各自只在所属面板可见时画,切过去时由 paintSection() 补画。
+    if(SECTION==='overview')renderCalendar();
+    if(SECTION==='analysis')renderAnalysisPane();
   }catch(e){document.getElementById('meta').textContent='Error: '+e.message}
 }
 function switchProfile(v){currentProfile=v||'all';load()}
@@ -312,7 +320,10 @@ function renderProfileQuotas(){
       +'</div>';
   }).join('');
 }
-function render(){
+// ── 渲染分片 ──
+// 常驻部分:工具条(协议/方案/申请加量)、meta、通知条、KPI 卡、签到条。都不依赖面板宽度,
+// 面板隐藏时也能安全渲染 —— 30 秒轮询每次都刷新它们。
+function renderChrome(){
   if(!D)return;
   const sel=document.getElementById('profileSel');
   // Always rebuild from the freshest D.availableProfiles (the backend narrows
@@ -339,15 +350,12 @@ function render(){
     '<div class="card"><div class="l">今日缓存写入</div><div class="v" data-cu="'+t.cacheWrite+'" data-cu-k>0</div></div>'+
     '<div class="card"><div class="l">今日缓存命中</div><div class="v" data-cu="'+t.cacheRead+'" data-cu-k>0</div></div>';
   runCountUps(document.getElementById('cards'));
-  renderProfileQuotas();
-  // Hourly chart
-  const hrs=[];for(let i=0;i<24;i++)hrs.push(i.toString().padStart(2,"0")+":00");
-  const hData=hrs.map((_,i)=>{const h=D.hourly[i.toString().padStart(2,"0")]||{};return{req:h.requests||0,tokens:ioTokens(h)}});
-  if(C.h)C.h.destroy();
-  C.h=new Chart(document.getElementById("hourChart"),{type:"bar",data:{labels:hrs,datasets:[{label:"Token(输入+输出)",data:hData.map(d=>d.tokens),backgroundColor:COL[0]+"cc",borderRadius:3},{label:"请求数",data:hData.map(d=>d.req),backgroundColor:COL[1]+"cc",borderRadius:3}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{labels:{color:"#686863",font:{size:10}}}},scales:{x:{ticks:{color:"#686863",font:{size:9},maxRotation:0,autoSkip:true,maxTicksLimit:12},grid:{display:false}},y:{ticks:{color:"#686863",callback:v=>fmtTk(v)},grid:{color:"rgba(24,24,22,.08)"}}}}});
-  // Trend chart
-  if(C.t)C.t.destroy();
-  C.t=new Chart(document.getElementById("trendChart"),{type:"line",data:{labels:D.trend.map(d=>d.date.slice(5)),datasets:[{label:"总Token(含缓存)",data:D.trend.map(d=>d.total),borderColor:COL[0],backgroundColor:"rgba(47,110,80,.12)",fill:true,tension:.28,pointRadius:2,borderWidth:2}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{labels:{color:"#686863",font:{size:10}}}},scales:{x:{ticks:{color:"#686863"},grid:{display:false}},y:{ticks:{color:"#686863",callback:v=>fmtTk(v)},grid:{color:"rgba(24,24,22,.08)"}}}}});
+  renderCheckin();
+  renderQuotaRequest();
+}
+// 配额相关两片都是纯 innerHTML,没有几何依赖,面板隐藏时渲染也不会画错 ——
+// 所以它们跟着 30 秒轮询刷新,不走「切过去才画」那套(两个渲染函数各自见名)。
+function renderModelTable(){
   // Model table. Two token columns side by side is the whole point: "实际" is what
   // the user spent, "计入配额" is what it cost them. The per-row multiplier is the
   // realised ratio (weighted/raw) — for a row that straddled a peak boundary or a
@@ -380,10 +388,22 @@ function render(){
     ?'「实际 Token」是真实消耗，「计入配额」是按配额口径（各模型倍率；Responses/Codex 链路再剔除缓存命中）折算后从每日额度里扣掉的数额。倍率列为今日实际计权比例，跨高峰边界或期间调整过倍率时会落在两档之间。'
     :'当前没有倍率或缓存规则造成差异，实际消耗与计入配额相同。')
     +cacheClause;
-  renderRateCard();
-  renderCheckin();
-  renderQuotaRequest();
-  renderCalendar();
+}
+// 用量分析面板:两张 Chart.js 图按容器宽度绘制,面板隐藏时容器宽度是 0,建图会得到一张
+// 空白图。所以这一片只在面板可见时渲染,切过去时由 paintSection() 补画。
+// (使用日历已搬到概览,同理由 paintSection() 的 overview 分支补画。)
+function renderAnalysisPane(){
+  if(!D)return;
+  const hc=document.getElementById("hourChart"),tc=document.getElementById("trendChart");
+  // Hourly chart
+  const hrs=[];for(let i=0;i<24;i++)hrs.push(i.toString().padStart(2,"0")+":00");
+  const hData=hrs.map((_,i)=>{const h=D.hourly[i.toString().padStart(2,"0")]||{};return{req:h.requests||0,tokens:ioTokens(h)}});
+  if(C.h){C.h.destroy();C.h=null}
+  if(hc)C.h=new Chart(hc,{type:"bar",data:{labels:hrs,datasets:[{label:"Token(输入+输出)",data:hData.map(d=>d.tokens),backgroundColor:COL[0]+"cc",borderRadius:3},{label:"请求数",data:hData.map(d=>d.req),backgroundColor:COL[1]+"cc",borderRadius:3}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{labels:{color:"#686863",font:{size:10}}}},scales:{x:{ticks:{color:"#686863",font:{size:9},maxRotation:0,autoSkip:true,maxTicksLimit:12},grid:{display:false}},y:{ticks:{color:"#686863",callback:v=>fmtTk(v)},grid:{color:"rgba(24,24,22,.08)"}}}}});
+  // Trend chart
+  if(C.t){C.t.destroy();C.t=null}
+  if(tc)C.t=new Chart(tc,{type:"line",data:{labels:D.trend.map(d=>d.date.slice(5)),datasets:[{label:"总Token(含缓存)",data:D.trend.map(d=>d.total),borderColor:COL[0],backgroundColor:"rgba(47,110,80,.12)",fill:true,tension:.28,pointRadius:2,borderWidth:2}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{labels:{color:"#686863",font:{size:10}}}},scales:{x:{ticks:{color:"#686863"},grid:{display:false}},y:{ticks:{color:"#686863",callback:v=>fmtTk(v)},grid:{color:"rgba(24,24,22,.08)"}}}}});
+  renderModelTable();
 }
 // Price list: what each alias costs right now. Answers "为什么额度掉这么快" before
 // the user spends, not after. Cheapest first — the cheap option should be the one
@@ -409,9 +429,9 @@ function renderRateCard(){
   }).join('')
     +'<div class="note" style="font-size:11px;color:var(--dim)">倍率越低越省额度：×0.5 表示消耗 1000 token 只扣 500 额度。倍率随时段自动切换，调整只影响之后的请求。</div>';
 }
-let calRz;window.addEventListener('resize',function(){clearTimeout(calRz);calRz=setTimeout(function(){if(D)renderCalendar()},150)});
+let calRz;window.addEventListener('resize',function(){clearTimeout(calRz);calRz=setTimeout(function(){if(D&&SECTION==='overview')renderCalendar()},150)});
 // ── 产出画像(仅本人;拉 /api/production/me,接口不可用时整块隐藏)──
-// 注意:本页面由服务端模板字符串生成,这里只能用字符串拼接,不能出现反引号或插值序列。
+// 注意:本文件是独立的外部资源(/assets/my-usage.js),不再是服务端模板字符串的一部分,
 (function loadProdMe(){
   const ph=esc;
   fetch('/api/production/me?range=7d',{headers:{'Authorization':'Bearer '+VK}})
@@ -438,3 +458,314 @@ let calRz;window.addEventListener('resize',function(){clearTimeout(calRz);calRz=
     .catch(()=>{const el=document.getElementById('prodProfile');if(el)el.style.display='none'});
 })();
 load();setInterval(load,30000);
+
+
+// ── 面板切换 ──
+// 菜单按功能划分,四块:概览(含使用日历、各方案配额、产出画像)/ 配额价目表 /
+// 用量分析(图表、模型表、项目分布、会话使用情况)/ 团队排行榜。
+// 顺序即导航顺序,id 由 setSection() 按 'mu-tab-'+s / 'mu-panel-'+s 硬拼 ——
+// 增删菜单必须与 lib/pages.mjs 的按钮和面板同时改,否则切换会静默失效。
+const SECTIONS=['overview','rates','analysis','leaderboard'];
+function setSection(name,focus){
+  if(SECTIONS.indexOf(name)<0)name='overview';
+  SECTION=name;
+  SECTIONS.forEach(function(s){
+    const btn=document.getElementById('mu-tab-'+s),panel=document.getElementById('mu-panel-'+s);
+    const on=s===name;
+    if(btn){btn.classList.toggle('active',on);btn.setAttribute('aria-selected',String(on));btn.tabIndex=on?0:-1}
+    if(panel){panel.hidden=!on;panel.classList.toggle('active',on)}
+  });
+  if(focus){const b=document.getElementById('mu-tab-'+name);if(b)b.focus()}
+  paintSection();
+}
+// 切到「用量分析」/「概览」才补画:隐藏期间容器宽度为 0,提前建图/排日历都会画错。
+// 日历现在挂在概览里,所以两个分支都要有 —— 少了 overview 这一支,切回概览会看到一张
+// 按 0 宽排出来、被压到 9px 下限的日历。
+// 排行榜首次进入才请求,且不参与 30 秒轮询 —— 它和 D 是两份数据,不必跟着刷新。
+function paintSection(){
+  if(SECTION==='analysis'){
+    if(D)renderAnalysisPane();
+    if(C.h)C.h.resize();
+    if(C.t)C.t.resize();
+    ensureActivity();   // 项目分布与会话使用情况首次进入才拉,拉过一次就不再重复
+  }else if(SECTION==='overview'){
+    if(D)renderCalendar();
+  }else if(SECTION==='leaderboard'){
+    ensureLeaderboard();
+  }
+}
+(function bindMyUsageNav(){
+  const nav=document.getElementById('myUsageNav');
+  if(!nav)return;
+  nav.addEventListener('click',function(e){
+    const b=e.target.closest('.nav-btn');
+    if(b)setSection(b.dataset.section,false);
+  });
+  nav.addEventListener('keydown',function(e){
+    if(['ArrowDown','ArrowRight','ArrowUp','ArrowLeft','Home','End'].indexOf(e.key)<0)return;
+    const btns=[].slice.call(nav.querySelectorAll('.nav-btn'));
+    const i=btns.indexOf(document.activeElement);
+    if(i<0)return;
+    let n=i;
+    if(e.key==='ArrowDown'||e.key==='ArrowRight')n=(i+1)%btns.length;
+    else if(e.key==='ArrowUp'||e.key==='ArrowLeft')n=(i-1+btns.length)%btns.length;
+    else if(e.key==='Home')n=0;
+    else n=btns.length-1;
+    e.preventDefault();
+    setSection(btns[n].dataset.section,true);
+  });
+})();
+
+// ── 排行榜 ──
+// 维度清单、单位、以及「好的方向」全部由服务端随响应下发,前端不硬编码 ——
+// 加维度只改 lib/leaderboard.mjs 一处,不会出现前后端各写一份而慢慢漂移。
+// 默认维度/窗口同理:首次请求不带参数,服务端回落后再把结果同步回 LB,默认值只写一遍。
+const LB={dim:'',win:'',data:null,error:'',loading:false};
+const LB_WINDOWS=[['today','今日'],['week','本周'],['month','本月']];
+function fmtLbVal(v){
+  if(v==null)return'';
+  if(Math.abs(v)>=10000)return fmtTk(v);
+  return Number.isInteger(v)?fmtT(v):v.toFixed(1);
+}
+function renderLbSegs(){
+  const dimBox=document.getElementById('lbDim');
+  if(dimBox){
+    dimBox.innerHTML=((LB.data&&LB.data.dimensions)||[]).map(function(x){
+      return '<button type="button" role="tab" aria-selected="'+(x.key===LB.dim)+'" data-dim="'+esc(x.key)+'" class="'+(x.key===LB.dim?'on':'')+'">'+esc(x.label)+'</button>';
+    }).join('');
+  }
+  const winBox=document.getElementById('lbWin');
+  if(winBox){
+    winBox.innerHTML=LB_WINDOWS.map(function(w){
+      return '<button type="button" role="tab" aria-selected="'+(w[0]===LB.win)+'" data-win="'+w[0]+'" class="'+(w[0]===LB.win?'on':'')+'">'+w[1]+'</button>';
+    }).join('');
+  }
+}
+function renderLeaderboard(){
+  const board=document.getElementById('lbBoard'),sub=document.getElementById('lbSub'),note=document.getElementById('lbNote');
+  if(!board)return;
+  renderLbSegs();
+  if(LB.error){board.innerHTML='<div class="lb-msg">加载失败：'+esc(LB.error)+'</div>';if(sub)sub.textContent='';if(note)note.innerHTML='';return}
+  if(!LB.data){board.innerHTML='<div class="lb-msg">加载中…</div>';if(sub)sub.textContent='';return}
+  const d=LB.data;
+  // 服务端回落的维度/窗口同步回来,保证按钮高亮与真实的排序口径一致
+  if(d.dimension)LB.dim=d.dimension;
+  if(d.window)LB.win=d.window;
+  renderLbSegs();
+  if(sub)sub.textContent=(d.from||'')+' ~ '+(d.to||'');
+  if(note)note.innerHTML=(d.hint?'<span class="lb-hint">'+esc(d.hint)+'</span>':'')+(d.note?'<span class="lb-flag">'+esc(d.note)+'</span>':'');
+  const rows=d.rows||[],c=d.cohort||{};
+  if(!rows.length){board.innerHTML='<div class="lb-msg">本期还没有人产生用量</div>';return}
+  // 榜单常常只有一行(窗口内只有一个人在跑),那不是故障而是实情。cohort 那行把
+  // 「本期 N 人活跃 · 共 M 人」摆出来,界面才说得出榜单为什么这么短。
+  board.innerHTML='<div class="lb-cohort">本期 <b>'+(c.active||0)+'</b> 人活跃 · 共 '+(c.total||0)+' 人 · 按「'+esc(d.dimensionLabel||'')+'」'+(d.direction==='asc'?'由低到高':'由高到低')+'排序'+(d.me?'':' · 你本期无数据')+'</div>'
+    +'<div class="lb-list">'+rows.map(function(r){
+      const has=r.value!=null;
+      return '<div class="lb-row'+(r.isMe?' me':'')+(r.rank<=3?' r'+r.rank:'')+'">'
+        +'<span class="lb-rank">'+r.rank+'</span>'
+        +'<div class="lb-who"><div class="lb-name">'+esc(r.user_name)+(r.isMe?' <span class="tag">我</span>':'')+'</div>'
+        +'<div class="lb-det">'+esc(r.user_key)+' · 活跃 '+r.detail.active_days+' 天 · '+fmtT(r.detail.requests)+' 次请求'+(r.detail.has_edit?'':' · 无代码产出')+'</div></div>'
+        +'<div class="lb-val'+(has?'':' none')+'">'+(has?'<b>'+fmtLbVal(r.value)+'</b><span>'+esc(d.unit||'')+'</span>':'<b>无数据</b>')+'</div>'
+        +'</div>';
+    }).join('')+'</div>';
+}
+async function fetchLeaderboard(){
+  if(LB.loading)return;
+  LB.loading=true;
+  renderLbSegs();                     // 立刻高亮刚点的那个,不等请求回来
+  if(!LB.data)renderLeaderboard();    // 只有首次进入才需要「加载中」占位
+  try{
+    const r=await fetch('/api/leaderboard?dimension='+encodeURIComponent(LB.dim)+'&window='+encodeURIComponent(LB.win),{headers:{'Authorization':'Bearer '+VK}});
+    const j=await r.json();
+    if(!r.ok)throw new Error(j.error||('HTTP '+r.status));
+    LB.data=j;LB.error='';
+  }catch(e){LB.error=e.message||'加载失败';LB.data=null}
+  LB.loading=false;
+  renderLeaderboard();
+}
+function ensureLeaderboard(){if(!LB.data&&!LB.loading)fetchLeaderboard()}
+(function bindLeaderboardControls(){
+  const dimBox=document.getElementById('lbDim');
+  if(dimBox)dimBox.addEventListener('click',function(e){
+    const b=e.target.closest('button[data-dim]');
+    if(!b||(b.dataset.dim===LB.dim&&LB.data))return;
+    LB.dim=b.dataset.dim;fetchLeaderboard();
+  });
+  const winBox=document.getElementById('lbWin');
+  if(winBox)winBox.addEventListener('click',function(e){
+    const b=e.target.closest('button[data-win]');
+    if(!b||(b.dataset.win===LB.win&&LB.data))return;
+    LB.win=b.dataset.win;fetchLeaderboard();
+  });
+})();
+
+// ── 项目分布 / 会话使用情况(成员侧) ─────────────────────────────────────────
+// 数据来自 /api/my-activity,与 /api/my-usage 是两份:那份是「今日 + 各方案配额」的
+// 实时快照,这份是「近 7 天 · 按会话聚合」的项目与习惯视图。所以两块各自独立拉取、
+// 各自独立渲染,谁也不去动对方的 DOM,也不跟着 30 秒轮询刷新。
+//
+// 三个如实披露点,全部由服务端下发的字段驱动,前端不自己算:
+//   · token_data=false → token 与缓存率显示「—」而不是 0。采集上线前的历史会话没有
+//     token 记录,那是「没测到」,写成 0 会被读成「真的花了 0 token、命中 0%」。
+//   · unattributed → 无会话标识、归属不到任何会话的那部分请求,必须写出来,
+//     否则读者会把上表的合计当成全量。
+//   · crossSessions → 横跨多个项目的会话,其 token 只能整段记在主项目名下,
+//     次项目的 token 因此偏低。不写出来,那个数字会被当成错的。
+const ACT={data:null,error:'',loading:false};
+const DASH='<span style="color:var(--dim)">—</span>';
+const GRADE_CLS={good:'good',warn:'warn',bad:'bad'};
+const THS_FALLBACK={cache_rate_good:.9,cache_rate_warn:.8,new_input_good:3000,new_input_bad:8000,fragment_max_requests:2};
+// 首末时刻是 UTC ISO,展示一律北京(全站口径)。跨天是常态(会话能挂很久),
+// 所以详情行带月日,而同一会话内部用纯时分更省地方。
+function cnStamp(iso){
+  const t=Date.parse(iso||'');
+  if(!Number.isFinite(t))return '';
+  const s=new Date(t+8*3600000).toISOString();
+  return s.slice(5,10).replace('-','/')+' '+s.slice(11,16);
+}
+function fmtDur(ms){
+  if(ms==null)return '';
+  const m=Math.round(ms/60000);
+  if(m<1)return '不足 1 分钟';
+  if(m<60)return m+' 分钟';
+  return Math.floor(m/60)+' 小时 '+(m%60)+' 分';
+}
+// 会话标识的前缀(hdr:/pck:/dig:)说明这个标识是怎么来的,留着比一串 uuid 好认
+function sessShort(id){
+  const raw=String(id||'');
+  const i=raw.indexOf(':');
+  return i>0?raw.slice(0,i+1)+raw.slice(i+1,i+9):raw.slice(0,9);
+}
+function ratioCell(rate,ths){
+  if(rate==null)return DASH;
+  const col=rate>=ths.cache_rate_good?'var(--green)':rate>=ths.cache_rate_warn?'var(--orange)':'var(--red)';
+  return '<span style="color:'+col+'">'+(rate*100).toFixed(1)+'%</span>';
+}
+function perTurnCell(v,ths){
+  if(v==null)return DASH;
+  const col=v<=ths.new_input_good?'var(--green)':v<=ths.new_input_bad?'var(--orange)':'var(--red)';
+  return '<span style="color:'+col+'">'+fmtT(Math.round(v))+'</span> <span style="color:var(--dim)">token/轮</span>';
+}
+// 两张表共用的一段脚注:归属不到会话的那部分 + 统计范围。范围必须写清楚,因为
+// 上方的方案筛选(全部 / 单个方案)不影响这两块 —— 它们是全方案的近 7 天视图。
+function actScopeNote(d,unit){
+  const ths=Object.assign({},THS_FALLBACK,d.thresholds||{});
+  const out=['统计范围 '+esc(d.from)+' ~ '+esc(d.to)+' · 全部方案'
+    +(currentProfile==='all'?'':' · <b>上方的方案筛选不影响这两块</b>')];
+  const un=d.unattributed||{};
+  if(un.requests>0){
+    out.push('另有 '+fmtT(un.requests)+' 次请求没有会话标识('+fmtTk(un.tokens)+' token),无法归属到任何'
+      +(unit||'会话')+',未计入上表');
+  }
+  return {notes:out,ths:ths};
+}
+function renderProjDist(){
+  const box=document.getElementById('projDist'),tb=document.querySelector('#projDistTable tbody'),note=document.getElementById('projDistNote');
+  if(!box||!tb)return;
+  const d=ACT.data,rows=d.projects||[];
+  if(!rows.length){box.style.display='none';return}
+  box.style.display='';
+  const sc=actScopeNote(d,'项目');
+  tb.innerHTML=rows.map(function(p){
+    return '<tr>'
+      +'<td style="color:var(--blue)">'+esc(p.project)+'</td>'
+      +'<td class="n">'+(p.files==null?DASH:fmtT(p.files))+'</td>'
+      +'<td class="n">'+(p.net_lines==null?DASH:((p.net_lines>0?'+':'')+fmtT(p.net_lines)))+'</td>'
+      +'<td class="n">'+(p.token_data?fmtTk(p.tokens):DASH)+'</td>'
+      +'<td class="n">'+ratioCell(p.cache_rate,sc.ths)+'</td>'
+      +'</tr>';
+  }).join('');
+  if(d.crossSessions>0){
+    sc.notes.push('有 '+fmtT(d.crossSessions)+' 个会话横跨多个项目:token 是按会话记的,整段算在了它的主项目名下,次项目的 token 会因此偏低');
+  }
+  note.innerHTML='<div class="sess-note-list">'+sc.notes.map(function(t){return '<div>'+t+'</div>'}).join('')+'</div>';
+}
+function renderSessSummary(){
+  const el=document.getElementById('sessSummary');
+  if(!el)return;
+  const d=ACT.data,s=d.sessionSummary||{},sc=actScopeNote(d,'会话');
+  const share=s.fragment_share==null?null:s.fragment_share;
+  const card=(l,v,sub)=>'<div class="card"><div class="l">'+l+'</div><div class="v">'+v+'</div>'
+    +(sub?'<div style="margin-top:6px;font-size:10px;color:var(--dim)">'+sub+'</div>':'')+'</div>';
+  el.innerHTML=
+    card('会话数',fmtT(s.sessions||0),'碎片 '+(s.fragments||0)+' 个'+(share==null?'':' · '+Math.round(share*100)+'%'))
+    +card('总轮数',fmtT(s.requests||0),'平均每会话 '+(s.sessions?Math.round(s.requests/s.sessions*10)/10:0)+' 轮')
+    +card('缓存率',ratioCell(s.cache_rate,sc.ths),'越高说明上下文复用得越好')
+    +card('平均单轮新增上下文',perTurnCell(s.new_input_per_turn,sc.ths),'越低越省:每轮重发的量')
+    +card('工具失败率',s.fail_rate==null?DASH:'<span style="color:'+(s.fail_rate<.1?'var(--green)':s.fail_rate<.3?'var(--orange)':'var(--red)')+'">'+(s.fail_rate*100).toFixed(1)+'%</span>',fmtT(s.tool_calls||0)+' 次工具调用');
+}
+function renderSessBoard(){
+  const board=document.getElementById('sessBoard');
+  if(!board)return;
+  const d=ACT.data,rows=d.sessions||[];
+  if(!rows.length){board.innerHTML='<div class="lb-msg">近 7 天还没有可归属到会话的请求</div>';return}
+  const ths=Object.assign({},THS_FALLBACK,d.thresholds||{});
+  board.innerHTML=rows.map(function(s){
+    const g=GRADE_CLS[s.grade]||'none';
+    const name=s.project?esc(s.project):'<span style="color:var(--dim)">纯问答 · 无代码产出</span>';
+    const when=s.first_seen===s.last_seen?cnStamp(s.first_seen):(cnStamp(s.first_seen)+' → '+cnStamp(s.last_seen));
+    const parts=[];
+    parts.push(s.requests?fmtT(s.requests)+' 轮':'轮数未知');
+    parts.push(s.duration_ms!=null?fmtDur(s.duration_ms):null);
+    parts.push(s.token_data?fmtTk(s.tokens)+' token':null);
+    parts.push('单轮新增 '+(s.new_input_per_turn==null?'—':fmtT(Math.round(s.new_input_per_turn))));
+    if(s.tool_calls)parts.push('工具 '+fmtT(s.tool_calls)+' 次');
+    if(s.files)parts.push(s.files+' 个文件');
+    if(s.net_lines!=null&&s.net_lines!==0)parts.push((s.net_lines>0?'+':'')+fmtT(s.net_lines)+' 行');
+    if(s.cross_projects>0)parts.push('跨 '+s.cross_projects+' 个项目');
+    const adv=(s.advice||[]).map(function(a){return esc(a)}).join('；');
+    return '<div class="lb-row sess-row '+g+'">'
+      +'<span class="sess-grade">'+(s.gradeLabel?esc(s.gradeLabel):'—')+'</span>'
+      +'<div class="lb-who"><div class="lb-name">'+name+' <span style="font-weight:400;color:var(--dim);font-size:10.5px">'+esc(sessShort(s.session))+'</span></div>'
+      +'<div class="lb-det">'+esc(when)+(when?' · ':'')+parts.filter(Boolean).join(' · ')+'</div>'
+      +(adv?'<div class="sess-adv">'+adv+'</div>':'')
+      +'</div>'
+      +'<div class="lb-val'+(s.cache_rate==null?' none':'')+'">'
+      +(s.cache_rate==null?'<b>缓存率 —</b>':'<b style="color:'+(s.cache_rate>=ths.cache_rate_good?'var(--green)':s.cache_rate>=ths.cache_rate_warn?'var(--orange)':'var(--red)')+'">'+(s.cache_rate*100).toFixed(0)+'%</b><span>缓存率</span>')
+      +'</div></div>';
+  }).join('');
+}
+function renderActivity(){
+  const pd=document.getElementById('projDist'),sb=document.getElementById('sessBox');
+  if(ACT.error){
+    if(pd)pd.style.display='none';
+    if(sb)sb.style.display='';
+    const b=document.getElementById('sessBoard');if(b)b.innerHTML='<div class="lb-msg">加载失败：'+esc(ACT.error)+'</div>';
+    const sm=document.getElementById('sessSummary');if(sm)sm.innerHTML='';
+    const sn=document.getElementById('sessNote');if(sn)sn.innerHTML='';
+    return;
+  }
+  if(!ACT.data)return;
+  // 骨架里 #sessBox 是 display:none,而 renderProjDist() 只管自己那个盒子。
+  // 不在这里显式打开,整个「会话使用情况」永远不显示(接口有数据也白搭)。
+  if(sb)sb.style.display='';
+  renderProjDist();
+  renderSessSummary();
+  renderSessBoard();
+  const d=ACT.data,sc=actScopeNote(d,'会话');
+  const nt=document.getElementById('sessNote');
+  if(nt){
+    const tless=(d.sessions||[]).filter(function(s){return !s.token_data}).length;
+    if(tless>0)sc.notes.push('有 '+fmtT(tless)+' 个会话早于 token 按会话采集上线,只有工具数据,token 与缓存率显示「—」');
+    if(d.fragments_note)sc.notes.push(esc(d.fragments_note));
+    if(d.truncated)sc.notes.push('会话流水只显示最近 '+fmtT((d.sessions||[]).length)+' 条');
+    nt.innerHTML='<div class="sess-note-list">'+sc.notes.map(function(t){return '<div>'+t+'</div>'}).join('')+'</div>';
+  }
+}
+async function fetchActivity(){
+  if(ACT.loading)return;
+  ACT.loading=true;
+  if(!ACT.data){const b=document.getElementById('sessBoard');if(b)b.innerHTML='<div class="lb-msg">加载中…</div>'}
+  try{
+    const r=await fetch('/api/my-activity?range=7d',{headers:{'Authorization':'Bearer '+VK}});
+    const j=await r.json();
+    if(!r.ok)throw new Error(j.error||('HTTP '+r.status));
+    ACT.data=j;ACT.error='';
+  }catch(e){ACT.error=e.message||'加载失败';ACT.data=null}
+  ACT.loading=false;
+  renderActivity();
+}
+// 首次进入「用量分析」才拉,不挂 30 秒轮询 —— 与排行榜同一处理
+function ensureActivity(){if(!ACT.data&&!ACT.loading)fetchActivity()}
+
+setSection('overview',false);

@@ -8,8 +8,9 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { initProductionDb, createProductionTracker, rangeFromTo, productionSummary, productionUserDetail,
   productionProjects, productionAlerts, markAlertSeen, pruneProductionData, DEFAULT_COST_RATES,
-  computeCosts, contextHealth, buildReportHTML, ALERT_KIND_LABEL, alertDetailText } from "./production.mjs";
-import { cnNow, cnDate, cnHour, secondsUntilNextCnMidnight, cnWeekStartIso, cnDayStartIso } from "./lib/time.mjs";
+  computeCosts, contextHealth, buildReportHTML, ALERT_KIND_LABEL, alertDetailText,
+  sessionProjectLabels, sessionToolStats, sessionKey } from "./production.mjs";
+import { cnNow, cnDate, cnHour, secondsUntilNextCnMidnight, cnWeekStartIso, cnWeekStartDate, cnDayStartIso } from "./lib/time.mjs";
 import { parsePeakTimeMinutes, normalizePeakHours, isInPeakHours, formatPeakHoursSummary } from "./lib/schedule.mjs";
 import { sanitizeJson } from "./lib/sanitize.mjs";
 import { QUOTA_RATE_MAX, normalizeQuotaRate, normalizeCacheReadQuotaRate, normalizeModelQuotaRates, lookupModelQuotaRate, currentQuotaRate, nextRateChangeHint, QUOTA_POOL_NAME_MAX, normalizeQuotaPoolName, canonicalJson, shortDigest, applyStickyReorder, buildPoolResolver, quotaExceededMessage, quotaErrorDetail, buildQuotaCore } from "./lib/quota.mjs";
@@ -21,6 +22,8 @@ import { buildCodexModelCatalog, buildCodexSetupScript, buildCodexSetupScriptWin
 import { createStatsReader } from "./lib/stats.mjs";
 import { createSettingsWriter } from "./lib/settings-write.mjs";
 import { createUsageReader } from "./lib/personal-usage.mjs";
+import { createLeaderboardReader } from "./lib/leaderboard.mjs";
+import { createSessionsReader } from "./lib/sessions.mjs";
 import { createNotifier } from "./lib/notifier.mjs";
 import { createPersistence } from "./lib/persistence.mjs";
 import { createMemberRewards } from "./lib/member-rewards.mjs";
@@ -81,7 +84,7 @@ const backupDir = path.join(__dirname, "backups");
 // 页面静态资源（public/assets/）在启动时读入内存并按内容生成 ?v= 版本号；
 // 引用见各页面模板的 assets.url(...)，服务路由在 createServer 入口处。
 const assets = loadAssets(path.join(__dirname, "public", "assets"));
-const RESERVED_SUFFIXES = new Set(["dashboard", "settings", "api", "health", "usage", "my-usage", "v1", "login", "logout", "favicon", "robots", "js", "css", "responses", "models"]);
+const RESERVED_SUFFIXES = new Set(["dashboard", "settings", "api", "health", "usage", "my-usage", "v1", "login", "logout", "favicon", "robots", "js", "css", "responses", "models", "leaderboard", "sessions", "my-activity"]);
 const PROFILE_SUFFIX_RE = /^[a-z0-9_-]{2,20}$/;
 
 // A profile serves exactly one client protocol. The two pools are strictly
@@ -1574,6 +1577,19 @@ function hasGlobalUser(apiKey) {
   return Object.values(runtimes).some(runtime => !!getGlobalUser(apiKey, runtime));
 }
 
+// 全队真实 key 的并集(方案成员 + 全局用户),去重。
+// 排行榜用它把「12 字符孤儿 key」认领回本人:resolveUserKey(:1450)对未知 key 只留
+// 前 12 字符,于是同一个人可能在 usage_daily 留下完整 key 与桩两条记录。桩只能靠
+// 前缀命中某个已知 key 认领 —— 不能按名字合并,桩落库时的名字是 未知(jx-abcdef)。
+function knownUserKeys() {
+  const out = new Set();
+  for (const runtime of Object.values(runtimes)) {
+    for (const k of Object.keys(runtime.users || {})) out.add(k);
+    for (const k of Object.keys(runtime.globalUsers || {})) out.add(k);
+  }
+  return [...out];
+}
+
 // During peak hours, peak aliases override the defaults per key; keys absent from
 // the peak set keep their default mapping. Evaluated per request, so crossing a
 // peak boundary needs no config reload.
@@ -1738,7 +1754,9 @@ function usageHasTokens(usage = {}) {
 // ─── Timezone Helpers (UTC+8 北京时间) ────────────────────────────────────────
 // cnNow/cnDate/cnHour/secondsUntilNextCnMidnight 已迁至 ./lib/time.mjs。
 
-function recordUsage(apiKey, usage, model, suffix, _rt) {
+// session 由代理主路径透传(proxy-core 的 extractSessionSignal),只用于会话维度的记账,
+// 不参与任何路由或配额判断。省略时为 undefined,即不落 usage_session。
+function recordUsage(apiKey, usage, model, suffix, _rt, session) {
   const runtime = _rt || runtimes[normalizeProfileSuffix(suffix)] || rt;
   const sfx = normalizeProfileSuffix(suffix) || runtime?.suffix || getDefaultProfileSuffix();
   const key = resolveUserKey(apiKey, runtime);
@@ -1790,6 +1808,10 @@ function recordUsage(apiKey, usage, model, suffix, _rt) {
     stmts.upsertDailyModel.run(p);
     stmts.upsertDailyHourly.run(p);
     stmts.upsertHourlyModel.run(p);
+    // 会话维度:extractSessionSignal 回落到 "nosession"(无会话头、无 prompt_cache_key、
+    // 首条消息也推不出)时不落表 —— 否则所有人的无标识请求会挤进同一个假会话,比不记更糟。
+    // 缺的这部分由接口的 unattributed 如实披露,不藏。
+    if (session && session !== "nosession") stmts.upsertSession.run({ ...p, session });
   });
   tx();
 }
@@ -2380,6 +2402,36 @@ const USAGE_DEPS = {
   getPoolForSuffix,
 };
 const usageApi = createUsageReader(USAGE_DEPS);
+
+// 团队排行榜(lib/leaderboard.mjs)依赖注入对象。与 USAGE_DEPS 同规矩:db 与 stmts 都是
+// 在 initDb 阶段才被赋值的模块级变量,必须用 getter 让 lib 在调用时读取当前值,
+// 而不是在模块加载期解构成 null 快照。
+const LEADERBOARD_DEPS = {
+  cnDate,
+  cnWeekStartDate,
+  responsesProfileSet,
+  knownUserKeys,
+  productionSummary,
+  contextHealth,
+  get db() { return db; },
+  get stmts() { return stmts; },
+};
+const leaderboardApi = createLeaderboardReader(LEADERBOARD_DEPS);
+
+// 会话使用情况(lib/sessions.mjs)。同 LEADERBOARD_DEPS 的规矩:db/stmts 用 getter。
+// 项目标签与工具聚合都注入 production.mjs 的导出函数 —— 路径解析、协议修正各只应有一处实现。
+const SESSIONS_DEPS = {
+  responsesProfileSet,
+  sessionProjectLabels,
+  sessionToolStats,
+  productionProjects,
+  sessionKey,
+  knownUserKeys,
+  nameOf: (key) => getUserName(key),
+  get db() { return db; },
+  get stmts() { return stmts; },
+};
+const sessionsApi = createSessionsReader(SESSIONS_DEPS);
 
 // API 代理核心(lib/proxy-core.mjs)依赖注入对象。必须排在被它引用的工厂实例之后
 // (toolPatternApi / visionApi / notifierApi); rt 是会被重新赋值的模块级 let, 用 getter
@@ -4219,6 +4271,103 @@ const server = http.createServer((req, res) => {
       } else {
         // Headers already sent — can't change status, just end the response.
         console.log(`[production-me] 响应已开始但出错: ${err.message}`);
+        if (!res.writableEnded) res.end();
+      }
+    }
+    return;
+  }
+
+  // 团队排行榜。刻意排在 /api/my-usage 之前 —— 后者是 startsWith 匹配,若将来有人把
+  // 排行榜误命名成 /api/my-usage/leaderboard(它确实是「我的用量」页里的一个菜单项,
+  // 很容易这么起名),会被整个吞掉并返回 200 的个人用量载荷,错误还查不出来。
+  // 排前面让这个失败模式不可能出现。
+  if (req.method === "GET" && req.url.startsWith("/api/leaderboard")) {
+    const apiKey = getApiKey(req);
+    if (!getAccessibleProfiles(apiKey).length) {
+      const knownUser = hasGlobalUser(apiKey);
+      res.writeHead(knownUser ? 403 : 401, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: knownUser ? "User is not allowed to view any profile." : "认证失败：请提供有效的虚拟Key (Authorization: Bearer jx-...)" }));
+      return;
+    }
+    try {
+      const url = new URL(req.url, `http://localhost`);
+      // dimension/window 在 reader 内部按白名单查表,非法值回落默认档,不拼进 SQL。
+      // 生效值随响应回传,调用方永远能看到自己实际拿到的是哪一档。
+      const payload = leaderboardApi.getLeaderboard({
+        dimension: url.searchParams.get("dimension") || "",
+        window: url.searchParams.get("window") || "",
+        meKey: resolveUserKey(apiKey, rt),
+      });
+      res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+      res.end(JSON.stringify(payload));   // 紧凑输出:按需拉取的表格,缩进纯属浪费
+    } catch (err) {
+      if (!res.headersSent) {
+        res.writeHead(err.statusCode || 400, { "Content-Type": "application/json; charset=utf-8" });
+        res.end(JSON.stringify({ error: err.message }));
+      } else {
+        console.log(`[leaderboard] 响应已开始但出错: ${err.message}`);
+        if (!res.writableEnded) res.end();
+      }
+    }
+    return;
+  }
+
+  // 会话使用情况。两条路由都刻意排在 /api/my-usage 之前:后者是 startsWith 匹配,
+  // 而「会话使用情况」正是「我的用量」页里的一个区块,很容易被命名成
+  // /api/my-usage/sessions —— 那样会被整个吞掉并返回个人用量载荷,错误还查不出来。
+  // 排前面让这个失败模式不可能出现(与 /api/leaderboard 同一处坑)。
+  if (req.method === "GET" && req.url.startsWith("/api/sessions")) {
+    if (!checkAuth(req)) { res.writeHead(401); res.end("Unauthorized"); return; }
+    try {
+      const url = new URL(req.url, "http://localhost");
+      const { from, to } = rangeFromTo(url.searchParams.get("range") || "7d");
+      // user 是下钻筛选,取的是聚合表下发的**原始** key(不是掩码串)。
+      // 空串按「不筛选」处理,不然 ?user= 会筛出一个空表而不是全量。
+      const userKey = url.searchParams.get("user") || "";
+      const payload = sessionsApi.getSessions({
+        from, to,
+        userKey: userKey || undefined,
+        limit: url.searchParams.get("limit") || undefined,
+      });
+      res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+      res.end(JSON.stringify(payload));
+    } catch (err) {
+      if (!res.headersSent) {
+        res.writeHead(err.statusCode || 500, { "Content-Type": "application/json; charset=utf-8" });
+        res.end(JSON.stringify({ error: err.message }));
+      } else {
+        console.log(`[sessions-api] 响应已开始但出错: ${err.message}`);
+        if (!res.writableEnded) res.end();
+      }
+    }
+    return;
+  }
+
+  // 成员的活动视图:项目分布 + 会话使用情况。鉴权与 /api/leaderboard 同款。
+  if (req.method === "GET" && req.url.startsWith("/api/my-activity")) {
+    const apiKey = getApiKey(req);
+    if (!getAccessibleProfiles(apiKey).length) {
+      const knownUser = hasGlobalUser(apiKey);
+      res.writeHead(knownUser ? 403 : 401, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: knownUser ? "User is not allowed to view any profile." : "认证失败：请提供有效的虚拟Key (Authorization: Bearer jx-...)" }));
+      return;
+    }
+    try {
+      const url = new URL(req.url, "http://localhost");
+      const { from, to } = rangeFromTo(url.searchParams.get("range") || "7d");
+      const payload = sessionsApi.getMyActivity({
+        from, to,
+        userKey: resolveUserKey(apiKey, rt),
+        limit: url.searchParams.get("limit") || undefined,
+      });
+      res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+      res.end(JSON.stringify(payload));
+    } catch (err) {
+      if (!res.headersSent) {
+        res.writeHead(err.statusCode || 500, { "Content-Type": "application/json; charset=utf-8" });
+        res.end(JSON.stringify({ error: err.message }));
+      } else {
+        console.log(`[sessions-api] 响应已开始但出错: ${err.message}`);
         if (!res.writableEnded) res.end();
       }
     }

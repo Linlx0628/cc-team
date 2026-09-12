@@ -595,6 +595,75 @@ async function loadCosts(){
   }catch(e){document.getElementById('costSummary').textContent='加载失败: '+e.message}
 }
 document.getElementById('workspace-tab-costs').addEventListener('click',()=>{if(!costsLoaded){costsLoaded=true;loadCosts()}});
+// ── 会话使用情况 tab(懒加载:首次切到该 tab 才拉数据)──
+// 与成本/产出一致:会话视图比总览更细(时间戳、文件路径、会话标识),按需拉、不挂 30 秒轮询。
+// 徽标由 loadSessions() 自己维护,renderWorkspaceSummaries() 不碰它 —— 那个函数每 30 秒跑一次,
+// 按 D 去算会把已加载的会话数擦成 0。
+let sessionsLoaded=false,sessDrillUser='';
+// 分档 → 药丸配色。档位一律服务端算好(方向不写死在前端),这里只做颜色映射。
+const SESS_GRADE_CLS={good:'pill-ok',warn:'pill-warn',bad:'pill-bad'};
+const SESS_THS_FALLBACK={cache_rate_good:.9,cache_rate_warn:.8,new_input_good:3000,new_input_bad:8000};
+const DASH='<span style="color:var(--dim)">—</span>';
+function sessGrade(s){return '<span class="'+(SESS_GRADE_CLS[s.grade]||'chip')+'">'+escH(s.gradeLabel||'—')+'</span>'}
+function sessRatio(v,ths){if(v==null)return DASH;const col=v>=ths.cache_rate_good?'var(--green)':v>=ths.cache_rate_warn?'var(--orange)':'var(--red)';return '<span style="color:'+col+'">'+(v*100).toFixed(1)+'%</span>'}
+function sessPerTurn(v,ths){if(v==null)return DASH;const col=v<=ths.new_input_good?'var(--green)':v<=ths.new_input_bad?'var(--orange)':'var(--red)';return '<span style="color:'+col+'">'+fmtT(Math.round(v))+'</span>'}
+function sessFail(v){if(v==null)return DASH;const col=v<0.1?'var(--green)':v<0.3?'var(--orange)':'var(--red)';return '<span style="color:'+col+'">'+(v*100).toFixed(1)+'%</span>'}
+// 下钻键必须用原始 key(载荷里的 key 字段),掩码后的 user_key 查不到任何东西。
+function drillSess(key){sessDrillUser=sessDrillUser===key?'':key;loadSessions()}
+function clearSessDrill(){sessDrillUser='';loadSessions()}
+async function loadSessions(){
+  const range=document.getElementById('sessRangeSel').value;
+  try{
+    const d=await fetch('/api/sessions?range='+range+(sessDrillUser?'&user='+encodeURIComponent(sessDrillUser):'')).then(r=>r.json());
+    const ths=Object.assign({},SESS_THS_FALLBACK,d.thresholds||{});
+    const s=d.summary||{};
+    const drill=d.users.find(u=>u.key===sessDrillUser);
+    document.getElementById('workspaceCountSessions').textContent=s.sessions||0;
+    document.getElementById('sessDrillClear').style.display=sessDrillUser?'':'none';
+    document.getElementById('sessDrillHint').textContent=sessDrillUser?('当前只看 '+(drill?drill.user_name:'已选成员')):'全部成员 · 点上方某行可只看该成员';
+    document.getElementById('sessSummary').textContent=s.sessions
+      ?('合计 '+s.sessions+' 个会话 / '+fmtT(s.requests||0)+' 轮 · 缓存率 '+(s.cache_rate==null?'—':(s.cache_rate*100).toFixed(1)+'%')+' · 单轮新增 '+(s.new_input_per_turn==null?'—':fmtT(Math.round(s.new_input_per_turn)))+' token/轮 · 总档位：'+(s.gradeLabel||'—'))
+      :'该周期没有可归属到会话的请求';
+    document.querySelector('#sessUserTable tbody').innerHTML=d.users.map(u=>
+      '<tr style="cursor:pointer'+(u.key===sessDrillUser?';background:rgba(47,110,80,.06)':'')+'" onclick="drillSess('+escH(JSON.stringify(String(u.key)))+')" title="点击下钻到该成员的会话流水">'
+      +'<td>'+escH(u.user_name)+' <span style="color:var(--dim);font-size:10px">'+escH(u.user_key)+'</span></td>'
+      +'<td class="n">'+fmtT(u.sessions)+'</td>'
+      +'<td class="n">'+fmtT(u.requests)+'</td>'
+      +'<td class="n hl">'+fmtTk(u.tokens)+'</td>'
+      +'<td class="n">'+sessRatio(u.cache_rate,ths)+'</td>'
+      +'<td class="n">'+sessPerTurn(u.new_input_per_turn,ths)+'</td>'
+      +'<td class="n">'+sessFail(u.fail_rate)+'</td>'
+      +'<td class="n">'+(u.fragments||0)+'</td>'
+      +'<td>'+sessGrade(u)+'</td></tr>').join('')
+      ||'<tr><td colspan="9" class="empty">该周期没有可归属到会话的请求</td></tr>';
+    document.querySelector('#sessTable tbody').innerHTML=d.sessions.map(x=>
+      '<tr>'
+      +'<td>'+escH(x.user_name)+'</td>'
+      +'<td>'+(x.project?escH(x.project)+(x.cross_projects>0?' <span class="chip chip-warn" title="该会话横跨多个项目，token 整段算在主项目名下">跨'+x.cross_projects+'</span>':''):'<span style="color:var(--dim)">纯问答</span>')+'</td>'
+      +'<td style="font-size:10px;color:var(--dim)" title="'+escH(x.session)+'">'+escH(String(x.session).slice(0,18))+'</td>'
+      +'<td style="font-size:11px;color:var(--dim);white-space:nowrap">'+bjClock(x.first_seen)+(x.last_seen!==x.first_seen?' → '+bjClock(x.last_seen).slice(6):'')+'</td>'
+      +'<td class="n">'+(x.requests?fmtT(x.requests):'<span style="color:var(--dim)" title="只有工具数据，轮数未知">—</span>')+'</td>'
+      +'<td class="n hl">'+(x.token_data?fmtTk(x.tokens):DASH)+'</td>'
+      +'<td class="n">'+sessRatio(x.cache_rate,ths)+'</td>'
+      +'<td class="n">'+sessPerTurn(x.new_input_per_turn,ths)+'</td>'
+      +'<td class="n">'+(x.tool_calls||0)+(x.errors?' <span style="color:var(--red);font-size:10px" title="其中 '+x.errors+' 次失败">/'+x.errors+'</span>':'')+'</td>'
+      +'<td class="n">'+(x.files||0)+'</td>'
+      +'<td class="n">'+(x.net_lines==null?DASH:((x.net_lines>0?'+':'')+fmtT(x.net_lines)))+'</td>'
+      +'<td class="n">'+sessFail(x.fail_rate)+'</td>'
+      +'<td>'+sessGrade(x)+(x.fragment?' <span class="chip chip-warn" title="轮数 ≤ '+(ths.fragment_max_requests||2)+'，会话偏碎">碎片</span>':'')+'</td></tr>').join('')
+      ||'<tr><td colspan="13" class="empty">该周期没有可归属到会话的请求</td></tr>';
+    // 无会话标识的部分必须如实披露 —— 否则「总量」和「会话表加起来」对不上时没人知道为什么
+    const un=d.unattributed||{},tot=d.totals||{},at=d.attributed||{};
+    const notes=['统计范围 '+escH(d.from)+' ~ '+escH(d.to)+' · 总量 '+fmtTk(tot.tokens||0)+' token / '+fmtT(tot.requests||0)+' 次请求'];
+    if(un.requests>0)notes.push('另有 '+fmtT(un.requests)+' 次请求没有会话标识('+fmtTk(un.tokens)+' token)，无法归属到任何会话 —— 会话表只覆盖了其中 '+fmtT(at.requests||0)+' 次');
+    if(d.truncated)notes.push('会话流水只显示最近 '+fmtT((d.sessions||[]).length)+' 条，缩小时间范围可看到更早的会话');
+    document.getElementById('sessNote').innerHTML=notes.join('<br>');
+  }catch(e){
+    document.getElementById('sessSummary').textContent='加载失败: '+e.message;
+    document.getElementById('workspaceCountSessions').textContent='—';
+  }
+}
+document.getElementById('workspace-tab-sessions').addEventListener('click',()=>{if(!sessionsLoaded){sessionsLoaded=true;loadSessions()}});
 function startAutoRefresh(){if(refreshTimer)clearInterval(refreshTimer);refreshTimer=setInterval(()=>{if(autoRefresh)load()},30000)}
 document.getElementById("autoRefreshBtn").addEventListener("click",()=>{autoRefresh=!autoRefresh;const btn=document.getElementById("autoRefreshBtn");btn.textContent="自动刷新: "+(autoRefresh?"开":"关");btn.className=autoRefresh?"ar-on":"ar-off"});
 window.addEventListener("resize",scheduleChartResize);

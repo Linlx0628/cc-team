@@ -73,6 +73,7 @@ body{padding:16px clamp(14px,2vw,28px) 28px}
 .detail-reset{width:auto;min-width:68px;cursor:pointer;font-weight:600}
 .pill-warn{display:inline-block;font-size:10px;line-height:1.5;color:var(--orange);border:1px solid var(--orange);border-radius:9px;padding:1px 7px;font-variant-numeric:tabular-nums}
 .pill-ok{display:inline-block;font-size:10px;line-height:1.5;color:var(--green);border:1px solid var(--green);border-radius:9px;padding:1px 7px;font-variant-numeric:tabular-nums}
+.pill-bad{display:inline-block;font-size:10px;line-height:1.5;color:var(--red);border:1px solid var(--red);border-radius:9px;padding:1px 7px;font-variant-numeric:tabular-nums}
 .chip{display:inline-block;font-size:10px;color:var(--dim);border:1px solid var(--border-strong);border-radius:9px;padding:1px 8px;margin:0 4px 4px 0}.chip-warn{color:var(--orange);border-color:var(--orange)}
 .prod-bar{height:6px;background:var(--accent);border-radius:3px;display:inline-block;max-width:100%}
 .detail-table-wrap{flex:1;min-height:0;overflow:auto;border-top:1px solid var(--border)}

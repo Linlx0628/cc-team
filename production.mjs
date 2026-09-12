@@ -429,36 +429,74 @@ function singleFileLabel(fp) {
 
 // 别名归并已移除:项目表直接按会话推导的标签聚合展示。
 
-export function productionProjects(db, { from, to } = {}) {
+// 会话 → 项目簇。productionProjects(按项目汇总)与 sessionProjectLabels(按会话取项目标签)
+// 共用这一份:项目标签的推导规则(路径清洗 → 主导子树 → 仓库根名)只应有一处实现,
+// 复制一份出去必然漂移。
+// userKey 可选:成员侧「只显示自己参与的项目」是纯 SQL 参数过滤,不引入新表依赖
+// —— 那些手工建表的既有测试因此不受影响。
+export function clusterSessions(db, { from, to, userKey } = {}) {
   // 会话为归组单位:同会话文件集合共同推导项目;session NULL 归 '' 桶。权重 = Σ(lines_add+lines_del)
-  const rows = db.prepare(`
+  const stmt = db.prepare(`
     SELECT session, file_path, user_key,
       SUM(lines_add) AS la, SUM(lines_del) AS ld, COUNT(*) AS edits
-    FROM tool_events WHERE date(time,'+8 hours') BETWEEN ? AND ? AND file_path IS NOT NULL
-    GROUP BY session, file_path, user_key`).all(from, to);
+    FROM tool_events WHERE ${userKey ? "user_key=? AND " : ""}date(time,'+8 hours') BETWEEN ? AND ? AND file_path IS NOT NULL
+    GROUP BY session, file_path, user_key`);
+  const rows = userKey ? stmt.all(userKey, from, to) : stmt.all(from, to);
+  // 键是 (user_key, session) 而不是 session:正常部署里会话标识是客户端发的 UUID,
+  // 一人一号不会撞;但 extractSessionSignal 有 dig: 回落(首条消息的哈希),理论上
+  // 两个人首轮相同就会共享标识。归组键带上人,这种撞车就不会把两个人的文件混成一个项目集。
   const sessions = new Map();
   for (const r of rows) {
-    const key = r.session || "";
+    const key = sessionKey(r.user_key, r.session);
     let byFile = sessions.get(key);
     if (!byFile) sessions.set(key, byFile = new Map());
     let f = byFile.get(r.file_path);
     if (!f) byFile.set(r.file_path, f = { users: new Set(), la: 0, ld: 0, edits: 0 });
     f.users.add(r.user_key); f.la += r.la || 0; f.ld += r.ld || 0; f.edits += r.edits || 0;
   }
-  const acc = new Map();   // 标签 → 聚合(users/files 按集合去重,与旧 COUNT DISTINCT 口径一致)
-  for (const byFile of sessions.values()) {
-    let clusters;
+  const out = new Map();   // "user_key session" → [{label, groups}]
+  for (const [key, byFile] of sessions) {
     if (byFile.size === 1) {
       const [fp, stat] = [...byFile.entries()][0];
-      clusters = [{ label: singleFileLabel(fp), groups: [{ stat, path: fp }] }];
-    } else {
-      const groups = [];
-      for (const [fp, stat] of byFile) {
-        const segments = cleanFilePath(fp);
-        groups.push({ segments: segments || [], weight: stat.la + stat.ld, stat, path: fp });   // 噪声 → 空段挂根,随主导标签并入
-      }
-      clusters = deriveClusters(groups);
+      out.set(key, [{ label: singleFileLabel(fp), groups: [{ stat, path: fp }] }]);
+      continue;
     }
+    const groups = [];
+    for (const [fp, stat] of byFile) {
+      const segments = cleanFilePath(fp);
+      groups.push({ segments: segments || [], weight: stat.la + stat.ld, stat, path: fp });   // 噪声 → 空段挂根,随主导标签并入
+    }
+    out.set(key, deriveClusters(groups));
+  }
+  return out;
+}
+
+// clusterSessions / sessionToolStats / sessionProjectLabels 的 Map 键,以及 lib/sessions.mjs
+// 折叠会话时的键 —— 三处必须拼成同一个串,所以格式只此一处。
+// 分隔符用 NUL 而不是空格:会话标识可能是 pck:<prompt_cache_key>,那个值来自请求体、
+// 里面完全可能有空格;NUL 则不会出现在任何 key 或会话标识里,拼接因此是无歧义的。
+export const sessionKey = (userKey, session) => `${userKey}\u0000${session || ""}`;
+
+// 会话 → 项目标签(供 lib/sessions.mjs 把 usage_session 的会话挂到项目上)。
+// 一个会话可能横跨多个项目,这里按「权重最大的项目」归属一次,不重复计入 ——
+// token 是按会话记的,同一个会话的 token 无法拆给两个项目,平摊只会制造假精度。
+// 被让出的项目条数用 cross 如实带出,由调用方披露,不藏。
+export function sessionProjectLabels(db, { from, to, userKey } = {}) {
+  const out = new Map();
+  for (const [key, clusters] of clusterSessions(db, { from, to, userKey })) {
+    const ranked = clusters.map(c => ({
+      label: c.label,
+      weight: c.groups.reduce((s, g) => s + (g.stat.la || 0) + (g.stat.ld || 0), 0),
+    })).sort((a, b) => b.weight - a.weight);
+    if (!ranked.length) continue;   // 该会话没有可归属的文件路径
+    out.set(key, { label: ranked[0].label, weight: ranked[0].weight, labels: ranked.map(r => r.label), cross: ranked.length - 1 });
+  }
+  return out;
+}
+
+export function productionProjects(db, { from, to, userKey } = {}) {
+  const acc = new Map();   // 标签 → 聚合(users/files 按集合去重,与旧 COUNT DISTINCT 口径一致)
+  for (const clusters of clusterSessions(db, { from, to, userKey }).values()) {
     for (const { label, groups } of clusters) {
       let a = acc.get(label);
       if (!a) acc.set(label, a = { users: new Set(), paths: new Set(), lines_add: 0, lines_del: 0, edits: 0 });
@@ -496,6 +534,35 @@ export function productionUserDetail(db, userKey, { from, to }) {
 }
 
 // —— Task 7: 告警查询/已读/90 天清理(API 任务消费)——
+// 会话 → 工具行为。与 productionSummary 同口径(同一个 FILE_SQL、同一个时间窗口),
+// 差别只是分组键。usage_session 那边给出「烧了多少 token」,这边给出「做了什么」,
+// 两侧按 session 连接 —— extractSessionSignal 是同一个来源,键天然一致。
+export function sessionToolStats(db, { from, to, userKey } = {}) {
+  const stmt = db.prepare(`
+    SELECT user_key, session, COUNT(*) AS tool_calls,
+      SUM(CASE WHEN ${FILE_SQL} THEN 1 ELSE 0 END) AS edits,
+      SUM(CASE WHEN ${FILE_SQL} THEN lines_add ELSE 0 END) AS lines_add,
+      SUM(CASE WHEN ${FILE_SQL} THEN lines_del ELSE 0 END) AS lines_del,
+      COUNT(DISTINCT CASE WHEN ${FILE_SQL} THEN file_path END) AS files,
+      SUM(CASE WHEN outcome='error' THEN 1 ELSE 0 END) AS errors,
+      MIN(time) AS first_time, MAX(time) AS last_time
+    FROM tool_events WHERE ${userKey ? "user_key=? AND " : ""}date(time,'+8 hours') BETWEEN ? AND ?
+    GROUP BY user_key, session`);
+  const rows = userKey ? stmt.all(userKey, from, to) : stmt.all(from, to);
+  const out = new Map();
+  for (const r of rows) {
+    out.set(sessionKey(r.user_key, r.session), {
+      ...r,
+      net_lines: (r.lines_add || 0) - (r.lines_del || 0),
+      // 失败率的分母是**全部**工具调用,不只是文件类 —— 会话里最该被看见的失败
+      // 恰恰是那些没落到文件上的(命令报错、检索失败)。分母为 0 时给 null 不给 0:
+      // 「没有调用」和「零失败」是两件事。
+      fail_rate: r.tool_calls ? (r.errors || 0) / r.tool_calls : null,
+    });
+  }
+  return out;
+}
+
 export function productionAlerts(db, { from, to }) {
   return db.prepare(`SELECT id, time, user_key, COALESCE(NULLIF(user_name,''),user_key) AS user_name, kind, detail, seen
     FROM production_alerts WHERE date(time,'+8 hours') BETWEEN ? AND ? ORDER BY time DESC LIMIT 200`).all(from, to);
@@ -669,10 +736,16 @@ export function contextHealth(db, { from, to, responsesProfiles }) {
   // 此时若照搬公式,缓存读会被分母算两遍、命中率被系统性压低(纯缓存上限 50%)。
   // responsesProfiles 传入这类方案的 profile 后缀集合,把它们的分母减去缓存读。
   // 按 (user_key, profile) 分组以便逐方案判断协议,再按 user 聚合。
+  //
+  // 关联 users 时**必须同时带上 profile**(users 主键就是 (profile,user_key))。只按
+  // user_key 关联会让每条 usage_daily 按「该人绑定的方案数」复制若干份,SUM 随之放大
+  // ——实测一个绑了 7 个方案的用户被放大 7 倍(cr 5.9 亿 → 41.5 亿)。
+  // ratio 是分子分母同倍数放大,侥幸不受影响;但 cr/i/denomI 的绝对值会虚高且各人
+  // 虚高倍数不同,拿它们跨人比较必然出错(排行榜的「平均单轮新增上下文」踩过)。
   const rows = db.prepare(`SELECT ud.user_key, ud.profile,
       MAX(COALESCE(u.name, ud.user_key)) user_name,
       SUM(ud.cache_read) cr, SUM(ud.input_tokens) i
-    FROM usage_daily ud LEFT JOIN users u ON u.user_key=ud.user_key
+    FROM usage_daily ud LEFT JOIN users u ON u.user_key=ud.user_key AND u.profile=ud.profile
     WHERE ud.date BETWEEN ? AND ? GROUP BY ud.user_key, ud.profile`).all(from, to);
   const acc = new Map(); // user_key -> { user_name, cr, i(原始,供展示), denomI(口径修正后) }
   for (const r of rows) {
@@ -689,7 +762,10 @@ export function contextHealth(db, { from, to, responsesProfiles }) {
     a.advice = a.ratio >= 0.9 ? "缓存命中率优秀,会话结构良好"
       : a.ratio >= 0.8 ? "缓存命中率良好;长会话尽量连续使用、减少频繁切换可进一步提升"
       : "缓存命中率偏低:长会话尽量连续使用、避免反复粘贴大段上下文";
-    out.push({ user_key, user_name: a.user_name, cr: a.cr, i: a.i, ratio: a.ratio, advice: a.advice });
+    // denomI 一并返回:它是协议修正后的「新增输入」(Anthropic 即 input,Responses 扣除
+    // 缓存读)。排行榜的「平均单轮新增上下文」= denomI/请求数 直接用它,免得在别处再实现
+    // 一遍协议判断而与这里的口径漂移。
+    out.push({ user_key, user_name: a.user_name, cr: a.cr, i: a.i, denomI: a.denomI, ratio: a.ratio, advice: a.advice });
   }
   return out;
 }

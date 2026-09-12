@@ -83,17 +83,23 @@ export function createProductionTracker({ db, getConfig, log = console.log, now 
     const insert = db.prepare(`INSERT INTO production_alerts (time,user_key,user_name,kind,detail) VALUES (?,?,?,?,?)`);
     const recentAlert = db.prepare(`SELECT COUNT(*) n FROM production_alerts WHERE kind=? AND user_key=? AND time>=?`);
     const cn = new Date(now + 8 * 3600000);
-    const dateKey = cn.toISOString().slice(0, 10), hourKey = cn.toISOString().slice(11, 13);
+    const dateKey = cn.toISOString().slice(0, 10);
+    // 必须是 2 位小时前缀,不要「现代化」成 cnHalfHour():下面用 substr(hour,1,2) 才能同时
+    // 命中新的半小时键 "14:30" 与旧的整点键 "14"。若这里传 "14:30",substr 取回的是 "14",
+    // 与传入值不相等,这个告警会以完全静默的方式永久哑掉。
+    const hourPrefix = cn.toISOString().slice(11, 13);
     // 1) idle_burn:当前小时 output ≥ 阈值 且 60 分钟内无文件类事件(usage 表无 user_name,经 users 表解析显示名)
+    // 按 substr(hour,1,2) 分组:一个自然小时的两个半小时格相加,恰好还是「这一小时的总量」,
+    // 所以 cfg.idleHourTokens 按小时的口径不用变。
     const hot = db.prepare(`SELECT h.user_key, MAX(COALESCE(NULLIF(u.name,''), h.user_key)) user_name, h.o
-      FROM (SELECT user_key, SUM(output_tokens) o FROM usage_daily_hourly WHERE date=? AND hour=? GROUP BY user_key HAVING o >= ?) h
-      LEFT JOIN users u ON u.user_key = h.user_key GROUP BY h.user_key`).all(dateKey, hourKey, cfg.idleHourTokens);
+      FROM (SELECT user_key, SUM(output_tokens) o FROM usage_daily_hourly WHERE date=? AND substr(hour,1,2)=? GROUP BY user_key HAVING o >= ?) h
+      LEFT JOIN users u ON u.user_key = h.user_key GROUP BY h.user_key`).all(dateKey, hourPrefix, cfg.idleHourTokens);
     const cutoffHour = new Date(now - 3600_000).toISOString();
     for (const u of hot) {
       const hasFiles = db.prepare(`SELECT COUNT(*) n FROM tool_events WHERE user_key=? AND ${FILE_SQL} AND time>=?`).get(u.user_key, cutoffHour).n;
       if (hasFiles) continue;
       if (recentAlert.get("idle_burn", u.user_key, new Date(now - cfg.cooldownMinutes * 60_000).toISOString()).n) continue;
-      insert.run(new Date(now).toISOString(), u.user_key, u.user_name, "idle_burn", JSON.stringify({ hour: hourKey, output_tokens: u.o }));
+      insert.run(new Date(now).toISOString(), u.user_key, u.user_name, "idle_burn", JSON.stringify({ hour: hourPrefix, output_tokens: u.o }));
       fired.push({ kind: "idle_burn", user_key: u.user_key, user_name: u.user_name, detail: `近一小时消耗 ${u.o.toLocaleString("zh-CN")} output tokens,无任何文件产出` });
     }
     // 2) error_loop:窗口内同 error_kind 次数 ≥ loopCount;有成功文件编辑(进展)不上报;可配置剔除杂音 kind
@@ -589,7 +595,9 @@ export function resolveRate(rates, model) {
   return rates["*"] || null;
 }
 
-// —— 峰谷时段:与 server.mjs normalizePeakHours/isInPeakHours 互为拷贝(production 不得 import server,防循环),fixture 同步防漂移 ——
+// —— 峰谷时段:normalizeCostPeakHours 与 server.mjs normalizePeakHours 互为拷贝(production 不得 import server,防循环),fixture 同步防漂移 ——
+// 但 hourIsPeak 与 server 的 isInPeakHours 不是一回事,别互相搬运:前者按**存储键**(半小时格,
+// 如 "14:30")判已落库的行,后者按**实时 Date** 判当前时刻。粒度与入参类型都不同。
 const PEAK_TIME_RE = /^([01]\d|2[0-3]):([0-5]\d)$/;
 function parsePeakTimeMinutes(t) {
   if (typeof t !== "string") return null;
@@ -610,13 +618,24 @@ export function normalizeCostPeakHours(raw) {
   }
   return out;
 }
-// hour 为 '00'-'23' 字符串,按 h×60 起始分钟判定;start 含、end 不含,end < start 为跨午夜
+// 存储键 → 该格起始分钟。"HH"(旧整点键)与 "HH:MM"(新半小时键,分钟已向下取整到 00/30)
+// 都接受;非法输入返回 null,由调用方判 false。
+// 必须走正则而不是 Number(hour.split(":")[0]):后者对空串会得到 Number("") === 0,
+// 把「没有值」判成一个真实的 00:00 档位。
+function hourSlotMinutes(hour) {
+  if (typeof hour !== "string") return null;
+  const m = /^(\d{1,2})(?::(\d{2}))?$/.exec(hour);
+  if (!m) return null;
+  const h = Number(m[1]), mi = m[2] === undefined ? 0 : Number(m[2]);
+  if (h > 23 || mi > 59) return null;
+  return h * 60 + mi;
+}
+// hour 为 'HH'(旧)或 'HH:MM'(新),按格子起始分钟判定;start 含、end 不含,end < start 为跨午夜。
+// 对旧格式的判定与放宽前逐位相同("23" → 1380、"0" → 0),这次是放宽入参而非改判定。
 export function hourIsPeak(hour, peakHours) {
   if (!Array.isArray(peakHours) || peakHours.length === 0) return false;
-  if (typeof hour !== "string" || !/^\d{1,2}$/.test(hour)) return false;
-  const h = Number(hour);
-  if (h > 23) return false;
-  const minutes = h * 60;
+  const minutes = hourSlotMinutes(hour);
+  if (minutes === null) return false;
   for (const r of peakHours) {
     const start = parsePeakTimeMinutes(r?.start);
     const end = parsePeakTimeMinutes(r?.end);

@@ -403,30 +403,31 @@ function render(){
   const mIdx=mVal.map((_,i)=>i).sort((a,b)=>mVal[b]-mVal[a]);
   C.m=new Chart(document.getElementById("modelChart"),{type:"bar",data:{labels:mIdx.map(i=>mNames[i]),datasets:[{label:MT==="requests"?"请求数":"Token",data:mIdx.map(i=>mVal[i]),backgroundColor:mIdx.map((_,i)=>COL[i%COL.length]+"cc"),borderWidth:0,borderRadius:3,borderSkipped:false}]},options:{indexAxis:"y",responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false},tooltip:{callbacks:{label:ctx=>MT==="requests"?fmtT(ctx.raw)+" 次请求":fmtT(ctx.raw)+" tokens"}}},scales:{x:{ticks:{color:"#686863",callback:v=>fmtTk(v)},grid:{color:"rgba(24,24,22,.08)"}},y:{ticks:{color:"#686863",font:{size:11},autoSkip:false},grid:{display:false}}}}});
 
-  // 24小时趋势图：周期窗口内逐日同小时累加（按日=当天真实曲线；周/月/年=各小时累计分布）。
+  // 24小时趋势图：周期窗口内逐日同半小时槽位累加（按日=当天真实曲线；周/月/年=各槽位累计分布）。
   // 不受日期范围筛选影响（date input 只作用于其余四图）。
-  const hrs=[];for(let i=0;i<24;i++)hrs.push(i.toString().padStart(2,"0")+":00");
-  const hAgg=Array.from({length:24},()=>({requests:0,tokens:0}));
+  // 槽位映射与旧格式的阶梯兜底都在 ui.js 的 halfHourSlots 里,与下面那张模型图共用同一份。
+  const hrs=halfHourLabels();
+  const hAgg=Array.from({length:48},()=>({requests:0,tokens:0}));
   for(const [date,hours] of Object.entries(D.hourly||{})){
     if(date<wb.wStart||date>wb.td)continue;
-    for(const [h,v] of Object.entries(hours)){
-      const i=Number(h);if(!(i>=0&&i<24)||typeof v!=="object")continue;
-      hAgg[i].requests+=(v.requests||0);hAgg[i].tokens+=totalTokens(v);
+    for(const [i,v,w] of halfHourSlots(hours)){
+      hAgg[i].requests+=(v.requests||0)*w;hAgg[i].tokens+=totalTokens(v)*w;
     }
   }
   const hReq=hAgg.map(a=>a.requests),hTokens=hAgg.map(a=>a.tokens);
-  C.h=new Chart(document.getElementById("hourChart"),{type:"line",data:{labels:hrs,datasets:[{label:"请求数",data:hReq,borderColor:"#2f6e50",backgroundColor:"rgba(47,110,80,.12)",fill:true,tension:.28,pointRadius:2,pointBackgroundColor:"#2f6e50",pointHoverRadius:4,borderWidth:2,yAxisID:"y"},{label:"总 Token",data:hTokens,borderColor:"#181816",backgroundColor:"rgba(24,24,22,.08)",fill:true,tension:.28,pointRadius:2,pointBackgroundColor:"#181816",pointHoverRadius:4,borderWidth:2,yAxisID:"y1"}]},options:{responsive:true,maintainAspectRatio:false,interaction:{mode:"index",intersect:false},plugins:{legend:{labels:{color:"#686863",font:{size:11},usePointStyle:true,pointStyle:"circle"}},tooltip:{callbacks:{label:ctx=>ctx.dataset.label+": "+fmtT(ctx.raw)}}},scales:{x:{ticks:{color:"#686863",font:{size:9},maxRotation:0,autoSkip:true,maxTicksLimit:12},grid:{display:false}},y:{type:"linear",position:"left",ticks:{color:"#2f6e50"},grid:{color:"rgba(24,24,22,.08)"},title:{display:true,text:"请求数",color:"#2f6e50",font:{size:10}}},y1:{type:"linear",position:"right",ticks:{color:"#181816",callback:v=>fmtTk(v)},grid:{drawOnChartArea:false},title:{display:true,text:"Tokens",color:"#181816",font:{size:10}}}}}});
+  C.h=new Chart(document.getElementById("hourChart"),{type:"line",data:{labels:hrs,datasets:[{label:"请求数",data:hReq,borderColor:"#2f6e50",backgroundColor:"rgba(47,110,80,.12)",fill:true,tension:.28,pointRadius:0,pointHitRadius:10,pointBackgroundColor:"#2f6e50",pointHoverRadius:4,borderWidth:2,yAxisID:"y"},{label:"总 Token",data:hTokens,borderColor:"#181816",backgroundColor:"rgba(24,24,22,.08)",fill:true,tension:.28,pointRadius:0,pointHitRadius:10,pointBackgroundColor:"#181816",pointHoverRadius:4,borderWidth:2,yAxisID:"y1"}]},options:{responsive:true,maintainAspectRatio:false,interaction:{mode:"index",intersect:false},plugins:{legend:{labels:{color:"#686863",font:{size:11},usePointStyle:true,pointStyle:"circle"}},tooltip:{callbacks:{label:ctx=>ctx.dataset.label+": "+fmtT(ctx.raw)}}},scales:{x:{ticks:{color:"#686863",font:{size:9},maxRotation:0,autoSkip:true,maxTicksLimit:12},grid:{display:false}},y:{type:"linear",position:"left",ticks:{color:"#2f6e50"},grid:{color:"rgba(24,24,22,.08)"},title:{display:true,text:"请求数",color:"#2f6e50",font:{size:10}}},y1:{type:"linear",position:"right",ticks:{color:"#181816",callback:v=>fmtTk(v)},grid:{drawOnChartArea:false},title:{display:true,text:"Tokens",color:"#181816",font:{size:10}}}}}});
 
-  // 24小时模型使用趋势：窗口内同小时累加，按模型分 series 的折线，Y 轴跟随指标筛选。
+  // 24小时模型使用趋势：窗口内同半小时槽位累加，按模型分 series 的折线，Y 轴跟随指标筛选。
   // 模型取窗口总量 Top6，其余合并为「其他」，避免 legend 过长。数据自 usage_hourly_model 表启用日起累积。
-  const hmAgg=Array.from({length:24},()=>({}));
+  // 必须**先按槽聚合、再算总量**：兜底的旧行有 0.5 权重,先算总量会把跨天的同模型拆成两份口径。
+  // 槽位数与上面那张图共用 halfHourLabels(),两图必须同步 —— 标签 48 配数据 24 只会画在轴左半边,不报错。
+  const hmAgg=Array.from({length:48},()=>({}));
   for(const [date,hours] of Object.entries(D.hourlyModels||{})){
     if(date<wb.wStart||date>wb.td)continue;
-    for(const [h,models] of Object.entries(hours)){
-      const i=Number(h);if(!(i>=0&&i<24)||typeof models!=="object")continue;
+    for(const [i,models,w] of halfHourSlots(hours)){
       for(const [m,v] of Object.entries(models)){
         if(!hmAgg[i][m])hmAgg[i][m]={requests:0,tokens:0};
-        hmAgg[i][m].requests+=(v.requests||0);hmAgg[i][m].tokens+=((v.inputTokens||0)+(v.outputTokens||0));
+        hmAgg[i][m].requests+=(v.requests||0)*w;hmAgg[i][m].tokens+=((v.inputTokens||0)+(v.outputTokens||0))*w;
       }
     }
   }
@@ -435,7 +436,7 @@ function render(){
   const hasOther=Object.keys(hmTot).length>topModels.length;
   const hmSeries=topModels.map(m=>({label:m,data:hmAgg.map(a=>MT==="requests"?((a[m]||{}).requests||0):((a[m]||{}).tokens||0))}));
   if(hasOther)hmSeries.push({label:"其他",data:hmAgg.map(a=>{let t=0;for(const [m,v] of Object.entries(a))if(!topModels.includes(m))t+=MT==="requests"?v.requests:v.tokens;return t})});
-  C.hm=new Chart(document.getElementById("hourModelChart"),{type:"line",data:{labels:hrs,datasets:hmSeries.map((s,i)=>({label:s.label,data:s.data,borderColor:COL[i%COL.length],backgroundColor:COL[i%COL.length]+"22",fill:i===0,tension:.28,pointRadius:2,pointBackgroundColor:COL[i%COL.length],pointHoverRadius:4,borderWidth:2}))},options:{responsive:true,maintainAspectRatio:false,interaction:{mode:"index",intersect:false},plugins:{legend:trendLegend(),tooltip:{callbacks:{label:ctx=>ctx.dataset.label+": "+fmtT(ctx.raw)+(MT==="requests"?" 次请求":" tokens")}}},scales:{x:{ticks:{color:"#686863",font:{size:9},maxRotation:0,autoSkip:true,maxTicksLimit:12},grid:{display:false}},y:{ticks:{color:"#686863",callback:v=>fmtTk(v)},grid:{color:"rgba(24,24,22,.08)"}}}}});
+  C.hm=new Chart(document.getElementById("hourModelChart"),{type:"line",data:{labels:hrs,datasets:hmSeries.map((s,i)=>({label:s.label,data:s.data,borderColor:COL[i%COL.length],backgroundColor:COL[i%COL.length]+"22",fill:i===0,tension:.28,pointRadius:0,pointHitRadius:10,pointBackgroundColor:COL[i%COL.length],pointHoverRadius:4,borderWidth:2}))},options:{responsive:true,maintainAspectRatio:false,interaction:{mode:"index",intersect:false},plugins:{legend:trendLegend(),tooltip:{callbacks:{label:ctx=>ctx.dataset.label+": "+fmtT(ctx.raw)+(MT==="requests"?" 次请求":" tokens")}}},scales:{x:{ticks:{color:"#686863",font:{size:9},maxRotation:0,autoSkip:true,maxTicksLimit:12},grid:{display:false}},y:{ticks:{color:"#686863",callback:v=>fmtTk(v)},grid:{color:"rgba(24,24,22,.08)"}}}}});
 
   // 方案请求情况：跨方案维度（恒为全部方案，不随方案下拉收窄），按周期分桶的堆叠柱。
   // 统计逻辑与 Token 用量趋势一致:默认全史按周期分桶,日期范围生效时才收窄窗口。

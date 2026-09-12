@@ -396,10 +396,20 @@ function renderAnalysisPane(){
   if(!D)return;
   const hc=document.getElementById("hourChart"),tc=document.getElementById("trendChart");
   // Hourly chart
-  const hrs=[];for(let i=0;i<24;i++)hrs.push(i.toString().padStart(2,"0")+":00");
-  const hData=hrs.map((_,i)=>{const h=D.hourly[i.toString().padStart(2,"0")]||{};return{req:h.requests||0,tokens:ioTokens(h)}});
+  // 半小时槽位("HH:MM")同图上的 x 轴标签是同一个字符串,旧整点行的阶梯兜底在 ui.js 的 halfHourSlots 里。
+  // D.hourly 是**只有今天**的一层 {hour: value} map(lib/personal-usage.mjs),没有日期维度,不做窗口过滤。
+  // 口径沿用 ioTokens(输入+输出,不含缓存),与本页 KPI 卡、模型表一致;改折线后它移到右轴,
+  // dataset 的 "Token(输入+输出)" 是唯一的口径提示,不能换成含义含缓存的 "总 Token"。
+  const hrs=halfHourLabels();
+  const hData=Array.from({length:48},()=>({req:0,tokens:0}));
+  for(const [i,h,w] of halfHourSlots(D.hourly)){
+    hData[i].req+=(h.requests||0)*w;hData[i].tokens+=ioTokens(h)*w;
+  }
   if(C.h){C.h.destroy();C.h=null}
-  if(hc)C.h=new Chart(hc,{type:"bar",data:{labels:hrs,datasets:[{label:"Token(输入+输出)",data:hData.map(d=>d.tokens),backgroundColor:COL[0]+"cc",borderRadius:3},{label:"请求数",data:hData.map(d=>d.req),backgroundColor:COL[1]+"cc",borderRadius:3}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{labels:{color:"#686863",font:{size:10}}}},scales:{x:{ticks:{color:"#686863",font:{size:9},maxRotation:0,autoSkip:true,maxTicksLimit:12},grid:{display:false}},y:{ticks:{color:"#686863",callback:v=>fmtTk(v)},grid:{color:"rgba(24,24,22,.08)"}}}}});
+  // 双 Y 轴:请求数是几十、Token 是几百万,同轴会把请求数压成贴地一条线,所以必须分开。
+  // 两个轴的 title 块刻意不加 —— .chart-row .box canvas 限高 190px,轴标题会吃掉约 15% 的绘图区,
+  // 而图例已经写明两个单位,信息没有损失。图例同样沿用本页的内联写法,不引 dashboard 的 trendLegend()。
+  if(hc)C.h=new Chart(hc,{type:"line",data:{labels:hrs,datasets:[{label:"请求数",data:hData.map(d=>d.req),borderColor:"#2f6e50",backgroundColor:"rgba(47,110,80,.12)",fill:true,tension:.28,pointRadius:0,pointHitRadius:10,pointBackgroundColor:"#2f6e50",pointHoverRadius:4,borderWidth:2,yAxisID:"y"},{label:"Token(输入+输出)",data:hData.map(d=>d.tokens),borderColor:"#181816",backgroundColor:"rgba(24,24,22,.08)",fill:true,tension:.28,pointRadius:0,pointHitRadius:10,pointBackgroundColor:"#181816",pointHoverRadius:4,borderWidth:2,yAxisID:"y1"}]},options:{responsive:true,maintainAspectRatio:false,interaction:{mode:"index",intersect:false},plugins:{legend:{labels:{color:"#686863",font:{size:10}}},tooltip:{callbacks:{label:ctx=>ctx.dataset.label+": "+fmtT(ctx.raw)}}},scales:{x:{ticks:{color:"#686863",font:{size:9},maxRotation:0,autoSkip:true,maxTicksLimit:12},grid:{display:false}},y:{type:"linear",position:"left",ticks:{color:"#2f6e50"},grid:{color:"rgba(24,24,22,.08)"}},y1:{type:"linear",position:"right",ticks:{color:"#181816",callback:v=>fmtTk(v)},grid:{drawOnChartArea:false}}}}});
   // Trend chart
   if(C.t){C.t.destroy();C.t=null}
   if(tc)C.t=new Chart(tc,{type:"line",data:{labels:D.trend.map(d=>d.date.slice(5)),datasets:[{label:"总Token(含缓存)",data:D.trend.map(d=>d.total),borderColor:COL[0],backgroundColor:"rgba(47,110,80,.12)",fill:true,tension:.28,pointRadius:2,borderWidth:2}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{labels:{color:"#686863",font:{size:10}}}},scales:{x:{ticks:{color:"#686863"},grid:{display:false}},y:{ticks:{color:"#686863",callback:v=>fmtTk(v)},grid:{color:"rgba(24,24,22,.08)"}}}}});

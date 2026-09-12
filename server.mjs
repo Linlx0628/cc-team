@@ -10,7 +10,7 @@ import { initProductionDb, createProductionTracker, rangeFromTo, productionSumma
   productionProjects, productionAlerts, markAlertSeen, pruneProductionData, DEFAULT_COST_RATES,
   computeCosts, contextHealth, buildReportHTML, ALERT_KIND_LABEL, alertDetailText,
   sessionProjectLabels, sessionToolStats, sessionKey } from "./production.mjs";
-import { cnNow, cnDate, cnHour, secondsUntilNextCnMidnight, cnWeekStartIso, cnWeekStartDate, cnDayStartIso } from "./lib/time.mjs";
+import { cnNow, cnDate, cnHalfHour, secondsUntilNextCnMidnight, cnWeekStartIso, cnWeekStartDate, cnDayStartIso } from "./lib/time.mjs";
 import { parsePeakTimeMinutes, normalizePeakHours, isInPeakHours, formatPeakHoursSummary } from "./lib/schedule.mjs";
 import { sanitizeJson } from "./lib/sanitize.mjs";
 import { QUOTA_RATE_MAX, normalizeQuotaRate, normalizeCacheReadQuotaRate, normalizeModelQuotaRates, lookupModelQuotaRate, currentQuotaRate, nextRateChangeHint, QUOTA_POOL_NAME_MAX, normalizeQuotaPoolName, canonicalJson, shortDigest, applyStickyReorder, buildPoolResolver, quotaExceededMessage, quotaErrorDetail, buildQuotaCore } from "./lib/quota.mjs";
@@ -1752,7 +1752,7 @@ function usageHasTokens(usage = {}) {
 }
 
 // ─── Timezone Helpers (UTC+8 北京时间) ────────────────────────────────────────
-// cnNow/cnDate/cnHour/secondsUntilNextCnMidnight 已迁至 ./lib/time.mjs。
+// cnNow/cnDate/cnHour/cnHalfHour/secondsUntilNextCnMidnight 已迁至 ./lib/time.mjs。
 
 // session 由代理主路径透传(proxy-core 的 extractSessionSignal),只用于会话维度的记账,
 // 不参与任何路由或配额判断。省略时为 undefined,即不落 usage_session。
@@ -1761,7 +1761,9 @@ function recordUsage(apiKey, usage, model, suffix, _rt, session) {
   const sfx = normalizeProfileSuffix(suffix) || runtime?.suffix || getDefaultProfileSuffix();
   const key = resolveUserKey(apiKey, runtime);
   const today = cnDate();
-  const hour = cnHour();
+  // 半小时槽位(如 "14:30"),三张按小时记账的表共用这一个键。旧行是 "14" 两字符,
+  // 与本格式不匹配 —— 这是刻意的:不迁移历史,只在读取端做阶梯兜底。
+  const hour = cnHalfHour();
   const toTokenNumber = (value) => {
     if (value === undefined || value === null || value === "") return 0;
     const n = Number(value);
@@ -1781,7 +1783,7 @@ function recordUsage(apiKey, usage, model, suffix, _rt, session) {
   // Weight the request at the rate in force right now, for THIS model. This is
   // settled at write time on purpose: the row's cost is frozen, so changing a rate
   // later only affects future requests and never silently re-prices history. Note
-  // the rate comes from the completion instant (same convention as cnHour()
+  // the rate comes from the completion instant (same convention as cnHalfHour()
   // above), so a request spanning a peak boundary is priced by where it finished.
   const rate = currentQuotaRate(runtime, new Date(), m);
   // Cache-hit accounting, aligned to the Anthropic protocol. Anthropic upstreams

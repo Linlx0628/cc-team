@@ -52,9 +52,19 @@ function loadConfig() {
   return JSON.parse(fs.readFileSync(configPath, "utf-8"));
 }
 function saveConfig(cfg) {
+  const text = JSON.stringify(cfg, null, 2);
   const tempPath = `${configPath}.tmp`;
-  fs.writeFileSync(tempPath, JSON.stringify(cfg, null, 2), "utf-8");
-  fs.renameSync(tempPath, configPath);
+  fs.writeFileSync(tempPath, text, "utf-8");
+  try {
+    fs.renameSync(tempPath, configPath);
+  } catch (err) {
+    // 单文件 bind mount(docker -v config.json:/app/config.json)会让容器内目标变成挂载点,
+    // 对它 rename 覆盖必然 EBUSY(Linux 的 vfs_rename 同样检查 is_local_mountpoint,非 macOS 独有)。
+    // 此时原子性让位给可用性,退回原地写,否则设置页等 30+ 处保存全部失败。
+    if (err.code !== "EBUSY" && err.code !== "EXDEV") throw err;
+    fs.writeFileSync(configPath, text, "utf-8");
+    fs.rmSync(tempPath, { force: true });
+  }
 }
 
 const config = loadConfig();

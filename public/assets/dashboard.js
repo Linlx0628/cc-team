@@ -637,11 +637,13 @@ async function loadSessions(){
       +'<td class="n">'+(u.fragments||0)+'</td>'
       +'<td>'+sessGrade(u)+'</td></tr>').join('')
       ||'<tr><td colspan="9" class="empty">该周期没有可归属到会话的请求</td></tr>';
+    // 「会话」列:有会话名(后端从本机 Claude Code 的会话文件现读)就顶掉那串标识 ——
+    // 列宽有限,两者同显会把表挤变形;完整标识挪进悬浮提示,别处对账仍以它为准。
     document.querySelector('#sessTable tbody').innerHTML=d.sessions.map(x=>
       '<tr>'
       +'<td>'+escH(x.user_name)+'</td>'
       +'<td>'+(x.project?escH(x.project)+(x.cross_projects>0?' <span class="chip chip-warn" title="该会话横跨多个项目，token 整段算在主项目名下">跨'+x.cross_projects+'</span>':''):'<span style="color:var(--dim)">纯问答</span>')+'</td>'
-      +'<td style="font-size:10px;color:var(--dim)" title="'+escH(x.session)+'">'+escH(String(x.session).slice(0,18))+'</td>'
+      +'<td style="font-size:10px;color:var(--dim)" title="'+escH(x.session)+'">'+escH(x.title||String(x.session).slice(0,18))+'</td>'
       +'<td style="font-size:11px;color:var(--dim);white-space:nowrap">'+bjClock(x.first_seen)+(x.last_seen!==x.first_seen?' → '+bjClock(x.last_seen).slice(6):'')+'</td>'
       +'<td class="n">'+(x.requests?fmtT(x.requests):'<span style="color:var(--dim)" title="只有工具数据，轮数未知">—</span>')+'</td>'
       +'<td class="n hl">'+(x.token_data?fmtTk(x.tokens):DASH)+'</td>'

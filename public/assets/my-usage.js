@@ -712,7 +712,11 @@ function renderSessBoard(){
   const ths=Object.assign({},THS_FALLBACK,d.thresholds||{});
   board.innerHTML=rows.map(function(s){
     const g=GRADE_CLS[s.grade]||'none';
-    const name=s.project?esc(s.project):'<span style="color:var(--dim)">纯问答 · 无代码产出</span>';
+    // 会话名(本机 Claude Code 的 ai-title,后端现读)优先当主标题;没有才退回项目标签,
+    // 再没有才是「纯问答」占位。有会话名时项目标签降到后面那行小字 —— 主标题只有一行,
+    // 项目与标识都是辅助信息,让给标题。标识串任何时候都保留:它是唯一能对上盘上文件的键。
+    const name=s.title?esc(s.title):(s.project?esc(s.project):'<span style="color:var(--dim)">纯问答 · 无代码产出</span>');
+    const idLine=(s.title&&s.project?esc(s.project)+' · ':'')+esc(sessShort(s.session));
     const when=s.first_seen===s.last_seen?cnStamp(s.first_seen):(cnStamp(s.first_seen)+' → '+cnStamp(s.last_seen));
     const parts=[];
     parts.push(s.requests?fmtT(s.requests)+' 轮':'轮数未知');
@@ -726,7 +730,7 @@ function renderSessBoard(){
     const adv=(s.advice||[]).map(function(a){return esc(a)}).join('；');
     return '<div class="lb-row sess-row '+g+'">'
       +'<span class="sess-grade">'+(s.gradeLabel?esc(s.gradeLabel):'—')+'</span>'
-      +'<div class="lb-who"><div class="lb-name">'+name+' <span style="font-weight:400;color:var(--dim);font-size:10.5px">'+esc(sessShort(s.session))+'</span></div>'
+      +'<div class="lb-who"><div class="lb-name">'+name+' <span style="font-weight:400;color:var(--dim);font-size:10.5px">'+idLine+'</span></div>'
       +'<div class="lb-det">'+esc(when)+(when?' · ':'')+parts.filter(Boolean).join(' · ')+'</div>'
       +(adv?'<div class="sess-adv">'+adv+'</div>':'')
       +'</div>'

@@ -19,7 +19,7 @@ import { loadAssets } from "./lib/assets.mjs";
 import { escHtml, escJs } from "./lib/html.mjs";
 import { settingsHtml, dashboardHtml, loginHtml, personalUsageLandingHtml, codexSetupHtml, personalUsageHtml } from "./lib/pages.mjs";
 import { buildCodexModelCatalog, buildCodexSetupScript, buildCodexSetupScriptWin } from "./lib/codex-setup-script.mjs";
-import { createStatsReader } from "./lib/stats.mjs";
+import { createStatsReader, hourlyChartFloor } from "./lib/stats.mjs";
 import { createSettingsWriter } from "./lib/settings-write.mjs";
 import { createUsageReader } from "./lib/personal-usage.mjs";
 import { createLeaderboardReader } from "./lib/leaderboard.mjs";
@@ -1352,8 +1352,10 @@ function loadProfileSnapshot(suffix) {
   for (const r of db.prepare("SELECT model,tokens,requests FROM usage_model WHERE profile=?").all(suffix)) {
     models[r.model] = { tokens: r.tokens, requests: r.requests };
   }
+  // 日期下界与聚合视图(getAggregatedStore)同源同值 —— 两条路径喂的是同一张前端图,
+  // 下界不一致会让「全部方案」与「单个方案」两个视图在同一天显示出不同的历史范围。
   const hourly = {};
-  for (const r of db.prepare("SELECT date,hour,requests,input_tokens,output_tokens,cache_creation,cache_read FROM usage_hourly WHERE profile=?").all(suffix)) {
+  for (const r of db.prepare("SELECT date,hour,requests,input_tokens,output_tokens,cache_creation,cache_read FROM usage_hourly WHERE profile=? AND date>=?").all(suffix, hourlyChartFloor())) {
     if (!hourly[r.date]) hourly[r.date] = {};
     hourly[r.date][r.hour] = { requests: r.requests, inputTokens: r.input_tokens, outputTokens: r.output_tokens, cacheCreationTokens: r.cache_creation, cacheReadTokens: r.cache_read };
   }

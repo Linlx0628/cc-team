@@ -9,12 +9,29 @@ body{padding:0;overflow:hidden;height:100vh}
 .sidebar-hd{padding:15px 16px;border-bottom:1px solid var(--border);display:flex;align-items:center}
 .sidebar-brand{display:flex;align-items:center;gap:10px;min-width:0}
 .sidebar-hd h1{font-size:16px;font-weight:650;line-height:1.25;white-space:nowrap}
-.sidebar-hd a{color:var(--dim);font-size:11px;text-decoration:none;white-space:nowrap}
-.sidebar-hd a:hover{color:var(--accent)}
-.sidebar-nav{flex:1;overflow-y:auto;padding:10px;display:flex;flex-direction:column;gap:3px;background:var(--surface-subtle)}
-.sidebar-nav .nav-btn{display:block;width:100%;text-align:left;font-family:inherit;font-size:12.5px;font-weight:600;padding:9px 12px;border:1px solid transparent;border-radius:6px;background:transparent;color:var(--dim);cursor:pointer;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.sidebar-nav .nav-btn:hover{background:var(--surface);border-color:var(--border);color:var(--text)}
-.sidebar-nav .nav-btn.active{background:var(--surface);border-color:var(--accent);color:var(--accent)}
+/* 菜单列。底色与 .sidebar 一致(移动端那条媒体查询里本来就是 --surface),
+   分区靠分隔线而不是靠色差;选中态用全站统一的 accent-soft 实底,
+   不再是「白底 + 绿描边」—— 那是全站唯一一处,连本页的移动端形态都不一致。
+   参考实现:settings.css:12/18/19。 */
+.sidebar-nav{flex:1;overflow-y:auto;padding:10px;display:flex;flex-direction:column;gap:4px;background:var(--surface)}
+/* 那 1px 透明描边只为保住盒模型(删掉每项矮 2px、文字上移 1px),不参与任何状态表达 */
+.sidebar-nav .nav-btn{display:flex;align-items:center;gap:10px;width:100%;text-align:left;font-family:inherit;font-size:12.5px;font-weight:600;padding:9px 12px;border:1px solid transparent;border-radius:8px;background:transparent;color:var(--dim);cursor:pointer;white-space:nowrap}
+/* 图标描边宽度是按「18px 显示尺寸」折算的等效值(2.5 × 18/24 = 1.875px)。
+   改这里的 width/height 必须同改 lib/pages.mjs 里的 stroke-width,否则线会变细。
+   transition 要自己写:theme.css:17 的选择器只到 button/a,不含 svg。 */
+.sidebar-nav .nav-btn svg{flex:none;display:block;opacity:.8;transition:transform .18s ease,opacity .18s ease}
+/* 悬停用 --surface-hover 而不是 settings.css:18 用的 --surface-subtle:在白底上
+   前者是 1.13:1、后者只有 1.06:1,后者会弱到几乎看不出悬停。层级必须是
+   悬停(1.13:1 中性灰)< 选中(1.17:1 且是全列唯一的绿色相)。 */
+.sidebar-nav .nav-btn:hover{background:var(--surface-hover);color:var(--text)}
+.sidebar-nav .nav-btn:hover svg{transform:translateX(1px);opacity:1}
+.sidebar-nav .nav-btn.active{background:var(--accent-soft);color:var(--accent)}
+.sidebar-nav .nav-btn.active svg{opacity:1}
+/* 补齐 .nav-btn 里 <a> 的按压反馈:theme.css:18 只写到 button:active,.btn:active,
+   而「配置 Codex」是 <a>,同一个视觉组件此前有两种手感。值与那边相同。 */
+.sidebar-nav .nav-btn:active{transform:translateY(1px)}
+/* 页脚次级入口:单独一条分隔线,弱化 */
+.sidebar-nav.sidebar-ft-nav{flex:none;padding-top:10px;border-top:1px solid var(--border)}
 .main{flex:1;min-width:0;overflow-y:auto;padding:24px clamp(20px,3vw,40px) 48px;scrollbar-gutter:stable}
 /* Wider than the old 1120px: with 5+ profiles the quota cards were squeezed to
    their 215px floor, wrapping every number onto two lines. The cap now sits on the
@@ -165,6 +182,72 @@ table{width:100%;border-collapse:collapse;min-width:560px}th{text-align:left;pad
 .lb-val span{font-size:10px;color:var(--dim);margin-left:3px}
 .lb-val.none b{font-size:12px;font-weight:600;color:var(--dim)}
 .lb-msg{font-size:11.5px;color:var(--dim);padding:2px 0}
+/* ── 领奖台(前三名) ──
+   金银铜不是新引入的色:上面 .lb-row.r1/.r2/.r3 早就染着同一组色,只是只染了 26px 的
+   圆点。这里把浅色沿用原值提成 token,再配一个深色给数字与皇冠 —— 否则同一个面板里会
+   出现两套互不相干的金银铜。宽度给在容器上而不是靠卡片 max-width 硬撑:桌面下 box 内容
+   宽 1364px,三张 180px 的卡居中只占 556px,不给容器定宽就是一块浮在中间的孤岛。 */
+.lb-podium{display:flex;align-items:flex-end;justify-content:center;gap:8px;max-width:560px;margin:0 auto 12px;
+  /* 浅色沿用 .lb-row.r1/.r2/.r3 的圆点底,--medal-*-deep 直接取那三条规则里的**文字色** ——
+     那本来就是这套代码给「奖牌上的字」定的颜色,提上来既不引入第二套金银铜,也顺带过掉对比度:
+     实测在淡底卡上是 10.40 / 9.27 / 10.34 比 1。第一版我照预览取的 #b8912f / #9a9a94 只有
+     2.78 / 2.59,连大字号 3:1 都不到 —— 银尤其躲不掉,银本来就浅,当文字必然不够深。 */
+  --medal-1:#e8c96a;--medal-1-deep:#4a3a10;--medal-1-mark:#8f7018;
+  --medal-2:#d8dadb;--medal-2-deep:#3f4244;
+  --medal-3:#e0b088;--medal-3-deep:#4d3419}
+/* overflow:hidden 是必需的:卡片是 flex 列容器,名字与明细一旦溢出默认会跑到卡外压到隔壁。
+   position:relative 是给皇冠做定位锚 —— 皇冠脱离文档流,这样三张卡的内容高度完全相同,
+   台阶只由 padding-top 决定,不会被「第 1 名多一顶皇冠」这件事顺带改变。 */
+.lb-pod{flex:1 1 0;max-width:180px;min-width:0;overflow:hidden;position:relative;border:1px solid;border-radius:8px;
+  display:flex;flex-direction:column;align-items:center;justify-content:flex-end;
+  gap:4px;padding:10px 8px;text-align:center}
+/* 视觉顺序摆成 2-1-3,DOM 顺序仍是 1、2、3 —— 读屏要按名次念,不能按台阶念。
+   order 三条都要显式写:默认值是 0,漏掉的那张会跑到最左边。
+   台阶用 padding-top 拉开而不用 height/min-height:卡片高度由内容撑出来(名字、明细、数值
+   全是不换行的),给死高度等于赌字体度量,赌输就是从顶部把皇冠或名次裁掉;而 min-height
+   要高到能盖住内容(≈114px)就已经没有余量,台阶根本拉不开 —— 这正是上一版 132/112/100
+   写了却完全不起作用的原因(实测三张都是 113.8px)。padding-top 只在内容上方留白,
+   不论字体怎么变都不会裁,而底边对齐由 align-items:flex-end 保证,台阶就是三张卡的上沿。 */
+.lb-pod-1{order:2;padding-top:44px}
+.lb-pod-2{order:1;padding-top:27px}
+.lb-pod-3{order:3;padding-top:10px}
+.lb-pod-1{background:#fdf8ea;border-color:var(--medal-1)}
+.lb-pod-2{background:#f4f5f5;border-color:var(--medal-2)}
+.lb-pod-3{background:#faf1e9;border-color:var(--medal-3)}
+.lb-pod-1 .lb-pod-rank{color:var(--medal-1-deep)}
+.lb-pod-2 .lb-pod-rank{color:var(--medal-2-deep)}
+.lb-pod-3 .lb-pod-rank{color:var(--medal-3-deep)}
+/* 皇冠的 stroke 是 currentColor,不单独给色它继承的是卡片的 color(正文黑),
+   会画出一顶黑皇冠配金卡。它比名次数字浅一档(--medal-1-mark 4.40:1):数字要读,
+   皇冠要像金色,4.40 已经比大字号门槛高出不少。定位脱离文档流,落在第 1 名
+   padding-top 留出的空当里(皇冠 18px 从 top:8px 起,占 8~26px,内容从 44px 起)。 */
+.lb-pod-1 .lb-crown{color:var(--medal-1-mark)}
+.lb-crown{position:absolute;top:8px;left:50%;transform:translateX(-50%)}
+.lb-pod-rank{font-size:22px;font-weight:700;line-height:1;font-variant-numeric:tabular-nums}
+/* 名字与「我」徽章是两个 flex item:整块 .lb-pod-name 一起打省略号会把徽章也截掉 */
+.lb-pod-name{display:flex;align-items:center;justify-content:center;gap:4px;max-width:100%;min-width:0;font-size:12.5px;font-weight:650}
+.lb-pod-nm{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.lb-pod-name .tag{flex:none}
+.lb-pod-det{font-size:10px;color:var(--dim);max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-variant-numeric:tabular-nums}
+/* 尺寸刻意与 .lb-val 对齐:领奖台上的数字不能比第 4 名那行还小 */
+.lb-pod-value{font-variant-numeric:tabular-nums;white-space:nowrap}
+.lb-pod-value b{font-size:16px;font-weight:700}
+.lb-pod-value span{font-size:10px;color:var(--dim);margin-left:3px}
+.lb-pod-value.none b{font-size:12px;font-weight:600;color:var(--dim)}
+/* 本人的那张。用 inset outline 而不是改 border-color:border 是名次色的通道,拿它去标
+   「我」会让第 2 名的银边变成绿边,而且 outline 不占盒模型,不会让本人那张比邻卡高。
+   卡片不可聚焦,所以不与 theme.css 的 :focus-visible 撞车。 */
+.lb-pod.me{outline:2px solid var(--accent);outline-offset:-2px}
+/* 领奖台首次出现时轻轻升起一次。这是全站第一个 @keyframes。 */
+@keyframes lbRise{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
+.lb-podium.anim .lb-pod{animation:lbRise .28s ease both}
+.lb-podium.anim .lb-pod-2{animation-delay:.05s}
+.lb-podium.anim .lb-pod-3{animation-delay:.1s}
+/* theme.css 那条 prefers-reduced-motion 只关掉 transition 与 scroll-behavior,不含
+   animation —— 全局兜底在这里不存在,必须自己补。媒体查询本身不带来任何特异性,所以
+   守卫必须**原样重复整条选择器**:写成 .lb-pod{animation:none} 会因 (0,1,0)<(0,3,0)
+   而输掉,reduced-motion 用户照样看动画,而且不报错。 */
+@media (prefers-reduced-motion:reduce){.lb-podium.anim .lb-pod{animation:none}}
 /* ── 项目分布 / 会话使用情况 ──
    会话行沿用 .lb-row 的骨架(左边框 + 上下两行),只是把「名次圆牌」换成「档位牌」:
    这里没有名次,行与行之间只有健康度可比。档位是服务端下发的,前端只做颜色映射。 */
@@ -187,6 +270,14 @@ table{width:100%;border-collapse:collapse;min-width:560px}th{text-align:left;pad
   .sidebar-hd{padding:12px 16px}
   .sidebar-nav{flex:none;flex-direction:row;overflow-x:auto;overflow-y:visible;gap:6px;padding:8px 12px;border-top:1px solid var(--border);background:var(--surface)}
   .sidebar-nav .nav-btn{width:auto;flex:none}
+  /* 页脚那条也必须清掉 border-top:上面那条菜单已经有 border-top,两条 1px 相邻会叠成深线 */
+  .sidebar-nav.sidebar-ft-nav{flex:none;border-top:0;padding-top:8px}
   .main{overflow:visible;padding:18px 14px 36px}
 }
-@media(max-width:560px){.cards{grid-template-columns:1fr 1fr}.card .v{font-size:20px}.box{padding:14px}.pq-grid{grid-template-columns:1fr}.lb-row{gap:9px;padding:9px 11px}.lb-val b{font-size:15px}}
+@media(max-width:560px){.cards{grid-template-columns:1fr 1fr}.card .v{font-size:20px}.box{padding:14px}.pq-grid{grid-template-columns:1fr}.lb-row{gap:9px;padding:9px 11px}.lb-val b{font-size:15px}.lb-podium{gap:6px}.lb-pod{padding:8px 6px;border-radius:6px}.lb-pod-rank{font-size:18px}.lb-pod-name{font-size:11.5px}.lb-pod-det{font-size:9.5px}
+  /* 台阶这三条必须排在 .lb-pod{padding:8px 6px} 之后:两者特异性相同(0,1,0),
+     靠源码顺序决定胜负,写在前面会被那条的 padding-top:8px 抹平。 */
+  .lb-pod-1{padding-top:38px}.lb-pod-2{padding-top:24px}.lb-pod-3{padding-top:8px}
+  /* 375px 下每张卡的内容宽只剩 ~86px,「138.9k」+「token/次」并排必定折行,一折行就把
+     台阶的高度差顶乱。改成上下摞,数字一行、单位一行 —— 比把单位藏掉好,单位不丢。 */
+  .lb-pod-value{display:flex;flex-direction:column;align-items:center;line-height:1.15}.lb-pod-value b{font-size:15px}.lb-pod-value span{margin-left:0;font-size:9px}}

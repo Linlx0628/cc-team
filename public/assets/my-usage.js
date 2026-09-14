@@ -496,11 +496,11 @@ load();setInterval(load,30000);
 
 
 // ── 面板切换 ──
-// 菜单按功能划分,四块:概览(含使用日历、各方案配额、产出画像)/ 配额价目表 /
-// 用量分析(图表、模型表、项目分布、会话使用情况)/ 团队排行榜。
+// 菜单按功能划分,五块:概览(含使用日历、各方案配额、产出画像)/ 配额价目表 /
+// 用量分析(图表、模型表、客户端用量、项目分布)/ 会话使用情况 / 团队排行榜。
 // 顺序即导航顺序,id 由 setSection() 按 'mu-tab-'+s / 'mu-panel-'+s 硬拼 ——
 // 增删菜单必须与 lib/pages.mjs 的按钮和面板同时改,否则切换会静默失效。
-const SECTIONS=['overview','rates','analysis','leaderboard'];
+const SECTIONS=['overview','rates','analysis','sessions','leaderboard'];
 function setSection(name,focus){
   if(SECTIONS.indexOf(name)<0)name='overview';
   SECTION=name;
@@ -516,15 +516,19 @@ function setSection(name,focus){
 // 切到「用量分析」/「概览」才补画:隐藏期间容器宽度为 0,提前建图/排日历都会画错。
 // 日历现在挂在概览里,所以两个分支都要有 —— 少了 overview 这一支,切回概览会看到一张
 // 按 0 宽排出来、被压到 9px 下限的日历。
+// 「会话使用情况」不在补画之列:活动那两块全靠 CSS 排版,从容器读宽度的只有 renderCalendar,
+// 所以在面板还隐藏时就把 innerHTML 写好是安全的,这里只需保证数据到位。
 // 排行榜首次进入才请求,且不参与 30 秒轮询 —— 它和 D 是两份数据,不必跟着刷新。
 function paintSection(){
   if(SECTION==='analysis'){
     if(D)renderAnalysisPane();
     if(C.h)C.h.resize();
     if(C.t)C.t.resize();
-    ensureActivity();   // 项目分布与会话使用情况首次进入才拉,拉过一次就不再重复
+    ensureActivity();   // 项目分布与会话使用情况共用一份载荷,从哪个入口进来都拉它
   }else if(SECTION==='overview'){
     if(D)renderCalendar();
+  }else if(SECTION==='sessions'){
+    ensureActivity();   // 已拉过是空操作;正在拉时 fetchActivity() 自己会早退
   }else if(SECTION==='leaderboard'){
     ensureLeaderboard();
   }
@@ -809,19 +813,25 @@ function renderSessBoard(){
   }).join('');
 }
 function renderActivity(){
-  const pd=document.getElementById('projDist'),sb=document.getElementById('sessBox');
+  const pd=document.getElementById('projDist');
   if(ACT.error){
-    if(pd)pd.style.display='none';
-    if(sb)sb.style.display='';
-    const b=document.getElementById('sessBoard');if(b)b.innerHTML='<div class="lb-msg">加载失败：'+esc(ACT.error)+'</div>';
+    // 项目分布与会话使用情况是同一份载荷,拉不到就两边都没数据。错误要往**两个面板各写一份**:
+    // 它们现在分属不同菜单,只写会话那边的话,用量分析里的项目分布会无声消失、一个字都没有,
+    // 看着像功能坏了。所以项目分布不再整体隐藏,而是保留盒子、清空表格、把错误写进脚注。
+    const msg='<div class="lb-msg">加载失败：'+esc(ACT.error)+'</div>';
+    if(pd){
+      pd.style.display='';
+      const ptb=document.querySelector('#projDistTable tbody');if(ptb)ptb.innerHTML='';
+      const pn=document.getElementById('projDistNote');if(pn)pn.innerHTML=msg;
+    }
+    const b=document.getElementById('sessBoard');if(b)b.innerHTML=msg;
     const sm=document.getElementById('sessSummary');if(sm)sm.innerHTML='';
     const sn=document.getElementById('sessNote');if(sn)sn.innerHTML='';
     return;
   }
   if(!ACT.data)return;
-  // 骨架里 #sessBox 是 display:none,而 renderProjDist() 只管自己那个盒子。
-  // 不在这里显式打开,整个「会话使用情况」永远不显示(接口有数据也白搭)。
-  if(sb)sb.style.display='';
+  // #sessBox 的显隐已经交给所在面板了(它自己那个 pane 管 hidden),这里不再插手 ——
+  // 原先这里有一句把 #sessBox 显式打开的代码,那是因为骨架里那个盒子内联了 display:none。
   renderProjDist();
   renderSessSummary();
   renderSessBoard();
@@ -848,7 +858,7 @@ async function fetchActivity(){
   ACT.loading=false;
   renderActivity();
 }
-// 首次进入「用量分析」才拉,不挂 30 秒轮询 —— 与排行榜同一处理
+// 首次进入「用量分析」或「会话使用情况」才拉,不挂 30 秒轮询 —— 与排行榜同一处理
 function ensureActivity(){if(!ACT.data&&!ACT.loading)fetchActivity()}
 
 setSection('overview',false);

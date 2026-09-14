@@ -1974,7 +1974,7 @@ function recordUsage(apiKey, usage, model, suffix, _rt, session, client) {
     // 会话维度:extractSessionSignal 回落到 "nosession"(无会话头、无 prompt_cache_key、
     // 首条消息也推不出)时不落表 —— 否则所有人的无标识请求会挤进同一个假会话,比不记更糟。
     // 缺的这部分由接口的 unattributed 如实披露,不藏。
-    if (session && session !== "nosession") stmts.upsertSession.run({ ...p, session });
+    if (session && session !== "nosession") stmts.upsertSession.run({ ...p, session, client: client || null });
   });
   tx();
 }

@@ -605,7 +605,6 @@ async function loadProduction(){
       fetch('/api/production/alerts?range='+range).then(r=>r.json()),
     ]);
     prodData=s;
-    document.getElementById('workspaceCountProd').textContent=s.rows.length;
     document.getElementById('prodSummary').textContent='净产出 '+s.rows.reduce((x,r)=>x+r.net_lines,0).toLocaleString('zh-CN')+' 行 · '+s.rows.length+' 人有产出';
     const tb=document.querySelector('#prodTable tbody');
     // 阈值着色(参考区间,与成员个人页同口径):失败率 <10 绿/≥30 橙;重写率 <30 绿/≥80 橙;验证密度 =0 橙/0.1-0.8 绿;token/行与净产出不参与着色。
@@ -687,8 +686,6 @@ async function loadCosts(){
 document.getElementById('workspace-tab-costs').addEventListener('click',()=>{if(!costsLoaded){costsLoaded=true;loadCosts()}});
 // ── 会话使用情况 tab(懒加载:首次切到该 tab 才拉数据)──
 // 与成本/产出一致:会话视图比总览更细(时间戳、文件路径、会话标识),按需拉、不挂 30 秒轮询。
-// 徽标由 loadSessions() 自己维护,renderWorkspaceSummaries() 不碰它 —— 那个函数每 30 秒跑一次,
-// 按 D 去算会把已加载的会话数擦成 0。
 let sessionsLoaded=false,sessDrillUser='';
 // 分档 → 药丸配色。档位一律服务端算好(方向不写死在前端),这里只做颜色映射。
 const SESS_GRADE_CLS={good:'pill-ok',warn:'pill-warn',bad:'pill-bad'};
@@ -708,7 +705,6 @@ async function loadSessions(){
     const ths=Object.assign({},SESS_THS_FALLBACK,d.thresholds||{});
     const s=d.summary||{};
     const drill=d.users.find(u=>u.key===sessDrillUser);
-    document.getElementById('workspaceCountSessions').textContent=s.sessions||0;
     document.getElementById('sessDrillClear').style.display=sessDrillUser?'':'none';
     document.getElementById('sessDrillHint').textContent=sessDrillUser?('当前只看 '+(drill?drill.user_name:'已选成员')):'全部成员 · 点上方某行可只看该成员';
     document.getElementById('sessSummary').textContent=s.sessions
@@ -731,6 +727,7 @@ async function loadSessions(){
     document.querySelector('#sessTable tbody').innerHTML=d.sessions.map(x=>
       '<tr>'
       +'<td>'+escH(x.user_name)+'</td>'
+      +'<td>'+(x.client?escH(clientLabel(x.client)):'<span style="color:var(--dim)">—</span>')+'</td>'
       +'<td>'+(x.project?escH(x.project)+(x.cross_projects>0?' <span class="chip chip-warn" title="该会话横跨多个项目，token 整段算在主项目名下">跨'+x.cross_projects+'</span>':''):'<span style="color:var(--dim)">纯问答</span>')+'</td>'
       +'<td style="font-size:10px;color:var(--dim)" title="'+escH(x.session)+'">'+escH(x.title||String(x.session).slice(0,18))+'</td>'
       +'<td style="font-size:11px;color:var(--dim);white-space:nowrap">'+bjClock(x.first_seen)+(x.last_seen!==x.first_seen?' → '+bjClock(x.last_seen).slice(6):'')+'</td>'
@@ -743,7 +740,7 @@ async function loadSessions(){
       +'<td class="n">'+(x.net_lines==null?DASH:((x.net_lines>0?'+':'')+fmtT(x.net_lines)))+'</td>'
       +'<td class="n">'+sessFail(x.fail_rate)+'</td>'
       +'<td>'+sessGrade(x)+(x.fragment?' <span class="chip chip-warn" title="轮数 ≤ '+(ths.fragment_max_requests||2)+'，会话偏碎">碎片</span>':'')+'</td></tr>').join('')
-      ||'<tr><td colspan="13" class="empty">该周期没有可归属到会话的请求</td></tr>';
+      ||'<tr><td colspan="14" class="empty">该周期没有可归属到会话的请求</td></tr>';
     // 无会话标识的部分必须如实披露 —— 否则「总量」和「会话表加起来」对不上时没人知道为什么
     const un=d.unattributed||{},tot=d.totals||{},at=d.attributed||{};
     const notes=['统计范围 '+escH(d.from)+' ~ '+escH(d.to)+' · 总量 '+fmtTk(tot.tokens||0)+' token / '+fmtT(tot.requests||0)+' 次请求'];
@@ -752,7 +749,6 @@ async function loadSessions(){
     document.getElementById('sessNote').innerHTML=notes.join('<br>');
   }catch(e){
     document.getElementById('sessSummary').textContent='加载失败: '+e.message;
-    document.getElementById('workspaceCountSessions').textContent='—';
   }
 }
 document.getElementById('workspace-tab-sessions').addEventListener('click',()=>{if(!sessionsLoaded){sessionsLoaded=true;loadSessions()}});

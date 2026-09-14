@@ -251,25 +251,29 @@ function showProfileSettings(){
   const view=document.getElementById('dataManagementView');
   const audit=document.getElementById('auditLogView');
   const pool=document.getElementById('quotaPoolView');
+  const sched=document.getElementById('planScheduleView');
   form.hidden=false;
   view.hidden=true;
   view.setAttribute('aria-hidden','true');
   audit.hidden=true;
   audit.setAttribute('aria-hidden','true');
   if(pool){pool.hidden=true;pool.setAttribute('aria-hidden','true')}
+  if(sched){sched.hidden=true;sched.setAttribute('aria-hidden','true')}
   document.getElementById('dataManagementNav').classList.remove('active');
   document.getElementById('auditLogNav').classList.remove('active');
   const pn=document.getElementById('quotaPoolNav');if(pn)pn.classList.remove('active');
+  const sn=document.getElementById('planScheduleNav');if(sn)sn.classList.remove('active');
 }
 function hideAllSecondaryViews(){
-  const dm=document.getElementById('dataManagementView'),audit=document.getElementById('auditLogView'),pool=document.getElementById('quotaPoolView'),qr=document.getElementById('quotaRequestView');
+  const dm=document.getElementById('dataManagementView'),audit=document.getElementById('auditLogView'),pool=document.getElementById('quotaPoolView'),qr=document.getElementById('quotaRequestView'),sched=document.getElementById('planScheduleView');
   dm.hidden=true;dm.setAttribute('aria-hidden','true');
   audit.hidden=true;audit.setAttribute('aria-hidden','true');
   if(pool){pool.hidden=true;pool.setAttribute('aria-hidden','true')}
   if(qr){qr.hidden=true;qr.setAttribute('aria-hidden','true')}
+  if(sched){sched.hidden=true;sched.setAttribute('aria-hidden','true')}
   document.querySelectorAll('.pl-item').forEach(function(el){el.classList.remove('active')});
   // Nav buttons live outside .pl-item now, so clear their highlight explicitly.
-  ['quotaPoolNav','dataManagementNav','auditLogNav','quotaRequestNav'].forEach(function(id){
+  ['quotaPoolNav','dataManagementNav','auditLogNav','quotaRequestNav','planScheduleNav'].forEach(function(id){
     const el=document.getElementById(id);
     if(el)el.classList.remove('active');
   });
@@ -1098,6 +1102,423 @@ function refreshBridgeSelect(profile){
   if(keep&&![...sel.options].some(o=>o.value===keep))sel.value='';
   else sel.value=keep;
 }
+// ─── 方案组调度（预先排列多套方案组 + 按星期几/时段自动切换） ────────────────────
+// **服务端一个实现，前端只渲染与提交**：命中的规则、下次切换时刻、各组健康告警全部来自
+// GET /api/schedule（首屏来自 SETTINGS.schedule，服务端跑的是同一个函数）。前端不复刻
+// 任何匹配逻辑 —— 两份判定必然漂移，现成的教训就是 nowInPeakHours 与 isInPeakHours 各写了一份。
+const SCHED_PROTOS=['anthropic','responses'];
+const SCHED_PROTO_LABEL={anthropic:'Anthropic',responses:'OpenAI'};
+const SCHED_BASE='@base';   // 必须与 lib/schedule.mjs 的 BASE_GROUP_TOKEN 一致
+// 星期复选框按周一开头排列（中文习惯），值仍是 0=周日…6=周六，与 config 同一口径。
+const SCHED_DAY_ORDER=[1,2,3,4,5,6,0];
+// min-width:0/max-width:100% 是防溢出的硬约束：下拉的固有宽度由**最长的 option** 决定，
+// 而组名是用户输入（最长 24 字）。没有它，一个长组名会把整行顶出去，在窄屏上变成横向滚动。
+const SCHED_SEL_STYLE='width:auto;min-width:0;max-width:100%;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:3px 6px;border-radius:4px;font-size:12px';
+let schedState=(SETTINGS.schedule&&SETTINGS.schedule.protocols)||{};
+let schedGroups={};   // proto → { 组名: [方案名...] }：提交前的编辑副本
+let schedDirty={};    // proto → 规则表有未保存的重排；此时不回显「命中」徽章，免得张冠李戴
+function schedProfileByName(n){return (SETTINGS.profiles||[]).filter(function(p){return p.name===n})[0]||null}
+function schedProfilesOf(proto){return (SETTINGS.profiles||[]).filter(function(p){return p.protocol===proto&&p.configured})}
+function schedBillingLabel(p){
+  if(!p)return '方案已不存在';
+  return p.billingType==='coding_plan'?'Coding Plan':p.billingType==='token_plan'?'Token Plan':'按量计费';
+}
+function schedOpts(vals,sel,labelOf){return vals.map(function(v){
+  return '<option value="'+h(v)+'"'+(v===sel?' selected':'')+'>'+h(labelOf?labelOf(v):v)+'</option>'}).join('')}
+function schedHourOpts(sel){var o='';for(var i=0;i<24;i++){var v=String(i).padStart(2,'0');o+='<option value="'+v+'"'+(v===sel?' selected':'')+'>'+v+'</option>'}return o}
+function schedMinOpts(sel){var o='';for(var i=0;i<60;i++){var v=String(i).padStart(2,'0');o+='<option value="'+v+'"'+(v===sel?' selected':'')+'>'+v+'</option>'}return o}
+// 规则的紧凑标签。**只用于告警文案**：哪条命中由服务端算，这里只把行内控件回显一遍，
+// 所以 describeRuleDays 算错也只是标签难看，不会让人误判路由。
+function schedRuleLabel(r){
+  var allDay=r.start===null||r.end===null||r.start===undefined||r.end===undefined;
+  return describeRuleDays(r.days)+' '+(allDay?'全天':(r.start+'-'+r.end))+' → '+(r.group===SCHED_BASE?'默认方案组':r.group);
+}
+function schedGroupOptions(proto,sel){
+  // 标签故意短：option 文本决定 select 的固有宽度，把基础组成员链写进标签会让这个下拉
+  // 宽到 438px，窄屏下直接顶穿整行。顺序在「当前生效」条与侧栏基础组编辑器里已经写全了。
+  var names=Object.keys(schedGroups[proto]||{});
+  return '<option value="'+SCHED_BASE+'"'+(sel===SCHED_BASE?' selected':'')+'>'+h('默认方案组（基础组）')+'</option>'
+    +schedOpts(names,sel);
+}
+function schedLoadDraft(){
+  schedGroups={};schedDirty={};
+  SCHED_PROTOS.forEach(function(proto){
+    var st=schedState[proto]||{},g={};
+    Object.keys(st.groups||{}).forEach(function(n){g[n]=(st.groups[n].members||[]).slice()});
+    schedGroups[proto]=g;
+    schedDirty[proto]=false;
+  });
+}
+function rememberScheduleViewForReload(){try{sessionStorage.setItem('tm_return_schedule_view','1')}catch(e){}}
+function openPlanScheduleView(){
+  const form=document.getElementById('settingsForm');
+  hideAllSecondaryViews();
+  form.hidden=true;
+  const view=document.getElementById('planScheduleView');
+  view.hidden=false;view.setAttribute('aria-hidden','false');
+  document.getElementById('planScheduleNav').classList.add('active');
+  schedLoadDraft();
+  SCHED_PROTOS.forEach(renderScheduleProto);
+  updateScheduleStatus();
+}
+function renderScheduleProto(proto){
+  const st=schedState[proto];
+  if(!st){   // 服务端生成调度状态失败时给一句人话，而不是留一片空白
+    document.getElementById('schedGroups-'+proto).innerHTML='<div class="note">调度状态不可用（服务端生成失败），请查看服务端日志。</div>';
+    document.getElementById('schedRules-'+proto).innerHTML='';
+    document.getElementById('schedOverridePick-'+proto).innerHTML='';
+    return;
+  }
+  renderScheduleOverridePick(proto);
+  renderScheduleGroups(proto);
+  renderScheduleRules(proto,st.rules||[]);
+  renderScheduleStatus(proto);
+}
+// ── 手动指定（决策④：允许临时覆盖，到下一个时间边界自动收回）──
+function renderScheduleOverridePick(proto){
+  const box=document.getElementById('schedOverridePick-'+proto);
+  if(!box)return;
+  box.innerHTML='<label style="color:var(--dim);margin:0">手动指定</label>'
+    +'<select id="schedOverrideSel-'+proto+'" style="'+SCHED_SEL_STYLE+'">'+schedGroupOptions(proto,'')+'</select>'
+    +'<button type="button" class="btn btn-outline btn-sm" onclick="scheduleSetOverride(\''+proto+'\')">指定</button>'
+    +'<span class="note" style="margin:0">覆盖当前调度，到下一个时间边界自动收回（见下方「下次切换」）；也可用 <code>/api/schedule</code> 读到当前是否处于手动指定。</span>';
+}
+// ── 命名方案组 ──
+function renderScheduleGroups(proto){
+  const box=document.getElementById('schedGroups-'+proto);
+  if(!box)return;
+  const names=Object.keys(schedGroups[proto]||{});
+  if(!names.length){
+    box.innerHTML='<div class="note">还没有命名方案组。规则可以指向命名组，也可以指向侧栏基础组，所以这不是必填的 —— 没有命名组时调度等于「按时间重排基础组」之外什么都没发生。</div>';
+    return;
+  }
+  box.innerHTML=names.map(function(name,gi){return schedGroupCardHtml(proto,gi,name,schedGroups[proto][name])}).join('');
+}
+function schedGroupCardHtml(proto,gi,name,members){
+  const rows=members.length?members.map(function(m,mi){
+    const p=schedProfileByName(m);
+    const nav=function(label,d,dis){return '<button type="button" class="btn btn-outline btn-sm" onclick="scheduleMoveMember(\''+proto+'\','+gi+','+mi+','+d+')"'+(dis?' disabled':'')+'>'+label+'</button>'};
+    return '<div class="group-item" data-name="'+h(m)+'" style="display:flex;align-items:center;gap:8px;padding:5px 8px;border:1px solid var(--border);border-radius:6px;margin-bottom:5px">'
+      +'<span style="color:var(--blue);font-weight:600;min-width:20px">'+(mi+1)+'</span>'
+      +'<span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+h(m)+' <span style="color:var(--dim);font-size:11px">'+h(schedBillingLabel(p))+'</span></span>'
+      +nav('↑',-1,mi===0)+nav('↓',1,mi===members.length-1)
+      +'<button type="button" class="btn btn-outline btn-sm" onclick="scheduleRemoveMember(\''+proto+'\','+gi+','+mi+')">移出</button></div>';
+  }).join(''):'<div class="note" style="margin:0 0 6px;color:var(--orange)">此组没有有效成员 —— 命中它的规则会被跳过（继续往下找），侧栏基础组不受影响。</div>';
+  const addable=schedProfilesOf(proto).map(function(p){return p.name}).filter(function(n){return members.indexOf(n)<0});
+  // 两种情况都让「加入」消失，但原因不同：一个是本协议压根没有可用方案，一个是**都已经在组里**
+  // （本协议只有 3 个方案、组里恰好是这 3 个时最常见）。同一句话会让人以为方案丢了。
+  const noneLeft=schedProfilesOf(proto).length===0?'本协议下没有可加入的方案':'本协议下的方案都已在此组中';
+  const addRow=addable.length
+    ?'<select data-sadd style="'+SCHED_SEL_STYLE+'">'+schedOpts(addable,'')+'</select>'
+      +'<button type="button" class="btn btn-outline btn-sm" onclick="scheduleAddMember(\''+proto+'\','+gi+')">加入</button>'
+    :'<span class="note" style="margin:0">'+noneLeft+'</span>';
+  return '<div data-sgi="'+gi+'" style="border:1px solid var(--border);border-radius:6px;padding:10px 12px;margin-bottom:10px;background:var(--surface)">'
+    +'<div style="display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap;margin-bottom:8px">'
+    +'<div style="min-width:0"><b style="font-size:13px">'+h(name)+'</b> <span class="note" style="margin:0">'+members.length+' 个方案'+(members.length?' · 组头 '+h(members[0]):'')+'</span></div>'
+    +'<div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap">'+addRow
+    +'<button type="button" class="btn btn-outline btn-sm" onclick="scheduleRenameGroup(\''+proto+'\','+gi+')">重命名</button>'
+    +'<button type="button" class="btn btn-danger btn-sm" onclick="scheduleDeleteGroup(\''+proto+'\','+gi+')">删除</button>'
+    +'</div></div>'
+    +rows
+    +'</div>';
+}
+function schedCopyGroups(proto){
+  var out={},g=schedGroups[proto]||{};
+  Object.keys(g).forEach(function(n){out[n]=g[n].slice()});
+  return out;
+}
+async function schedSaveGroups(proto,next,okMsg){
+  let r,data;
+  try{
+    r=await fetch('/api/schedule/groups',{method:'POST',headers:csrfHeaders({'Content-Type':'application/json'}),
+      body:JSON.stringify({protocol:proto,groups:next})});
+    data=await r.json().catch(function(){return {}});
+  }catch(err){alert('保存失败: '+err.message);return}
+  if(!r.ok){
+    // 服务端拒绝就**弹回服务端的状态**，绝不让界面留着一次没生效的改动 ——
+    // 决策⑦（删被引用的组）就靠这条路径给出人话的拒绝理由。
+    alert('保存失败: '+(data&&data.error?data.error:r.status));
+    schedLoadDraft();renderScheduleProto(proto);
+    return;
+  }
+  rememberScheduleViewForReload();
+  toastThen(okMsg,function(){location.reload()});
+}
+function scheduleToggleAddGroup(proto){
+  const box=document.getElementById('schedGroupCreate-'+proto);
+  if(!box)return;
+  if(box.innerHTML){box.innerHTML='';return}
+  const addable=schedProfilesOf(proto).map(function(p){return p.name});
+  if(!addable.length){alert('本协议下还没有可用方案，先到方案编辑页配置好方案再建组。');return}
+  box.innerHTML='<div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;padding:9px 11px;border:1px dashed var(--border);border-radius:6px">'
+    +'<input type="text" id="schedNewGroupName-'+proto+'" placeholder="组名，如：周末（最多 24 字）" maxlength="24" style="width:220px;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:5px 9px;border-radius:5px;font-size:12px">'
+    +'<span style="color:var(--dim);font-size:12px">第一个方案</span>'
+    +'<select id="schedNewGroupHead-'+proto+'" style="'+SCHED_SEL_STYLE+'">'+schedOpts(addable,'')+'</select>'
+    +'<button type="button" class="btn btn-primary btn-sm" onclick="scheduleCreateGroup(\''+proto+'\')">创建</button>'
+    +'<button type="button" class="btn btn-outline btn-sm" onclick="scheduleToggleAddGroup(\''+proto+'\')">取消</button>'
+    +'<span class="note" style="margin:0">方案组至少要有 1 个方案，所以创建时必须给出第一个；其余成员创建后随时增删。</span></div>';
+  const inp=document.getElementById('schedNewGroupName-'+proto);
+  if(inp)inp.focus();
+}
+function scheduleCreateGroup(proto){
+  const inp=document.getElementById('schedNewGroupName-'+proto),sel=document.getElementById('schedNewGroupHead-'+proto);
+  const name=(inp?inp.value:'').trim();
+  if(!name){alert('请填写方案组名称');return}
+  const head=sel?sel.value:'';
+  if(!head){alert('请选择第一个方案');return}
+  const next=schedCopyGroups(proto);
+  if(next[name]){alert('方案组「'+name+'」已存在');return}
+  if(name.charAt(0)==='@'){alert('方案组名称不能以 @ 开头（@base 是保留字）');return}
+  next[name]=[head];
+  schedSaveGroups(proto,next,'方案组「'+name+'」已创建');
+}
+function scheduleRenameGroup(proto,gi){
+  const names=Object.keys(schedGroups[proto]||{}),name=names[gi];
+  if(!name)return;
+  const to=prompt('新的方案组名称（引用它的时间规则会一起改写）',name);
+  if(to===null)return;
+  const nn=to.trim();
+  if(!nn||nn===name)return;
+  let r2,data;
+  fetch('/api/schedule/groups/rename',{method:'POST',headers:csrfHeaders({'Content-Type':'application/json'}),body:JSON.stringify({name:name,to:nn})})
+    .then(function(r){r2=r;return r.json().catch(function(){return {}})})
+    .then(function(d){
+      data=d;
+      if(!r2.ok){alert('重命名失败: '+(data&&data.error?data.error:r2.status));return}
+      rememberScheduleViewForReload();
+      toastThen('方案组已重命名为「'+nn+'」',function(){location.reload()});
+    })
+    .catch(function(err){alert('重命名失败: '+err.message)});
+}
+function scheduleDeleteGroup(proto,gi){
+  const names=Object.keys(schedGroups[proto]||{}),name=names[gi];
+  if(!name)return;
+  if(!confirm('确定删除方案组「'+name+'」？正被时间规则引用的组会被服务端拒绝，请先修改规则。'))return;
+  fetch('/api/schedule/groups/delete',{method:'POST',headers:csrfHeaders({'Content-Type':'application/json'}),body:JSON.stringify({name:name})})
+    .then(function(r){return r.json().catch(function(){return {}}).then(function(d){
+      if(!r.ok){alert('删除失败: '+(d&&d.error?d.error:r.status));return}
+      rememberScheduleViewForReload();
+      toastThen('方案组「'+name+'」已删除',function(){location.reload()});
+    })})
+    .catch(function(err){alert('删除失败: '+err.message)});
+}
+function scheduleAddMember(proto,gi){
+  const card=document.querySelector('#schedGroups-'+proto+' [data-sgi="'+gi+'"]');
+  const sel=card&&card.querySelector('select[data-sadd]');
+  const name=Object.keys(schedGroups[proto]||{})[gi];
+  if(!card||!sel||!sel.value||!name)return;
+  const next=schedCopyGroups(proto);
+  if(next[name].indexOf(sel.value)>=0)return;
+  next[name].push(sel.value);
+  schedSaveGroups(proto,next,'已把「'+sel.value+'」加入方案组「'+name+'」');
+}
+function scheduleRemoveMember(proto,gi,mi){
+  const name=Object.keys(schedGroups[proto]||{})[gi];
+  const members=name?(schedGroups[proto][name]||[]):[];
+  const member=members[mi];
+  if(!name||!member)return;
+  const next=schedCopyGroups(proto);
+  next[name]=next[name].filter(function(x){return x!==member});
+  schedSaveGroups(proto,next,'已把「'+member+'」移出方案组「'+name+'」');
+}
+function scheduleMoveMember(proto,gi,mi,d){
+  const name=Object.keys(schedGroups[proto]||{})[gi];
+  const members=name?(schedGroups[proto][name]||[]):[];
+  const j=mi+d;
+  if(!name||j<0||j>=members.length)return;
+  const next=schedCopyGroups(proto);
+  const arr=next[name];
+  const x=arr.splice(mi,1)[0];
+  arr.splice(j,0,x);
+  schedSaveGroups(proto,next,'方案组「'+name+'」顺序已更新');
+}
+// ── 时间规则 ──
+function renderScheduleRules(proto,rules){
+  const box=document.getElementById('schedRules-'+proto);
+  if(!box)return;
+  const rows=(rules||[]).map(function(r,i){return schedRuleRowHtml(proto,i,r)}).join('');
+  box.innerHTML=(rows||'<div class="note">暂无规则 —— 未命中任何规则时用侧栏基础组的顺序，与未配置调度时完全一致。</div>')
+    +'<div style="display:flex;justify-content:flex-end;margin-top:8px">'
+    +'<button type="button" class="btn btn-primary btn-sm" onclick="scheduleSaveRules(\''+proto+'\')">保存「'+h(SCHED_PROTO_LABEL[proto])+'」规则</button></div>';
+}
+function schedRuleRowHtml(proto,i,r){
+  const days=Array.isArray(r.days)?r.days:[];
+  const allDay=r.start===null||r.end===null||r.start===undefined||r.end===undefined;
+  const start=allDay?'09:00':r.start,end=allDay?'13:00':r.end;
+  const sh=String(start).slice(0,2),sm=String(start).slice(3,5),eh=String(end).slice(0,2),em=String(end).slice(3,5);
+  const boxStyle='display:inline-flex;align-items:center;gap:3px;cursor:pointer;font-weight:400;margin:0;white-space:nowrap';
+  const dayBoxes=SCHED_DAY_ORDER.map(function(d){
+    return '<label style="'+boxStyle+'"><input type="checkbox" class="sr-day" data-day="'+d+'"'+(days.indexOf(d)>=0?' checked':'')
+      +' onchange="scheduleMarkDirty(\''+proto+'\')" style="width:auto;accent-color:var(--accent)">'+h(RULE_DAY_NAMES[d])+'</label>';
+  }).join('');
+  const nav=function(label,d,dis){return '<button type="button" class="btn btn-outline btn-sm" onclick="scheduleMoveRule(\''+proto+'\','+i+','+d+')"'+(dis?' disabled':'')+'>'+label+'</button>'};
+  const timeSel='<select class="sr-sh" style="'+SCHED_SEL_STYLE+'"'+(allDay?' disabled':'')+' onchange="scheduleMarkDirty(\''+proto+'\')">'+schedHourOpts(sh)+'</select>'
+    +'<select class="sr-sm" style="'+SCHED_SEL_STYLE+'"'+(allDay?' disabled':'')+' onchange="scheduleMarkDirty(\''+proto+'\')">'+schedMinOpts(sm)+'</select>'
+    +'<span style="color:var(--dim)">至</span>'
+    +'<select class="sr-eh" style="'+SCHED_SEL_STYLE+'"'+(allDay?' disabled':'')+' onchange="scheduleMarkDirty(\''+proto+'\')">'+schedHourOpts(eh)+'</select>'
+    +'<select class="sr-em" style="'+SCHED_SEL_STYLE+'"'+(allDay?' disabled':'')+' onchange="scheduleMarkDirty(\''+proto+'\')">'+schedMinOpts(em)+'</select>';
+  return '<div class="sched-rule" data-sri="'+i+'" style="border:1px solid var(--border);border-radius:6px;padding:9px 11px;margin-bottom:8px;font-size:12px;background:var(--surface)">'
+    +'<div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">'
+    +'<b style="color:var(--dim);min-width:20px">'+(i+1)+'</b>'
+    +'<label style="'+boxStyle+'"><input type="checkbox" class="sr-on"'+(r.enabled===false?'':' checked')
+    +' onchange="scheduleMarkDirty(\''+proto+'\')" style="width:auto;accent-color:var(--accent)">启用</label>'
+    +'<span style="display:inline-flex;gap:8px;flex-wrap:wrap">'+dayBoxes+'</span>'
+    +'<label style="'+boxStyle+'"><input type="checkbox" class="sr-allday"'+(allDay?' checked':'')
+    +' onchange="scheduleToggleAllDay(this)" style="width:auto;accent-color:var(--accent)">全天</label>'
+    +timeSel
+    +'<span style="color:var(--dim)">生效组</span>'
+    +'<select class="sr-group" style="'+SCHED_SEL_STYLE+'" onchange="scheduleMarkDirty(\''+proto+'\')">'+schedGroupOptions(proto,r.group)+'</select>'
+    +'<span class="sr-match" style="font-size:11px"></span>'
+    +'<span style="margin-left:auto;display:flex;gap:4px">'+nav('↑',-1,i===0)+nav('↓',1,false)
+    +'<button type="button" class="btn btn-outline btn-sm" onclick="scheduleRemoveRule(\''+proto+'\','+i+')">删除</button></span>'
+    +'</div></div>';
+}
+// 「全天」勾上就禁用时段下拉：截断的时段比禁用控件更容易被误读成「已生效的 09:00-13:00」。
+function scheduleToggleAllDay(cb){
+  const row=cb.closest('.sched-rule');
+  if(!row)return;
+  row.querySelectorAll('.sr-sh,.sr-sm,.sr-eh,.sr-em').forEach(function(s){s.disabled=cb.checked});
+  const proto=(row.closest('[data-sched-proto]')||{}).dataset.schedProto;
+  if(proto)scheduleMarkDirty(proto);
+}
+function scheduleMarkDirty(proto){
+  schedDirty[proto]=true;
+  document.querySelectorAll('#schedRules-'+proto+' .sr-match').forEach(function(b){b.textContent='未保存';b.style.color='var(--dim)'});
+}
+function scheduleCollectRules(proto){
+  const rows=document.querySelectorAll('#schedRules-'+proto+' .sched-rule');
+  return Array.prototype.map.call(rows,function(row){
+    const days=[];
+    row.querySelectorAll('.sr-day').forEach(function(cb){if(cb.checked)days.push(parseInt(cb.dataset.day,10))});
+    const q=function(k){const s=row.querySelector('.sr-'+k);return s?s.value:''};
+    const rule={days:days,start:null,end:null,group:q('group')};
+    if(!row.querySelector('.sr-allday').checked)rule.start=q('sh')+':'+q('sm'),rule.end=q('eh')+':'+q('em');
+    if(!row.querySelector('.sr-on').checked)rule.enabled=false;
+    return rule;
+  });
+}
+function scheduleAddRule(proto){
+  const r=scheduleCollectRules(proto);
+  const names=Object.keys(schedGroups[proto]||{});
+  r.push({days:[1,2,3,4,5],start:'09:00',end:'13:00',group:names.length?names[0]:SCHED_BASE});
+  schedDirty[proto]=true;
+  renderScheduleRules(proto,r);
+}
+function scheduleRemoveRule(proto,i){
+  const r=scheduleCollectRules(proto);
+  r.splice(i,1);
+  schedDirty[proto]=true;
+  renderScheduleRules(proto,r);
+}
+function scheduleMoveRule(proto,i,d){
+  const r=scheduleCollectRules(proto);
+  const j=i+d;
+  if(j<0||j>=r.length)return;
+  const x=r.splice(i,1)[0];
+  r.splice(j,0,x);
+  schedDirty[proto]=true;
+  renderScheduleRules(proto,r);
+}
+async function scheduleSaveRules(proto){
+  const rules=scheduleCollectRules(proto);
+  let r,data;
+  try{
+    r=await fetch('/api/schedule/rules',{method:'POST',headers:csrfHeaders({'Content-Type':'application/json'}),
+      body:JSON.stringify({protocol:proto,rules:rules})});
+    data=await r.json().catch(function(){return {}});
+  }catch(err){alert('保存失败: '+err.message);return}
+  if(!r.ok){alert('保存失败: '+(data&&data.error?data.error:r.status));return}
+  rememberScheduleViewForReload();
+  toastThen(SCHED_PROTO_LABEL[proto]+'时间规则已保存（'+rules.length+' 条，自上而下首条命中胜）',function(){location.reload()});
+}
+async function scheduleSetOverride(proto){
+  const sel=document.getElementById('schedOverrideSel-'+proto);
+  if(!sel)return;
+  const label=sel.options[sel.selectedIndex]?sel.options[sel.selectedIndex].textContent:sel.value;
+  if(!confirm('把「'+label+'」指定为当前生效组？它会在下一个时间边界自动收回。'))return;
+  await schedPostOverride(proto,sel.value,'手动指定已生效');
+}
+async function scheduleClearOverride(proto){
+  await schedPostOverride(proto,null,'已取消手动指定');
+}
+async function schedPostOverride(proto,group,okMsg){
+  let r,data;
+  try{
+    r=await fetch('/api/schedule/override',{method:'POST',headers:csrfHeaders({'Content-Type':'application/json'}),
+      body:JSON.stringify({protocol:proto,group:group,action:group?'set':'clear'})});
+    data=await r.json().catch(function(){return {}});
+  }catch(err){alert('操作失败: '+err.message);return}
+  if(!r.ok){alert('操作失败: '+(data&&data.error?data.error:r.status));return}
+  rememberScheduleViewForReload();
+  toastThen(okMsg,function(){location.reload()});
+}
+// ── 状态回显（30s 轮询 + 打开视图时立即一次）──
+// **只改横幅、告警与「命中」徽章，绝不重建输入控件** —— 重建会把用户正在编辑的规则表抹掉。
+async function updateScheduleStatus(){
+  let r,data;
+  try{
+    r=await fetch('/api/schedule',{headers:csrfHeaders({})});
+    data=await r.json();
+  }catch(e){return}   // 轮询失败保持上一次的显示：调度本身不受影响，不值得打断用户
+  if(!r.ok||!data||!data.protocols)return;
+  schedState=data.protocols;
+  SCHED_PROTOS.forEach(function(proto){if(document.getElementById('schedActive-'+proto))renderScheduleStatus(proto)});
+}
+function renderScheduleStatus(proto){
+  const st=schedState[proto];
+  if(!st)return;
+  // ① 当前生效：这一条是「默认入口」徽章在规则生效期间会误导人的唯一补丁，必须写清组头。
+  const el=document.getElementById('schedActive-'+proto);
+  if(el){
+    const a=st.active||{};
+    const baseLabel='基础组（侧栏「'+(proto==='responses'?'OpenAI 方案组':'默认方案组')+'」）';
+    const gname=a.group===SCHED_BASE?baseLabel:(a.group||'（未知）');
+    let line='<b>当前生效：'+h(gname)+'</b>（'+h((a.members||[]).join(' → ')||'无成员')+'）';
+    if(a.source==='manual')line+=' <span style="color:var(--orange)">手动指定覆盖中</span>';
+    else if(a.source==='rule')line+=' · 规则「'+h(a.ruleSummary||'')+'」';
+    else line+=' · 无规则命中';
+    if(st.next){
+      line+='<br>下次切换：'+h(st.next.at)
+        +(st.next.reason==='override_expire'?' 手动指定到期，按规则重新判定':' → '+h(st.next.group===SCHED_BASE?'基础组':st.next.group));
+    }
+    line+='<br><span style="color:var(--dim)">组头（failover 首选）：'+h(a.head||'无')+' · 规则表 '+(st.rules||[]).length+' 条</span>';
+    el.innerHTML=line;
+  }
+  // ② 手动指定横幅：到点自动收回这件事必须看得见，否则用户不知道它已经过期了
+  const ov=document.getElementById('schedOverride-'+proto),ovt=document.getElementById('schedOverrideText-'+proto);
+  if(ov&&ovt){
+    if(st.override){
+      ov.style.display='flex';
+      ovt.innerHTML='<b>手动指定：'+h(st.override.group===SCHED_BASE?'基础组':st.override.group)+'</b>（覆盖调度规则）· '+h(st.override.untilLabel)+' 自动收回'
+        +(st.override.by?' · 由 '+h(st.override.by)+' 指定':'');
+    }else{ov.style.display='none';ovt.textContent=''}
+  }
+  // ③ 配置健康度：空组与永不生效的规则都点名说出来，不静默
+  const hl=document.getElementById('schedHealth-'+proto);
+  if(hl){
+    const hh=st.health||{},msgs=[];
+    (hh.emptyGroups||[]).forEach(function(n){msgs.push('方案组「'+h(n)+'」没有有效成员')});
+    (hh.inertRules||[]).forEach(function(x){
+      const rule=(st.rules||[])[x.index];
+      msgs.push('第 '+(x.index+1)+' 条规则'+(rule?'（'+h(schedRuleLabel(rule))+'）':'')
+        +(x.reason==='empty_group'?'指向的方案组为空，求值时会被跳过':'引用的方案组不存在，永不生效'));
+    });
+    hl.innerHTML=msgs.length?'<b style="color:var(--orange)">注意：'+msgs.join('；')+'</b>':'';
+  }
+  // ④ 逐行「命中」：由服务端算好，前端只回显。规则表有未保存的重排时不回显（下标会对不上）。
+  const rows=document.querySelectorAll('#schedRules-'+proto+' .sched-rule');
+  if(schedDirty[proto])return;
+  const matched=st.ruleMatched||[];
+  Array.prototype.forEach.call(rows,function(row,i){
+    const badge=row.querySelector('.sr-match');
+    if(!badge)return;
+    if(matched[i]){badge.textContent='当前命中';badge.style.color='var(--green)'}
+    else{badge.textContent=''}
+  });
+}
+setInterval(function(){
+  if(document.getElementById('planScheduleView')&&!document.getElementById('planScheduleView').hidden)updateScheduleStatus();
+},30000);
 // Editing an alias's target model changes the set of models the rate rows can
 // point at, so keep those dropdowns in sync with every keystroke.
 document.getElementById('aliasRows').addEventListener('input',()=>{refreshPeakSelects();updateAllowedTags();refreshAllRateSelects()});
@@ -1112,6 +1533,9 @@ else{renderAliasRows(SETTINGS.profiles.find(p=>p.suffix===SETTINGS.selectedProfi
 // the 额度池 view instead of the profile form. sessionStorage = once only, this
 // session; a fresh open of the settings page starts on profiles as usual.
 try{if(sessionStorage.getItem('tm_return_pool_view')==='1'){sessionStorage.removeItem('tm_return_pool_view');openQuotaPoolView()}}catch(e){}
+// Same one-shot for the 方案组调度 view: an admin adjusting several groups/rules in a
+// row shouldn't be kicked back to the profile form after each save.
+try{if(sessionStorage.getItem('tm_return_schedule_view')==='1'){sessionStorage.removeItem('tm_return_schedule_view');openPlanScheduleView()}}catch(e){}
 })();
 document.addEventListener("keydown",e=>{if(e.key==="Enter"&&e.target.tagName!=="TEXTAREA"&&e.target.tagName!=="INPUT")e.preventDefault()});
 // ─── 产出与成本设置(参考牌价表 + 产出解析开关;走 /api/production/settings,独立于 settings-save 表单)───

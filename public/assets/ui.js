@@ -89,3 +89,25 @@ function clientLabel(client){
   if(CLIENT_LABELS[key])return CLIENT_LABELS[key];
   return key||'未识别';
 }
+// 方案组调度：把星期下标数组渲染成一个紧凑标签（"周一~周五"）。
+// **纯展示**，没有判定语义 —— 哪条规则命中由服务端决定，这里只是把紧挨着的那 7 个
+// 复选框回显一遍，所以它算错也只是标签难看，不会让人误判路由。
+const RULE_DAY_NAMES=['周日','周一','周二','周三','周四','周五','周六'];
+const RULE_DAY_ORDER=[1,2,3,4,5,6,0];   // 展示顺序按周一开头，0=周日放最后
+function describeRuleDays(days){
+  if(!Array.isArray(days)||days.length===0)return '每天';
+  // 先映射成「周一开头」的下标，再在线性下标上折叠连续段 —— 比在星期值上判相邻简单得多。
+  const idx=[];
+  for(let i=0;i<RULE_DAY_ORDER.length;i++)if(days.indexOf(RULE_DAY_ORDER[i])>=0)idx.push(i);
+  if(idx.length===0||idx.length===7)return '每天';
+  const out=[];
+  let i=0;
+  while(i<idx.length){
+    let j=i;
+    while(j+1<idx.length&&idx[j+1]===idx[j]+1)j++;
+    if(j-i>=2)out.push(RULE_DAY_NAMES[RULE_DAY_ORDER[idx[i]]]+'~'+RULE_DAY_NAMES[RULE_DAY_ORDER[idx[j]]]);
+    else out.push(idx.slice(i,j+1).map(function(k){return RULE_DAY_NAMES[RULE_DAY_ORDER[k]]}).join('、'));
+    i=j+1;
+  }
+  return out.join('、');
+}

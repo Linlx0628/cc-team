@@ -11,7 +11,11 @@ import { initProductionDb, createProductionTracker, rangeFromTo, productionSumma
   computeCosts, contextHealth, buildReportHTML, ALERT_KIND_LABEL, alertDetailText,
   sessionProjectLabels, sessionToolStats, sessionKey } from "./production.mjs";
 import { cnNow, cnDate, cnHalfHour, secondsUntilNextCnMidnight, cnWeekStartIso, cnWeekStartDate, cnDayStartIso } from "./lib/time.mjs";
-import { parsePeakTimeMinutes, normalizePeakHours, isInPeakHours, formatPeakHoursSummary } from "./lib/schedule.mjs";
+import { parsePeakTimeMinutes, normalizePeakHours, isInPeakHours, formatPeakHoursSummary,
+  BASE_GROUP_TOKEN, resolveEffectiveGroup, formatScheduleRuleSummary,
+  normalizeScheduleGroups, normalizeScheduleRules, normalizeScheduleRule, normalizeScheduleGroupName,
+  nextScheduleBoundary, msUntilNextBeijingMidnight, describeScheduleHealth, matchesScheduleRule,
+  beijingDayOfWeek, GROUP_NAME_MAX, ALL_DAYS, DAY_LABELS } from "./lib/schedule.mjs";
 import { sanitizeJson } from "./lib/sanitize.mjs";
 import { QUOTA_RATE_MAX, normalizeQuotaRate, normalizeCacheReadQuotaRate, normalizeModelQuotaRates, lookupModelQuotaRate, currentQuotaRate, nextRateChangeHint, QUOTA_POOL_NAME_MAX, normalizeQuotaPoolName, canonicalJson, shortDigest, applyStickyReorder, buildPoolResolver, quotaExceededMessage, quotaErrorDetail, buildQuotaCore } from "./lib/quota.mjs";
 import { CB_MAX_BACKOFF_FACTOR, CB_MAX_COOLDOWN_MS, CircuitBreaker } from "./lib/circuit.mjs";
@@ -581,6 +585,69 @@ function profilePeakHoursMap() {
   if (migrated) {
     saveConfig(config);
     console.log(`[MIGRATE] Added profile protocol field; responses group: ${JSON.stringify(config.responsesProfileGroup)}`);
+  }
+})();
+
+// Auto-migrate: 方案组调度（命名方案组 + 时间规则 + 手动指定）。
+// 必须排在 migrateProfileProtocol 之后 —— 它依赖 profiles 的 protocol 与两个组数组都已定型。
+// **规则为空时行为与升级前完全一致**：生效组恒等于基础组，功能完全惰性。这是本功能最重要的
+// 安全性质，所以迁移只在真的改了东西时才写盘与打日志。
+(function migrateSchedule() {
+  const protoOfProfile = (name) => {
+    const p = config.profiles[name];
+    return p ? normalizeProfileProtocol(p.protocol) : null;
+  };
+  const before = JSON.stringify([config.scheduleGroups, config.scheduleRules, config.scheduleOverride]);
+  const notes = [];
+
+  // 1) 命名组。成员被剪空的组**保留**（通常来自「组里的方案被删了」）—— 连组带规则一起
+  //    静默丢掉会让用户配置凭空消失，留着并由设置页标红才是诚实的失败方式。
+  const groups = normalizeScheduleGroups(config.scheduleGroups, protoOfProfile);
+  // 2) 规则：按协议分桶保序归一。@base 恒合法；其余必须指向**本协议**已存在的组。
+  const rulesIn = (config.scheduleRules && typeof config.scheduleRules === "object" && !Array.isArray(config.scheduleRules)) ? config.scheduleRules : {};
+  const rulesOut = {};
+  for (const proto of ["anthropic", "responses"]) {
+    rulesOut[proto] = normalizeScheduleRules(rulesIn[proto], (name) => {
+      const g = groups[name];
+      return !!(g && g.protocol === proto);
+    });
+  }
+  // 3) 手动指定。启动是唯一会**物理删除**过期条目的地方之一（另一处是覆盖写路由）；
+  //    运行中过期的条目留在 config.json 里但完全 inert —— 请求内只做 expiresAt 比较，
+  //    这里不清也不会让过期条目生效，只是会留下一条没人看的记录。
+  const overrideOut = {};
+  const overrideIn = (config.scheduleOverride && typeof config.scheduleOverride === "object" && !Array.isArray(config.scheduleOverride)) ? config.scheduleOverride : {};
+  for (const proto of ["anthropic", "responses"]) {
+    const o = overrideIn[proto];
+    if (!o || typeof o !== "object" || Array.isArray(o)) continue;
+    const g = typeof o.group === "string" ? o.group : "";
+    const until = Date.parse(o.expiresAt);
+    // 组名不存在 / 协议不符 / 空组 / 到期时刻不可解析 / 已过期 → 删除。
+    let members = null;
+    if (g === BASE_GROUP_TOKEN) {
+      members = proto === "responses"
+        ? (Array.isArray(config.responsesProfileGroup) ? config.responsesProfileGroup : [])
+        : (Array.isArray(config.defaultProfileGroup) ? config.defaultProfileGroup : []);
+    } else {
+      const grp = groups[g];
+      if (grp && grp.protocol === proto) members = grp.members;
+    }
+    if (!g || !Number.isFinite(until) || until <= Date.now() || !members || members.length === 0) {
+      notes.push(`清除无效/已过期的方案组手动指定: ${proto}`);
+      continue;
+    }
+    overrideOut[proto] = o;
+  }
+
+  config.scheduleGroups = groups;
+  config.scheduleRules = rulesOut;
+  config.scheduleOverride = overrideOut;
+  const after = JSON.stringify([config.scheduleGroups, config.scheduleRules, config.scheduleOverride]);
+  if (before !== after || notes.length > 0) {
+    saveConfig(config);
+    const summary = Object.entries(rulesOut).map(([p, rs]) => `${p}=${rs.length}`).join(", ");
+    console.log(`[MIGRATE] 方案组调度已归一：组 ${Object.keys(groups).length} 个，规则 ${summary}（规则为空时行为与升级前完全一致）`,
+      notes.length ? `；${notes.join("；")}` : "");
   }
 })();
 
@@ -1251,7 +1318,16 @@ function deleteStickyProfile(protocol, userKey, signal) {
 // A single Map entry per group head records which member is currently taking
 // over its traffic, so a sustained outage logs one "switch" (and one
 // "recover") instead of one line per request.
-const failoverActive = new Map(); // head profile name → { member, at }
+// key = `${protocol}|${组头名}`。协议前缀是必须的：两个协议可以各有一个同名组头，
+// 不带前缀会让它们互相顶掉对方的记录。
+const failoverActive = new Map(); // `${protocol}|${head}` → { member, at }
+
+// 组定义变了（改名/改序/删方案）以后，任何「某组头正在被某成员代答」的记录都失去了参照
+// —— 组头可能已经不是组头，也可能已经不存在。留着它会让下一次切换漏写一条 failover.switch
+// （new head 的 entry 被旧 key 挡住），并且永远等到进程结束才消失。
+function resetFailoverTracking() {
+  if (failoverActive.size > 0) failoverActive.clear();
+}
 
 function getRuntimeByProfileName(name) {
   for (const r of Object.values(runtimes)) {
@@ -1260,36 +1336,98 @@ function getRuntimeByProfileName(name) {
   return null;
 }
 
-function noteFailoverServed(protocol, servedBy, userName) {
-  const headName = protocol === "responses"
-    ? (Array.isArray(config.responsesProfileGroup) ? config.responsesProfileGroup[0] : null)
-    : (Array.isArray(config.defaultProfileGroup) ? config.defaultProfileGroup[0] : null);
-  if (!headName || servedBy === headName) {
-    if (headName && servedBy === headName && failoverActive.has(headName)) {
-      const prev = failoverActive.get(headName);
-      failoverActive.delete(headName);
-      recordAudit("system", "failover.recover", headName,
-        `组头 "${headName}" 恢复接管（此前由 "${prev.member}" 代答），流量切回`);
+// ─── 方案组调度：生效组解析 ───────────────────────────────────────────────────
+// 本次请求的生效组。整个请求**只解析一次**：候选生成、粘性绑定判定、failover 审计三处必须看到
+// 同一个答案 —— 若各自读一次，请求恰好跨过时间边界时三处会算出不同的组头，后果是粘性绑定被
+// 每轮清掉（跨轮 prompt 缓存亲和不报错地失效）并且审计会谎称组头不可用。
+// 照 effectiveModelAliases() 的既有范式：按请求求值，所以跨过时间边界不需要 reload config。
+// ignoreOverride=true 用来问「**不考虑**手动指定时，规则会选哪个组」—— 手动指定路由需要它来
+// 判断这次指定是不是一个空操作。
+function resolveRequestGroup(protocol, date = new Date(), ignoreOverride = false) {
+  const baseGroup = protocol === "responses"
+    ? (Array.isArray(config.responsesProfileGroup) ? config.responsesProfileGroup : [])
+    : (Array.isArray(config.defaultProfileGroup) ? config.defaultProfileGroup : []);
+  const fallback = { members: baseGroup.slice(), source: "base", groupName: BASE_GROUP_TOKEN, ruleIndex: -1, rule: null };
+  try {
+    return resolveEffectiveGroup({
+      baseGroup,
+      groups: config.scheduleGroups || {},
+      rules: ((config.scheduleRules || {})[protocol]) || [],
+      override: ignoreOverride ? null : ((config.scheduleOverride || {})[protocol] || null),
+    }, protocol, date);
+  } catch (err) {
+    // 调度配置损坏绝不能让请求 500 —— 退回基础组等价于「这个功能没开」。
+    console.warn(`[SCHEDULE] ${protocol} 生效组解析失败，已回退基础组: ${err.message}`);
+    return fallback;
+  }
+}
+
+// 调度切换审计 + 僵尸条目清理。用「状态对比」而不是「定时器」：lastServedGroup 记住上一次真正
+// 服务过请求的生效组，组名一变就写一条 —— 天然去重，不需要 cron。首次观测只记基线不写日志
+// （否则每次重启都多一条假切换）。
+const lastServedGroup = new Map(); // protocol → { key, head }
+
+function noteGroupSwitch(protocol, group, userName) {
+  try {
+    const key = group.groupName || BASE_GROUP_TOKEN;
+    const head = group.members[0] || null;
+    const prev = lastServedGroup.get(protocol);
+    if (prev && prev.key === key) return;
+    lastServedGroup.set(protocol, { key, head });
+
+    // 生效组换了头，旧组头的代答记录就永远等不到它的「恢复接管」了 —— 必须就地作废，
+    // 否则 failoverActive 会留下一条指向已卸任组头的僵尸条目，并且下次回到那个组时
+    // 会因为 prev.member 相同而漏掉一条本该写的 switch 日志。
+    for (const k of [...failoverActive.keys()]) {
+      if (k.startsWith(`${protocol}|`) && k !== `${protocol}|${head || ""}`) failoverActive.delete(k);
+    }
+    if (!prev) return;  // 首次观测：只记基线
+
+    const label = group.source === "manual" ? "手动指定" : "方案组调度";
+    const rule = group.rule ? `（规则: ${formatScheduleRuleSummary(group.rule)}）` : "";
+    recordAudit("system", "schedule.group_switch", `${prev.key} → ${key}`,
+      `${label}：生效方案组由 "${prev.key}" 切换为 "${key}"，组内优先级 ${group.members.join(" → ")}${rule}${userName ? `（触发用户: ${userName}）` : ""}`);
+  } catch (err) {
+    console.warn(`[SCHEDULE] 组切换审计失败: ${err.message}`);
+  }
+}
+
+// headName 缺省时退回「基础组头」＝升级前的行为，所以非请求调用点不必传。
+function noteFailoverServed(protocol, servedBy, userName, headName) {
+  const head = headName !== undefined
+    ? headName
+    : (protocol === "responses"
+      ? (Array.isArray(config.responsesProfileGroup) ? config.responsesProfileGroup[0] : null)
+      : (Array.isArray(config.defaultProfileGroup) ? config.defaultProfileGroup[0] : null));
+  const key = head ? `${protocol}|${head}` : null;
+  if (!key || servedBy === head) {
+    if (key && servedBy === head && failoverActive.has(key)) {
+      const prev = failoverActive.get(key);
+      failoverActive.delete(key);
+      recordAudit("system", "failover.recover", head,
+        `组头 "${head}" 恢复接管（此前由 "${prev.member}" 代答），流量切回`);
     }
     return;
   }
-  const prev = failoverActive.get(headName);
+  const prev = failoverActive.get(key);
   if (!prev || prev.member !== servedBy) {
-    const headRt = getRuntimeByProfileName(headName);
-    const why = isRateLimited(headName) ? "被限流" : (headRt && headRt.breaker.status().state === "OPEN" ? "熔断" : "");
-    failoverActive.set(headName, { member: servedBy, at: Date.now() });
-    recordAudit("system", "failover.switch", `${headName} → ${servedBy}`,
-      `组头 "${headName}"${why ? `因${why}不可用` : "不可用"}，请求自动切换到备选方案 "${servedBy}"${userName ? `（触发用户: ${userName}）` : ""}`);
+    const headRt = getRuntimeByProfileName(head);
+    const why = isRateLimited(head) ? "被限流" : (headRt && headRt.breaker.status().state === "OPEN" ? "熔断" : "");
+    failoverActive.set(key, { member: servedBy, at: Date.now() });
+    recordAudit("system", "failover.switch", `${head} → ${servedBy}`,
+      `组头 "${head}"${why ? `因${why}不可用` : "不可用"}，请求自动切换到备选方案 "${servedBy}"${userName ? `（触发用户: ${userName}）` : ""}`);
   }
 }
 
 
 // Ordered list of currently-usable default-group profiles for a given user key.
 // Skips: rate-limited, breaker OPEN, user not authorized, or profiles with no runtime.
-function getAvailableDefaultProfiles(apiKey) {
-  const group = Array.isArray(config.defaultProfileGroup) ? config.defaultProfileGroup : [];
+// `group` 是本次请求的**生效组**成员（调度规则可能给出另一套顺序/集合）。缺省即基础组，
+// 所以未来任何非请求调用点不传这个参数时不可能被时间规则悄悄影响。
+function getAvailableDefaultProfiles(apiKey, group) {
+  const members = Array.isArray(group) ? group : (Array.isArray(config.defaultProfileGroup) ? config.defaultProfileGroup : []);
   const out = [];
-  for (const name of group) {
+  for (const name of members) {
     const profile = config.profiles[name];
     if (!profile) continue;
     const suffix = normalizeProfileSuffix(profile.suffix);
@@ -1312,10 +1450,10 @@ function getAvailableDefaultProfiles(apiKey) {
 // Ordered failover candidates for the /v1/responses entry. Mirrors
 // getAvailableDefaultProfiles but reads the responses group and only ever
 // yields responses-protocol profiles.
-function getAvailableResponsesProfiles(apiKey) {
-  const group = Array.isArray(config.responsesProfileGroup) ? config.responsesProfileGroup : [];
+function getAvailableResponsesProfiles(apiKey, group) {
+  const members = Array.isArray(group) ? group : (Array.isArray(config.responsesProfileGroup) ? config.responsesProfileGroup : []);
   const out = [];
-  for (const name of group) {
+  for (const name of members) {
     const profile = config.profiles[name];
     if (!profile) continue;
     const suffix = normalizeProfileSuffix(profile.suffix);
@@ -2166,6 +2304,12 @@ function attachRequestLogger(res, clientState, reqLog) {
       model: reqLog.model || "",
       servedModel: (usage && usage.model) || "",
       profile: reqLog.profile || "",
+      // 方案组调度：这次请求**按哪个组**选的路由，以及那个组是怎么定下来的
+      // （rule=时间规则 / manual=手动指定 / base=基础组）。调度上线后同一用户相邻两次请求
+      // 可能落到完全不同的组，只看 profile 无法解释「为什么这次用了火山」。
+      // 即使候选全失败也不清空（profile 会被清成 ""），因为「哪个组生效」是有答案的。
+      group: reqLog.group || "",
+      groupSource: reqLog.groupSource || "",
       client: reqLog.client || "",
       userAgent: reqLog.userAgent || "",
       in: usage ? (usage.usage.input_tokens || 0) : 0,
@@ -2242,6 +2386,70 @@ function sendUpstream(body, reqUrl, reqMethod, reqHeaders, timeout, _rt, clientS
 
 // ─── Settings API Helpers ─────────────────────────────────────────────────────
 
+// ─── 方案组调度：对外状态 ─────────────────────────────────────────────────────
+// 北京时间的紧凑时刻标签（"09-15(周一) 09:00"），前端直接显示，不做任何时区换算。
+// cnNow 返回的是已 +8 的「伪 UTC」，所以切片即可，与全项目「存储 UTC、展示 +8」同一手法。
+function formatScheduleMoment(date) {
+  const iso = cnNow(date.getTime()).toISOString();
+  return `${iso.slice(5, 10)}(${DAY_LABELS[beijingDayOfWeek(date)]}) ${iso.slice(11, 16)}`;
+}
+
+// 设置页与首屏共用的调度状态。**服务端一个实现，前端不复刻匹配逻辑** ——
+// 否则两份判定必然漂移（现成的教训：nowInPeakHours vs isInPeakHours）。
+function buildScheduleState() {
+  const now = new Date();
+  const out = { protocols: {} };
+  for (const proto of ["anthropic", "responses"]) {
+    const baseGroup = proto === "responses"
+      ? (Array.isArray(config.responsesProfileGroup) ? config.responsesProfileGroup : [])
+      : (Array.isArray(config.defaultProfileGroup) ? config.defaultProfileGroup : []);
+    const groups = {};
+    for (const [name, g] of Object.entries(config.scheduleGroups || {})) {
+      if (!g || typeof g !== "object" || g.protocol !== proto) continue;
+      // protocol 必须留着：describeScheduleHealth 按它过滤，前端也按它分区段渲染。
+      // 少了这个字段，health 会把每个组都当成「不存在」，于是每条规则都被报成
+      // unknown_group —— 一个永久误报的警告，比不报还糟。
+      groups[name] = { protocol: proto, members: Array.isArray(g.members) ? g.members.slice() : [] };
+    }
+    const rules = Array.isArray((config.scheduleRules || {})[proto]) ? config.scheduleRules[proto] : [];
+    const override = (config.scheduleOverride || {})[proto] || null;
+    const active = resolveRequestGroup(proto, now);
+    const health = describeScheduleHealth({ groups, rules, override }, proto);
+    let overrideAlive = false;
+    let overrideUntilLabel = "";
+    if (override && Number.isFinite(Date.parse(override.expiresAt)) && Date.parse(override.expiresAt) > now.getTime()) {
+      overrideAlive = true;
+      overrideUntilLabel = formatScheduleMoment(new Date(Date.parse(override.expiresAt)));
+    }
+    // 「下次切换」= 下一个会真正改变生效组的时刻。手动指定期间它的到期时刻就是按定义算出来的
+    // 那个边界，所以直接报到期时刻更诚实（也解释了「为什么是那个点」）。
+    let next = null;
+    if (overrideAlive) {
+      next = { at: overrideUntilLabel, group: BASE_GROUP_TOKEN, reason: "override_expire" };
+    } else {
+      const b = nextScheduleBoundary(rules, now);
+      if (b) next = { at: formatScheduleMoment(new Date(now.getTime() + b.deltaMs)), group: b.group, reason: "rule" };
+    }
+    out.protocols[proto] = {
+      baseGroup: baseGroup.slice(),
+      groups,
+      rules,
+      ruleSummaries: rules.map(r => formatScheduleRuleSummary(r)),
+      // 每条规则当前是否命中（同一份判定，前端只渲染不判断）
+      ruleMatched: rules.map(r => !!matchesScheduleRule(r, now)),
+      active: {
+        group: active.groupName, source: active.source, ruleIndex: active.ruleIndex,
+        members: active.members.slice(), head: active.members[0] || null,
+        ruleSummary: active.rule ? formatScheduleRuleSummary(active.rule) : "",
+      },
+      next,
+      override: overrideAlive ? { group: override.group, expiresAt: override.expiresAt, at: override.at || "", by: override.by || "", untilLabel: overrideUntilLabel } : null,
+      health,
+    };
+  }
+  return out;
+}
+
 function getPublicSettings() {
   const globalUsers = {};
   for (const [k, v] of Object.entries(config.users || {})) {
@@ -2289,6 +2497,15 @@ function getPublicSettings() {
     autoQuotaAdjust: config.autoQuotaAdjust || {},
     checkIn: config.checkIn || {},
     quotaRequest: config.quotaRequest || {},
+    // 首屏与 GET /api/schedule 同源：页面加载时不必再发一次请求就能画出「当前生效」。
+    // 调度配置坏掉不该连带打不开设置页 —— 退化成「无调度」，而不是让 getPublicSettings 抛。
+    schedule: (() => {
+      try { return buildScheduleState(); }
+      catch (err) {
+        console.warn(`[SCHEDULE] 生成调度状态失败，设置页退化为空调度: ${err.message}`);
+        return { protocols: {} };
+      }
+    })(),
   };
 }
 
@@ -2493,6 +2710,8 @@ const PROXY_CORE_DEPS = {
   mergeUsageCounters,
   modelNotAllowedMessage,
   noteFailoverServed,
+  noteGroupSwitch,
+  resolveRequestGroup,
   notifierApi,
   port,
   productionEnabled,
@@ -2793,6 +3012,281 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+  // ─── 方案组调度 API ─────────────────────────────────────────────────────────
+  // 全部照 /api/restrict-group-suffix 的先例：表单外 + JSON 即时保存 + 自己的审计。
+  // 有意不走 applySettings 白名单 —— 否则「保存任意一个方案的设置」会顺带写一遍**全局**调度
+  // 配置（lib/settings-write.mjs:250 的注释正是在警告这种跨域污染），而且规则引用 profile 名，
+  // 表单快照式提交会把改名前的旧名字一起提交回来。
+  // 生效时机是**落盘即生效，不 reload**：resolveRequestGroup 按请求求值（照 effectiveModelAliases
+  // 的既有范式），所以跨过时间边界不需要重启，reloadAllRuntimes 的代价则真实而收益为零。
+
+  if (req.method === "GET" && req.url === "/api/schedule") {
+    if (!checkAuth(req)) { res.writeHead(401); res.end("Unauthorized"); return; }
+    // 同样先算 body 再写头：buildScheduleState 抛错时必须是干净的 500，而不是
+    // 「已发头 → 再写头 → 未捕获异常」把进程带走。
+    let body;
+    try { body = JSON.stringify({ ok: true, ...buildScheduleState() }); }
+    catch (err) {
+      console.warn(`[SCHEDULE] 生成调度状态失败: ${err.message}`);
+      res.writeHead(500, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "调度状态生成失败" }));
+      return;
+    }
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(body);
+    return;
+  }
+
+  // 组：整体替换。决策⑦ 的两个入口都必须拦 —— 显式删除与「整体替换时省掉某个组」是同一件
+  // 事的两个入口，只拦前者会留一个静默删组的洞。
+  if (req.method === "POST" && req.url === "/api/schedule/groups") {
+    if (!checkAuth(req)) { res.writeHead(401); res.end("Unauthorized"); return; }
+    if (!checkCsrf(req)) { res.writeHead(403); res.end("CSRF validation failed"); return; }
+    readBody(req, 100_000).then(buf => {
+      try {
+        const { protocol, groups } = JSON.parse(buf.toString());
+        const proto = normalizeProfileProtocol(protocol);
+        if (!groups || typeof groups !== "object" || Array.isArray(groups)) throw new Error("groups 必须是「组名 → 方案名数组」的对象");
+        const next = {};
+        for (const [rawName, rawMembers] of Object.entries(groups)) {
+          const name = normalizeScheduleGroupName(rawName);   // 抛中文错：空/过长/以 @ 开头
+          if (next[name]) throw new Error(`方案组 "${name}" 重复`);
+          if (!Array.isArray(rawMembers)) throw new Error(`方案组 "${name}" 的成员必须是方案名数组`);
+          const members = [];
+          for (const m of rawMembers) {
+            if (typeof m !== "string" || !m.trim()) continue;
+            const member = m.trim();
+            if (!config.profiles[member]) continue;   // 成员不存在 → 静默剪掉（照 /api/profile/default-group 的约定）
+            if (normalizeProfileProtocol(config.profiles[member].protocol) !== proto) {
+              throw new Error(`方案 "${member}" 不是 ${proto} 协议方案，不能加入调度组 "${name}"`);
+            }
+            if (!members.includes(member)) members.push(member);
+          }
+          if (members.length === 0) throw new Error(`方案组 "${name}" 至少需要 1 个方案`);
+          next[name] = { protocol: proto, members };
+        }
+        // 决策⑦：这次替换会让某个「正被规则引用」的组消失 → 整体拒绝。
+        const referenced = new Set();
+        for (const r of (Array.isArray((config.scheduleRules || {})[proto]) ? config.scheduleRules[proto] : [])) {
+          if (r && typeof r.group === "string" && r.group !== BASE_GROUP_TOKEN) referenced.add(r.group);
+        }
+        const gone = [...referenced].filter(n => !next[n]);
+        if (gone.length) {
+          const counts = gone.map(n => `"${n}"（${config.scheduleRules[proto].filter(r => r && r.group === n).length} 条）`);
+          throw new Error(`方案组 ${counts.join("、")} 正被时间规则引用，请先修改或删除这些规则`);
+        }
+        // 其它协议的组原样保留。
+        const merged = {};
+        for (const [name, g] of Object.entries(config.scheduleGroups || {})) {
+          if (g && g.protocol !== proto) merged[name] = g;
+        }
+        config.scheduleGroups = { ...merged, ...next };
+        saveConfig(config);
+        resetFailoverTracking();
+        recordAdminAudit(req, "schedule.groups", `${proto} 组`, `设置${proto === "responses" ? "OpenAI (Responses)" : "Anthropic"}调度组：${Object.entries(next).map(([n, g]) => `${n}[${g.members.join(" → ")}]`).join("，") || "（空）"}`);
+        const body = JSON.stringify({ ok: true, ...buildScheduleState() });
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(body);
+      } catch (err) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: err.message }));
+      }
+    }).catch(() => {
+      res.writeHead(413, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Request too large" }));
+    });
+    return;
+  }
+
+  if (req.method === "POST" && req.url === "/api/schedule/groups/delete") {
+    if (!checkAuth(req)) { res.writeHead(401); res.end("Unauthorized"); return; }
+    if (!checkCsrf(req)) { res.writeHead(403); res.end("CSRF validation failed"); return; }
+    readBody(req, 10_000).then(buf => {
+      try {
+        const { name } = JSON.parse(buf.toString());
+        const g = (config.scheduleGroups || {})[String(name || "")];
+        if (!g) throw new Error(`方案组 "${name}" 不存在`);
+        const proto = g.protocol;
+        const refs = (Array.isArray((config.scheduleRules || {})[proto]) ? config.scheduleRules[proto] : [])
+          .filter(r => r && r.group === name).length;
+        if (refs > 0) throw new Error(`方案组 "${name}" 正被 ${refs} 条时间规则引用，请先修改或删除这些规则`);
+        delete config.scheduleGroups[name];
+        saveConfig(config);
+        resetFailoverTracking();
+        recordAdminAudit(req, "schedule.groups", String(name), `删除调度组 "${name}"（${proto}）`);
+        const body = JSON.stringify({ ok: true, ...buildScheduleState() });
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(body);
+      } catch (err) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: err.message }));
+      }
+    }).catch(() => {
+      res.writeHead(413); res.end("Request too large");
+    });
+    return;
+  }
+
+  if (req.method === "POST" && req.url === "/api/schedule/groups/rename") {
+    if (!checkAuth(req)) { res.writeHead(401); res.end("Unauthorized"); return; }
+    if (!checkCsrf(req)) { res.writeHead(403); res.end("CSRF validation failed"); return; }
+    readBody(req, 10_000).then(buf => {
+      try {
+        const { name, to } = JSON.parse(buf.toString());
+        const g = (config.scheduleGroups || {})[String(name || "")];
+        if (!g) throw new Error(`方案组 "${name}" 不存在`);
+        const newName = normalizeScheduleGroupName(to);
+        if (newName === name) throw new Error("新名称与原名相同");
+        if (config.scheduleGroups[newName]) throw new Error(`方案组 "${newName}" 已存在`);
+        // 同步重写规则里的引用（照 /api/profile/rename 重写组数组的手法）。漏了这一步，
+        // 改名会让引用它的规则全部变成指向不存在的组，从而被静默跳过。
+        const rules = (config.scheduleRules || {})[g.protocol];
+        let touched = 0;
+        if (Array.isArray(rules)) {
+          for (const r of rules) {
+            if (r && r.group === name) { r.group = newName; touched++; }
+          }
+        }
+        // 保序重建，让改名不改变组在对象里的位置（设置页按插入序渲染）。
+        const rebuilt = {};
+        for (const [k, v] of Object.entries(config.scheduleGroups)) rebuilt[k === name ? newName : k] = v;
+        config.scheduleGroups = rebuilt;
+        // 手动指定若指向该组，一并跟随改名。
+        const o = (config.scheduleOverride || {})[g.protocol];
+        if (o && o.group === name) o.group = newName;
+        saveConfig(config);
+        recordAdminAudit(req, "schedule.groups", newName, `调度组 "${name}" 重命名为 "${newName}"${touched ? `，同步更新 ${touched} 条规则引用` : ""}`);
+        const body = JSON.stringify({ ok: true, ...buildScheduleState() });
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(body);
+      } catch (err) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: err.message }));
+      }
+    }).catch(() => {
+      res.writeHead(413); res.end("Request too large");
+    });
+    return;
+  }
+
+  // 规则：整体替换（让设置页的 ↑/↓ 变成一次纯前端重排 + 一次提交）。
+  // 逐条严格校验，第一条不合法的用 400 点名「第 N 条」—— 保存这一刻是唯一有人可问的时机。
+  if (req.method === "POST" && req.url === "/api/schedule/rules") {
+    if (!checkAuth(req)) { res.writeHead(401); res.end("Unauthorized"); return; }
+    if (!checkCsrf(req)) { res.writeHead(403); res.end("CSRF validation failed"); return; }
+    readBody(req, 100_000).then(buf => {
+      try {
+        const { protocol, rules } = JSON.parse(buf.toString());
+        const proto = normalizeProfileProtocol(protocol);
+        if (!Array.isArray(rules)) throw new Error("rules 必须是数组");
+        const groupExists = (name) => {
+          const g = (config.scheduleGroups || {})[name];
+          return !!(g && g.protocol === proto);
+        };
+        const next = [];
+        for (let i = 0; i < rules.length; i++) {
+          const n = i + 1;
+          const raw = rules[i];
+          if (!raw || typeof raw !== "object" || Array.isArray(raw)) throw new Error(`第 ${n} 条规则格式非法`);
+          const group = typeof raw.group === "string" ? raw.group.trim() : "";
+          if (!group) throw new Error(`第 ${n} 条规则缺少方案组`);
+          if (group !== BASE_GROUP_TOKEN && !groupExists(group)) throw new Error(`第 ${n} 条规则引用的方案组 "${group}" 不存在`);
+          if (raw.days !== null && raw.days !== undefined) {
+            if (!Array.isArray(raw.days)) throw new Error(`第 ${n} 条规则的星期必须是数组`);
+            if (raw.days.length === 0) throw new Error(`第 ${n} 条规则的星期不能为空`);
+            const bad = raw.days.find(d => !(Number.isInteger(d) && d >= 0 && d <= 6) && !(typeof d === "string" && /^[0-6]$/.test(d.trim())));
+            if (bad !== undefined) throw new Error(`第 ${n} 条规则的星期取值非法（应为 0-6，0=周日）`);
+          }
+          const hasStart = raw.start !== null && raw.start !== undefined && raw.start !== "";
+          const hasEnd = raw.end !== null && raw.end !== undefined && raw.end !== "";
+          if (hasStart !== hasEnd) throw new Error(`第 ${n} 条规则需要同时给出开始与结束时间`);
+          if (hasStart) {
+            const s = parsePeakTimeMinutes(raw.start), e = parsePeakTimeMinutes(raw.end);
+            if (s === null || e === null) throw new Error(`第 ${n} 条规则的时段格式非法（应为 HH:mm）`);
+            if (s === e) throw new Error(`第 ${n} 条规则的开始与结束时间相同`);
+          }
+          const rule = normalizeScheduleRule(raw, () => true);
+          if (!rule) throw new Error(`第 ${n} 条规则格式非法`);
+          next.push(rule);
+        }
+        if (!config.scheduleRules || typeof config.scheduleRules !== "object") config.scheduleRules = {};
+        config.scheduleRules[proto] = next;
+        saveConfig(config);
+        recordAdminAudit(req, "schedule.rules", `${proto} 规则`,
+          `设置${proto === "responses" ? "OpenAI (Responses)" : "Anthropic"}时间规则（${next.length} 条，首条命中胜）：${next.map(r => formatScheduleRuleSummary(r)).join("；") || "（空，行为与未启用调度一致）"}`);
+        const body = JSON.stringify({ ok: true, ...buildScheduleState() });
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(body);
+      } catch (err) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: err.message }));
+      }
+    }).catch(() => {
+      res.writeHead(413, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Request too large" }));
+    });
+    return;
+  }
+
+  // 手动指定（决策④）：允许临时覆盖，**到点自动收回**（决策⑥ = 下一个时间边界）。
+  if (req.method === "POST" && req.url === "/api/schedule/override") {
+    if (!checkAuth(req)) { res.writeHead(401); res.end("Unauthorized"); return; }
+    if (!checkCsrf(req)) { res.writeHead(403); res.end("CSRF validation failed"); return; }
+    readBody(req, 10_000).then(buf => {
+      try {
+        const { protocol, group, action } = JSON.parse(buf.toString());
+        const proto = normalizeProfileProtocol(protocol);
+        if (!config.scheduleOverride || typeof config.scheduleOverride !== "object") config.scheduleOverride = {};
+        if (action === "clear") {
+          const prev = config.scheduleOverride[proto];
+          delete config.scheduleOverride[proto];
+          saveConfig(config);
+          if (prev) recordAdminAudit(req, "schedule.override", `${proto} 手动指定`, `取消手动指定（原为 "${prev.group}"，本应在 ${prev.expiresAt} 自动收回）`);
+          const body = JSON.stringify({ ok: true, ...buildScheduleState() });
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(body);
+          return;
+        }
+        const name = typeof group === "string" ? group.trim() : "";
+        if (!name) throw new Error("请选择要指定的方案组");
+        if (name !== BASE_GROUP_TOKEN) {
+          const g = (config.scheduleGroups || {})[name];
+          if (!g || g.protocol !== proto) throw new Error(`方案组 "${name}" 不存在或不是 ${proto} 协议组`);
+        }
+        const rules = Array.isArray((config.scheduleRules || {})[proto]) ? config.scheduleRules[proto] : [];
+        const now = new Date();
+        // 与「不考虑手动指定时规则会选的组」相同 → 这次指定什么都不会改变，拒绝
+        // （否则会给用户一个「我指定了但毫无效果」的假动作）。已存在的手动指定若指向同一个组，
+        // 重设它就是**续期**（把到期时刻推到新的下一个边界），这是有意义的，所以不拦。
+        const ruleOnly = resolveRequestGroup(proto, now, true);
+        if (name === ruleOnly.groupName) {
+          throw new Error(`方案组 "${name}" 已是当前生效组，无需手动指定`);
+        }
+        const boundary = nextScheduleBoundary(rules, now);
+        // 规则表里没有任何会变化的边界时，退到下一个北京 00:00 —— **不让它永不过期**：
+        // 「到点自动收回」是产品决策，永不回收等于这个机制不存在，只会在某天变成没人记得
+        // 为什么生效的幽灵。这也是决策⑥（下一个边界）而非「固定时长」的直接后果。
+        const deltaMs = boundary ? boundary.deltaMs : msUntilNextBeijingMidnight(now);
+        const expiresAt = new Date(now.getTime() + deltaMs).toISOString();
+        // by 只能是 "admin"：仪表盘是**单一共享口令**，没有逐用户身份可记。真正可追溯的
+        // 是审计条目里的来源 IP（recordAdminAudit → getClientIp），不是这个字段。
+        config.scheduleOverride[proto] = { group: name, expiresAt, at: now.toISOString(), by: "admin" };
+        saveConfig(config);
+        recordAdminAudit(req, "schedule.override", `${proto} 手动指定`,
+          `手动指定生效方案组为 "${name}"（覆盖调度规则），将于 ${formatScheduleMoment(new Date(Date.parse(expiresAt)))} 自动收回${boundary ? `（下一个时间边界）` : "（下一个北京 00:00，当前规则表没有更早的边界）"}`);
+        const body = JSON.stringify({ ok: true, ...buildScheduleState() });
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(body);
+      } catch (err) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: err.message }));
+      }
+    }).catch(() => {
+      res.writeHead(413); res.end("Request too large");
+    });
+    return;
+  }
+
   // Profile: switch (kept for backward compat — now just reloads the specified profile)
   if (req.method === "POST" && req.url === "/api/profile/switch") {
     if (!checkAuth(req)) { res.writeHead(401); res.end("Unauthorized"); return; }
@@ -2844,6 +3338,7 @@ const server = http.createServer((req, res) => {
         }
         saveConfig(config);
         reloadAllRuntimes();
+        resetFailoverTracking();
         recordAdminAudit(req, "profile.default", name, `将方案 "${name}" 设为 ${proto === "responses" ? "OpenAI (Responses)" : "Anthropic"} 协议组的默认入口（组头）`);
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify({
@@ -2894,6 +3389,7 @@ const server = http.createServer((req, res) => {
         }
         saveConfig(config);
         reloadAllRuntimes();
+        resetFailoverTracking();
         console.log(`[PROFILE] ${proto} group set: ${JSON.stringify(valid)}`);
         recordAdminAudit(req, "profile.group_set", `${proto} 组`, `设置${proto === "responses" ? "OpenAI (Responses)" : "Anthropic"}协议 failover 链: ${valid.join(" → ") || "（空）"}`);
         res.writeHead(200, { "Content-Type": "application/json" });
@@ -3000,6 +3496,15 @@ const server = http.createServer((req, res) => {
         if (Array.isArray(config.responsesProfileGroup)) {
           config.responsesProfileGroup = config.responsesProfileGroup.filter(n => n !== profile);
         }
+        // 也从全部调度组里剪掉。**组因此变空时保留该组**（由设置页标红「此组没有有效成员」）——
+        // 连带把组和引用它的规则一起删掉，会让用户的配置在删一个方案时凭空消失一大块。
+        // 规则留着，求值时会被跳过（见 lib/schedule.mjs 的空组继续往下找）。
+        const emptiedGroups = [];
+        for (const [gname, g] of Object.entries(config.scheduleGroups || {})) {
+          if (!g || !Array.isArray(g.members) || !g.members.includes(profile)) continue;
+          g.members = g.members.filter(n => n !== profile);
+          if (g.members.length === 0) emptiedGroups.push(gname);
+        }
         // An orphaned pool has no members to draw on it and its limits are dead
         // weight — drop it. A pool still referenced elsewhere is left alone.
         const orphanPool = p && p.quotaPool ? normalizeQuotaPoolName(p.quotaPool) : "";
@@ -3009,8 +3514,9 @@ const server = http.createServer((req, res) => {
         }
         delete config.profiles[profile];
         saveConfig(config);
+        resetFailoverTracking();
         console.log(`[PROFILE] Deleted profile "${profile}"`);
-        recordAdminAudit(req, "profile.delete", profile, `删除方案 "${profile}"（后缀 /${p ? p.suffix : "?"}）`);
+        recordAdminAudit(req, "profile.delete", profile, `删除方案 "${profile}"（后缀 /${p ? p.suffix : "?"}${emptiedGroups.length ? `；调度组 ${emptiedGroups.join("、")} 因此变空，组与引用它的规则保留` : ""}）`);
         res.end(JSON.stringify({ ok: true }));
       } catch (err) {
         res.writeHead(400, { "Content-Type": "application/json" });
@@ -3042,9 +3548,14 @@ const server = http.createServer((req, res) => {
         const moved = {};
         for (const [k, v] of Object.entries(config.profiles)) moved[k === profile ? newName : k] = v;
         config.profiles = moved;
-        // Rewrite group memberships stored by name.
+        // Rewrite group memberships stored by name. 调度组也要重写：漏了这一处，
+        // 「重命名方案」会把该方案**静默地**踢出所有调度组（组还在、成员没了），
+        // 而规则照旧引用那个组 —— 症状是「到了时间点却没切过去」，很难反查到改名上。
         for (const key of ["defaultProfileGroup", "responsesProfileGroup"]) {
           if (Array.isArray(config[key])) config[key] = config[key].map(n => (n === profile ? newName : n));
+        }
+        for (const g of Object.values(config.scheduleGroups || {})) {
+          if (g && Array.isArray(g.members)) g.members = g.members.map(n => (n === profile ? newName : n));
         }
         // Auto-pool case: an empty quotaPool means the pool is named after the
         // profile — pin it to the existing pool key so the rename doesn't orphan
@@ -3062,6 +3573,7 @@ const server = http.createServer((req, res) => {
         }
         saveConfig(config);
         reloadAllRuntimes();
+        resetFailoverTracking();
         console.log(`[PROFILE] Renamed profile "${profile}" → "${newName}"`);
         recordAdminAudit(req, "profile.rename", newName, `方案 "${profile}" 重命名为 "${newName}"（后缀 /${p.suffix || "?"} 不变）`);
         res.writeHead(200, { "Content-Type": "application/json" });

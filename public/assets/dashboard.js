@@ -3,7 +3,7 @@ Chart.defaults.color='#686863';Chart.defaults.font.family='-apple-system,BlinkMa
 // 页面内联引导脚本先注入 toast() 及 UI_HELPERS 提供的辅助函数再加载本文件；
 // 全部数据经 /api/* 运行时拉取，文件不含任何密钥，可长期强缓存（?v= 内容版本号）。
 let D=null,P="day",C={t:null,p:null,m:null,h:null,hm:null,pr:null},errPage=1,autoRefresh=true,refreshTimer=null,currentProfile="all",PROTO="";
-let MDL="all",USR="all",MT="tokens";
+let MDL="all",USR="all",MT="tokens",PIEDIM="user";
 let DS="",DE="";
 let activeWorkspaceTab="users";
 let quotaFocus=(function(){try{return localStorage.getItem('tm_quota_focus')==='1'}catch(e){return false}})();
@@ -75,6 +75,63 @@ function handleWorkspaceTabKeydown(event){
   const tabs=[...document.querySelectorAll(".workspace-tab")],index=tabs.indexOf(event.currentTarget);let next=index;
   if(event.key==="ArrowRight")next=(index+1)%tabs.length;else if(event.key==="ArrowLeft")next=(index-1+tabs.length)%tabs.length;else if(event.key==="Home")next=0;else if(event.key==="End")next=tabs.length-1;else return;
   event.preventDefault();setWorkspaceTab(tabs[next].id.replace("workspace-tab-",""),true);
+}
+// ── 客户端用量 board ────────────────────────────────────────────────────────
+// 按 客户端 × 用户 展开,组内按合计降序,组间也按合计降序。数据来自 /api/stats 的
+// dailyClients(与 dailyModels 同形),随 render() 一起刷新 —— 不走懒加载,所以 tab 上的
+// 计数在这里自己写,不能放进 renderWorkspaceSummaries()(那个函数每 30 秒跑一次,
+// 对懒加载 tab 会把数字擦掉;这张表虽然不受影响,但归属写在一处更好维护)。
+// 客户端与协议正交,所以这里不套用 protoSeg;但窗口与 USR/MDL 筛选沿用全局那套。
+function renderClientBoard(){
+  const body=document.getElementById("clientBoardBody");
+  if(!D||!body)return;
+  const eb=effBounds();
+  // 与用户分布图同一条规则:窗口用 effBounds()(日期范围优先,否则周期窗口)。
+  const agg={};
+  for(const[date,users]of Object.entries(D.dailyClients||{})){
+    if(date<eb.start||date>eb.end)continue;
+    for(const[u,clients]of Object.entries(users)){
+      if(USR!=="all"&&u!==USR)continue;
+      for(const[c,v]of Object.entries(clients)){
+        if(!agg[c])agg[c]={requests:0,input:0,output:0,users:{}};
+        const g=agg[c];
+        g.requests+=(v.requests||0);g.input+=(v.inputTokens||0);g.output+=(v.outputTokens||0);
+        if(!g.users[u])g.users[u]={requests:0,input:0,output:0};
+        g.users[u].requests+=(v.requests||0);g.users[u].input+=(v.inputTokens||0);g.users[u].output+=(v.outputTokens||0);
+      }
+    }
+  }
+  const total=Object.values(agg).reduce((a,g)=>a+g.input+g.output,0);
+  const order=Object.keys(agg).sort((a,b)=>(agg[b].input+agg[b].output)-(agg[a].input+agg[a].output));
+  const userName=k=>{const u=(D.users||{})[k];return(u&&u.name)||k};
+  if(!order.length){
+    body.innerHTML='<tr><td colspan="7" class="empty">'+(MDL!=="all"?"客户端维度不含模型信息，请先清除模型筛选":"暂无数据")+'</td></tr>';
+  }else{
+    const rows=[];
+    for(const c of order){
+      const g=agg[c],gTotal=g.input+g.output,unknown=c==="unknown";
+      rows.push('<tr class="client-group"><td><strong'+(unknown?' style="color:var(--dim)"':'')+'>'+escH(clientLabel(c))+'</strong></td>'
+        +'<td style="color:var(--dim)">'+Object.keys(g.users).length+' 位用户</td>'
+        +'<td class="n">'+fmtT(g.requests)+'</td>'
+        +'<td class="n">'+fmtT(g.input)+'</td>'
+        +'<td class="n">'+fmtT(g.output)+'</td>'
+        +'<td class="n hl">'+fmtT(gTotal)+'</td>'
+        +'<td class="n">'+(total>0?(gTotal/total*100).toFixed(1):"0.0")+'%</td></tr>');
+      // 组内按用户合计降序。用户身份用掩码后的 key(与 D.users 同源),名字取 D.users 的 name。
+      const members=Object.entries(g.users).sort((a,b)=>(b[1].input+b[1].output)-(a[1].input+a[1].output));
+      for(const[k,v]of members){
+        const vt=v.input+v.output;
+        rows.push('<tr><td style="padding-left:22px;color:var(--dim)">'+escH(userName(k))+'</td><td></td>'
+          +'<td class="n">'+fmtT(v.requests)+'</td><td class="n">'+fmtT(v.input)+'</td><td class="n">'+fmtT(v.output)+'</td>'
+          +'<td class="n">'+fmtT(vt)+'</td><td class="n">'+(total>0?(vt/total*100).toFixed(1):"0.0")+'%</td></tr>');
+      }
+    }
+    body.innerHTML=rows.join("");
+  }
+  document.getElementById("workspaceCountClients").textContent=order.length;
+  document.getElementById("clientContext").textContent=order.length
+    ?(order.length+' 个客户端 · 合计 '+fmtT(total)+' Token')
+    :"暂无数据";
 }
 function renderWorkspaceSummaries(){
   if(!D)return;
@@ -316,6 +373,10 @@ function switchProfileView(v){currentProfile=v||"all";resetDetailGrouping();load
 function setProtoSeg(proto){document.querySelectorAll("#protoSeg button").forEach(b=>b.classList.toggle("on",b.dataset.proto===(proto||"")))}
 function switchProtocolView(proto){PROTO=proto||"";if(currentProfile!=="all"){currentProfile="all";const sel=document.getElementById("profileSel");if(sel)sel.value="all"}setProtoSeg(PROTO);resetDetailGrouping();load()}
 document.querySelectorAll("#protoSeg button").forEach(b=>b.addEventListener("click",()=>switchProtocolView(b.dataset.proto)));
+// 用户分布图的维度切换(按用户 / 按客户端)。只重画这一张图,不需要重新拉数 ——
+// dailyClients 与 daily/dailyModels 一起来自 /api/stats,已经在 D 里了。
+function setPieDim(dim){PIEDIM=dim==="client"?"client":"user";document.querySelectorAll("#pieDim button").forEach(b=>b.classList.toggle("on",b.dataset.dim===PIEDIM));if(D)render()}
+document.querySelectorAll("#pieDim button").forEach(b=>b.addEventListener("click",()=>setPieDim(b.dataset.dim)));
 const protoLabel=proto=>proto==="anthropic"?"Anthropic":proto==="responses"?"OpenAI":"";
 function render(){
   if(!D)return;
@@ -324,7 +385,7 @@ function render(){
   if(sel.options.length<=1 && D.profiles){
     sel.innerHTML='<option value="all">全部方案</option>';
     for(const p of D.profiles){
-      const sfx="/"+p.suffix+(p.isDefault?" · 默认入口":"")+(p.protocol==="responses"?" · Codex":" · Claude Code");
+      const sfx="/"+p.suffix+(p.isDefault?" · 默认入口":"")+(p.protocol==="responses"?" · OpenAI":" · Anthropic");
       sel.innerHTML+='<option value="'+escH(p.suffix)+'">'+escH(p.name)+' '+escH(sfx)+'</option>';
     }
     sel.value=currentProfile==="all"?"all":currentProfile;
@@ -351,7 +412,7 @@ function render(){
   runCountUps(document.getElementById("cards"));
   const psb=document.getElementById("profileSummaryBody"),profiles=Array.isArray(D.profileSummaries)?D.profileSummaries:[];
   const fmtResume=function(iso){const d=new Date(new Date(iso).getTime()+8*3600000);const p=n=>String(n).padStart(2,'0');const now=new Date(Date.now()+8*3600000);const hm=p(d.getUTCHours())+':'+p(d.getUTCMinutes());if(d.getUTCFullYear()===now.getUTCFullYear()&&d.getUTCMonth()===now.getUTCMonth()&&d.getUTCDate()===now.getUTCDate())return hm;if(Date.UTC(d.getUTCFullYear(),d.getUTCMonth(),d.getUTCDate())-Date.UTC(now.getUTCFullYear(),now.getUTCMonth(),now.getUTCDate())===86400000)return '明天 '+hm;return (d.getUTCFullYear()===now.getUTCFullYear()?'':d.getUTCFullYear()+'-')+p(d.getUTCMonth()+1)+'-'+p(d.getUTCDate())+' '+hm};
-  const rowOf=p=>{const st=p.breakerState||"UNKNOWN";const rl=p.rateLimit;let col,led,stateLabel;if(rl){col='var(--red)';led='err';stateLabel='限额中 '+fmtResume(rl.resumeAt)+'恢复';}else{col=st==="CLOSED"?"var(--green)":st==="HALF_OPEN"?"var(--orange)":"var(--red)";led=st==="CLOSED"?"on":st==="HALF_OPEN"?"warn":"err";stateLabel=st==="CLOSED"?"正常":st==="HALF_OPEN"?"探测中":"熔断"+(p.breakerCooldownRemaining>0?' '+Math.ceil(p.breakerCooldownRemaining/1000)+'s后探测':'');}const current=currentProfile!=="all"&&p.suffix===currentProfile;const gBadge=p.inDefaultGroup?' <span style="color:var(--blue);font-size:10px;font-weight:600">默认组·'+(p.groupOrder+1)+'</span>':'';const rBadge=p.inResponsesGroup?' <span style="color:var(--blue);font-size:10px;font-weight:600">Resp组·'+(p.responsesGroupOrder+1)+'</span>':'';const protoBadge=p.protocol==='responses'?' <span style="color:var(--blue);font-size:10px">Codex</span>':'';const bLabel=p.billingType==='coding_plan'?' <span style="color:var(--dim);font-size:10px">CP</span>':p.billingType==='token_plan'?' <span style="color:var(--dim);font-size:10px">TP</span>':'';const pk=(p.peakHours&&p.peakHours.length)?(function(rs){const now=new Date(),cur=((now.getTime()+8*3600000)%86400000)/60000;const tm=function(t){if(!t)return null;const a=t.split(':');return (+a[0])*60+(+a[1])};const inPk=rs.some(function(r){const s=tm(r.start),e=tm(r.end);return s!==null&&e!==null&&s!==e&&(s<e?(cur>=s&&cur<e):(cur>=s||cur<e))});return ' <span style="color:'+(inPk?'var(--orange)':'var(--dim)')+';font-size:10px" title="高峰时段(北京时间) '+rs.map(function(r){return r.start+'-'+r.end}).join(', ')+'">'+(inPk?'高峰中':rs.map(function(r){return r.start+'-'+r.end}).join(','))+'</span>'})(p.peakHours):'';const rt2=(function(){if(p.peakQuotaRate==null&&p.offPeakQuotaRate==null)return'';const pr=p.peakQuotaRate==null?1:p.peakQuotaRate,orr=p.offPeakQuotaRate==null?1:p.offPeakQuotaRate;const nCustom=Object.keys(p.modelQuotaRates||{}).length;if(pr===1&&orr===1&&nCustom===0)return'';var now=new Date(),cur=((now.getTime()+8*3600000)%86400000)/60000;var tm=function(t){if(!t)return null;var a=t.split(':');return (+a[0])*60+(+a[1])};var ip=(p.peakHours||[]).some(function(r){var s=tm(r.start),e=tm(r.end);return s!==null&&e!==null&&s!==e&&(s<e?(cur>=s&&cur<e):(cur>=s||cur<e))});return ' <span style="color:var(--accent);font-size:10px" title="默认配额倍率：高峰 ×'+pr+' / 低谷 ×'+orr+'（当前'+(ip?'高峰':'低谷')+'）'+(nCustom?'；另有 '+nCustom+' 个模型单独定价':'')+'">×'+(ip?pr:orr)+(nCustom?'+'+nCustom:'')+'</span>'})();const restricted=(p.inDefaultGroup&&profiles.filter(x=>x.inDefaultGroup).length>=2)||(p.inResponsesGroup&&profiles.filter(x=>x.inResponsesGroup).length>=2);const entryCode=p.protocol==='responses'?'/v1/responses':'/v1';const defBadge=(p.isDefault||p.isResponsesDefault)?' <span style="color:var(--green);font-size:11px;font-weight:600;vertical-align:middle">默认</span>':'';return'<tr'+(current?' class="profile-current" aria-current="true"':'')+'><td>'+escH(p.name)+defBadge+gBadge+rBadge+protoBadge+bLabel+pk+rt2+(current?' <span class="current-mark">当前</span>':'')+'</td><td>'+(restricted?'<code>'+entryCode+'</code> <span style="color:var(--dim);font-size:10px">仅 '+entryCode+'</span>':'<code>/'+escH(p.suffix)+'</code>'+((p.isDefault||p.isResponsesDefault)?' <span style="color:var(--dim)">/ <code>'+entryCode+'</code></span>':''))+'</td><td style="font-size:12px;color:var(--dim);max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+escH((p.upstream||'').replace('https://','').replace('http://',''))+'</td><td class="n">'+fmtT(p.todayRequests||0)+'</td><td class="n hl">'+fmtT(p.todayTokens||0)+'</td><td><span class="led '+led+'"></span><span style="color:'+col+';font-size:12px">'+stateLabel+'</span></td></tr>'};
+  const rowOf=p=>{const st=p.breakerState||"UNKNOWN";const rl=p.rateLimit;let col,led,stateLabel;if(rl){col='var(--red)';led='err';stateLabel='限额中 '+fmtResume(rl.resumeAt)+'恢复';}else{col=st==="CLOSED"?"var(--green)":st==="HALF_OPEN"?"var(--orange)":"var(--red)";led=st==="CLOSED"?"on":st==="HALF_OPEN"?"warn":"err";stateLabel=st==="CLOSED"?"正常":st==="HALF_OPEN"?"探测中":"熔断"+(p.breakerCooldownRemaining>0?' '+Math.ceil(p.breakerCooldownRemaining/1000)+'s后探测':'');}const current=currentProfile!=="all"&&p.suffix===currentProfile;const gBadge=p.inDefaultGroup?' <span style="color:var(--blue);font-size:10px;font-weight:600">默认组·'+(p.groupOrder+1)+'</span>':'';const rBadge=p.inResponsesGroup?' <span style="color:var(--blue);font-size:10px;font-weight:600">Resp组·'+(p.responsesGroupOrder+1)+'</span>':'';const protoBadge=p.protocol==='responses'?' <span style="color:var(--blue);font-size:10px">OpenAI</span>':'';const bLabel=p.billingType==='coding_plan'?' <span style="color:var(--dim);font-size:10px">CP</span>':p.billingType==='token_plan'?' <span style="color:var(--dim);font-size:10px">TP</span>':'';const pk=(p.peakHours&&p.peakHours.length)?(function(rs){const now=new Date(),cur=((now.getTime()+8*3600000)%86400000)/60000;const tm=function(t){if(!t)return null;const a=t.split(':');return (+a[0])*60+(+a[1])};const inPk=rs.some(function(r){const s=tm(r.start),e=tm(r.end);return s!==null&&e!==null&&s!==e&&(s<e?(cur>=s&&cur<e):(cur>=s||cur<e))});return ' <span style="color:'+(inPk?'var(--orange)':'var(--dim)')+';font-size:10px" title="高峰时段(北京时间) '+rs.map(function(r){return r.start+'-'+r.end}).join(', ')+'">'+(inPk?'高峰中':rs.map(function(r){return r.start+'-'+r.end}).join(','))+'</span>'})(p.peakHours):'';const rt2=(function(){if(p.peakQuotaRate==null&&p.offPeakQuotaRate==null)return'';const pr=p.peakQuotaRate==null?1:p.peakQuotaRate,orr=p.offPeakQuotaRate==null?1:p.offPeakQuotaRate;const nCustom=Object.keys(p.modelQuotaRates||{}).length;if(pr===1&&orr===1&&nCustom===0)return'';var now=new Date(),cur=((now.getTime()+8*3600000)%86400000)/60000;var tm=function(t){if(!t)return null;var a=t.split(':');return (+a[0])*60+(+a[1])};var ip=(p.peakHours||[]).some(function(r){var s=tm(r.start),e=tm(r.end);return s!==null&&e!==null&&s!==e&&(s<e?(cur>=s&&cur<e):(cur>=s||cur<e))});return ' <span style="color:var(--accent);font-size:10px" title="默认配额倍率：高峰 ×'+pr+' / 低谷 ×'+orr+'（当前'+(ip?'高峰':'低谷')+'）'+(nCustom?'；另有 '+nCustom+' 个模型单独定价':'')+'">×'+(ip?pr:orr)+(nCustom?'+'+nCustom:'')+'</span>'})();const restricted=(p.inDefaultGroup&&profiles.filter(x=>x.inDefaultGroup).length>=2)||(p.inResponsesGroup&&profiles.filter(x=>x.inResponsesGroup).length>=2);const entryCode=p.protocol==='responses'?'/v1/responses':'/v1';const defBadge=(p.isDefault||p.isResponsesDefault)?' <span style="color:var(--green);font-size:11px;font-weight:600;vertical-align:middle">默认</span>':'';return'<tr'+(current?' class="profile-current" aria-current="true"':'')+'><td>'+escH(p.name)+defBadge+gBadge+rBadge+protoBadge+bLabel+pk+rt2+(current?' <span class="current-mark">当前</span>':'')+'</td><td>'+(restricted?'<code>'+entryCode+'</code> <span style="color:var(--dim);font-size:10px">仅 '+entryCode+'</span>':'<code>/'+escH(p.suffix)+'</code>'+((p.isDefault||p.isResponsesDefault)?' <span style="color:var(--dim)">/ <code>'+entryCode+'</code></span>':''))+'</td><td style="font-size:12px;color:var(--dim);max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+escH((p.upstream||'').replace('https://','').replace('http://',''))+'</td><td class="n">'+fmtT(p.todayRequests||0)+'</td><td class="n hl">'+fmtT(p.todayTokens||0)+'</td><td><span class="led '+led+'"></span><span style="color:'+col+';font-size:12px">'+stateLabel+'</span></td></tr>'};
   const anthProfiles=profiles.filter(p=>p.protocol!=="responses"),respProfiles=profiles.filter(p=>p.protocol==="responses");
   const protoRow=(label,entry,count)=>'<tr class="proto-row"><td colspan="6">'+label+' · 入口 '+entry+' · '+count+' 个方案</td></tr>';
   let psbHtml="";
@@ -378,11 +439,38 @@ function render(){
   document.getElementById("trendNote").textContent=MDL!=="all"?"模型筛选：不含缓存 Token":"";
   if(C.t)C.t.destroy();if(C.p)C.p.destroy();if(C.m)C.m.destroy();if(C.h)C.h.destroy();if(C.hm)C.hm.destroy();if(C.pr)C.pr.destroy();
   C.t=new Chart(document.getElementById("trend"),{type:"bar",data:{labels:keys.map(k=>lbl(P,k)),datasets:uks.map((u,i)=>({label:D.users[u].name,data:keys.map(k=>val(g[k][u]||{})),backgroundColor:COL[i%COL.length]+"cc",borderRadius:3,borderSkipped:false}))},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:trendLegend(),tooltip:{callbacks:{label:ctx=>ctx.dataset.label+": "+fmtT(ctx.raw)}}},scales:{x:{stacked:true,ticks:{color:"#686863",font:{size:10}},grid:{color:"rgba(24,24,22,.08)"}},y:{stacked:true,ticks:{color:"#686863",callback:v=>fmtTk(v)},grid:{color:"rgba(24,24,22,.08)"}}}}});
-  // 用户分布：按有效窗口累加(默认按日=今天;日期范围生效时按范围),横向柱状图,Y 轴显示用户名完整可读。
-  const tot=uks.map(u=>{let t=0;for(const[date,ud]of Object.entries(fd)){const s=ud[u];if(s)t+=val(s)}return t});
-  // 用户分布：横向柱状图，Y 轴显示用户名完整可读。
-  const uIdx=tot.map((_,i)=>i).sort((a,b)=>tot[b]-tot[a]);
-  C.p=new Chart(document.getElementById("pie"),{type:"bar",data:{labels:uIdx.map(i=>D.users[uks[i]].name),datasets:[{label:MT==="requests"?"请求数":"总 Token",data:uIdx.map(i=>tot[i]),backgroundColor:uIdx.map((_,i)=>COL[i%COL.length]+"cc"),borderWidth:0,borderRadius:3,borderSkipped:false}]},options:{indexAxis:"y",responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false},tooltip:{callbacks:{label:ctx=>MT==="requests"?fmtT(ctx.raw)+" 次请求":fmtT(ctx.raw)+" tokens"}}},scales:{x:{ticks:{color:"#686863",callback:v=>fmtTk(v)},grid:{color:"rgba(24,24,22,.08)"}},y:{ticks:{color:"#686863",font:{size:11},autoSkip:false},grid:{display:false}}}}});
+  // 用户分布 / 客户端分布:共用 #pie 这张横向柱状图,顶部 seg 切维度。
+  // 两张图都是「按有效窗口累加(默认按日=今天;日期范围生效时按范围)」,只是分组键不同:
+  // 用户维度按 user_key 聚合 filteredDaily();客户端维度按 client 聚合 dailyClients。
+  // Y 轴标签都取完整可读的名字(用户名 / 客户端友好名)。
+  let pieLabels,pieVals;
+  if(PIEDIM==="client"){
+    // 客户端维度自带 user_key 一层,所以 USR 筛选在这里自己应用;MDL(模型)筛选对它不适用
+    // —— usage_daily_client 没有模型列,按模型筛出来的客户端分布无从计算,只能整段忽略。
+    const cAgg={};
+    for(const[date,users]of Object.entries(D.dailyClients||{})){
+      if(date<eb.start||date>eb.end)continue;
+      for(const[u,clients]of Object.entries(users)){
+        if(USR!=="all"&&u!==USR)continue;
+        for(const[c,v]of Object.entries(clients)){
+          if(!cAgg[c])cAgg[c]={requests:0,tokens:0};
+          cAgg[c].requests+=(v.requests||0);
+          cAgg[c].tokens+=((v.inputTokens||0)+(v.outputTokens||0));
+        }
+      }
+    }
+    const names=Object.keys(cAgg);
+    const vals=names.map(c=>MT==="requests"?cAgg[c].requests:cAgg[c].tokens);
+    const idx=vals.map((_,i)=>i).sort((a,b)=>vals[b]-vals[a]);
+    pieLabels=idx.map(i=>clientLabel(names[i]));pieVals=idx.map(i=>vals[i]);
+    document.getElementById("pieTitle").textContent="客户端分布";
+  }else{
+    const tot=uks.map(u=>{let t=0;for(const[date,ud]of Object.entries(fd)){const s=ud[u];if(s)t+=val(s)}return t});
+    const uIdx=tot.map((_,i)=>i).sort((a,b)=>tot[b]-tot[a]);
+    pieLabels=uIdx.map(i=>D.users[uks[i]].name);pieVals=uIdx.map(i=>tot[i]);
+    document.getElementById("pieTitle").textContent="用户分布";
+  }
+  C.p=new Chart(document.getElementById("pie"),{type:"bar",data:{labels:pieLabels,datasets:[{label:MT==="requests"?"请求数":"总 Token",data:pieVals,backgroundColor:pieVals.map((_,i)=>COL[i%COL.length]+"cc"),borderWidth:0,borderRadius:3,borderSkipped:false}]},options:{indexAxis:"y",responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false},tooltip:{callbacks:{label:ctx=>MT==="requests"?fmtT(ctx.raw)+" 次请求":fmtT(ctx.raw)+" tokens"}}},scales:{x:{ticks:{color:"#686863",callback:v=>fmtTk(v)},grid:{color:"rgba(24,24,22,.08)"}},y:{ticks:{color:"#686863",font:{size:11},autoSkip:false},grid:{display:false}}}}});
 
   // 模型请求分布：按有效窗口(日期范围优先,否则周期窗口,北京时间)基于 usage_daily_model
   // 保留约 400 天的按日模型数据求和，可按用户与指标筛选。横向柱状图便于读取模型名。
@@ -492,6 +580,7 @@ function render(){
   document.getElementById("errorCount").textContent=allErrs.length>0?'('+allErrs.length+')':'';
   document.getElementById("errorHint").textContent=allErrs.length>0?(allErrs.length+'条错误'):'暂无错误';
   renderWorkspaceSummaries();
+  renderClientBoard();
   renderRateBoard();
 }
 async function load(){try{const profile=currentProfile==="all"?"all":currentProfile;const qs=[];if(profile!=="all")qs.push("profile="+encodeURIComponent(profile));else if(PROTO)qs.push("protocol="+PROTO);const r=await fetch("/api/stats"+(qs.length?"?"+qs.join("&"):""));D=await r.json();render()}catch(e){document.getElementById("meta").textContent="Error: "+e.message}}
@@ -500,7 +589,7 @@ document.querySelectorAll(".tab").forEach(b=>b.addEventListener("click",()=>{doc
 document.getElementById("metricSel").addEventListener("change",e=>{MT=e.target.value;render()});
 document.getElementById("modelSel").addEventListener("change",e=>{MDL=e.target.value;resetDetailGrouping();render()});
 document.getElementById("userSel").addEventListener("change",e=>{USR=e.target.value;render()});
-function resetChartFilters(){P="day";MT="tokens";MDL="all";USR="all";DS="";DE="";PROTO="";setProtoSeg("");document.querySelectorAll("#globalTabs .tab").forEach(x=>x.classList.toggle("on",x.dataset.p==="day"));document.getElementById("metricSel").value="tokens";document.getElementById("modelSel").value="all";document.getElementById("userSel").value="all";document.getElementById("dateStart").value="";document.getElementById("dateEnd").value="";if(currentProfile!=="all"){currentProfile="all";document.getElementById("profileSel").value="all"}resetDetailGrouping();load()}
+function resetChartFilters(){P="day";MT="tokens";MDL="all";USR="all";DS="";DE="";PROTO="";setPieDim("user");setProtoSeg("");document.querySelectorAll("#globalTabs .tab").forEach(x=>x.classList.toggle("on",x.dataset.p==="day"));document.getElementById("metricSel").value="tokens";document.getElementById("modelSel").value="all";document.getElementById("userSel").value="all";document.getElementById("dateStart").value="";document.getElementById("dateEnd").value="";if(currentProfile!=="all"){currentProfile="all";document.getElementById("profileSel").value="all"}resetDetailGrouping();load()}
 document.querySelectorAll(".workspace-tab").forEach(button=>{button.addEventListener("click",()=>setWorkspaceTab(button.id.replace("workspace-tab-","")));button.addEventListener("keydown",handleWorkspaceTabKeydown)});
 document.getElementById("clearErrors").addEventListener("click",async()=>{if(confirm("确定清除所有错误记录？")){const csrf=(document.cookie.match(/tm_csrf=([^;]+)/)||[])[1]||'';await fetch("/api/clear-errors",{method:"POST",headers:{"x-csrf-token":csrf}});toast('错误记录已清除');errPage=1;load()}});
 // ── 产出质量 tab(懒加载:首次切到该 tab 才拉数据)──

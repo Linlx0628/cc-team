@@ -27,7 +27,7 @@ import { createSessionsReader } from "./lib/sessions.mjs";
 import { createNotifier } from "./lib/notifier.mjs";
 import { createPersistence } from "./lib/persistence.mjs";
 import { createMemberRewards } from "./lib/member-rewards.mjs";
-import { getApiKey, makeClientAbortError, isClientAbortError, createClientAbortState, markClientAborted, addClientAbortListener, setActiveUpstreamRequest, throwIfClientAborted, sleepWithClientAbort, jitter, buildUpstreamPath } from "./lib/proxy-helpers.mjs";
+import { getApiKey, makeClientAbortError, isClientAbortError, createClientAbortState, markClientAborted, addClientAbortListener, setActiveUpstreamRequest, throwIfClientAborted, sleepWithClientAbort, jitter, buildUpstreamPath, extractClientSignal } from "./lib/proxy-helpers.mjs";
 import { createVisionBridge } from "./lib/vision-bridge.mjs";
 import { createToolPatternCompat } from "./lib/tool-pattern-compat.mjs";
 import { createProxyCore } from "./lib/proxy-core.mjs";
@@ -996,8 +996,9 @@ function sanitizeStore(raw) {
     }
     s.daily = safe;
   }
-  // Mask user keys in dailyModels / dailyHourly the same way as s.daily so the
-  // dashboard's user filter (keyed on masked keys) applies to model/hour dimensions too.
+  // Mask user keys in dailyModels / dailyClients / dailyHourly the same way as s.daily so the
+  // dashboard's user filter (keyed on masked keys) applies to those dimensions too.
+  // 新维度必须一并加进来:漏掉一格就等于把明文 user_key 直接送进浏览器。
   const maskByUser = (obj) => {
     if (!obj) return obj;
     const safe = {};
@@ -1010,6 +1011,7 @@ function sanitizeStore(raw) {
     return safe;
   };
   s.dailyModels = maskByUser(s.dailyModels);
+  s.dailyClients = maskByUser(s.dailyClients);
   s.dailyHourly = maskByUser(s.dailyHourly);
   if (Array.isArray(s.errors)) {
     s.errors = s.errors.map(e => { const { userKey, ...rest } = e; return rest; });
@@ -1371,8 +1373,16 @@ function loadProfileSnapshot(suffix) {
     if (!dailyHourly[r.date][r.user_key]) dailyHourly[r.date][r.user_key] = {};
     dailyHourly[r.date][r.user_key][r.hour] = { requests: r.requests, inputTokens: r.input_tokens, outputTokens: r.output_tokens, cacheCreationTokens: r.cache_creation, cacheReadTokens: r.cache_read };
   }
+  // 客户端维度与 dailyModels 同形。单方案视图也必须带上 —— 否则切到具体方案时这一轴就空了,
+  // 而「这个方案是谁在用哪个客户端」恰恰是单方案视图下最想问的。
+  const dailyClients = {};
+  for (const r of db.prepare("SELECT date,user_key,client,input_tokens,output_tokens,requests FROM usage_daily_client WHERE profile=?").all(suffix)) {
+    if (!dailyClients[r.date]) dailyClients[r.date] = {};
+    if (!dailyClients[r.date][r.user_key]) dailyClients[r.date][r.user_key] = {};
+    dailyClients[r.date][r.user_key][r.client] = { inputTokens: r.input_tokens, outputTokens: r.output_tokens, requests: r.requests };
+  }
   const errors = db.prepare("SELECT time,user_name AS user,user_key AS userKey,status_code AS statusCode,error,path,model FROM errors WHERE profile=? ORDER BY id DESC LIMIT 200").all(suffix);
-  return { users, daily, dailyModels, dailyHourly, models, hourly, errors };
+  return { users, daily, dailyModels, dailyClients, dailyHourly, models, hourly, errors };
 }
 
 ({ db, stmts } = persistenceApi.initDb());
@@ -1414,7 +1424,7 @@ function removeLegacyOpenAIData() {
   const placeholders = suffixes.map(() => "?").join(",");
   const removedKeys = db.prepare(`SELECT DISTINCT user_key FROM users WHERE profile IN (${placeholders})`).all(...suffixes).map((row) => row.user_key);
   const tx = db.transaction(() => {
-    for (const table of ["users", "usage_daily", "usage_daily_model", "usage_daily_hourly", "usage_hourly_model", "usage_model", "usage_hourly", "errors"]) {
+    for (const table of ["users", "usage_daily", "usage_daily_model", "usage_daily_client", "usage_daily_hourly", "usage_hourly_model", "usage_model", "usage_hourly", "errors"]) {
       db.prepare(`DELETE FROM ${table} WHERE profile IN (${placeholders})`).run(...suffixes);
     }
     for (const key of removedKeys) {
@@ -1758,7 +1768,8 @@ function usageHasTokens(usage = {}) {
 
 // session 由代理主路径透传(proxy-core 的 extractSessionSignal),只用于会话维度的记账,
 // 不参与任何路由或配额判断。省略时为 undefined,即不落 usage_session。
-function recordUsage(apiKey, usage, model, suffix, _rt, session) {
+// client 同理(proxy-core 的 extractClientSignal),只用于客户端维度的记账。
+function recordUsage(apiKey, usage, model, suffix, _rt, session, client) {
   const runtime = _rt || runtimes[normalizeProfileSuffix(suffix)] || rt;
   const sfx = normalizeProfileSuffix(suffix) || runtime?.suffix || getDefaultProfileSuffix();
   const key = resolveUserKey(apiKey, runtime);
@@ -1810,6 +1821,7 @@ function recordUsage(apiKey, usage, model, suffix, _rt, session) {
     stmts.upsertModel.run(p);
     stmts.upsertHourly.run(p);
     stmts.upsertDailyModel.run(p);
+    stmts.upsertDailyClient.run({ ...p, client: client || "unknown" });
     stmts.upsertDailyHourly.run(p);
     stmts.upsertHourlyModel.run(p);
     // 会话维度:extractSessionSignal 回落到 "nosession"(无会话头、无 prompt_cache_key、
@@ -2145,6 +2157,8 @@ function attachRequestLogger(res, clientState, reqLog) {
       model: reqLog.model || "",
       servedModel: (usage && usage.model) || "",
       profile: reqLog.profile || "",
+      client: reqLog.client || "",
+      userAgent: reqLog.userAgent || "",
       in: usage ? (usage.usage.input_tokens || 0) : 0,
       out: usage ? (usage.usage.output_tokens || 0) : 0,
       cacheC: usage ? (usage.usage.cache_creation_input_tokens || 0) : 0,
@@ -2454,6 +2468,7 @@ const PROXY_CORE_DEPS = {
   classifyRateLimit,
   config,
   deleteStickyProfile,
+  extractClientSignal,
   extractSessionSignal,
   gProxy,
   getAvailableDefaultProfiles,
@@ -3590,7 +3605,7 @@ const server = http.createServer((req, res) => {
           delete config.profiles[pname].users[key];
         }
         const tx = db.transaction(() => {
-          for (const table of ["users", "usage_daily", "usage_daily_model", "usage_daily_hourly", "usage_hourly_model", "errors", "quota_adjust_history", "quota_daily_ops"]) {
+          for (const table of ["users", "usage_daily", "usage_daily_model", "usage_daily_client", "usage_daily_hourly", "usage_hourly_model", "errors", "quota_adjust_history", "quota_daily_ops"]) {
             db.prepare(`DELETE FROM ${table} WHERE user_key=?`).run(key);
           }
           saveConfig(config);
@@ -4018,7 +4033,7 @@ const server = http.createServer((req, res) => {
         if (!key) throw new Error("Key required");
         backupDatabaseSync("stats-user-delete");
         const tx = db.transaction(() => {
-          for (const table of ["users", "usage_daily", "usage_daily_model", "usage_daily_hourly", "usage_hourly_model", "errors", "quota_adjust_history", "quota_daily_ops"]) {
+          for (const table of ["users", "usage_daily", "usage_daily_model", "usage_daily_client", "usage_daily_hourly", "usage_hourly_model", "errors", "quota_adjust_history", "quota_daily_ops"]) {
             db.prepare(`DELETE FROM ${table} WHERE user_key=?`).run(key);
           }
         });

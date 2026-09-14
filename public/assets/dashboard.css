@@ -35,6 +35,9 @@ body{padding:16px clamp(14px,2vw,28px) 28px}
 .chart-models{grid-column:1;grid-row:2}.chart-users{grid-column:2;grid-row:2}
 .chart-hmodel{grid-column:1;grid-row:3}.chart-hourly{grid-column:2;grid-row:3}
 .chart-head{min-height:24px;display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:4px}.chart-head h2{font-size:12px;font-weight:650;color:var(--text);white-space:nowrap}
+/* 图内维度切换(用户分布:按用户/按客户端)。工具栏那档 .proto-seg 是 30px,
+   放进 24px 的 chart-head 会把标题栏撑高、直接吃掉画布高度,所以收小一档。 */
+.chart-head .proto-seg{height:22px;align-self:center}.chart-head .proto-seg button{font-size:10px;padding:0 9px}
 .chart-canvas{position:relative;flex:1;min-height:0}.chart-canvas canvas{position:absolute!important;inset:0;width:100%!important;height:100%!important}
 .tabs{display:flex;gap:1px;background:var(--surface-subtle);border:1px solid var(--border);border-radius:5px;padding:2px;width:fit-content;flex-shrink:0}
 .tab{padding:3px 9px;font-size:10px;border:0;border-radius:3px;background:transparent;color:var(--dim);cursor:pointer}.tab:hover{color:var(--text)}.tab.on{background:var(--surface);color:var(--text);font-weight:600}
@@ -81,6 +84,10 @@ body{padding:16px clamp(14px,2vw,28px) 28px}
 #dTable .detail-sticky{position:sticky;left:0;z-index:2;background:var(--surface);min-width:220px}#dTable thead .detail-sticky{z-index:4;background:#fafaf7}
 #dTable .detail-group{cursor:pointer;outline:none}#dTable .detail-group td{background:var(--surface-subtle);font-weight:600;border-top:1px solid var(--border)}#dTable .detail-group .detail-sticky{background:var(--surface-subtle)}#dTable .detail-group:hover td,#dTable .detail-group:focus-visible td{background:#ecece7}
 #dTable tbody tr:not(.detail-group):hover .detail-sticky{background:#fafaf7}
+/* 客户端用量:每个客户端一组,组头行压深一档与组内成员行区分开(照 #dTable 的分组观感)。 */
+#clientBoardTable .client-group td{background:var(--surface-subtle);font-weight:600;border-top:1px solid var(--border)}
+#clientBoardTable tbody tr:hover td{background:#fafaf7}
+#clientBoardTable .client-group:hover td{background:#ecece7}
 .detail-period{display:flex;align-items:center;gap:9px}.detail-period-toggle{display:inline-block;width:8px;height:8px;border-right:1.5px solid var(--dim);border-bottom:1.5px solid var(--dim);transform:rotate(-45deg);transition:transform .18s;flex-shrink:0}.detail-period-toggle.open{transform:rotate(45deg)}
 .detail-period-meta{font-size:10px;color:var(--dim);font-weight:400}.detail-user{display:flex;align-items:baseline;gap:8px;padding-left:17px}.detail-user-name{font-weight:550}.detail-key{font-family:var(--font-mono);font-size:10px;color:var(--dim)}.detail-share{display:block;font-size:10px;color:var(--dim);font-weight:400;margin-top:1px}
 .detail-pages{display:flex;align-items:center;justify-content:flex-end;gap:7px;padding:6px 12px;min-height:36px;border-top:1px solid var(--border)}.detail-pages span{font-size:11px;color:var(--dim);margin-right:3px}.detail-pages button{font-size:11px;background:var(--surface);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:3px 9px;cursor:pointer}.detail-pages button:hover:not(:disabled){border-color:var(--border-strong);background:var(--surface-subtle)}.detail-pages button:disabled{opacity:.4;cursor:default}

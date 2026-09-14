@@ -421,6 +421,8 @@ Bob     离线   380k      20% ██    -           2小时前
 | `proto` / `src` | 协议（anthropic/responses）、请求来源（用户请求/工具调用/子代理） |
 | `model` / `servedModel` | 请求的模型（别名）、响应中的实际模型 |
 | `profile` | 实际服务的方案名（被拒绝的请求为空） |
+| `client` | 识别到的调用方客户端（`claude-cli` / `codex_cli_rs` / `zcode` …，取不到为 `unknown`） |
+| `userAgent` | 客户端原始 `User-Agent`（截断到 256 字符），供排查未识别的新客户端 |
 | `in` / `out` / `cacheC` / `cacheR` | 输入/输出/缓存写入/缓存读取 token |
 | `status` / `ms` | 返回给客户端的状态码、耗时毫秒 |
 | `aborted` | 客户端是否中途断开 |
@@ -453,19 +455,29 @@ Bob     离线   380k      20% ██    -           2小时前
 
 | 页面 | 地址 | 说明 |
 | --- | --- | --- |
-| 管理面板 | `http://localhost:6789/dashboard` | 单屏查看指标、图表、用户、周期明细、方案和错误；顶部"全部 / Claude Code / Codex"三段开关可按协议切换全部统计视角 |
-| 设置 | `http://localhost:6789/settings` | 双标签页（Claude Code / Codex）分别管理各自协议的方案、默认入口与方案组 |
+| 管理面板 | `http://localhost:6789/dashboard` | 单屏查看指标、图表、用户、周期明细、方案和错误；顶部"全部 / Anthropic / OpenAI"三段开关可按协议切换全部统计视角 |
+| 设置 | `http://localhost:6789/settings` | 双标签页（Anthropic / OpenAI）分别管理各自协议的方案、默认入口与方案组 |
 | 个人用量 | `http://localhost:6789/usage/虚拟Key` | 指定成员的用量页面，方案下拉标注所属协议 |
 | Key 查询 | `http://localhost:6789/my-usage` | 输入虚拟 Key 查询 |
 | 健康检查 | `http://localhost:6789/health` | 服务与熔断状态 |
 
 ### 两种协议的默认入口互不影响
 
-Anthropic 默认组只管 Claude Code 的 `/v1` 入口，Responses 组只管 Codex 的 `/v1/responses` 入口；把某个 Codex 方案设为 Responses 默认，Claude Code 的请求路径、路由和 failover 完全不变（反之亦然）。设置页的两个标签页分别展示各自的"默认入口"徽章和方案组编辑器，两边的操作只在各自协议内生效。
+Anthropic 默认组只管 `/v1` 入口，Responses 组只管 `/v1/responses` 入口；把某个方案设为 Responses 默认，走 `/v1` 的请求（路径、路由和 failover）完全不变，反之亦然。设置页的两个标签页分别展示各自的"默认入口"徽章和方案组编辑器，两边的操作只在各自协议内生效。
 
 ### Dashboard 协议分类
 
 `/api/stats` 支持可选的 `protocol=anthropic|responses` 参数（不传则聚合全部，行为与旧版一致）。管理面板的三段开关切换后，卡片、六张图表、用户表、错误表和明细表整体切换到该协议的方案集合；方案中心表格按协议分节展示，两个协议的组头都带"默认"徽章。
+
+### 客户端统计
+
+**协议与客户端是两个正交的维度**：Claude Code 和 zcode 都走 Anthropic 协议，zcode 还能走 OpenAI 协议——所以协议推不出客户端，客户端也推不出协议。页面上凡是指协议的地方一律写协议名（Anthropic / OpenAI），客户端单独成一轴。
+
+采集依据请求头，优先级 `originator` → `User-Agent` 首个 product token → `x-app`，都取不到记为 `unknown`。实测值：Claude Code 2.1.266 发 `claude-cli/2.1.266 (external, sdk-cli)` + `x-app: cli`；Codex 0.145.0 发 `originator: codex_exec`（界面变体另有 `codex-tui` / `codex_vscode` / `codex_sdk_ts` / `codex-app-server` / `codex_cli_rs`），不发 `x-app`。
+
+`x-app` 排在 UA 之后是实测定的：Claude Code 的 `x-app` 就是 `cli` 三个字母，通用到什么都说明不了，而它 UA 里的 `claude-cli` 才点名了客户端。若按 `x-app` 优先，主客户端会被记成一堆叫 `cli` 的请求。**不写死白名单**——新客户端只会在展示层显示为原始标识，不会归成"其他"而消失；要加友好名改 `public/assets/ui.js` 的 `CLIENT_LABELS`。UA 原文另记进 JSONL 请求日志，遇到没见过的客户端可以回溯。
+
+落地位置：`usage_daily_client` 表，以及管理面板的「用户分布图 · 按客户端」和「客户端用量」数据表；个人用量页的「客户端用量」卡片。客户端头部可被伪造，归属是尽力而为的观测值，不是鉴权依据。
 
 ## 主要接口
 
@@ -507,6 +519,8 @@ Anthropic Messages 代理使用虚拟 Key 鉴权。管理类写入接口除登�
 运行中的旧版 `data.json` 可通过设置页导入。首次启动且 SQLite 为空时，服务也会自动迁移同目录下的旧文件并将其重命名为 `data.json.migrated`。
 
 数据库结构变更（如为配额倍率新增的 `weighted_tokens` 列，覆盖 `usage_daily` / `usage_daily_hourly` / `usage_daily_model` 三张表）在启动时幂等执行：先把整库备份到 `backups/`，再加列并按倍率 1.0 回填历史数据，重启不会重复执行。**升级后不建议回滚到旧版本**——旧版写入不含该列，会导致配额少算。
+
+按客户端统计的 `usage_daily_client`（主键 `profile, date, user_key, client`）是纯新增表，`CREATE TABLE IF NOT EXISTS` 直接建，不做回填：客户端信息过去从未采集，历史区间没有可补的数据，所以该表的统计从升级后开始累积。`client='unknown'` 是一行真实数据（识别不出调用方），所以表内合计等于总量，没有缺口需要披露。保留期与 `usage_daily_model` 同为 400 天。
 
 ## 技术栈
 

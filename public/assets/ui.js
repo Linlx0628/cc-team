@@ -69,3 +69,23 @@ function halfHourSlots(hours){
   }
   return out;
 }
+
+// ── 客户端友好名 ─────────────────────────────────────────────────────────────
+// 服务端存的是客户端自己发的原文 product token(usage_daily_client.client),这里只做展示映射。
+// 未知的**原样显示**而不是归成「其他」:以后还会有没见过的客户端,把它们藏进一个桶里
+// 就再也发现不了。写死的白名单只增不减,新增客户端时在下面补一行即可。
+const CLIENT_LABELS={
+  'unknown':'未识别',
+  'claude-cli':'Claude Code',
+  'codex_cli_rs':'Codex CLI',
+  'codex-tui':'Codex TUI',
+  'codex_vscode':'Codex VSCode',
+  'codex_exec':'Codex Exec',
+  'codex_sdk_ts':'Codex SDK',
+  'codex-app-server':'Codex App',
+};
+function clientLabel(client){
+  const key=String(client==null?'':client);
+  if(CLIENT_LABELS[key])return CLIENT_LABELS[key];
+  return key||'未识别';
+}

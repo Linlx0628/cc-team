@@ -201,7 +201,7 @@ function renderProtoSeg(){document.querySelectorAll('#protoSeg button').forEach(
 function rebuildProfileOptions(){
   const sel=document.getElementById('profileSel');
   sel.innerHTML='<option value="all">'+(PROTO==='anthropic'?'全部 Anthropic 方案':PROTO==='responses'?'全部 OpenAI 方案':'全部可用方案')+'</option>'
-    +(D&&(D.availableProfiles||[]).filter(p=>!PROTO||p.protocol===PROTO)||[]).map(p=>'<option value="'+p.suffix+'">'+p.name+' /'+p.suffix+(p.isDefault?' · 默认入口':'')+(p.protocol==='responses'?' · Codex':' · Claude Code')+'</option>').join('');
+    +(D&&(D.availableProfiles||[]).filter(p=>!PROTO||p.protocol===PROTO)||[]).map(p=>'<option value="'+p.suffix+'">'+p.name+' /'+p.suffix+(p.isDefault?' · 默认入口':'')+(p.protocol==='responses'?' · OpenAI':' · Anthropic')+'</option>').join('');
 }
 function switchProtocolView(proto){
   PROTO=proto||'';
@@ -297,7 +297,7 @@ function renderProfileQuotas(){
     const tags=[];
     if(r.isDefault)tags.push('<span class="tag" style="background:rgba(47,110,80,.1);color:var(--green)">默认入口</span>');
     if(r.isPool&&r.poolProfiles&&r.poolProfiles.length>1)tags.push('<span class="tag" style="background:rgba(0,0,0,.04);color:var(--dim)" title="此额度池包含：'+esc((r.poolProfiles||[]).join('、'))+'">'+r.poolProfiles.length+' 个方案</span>');
-    else tags.push('<span class="tag" style="background:rgba(0,0,0,.04);color:var(--dim)">'+(r.protocol==='responses'?'Codex':'Claude Code')+'</span>');
+    else tags.push('<span class="tag" style="background:rgba(0,0,0,.04);color:var(--dim)">'+(r.protocol==='responses'?'OpenAI':'Anthropic')+'</span>');
     if(r.rate!=null&&r.rate!==1)tags.push('<span class="tag" style="background:rgba(0,0,0,.04);color:'+(r.inPeak?'var(--orange)':'var(--green)')+'" title="'+(r.inPeak?'高峰':'低谷')+'时段默认倍率 ×'+r.rate+'">'+(r.inPeak?'高峰':'低谷')+' ×'+r.rate+'</span>');
     if(r.bonus>0)tags.push('<span class="tag" style="background:rgba(46,164,79,.12);color:var(--green)" title="'+bonusTip()+'">临时+'+fmtTk(r.bonus)+'</span>');
     if(r.resetApplied)tags.push('<span class="tag" title="管理员已重置今日用量，统计数据保留">已重置</span>');
@@ -331,7 +331,7 @@ function renderChrome(){
   rebuildProfileOptions();
   sel.value=currentProfile;
   const curProto=(D.availableProfiles||[]).find(p=>p.suffix===currentProfile)?.protocol;
-  const linkTag=currentProfile==='all'?(PROTO?' · 链路: '+(PROTO==='responses'?'OpenAI (Codex)':'Anthropic (Claude Code)'):''):' · 链路: '+(curProto==='responses'?'Codex (Responses)':'Claude Code (Anthropic)');
+  const linkTag=currentProfile==='all'?(PROTO?' · 协议: '+(PROTO==='responses'?'OpenAI':'Anthropic'):''):' · 协议: '+(curProto==='responses'?'OpenAI':'Anthropic');
   const q=D.quota,t=D.today;
   const pct=q.limit>0?Math.min(100,Math.round(q.used/q.limit*100)):0;
   const color=pct>90?'var(--red)':pct>70?'var(--orange)':'var(--green)';
@@ -389,6 +389,30 @@ function renderModelTable(){
     :'当前没有倍率或缓存规则造成差异，实际消耗与计入配额相同。')
     +cacheClause;
 }
+// 客户端表:今天这些请求分别来自哪个 AI 客户端(Claude Code / Codex / ...)。
+// 客户端与协议是两回事 —— Claude Code 和 zcode 都走 Anthropic 协议,zcode 还能走 OpenAI 协议,
+// 所以这张表既不按方案分也不按协议分,只是把今天的量按调用方归一次。
+// 没有倍率列:倍率是「模型 × 时段」的函数,与客户端无关;一个客户端下的请求可能横跨多个模型,
+// 给它们合成一个倍率就是编造。额度口径仍看上面的模型表。
+function renderClientTable(){
+  const tb=document.querySelector("#clientTable tbody"),box=document.getElementById("clientBox");
+  const clients=Object.entries(D.clients||{}).filter(([,d])=>(d.requests||0)>0).sort((a,b)=>b[1].total-a[1].total);
+  if(!clients.length){box.style.display='none';return}
+  box.style.display='';
+  const sum=clients.reduce((a,[,d])=>a+(d.total||0),0);
+  tb.innerHTML=clients.map(([c,d])=>{
+    const pct=sum>0?d.total/sum*100:0;
+    const isUnknown=c==='unknown';
+    return '<tr><td'+(isUnknown?' style="color:var(--dim)"':' style="color:var(--blue)"')+'>'+clientLabel(c)+'</td>'
+      +'<td class="n">'+fmtT(d.requests||0)+'</td>'
+      +'<td class="n hl" title="输入 '+fmtT(d.inputTokens||0)+' / 输出 '+fmtT(d.outputTokens||0)+'">'+fmtTk(d.total||0)+'</td>'
+      +'<td class="n">'+pct.toFixed(1)+'%</td></tr>';
+  }).join("");
+  const unknown=clients.find(([c])=>c==='unknown');
+  document.getElementById('clientTableNote').innerHTML=
+    '客户端依据请求头（User-Agent / X-App / Originator）判定，可被伪造，仅供参考。'
+    +(unknown?' <span style="white-space:nowrap">其中 '+fmtT(unknown[1].requests||0)+' 次请求未能识别调用方。</span>':'');
+}
 // 用量分析面板:两张 Chart.js 图按容器宽度绘制,面板隐藏时容器宽度是 0,建图会得到一张
 // 空白图。所以这一片只在面板可见时渲染,切过去时由 paintSection() 补画。
 // (使用日历已搬到概览,同理由 paintSection() 的 overview 分支补画。)
@@ -414,6 +438,7 @@ function renderAnalysisPane(){
   if(C.t){C.t.destroy();C.t=null}
   if(tc)C.t=new Chart(tc,{type:"line",data:{labels:D.trend.map(d=>d.date.slice(5)),datasets:[{label:"总Token(含缓存)",data:D.trend.map(d=>d.total),borderColor:COL[0],backgroundColor:"rgba(47,110,80,.12)",fill:true,tension:.28,pointRadius:2,borderWidth:2}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{labels:{color:"#686863",font:{size:10}}}},scales:{x:{ticks:{color:"#686863"},grid:{display:false}},y:{ticks:{color:"#686863",callback:v=>fmtTk(v)},grid:{color:"rgba(24,24,22,.08)"}}}}});
   renderModelTable();
+  renderClientTable();
 }
 // Price list: what each alias costs right now. Answers "为什么额度掉这么快" before
 // the user spends, not after. Cheapest first — the cheap option should be the one

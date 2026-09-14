@@ -1134,8 +1134,12 @@ function applyScheduleDockState(){
     if(hint){
       hint.hidden=!on;
       if(on){
-        var a=schedState[proto].active,t=document.getElementById('schedDockHintText-'+proto);
-        if(t)t.textContent=a.source==='manual'?('手动指定：'+(a.group||'')):(a.ruleSummary||a.group||'');
+        // 组名与来源分两个 span：标题只留固定短语，长的摘要放在会换行的说明行里。
+        var a=schedState[proto].active,
+            gt=document.getElementById('schedDockHintText-'+proto),
+            st2=document.getElementById('schedDockHintSrc-'+proto);
+        if(gt)gt.textContent=a.group||'';
+        if(st2)st2.textContent=a.source==='manual'?'手动指定':(a.ruleSummary||'调度规则');
       }
     }
     if(editor)editor.hidden=on;

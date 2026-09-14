@@ -1183,14 +1183,23 @@ function stickyTtlMs() {
 }
 
 // Resolve a stable per-conversation signal, in priority order:
-// 1. explicit session headers (Codex sends `session_id` on /v1/responses),
+// 1. explicit session headers (Codex sends `session-id` on /v1/responses),
 // 2. the Responses API `prompt_cache_key` body field,
 // 3. digest of the conversation's first turn — replay protocols append at the
 //    tail, so item[0] (plus the constant system/instructions) is identical on
 //    every turn of the same conversation. Collisions between conversations that
 //    happen to share the first turn only cost cache locality, never correctness.
+//
+// 连字符不能省。Codex 发的是 `session-id`(连字符),而这里原先只查 `session_id`
+// (下划线)—— Node 把请求头名归一成小写但**保留连字符**,所以那一路对 Codex 从来
+// 没命中过,一直是靠第 2 优先级的 prompt_cache_key 兜住的(实测 Codex 0.145 在
+// /v1/responses 上同时发 session-id / thread-id / prompt_cache_key 三个同值 uuid,
+// 只有 pck 那条被读到)。补上别名后走显式头,不再依赖一个可选字段是否被客户端填。
+//
+// 副作用(一次性):Codex 的会话键由 `pck:<uuid>` 变成 `hdr:<uuid>`,同一段对话在
+// 切换前后各留一行。usage_session 与 tool_events 都只保 90 天,窗口内会重影,之后自愈。
 function extractSessionSignal(protocol, reqHeaders, parsed) {
-  const hdr = reqHeaders["session_id"] || reqHeaders["x-session-id"] || reqHeaders["x-claude-code-session-id"];
+  const hdr = reqHeaders["session-id"] || reqHeaders["session_id"] || reqHeaders["x-session-id"] || reqHeaders["x-claude-code-session-id"];
   if (typeof hdr === "string" && hdr.trim()) return "hdr:" + hdr.trim().slice(0, 128);
   const pck = parsed?.prompt_cache_key;
   if (typeof pck === "string" && pck.trim()) return "pck:" + pck.trim().slice(0, 128);

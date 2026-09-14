@@ -813,7 +813,9 @@ function renderSessBoard(){
     // 再没有才是「纯问答」占位。项目与标识都是辅助信息,降到下面那行小字。标识串任何时候都
     // 保留:它是唯一能对上盘上文件的键。
     const name=s.title?esc(s.title):(s.project?esc(s.project):'<span style="color:var(--dim)">纯问答 · 无代码产出</span>');
-    const idLine=(s.title&&s.project?esc(s.project)+' · ':'')+esc(sessShort(s.session));
+    const idLine=(s.title&&s.project?esc(s.project)+' · ':'')+esc(sessShort(s.session))
+      // 客户端与管理端流水同一套用词(clientLabel);迁移前旧行没采集过,省略比一个灰「—」干净。
+      +(s.client?' · '+esc(clientLabel(s.client)):'');
     const when=s.first_seen===s.last_seen?cnStamp(s.first_seen):(cnStamp(s.first_seen)+' → '+cnStamp(s.last_seen));
     // 时长是八格里最宽的一格(fmtDur 的空格是给「一句话里读」加的,进了定宽格会白占宽度,
     // 去掉后实测 70.6px;次宽的 Token 只有 56.8)。列宽分档就是按 70.6 定的,见 my-usage.css

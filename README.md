@@ -15,6 +15,7 @@ Claude Code 走 Anthropic Messages 协议（`/v1/messages`），Codex 走 OpenAI
 - 多个 Anthropic Messages 上游同时在线，通过 URL 后缀区分方案
 - Codex 透传接入：OpenAI Responses 协议（`/v1/responses`），上游需为原生 Responses 端点（如智谱 `https://open.bigmodel.cn/api/v1`）
 - Responses 方案组独立 failover，与 Anthropic 方案严格隔离
+- 方案组调度：预先排列多套方案组，按「星期几 + 时段」自动切换优先级（周末把便宜的排前面、工作日早上用 A 下午用 B），两个协议各一套规则表，互不影响
 - 每位成员使用独立的 `jx-` 虚拟 Key，真实上游 Key 不暴露
 - 按成员、方案、模型、日期和小时统计 Token 用量（含缓存 token）
 - 方案级与成员级每日配额，北京时间零点重置
@@ -138,7 +139,18 @@ node server.mjs
       "disabled": false
     }
   },
+  "defaultProfileGroup": ["glm"],
   "responsesProfileGroup": ["glm-codex"],
+  "scheduleGroups": {
+    "周末": { "protocol": "anthropic", "members": ["glm"] }
+  },
+  "scheduleRules": {
+    "anthropic": [
+      { "days": [6, 0], "start": null, "end": null, "group": "周末" },
+      { "days": [1, 2, 3, 4, 5], "start": "09:00", "end": "13:00", "group": "@base" }
+    ]
+  },
+  "scheduleOverride": {},
   "proxy": {
     "timeout": 180000,
     "streamTimeout": 600000,
@@ -158,6 +170,8 @@ node server.mjs
 
 `modelAliases` 是唯一的模型映射入口。别名目标会自动加入 `allowedModels`；不需要别名时可直接使用真实模型名。
 
+`defaultProfileGroup` 与 `responsesProfileGroup` 是**基础组**：两个协议各一份有序方案名单，第一位是默认入口。`scheduleGroups` / `scheduleRules` / `scheduleOverride` 是可选的三项调度配置——命名方案组、按协议分桶的时间规则、手动指定（存绝对 UTC 时刻）。三者缺失或类型不对都会被归一成空，此时路由行为与不含这三个键完全一致。`scheduleRules` 里 `days` 用数字表示星期（`0`=周日 … `6`=周六，缺省或 `null` 表示每天），`start`/`end` 同为 `null` 表示全天；一条规则只要有字段非法（空 `days`、`start === end`、时间格式不对、组名不存在）就会在加载时被整条丢弃，而不会放宽成「每天」。
+
 设置页的模型别名为一行一别名的结构化编辑器（别名 / 实际模型 / 每别名上下文长度一一对应，`jx-fable`/`jx-opus`/`jx-haiku`/`jx-sonnet` 可快捷添加也可自定义）；通用别名必填，`allowedModels` 由全部别名（含高峰期覆盖）的实际模型自动汇总生成，不可手填。每个别名的上下文长度写入成员 Codex 接入配置的 models.json。
 
 `jx-sonnet`、`jx-opus` 和 `jx-haiku` 没有特殊的独立配置入口，它们与其他别名一样统一写入 `modelAliases`。
@@ -171,6 +185,29 @@ node server.mjs
 方案连续失败达到 `circuitBreakerFailures` 次即熔断，期间请求自动切到默认组的下一个方案。冷却结束后**自动放行探测请求**：探测成功即关闭熔断、流量切回该方案；探测失败则重新熔断，且**冷却时间指数退避**（×2，最多 8 倍或 5 分钟上限），避免长时间故障期间反复消耗真实请求。上游答复成功后退避立即归零。
 
 这一步对「组头是 Coding Plan 套餐」的配置尤为重要：组头短暂网络故障熔断后必须能自动收回流量，否则套餐额度会被闲置，流量长期留在按量计费的备选方案上。整个过程无需手工重置熔断器；设置页与 Dashboard 方案中心会显示距下次探测的剩余秒数与当前退避倍数。
+
+### 方案组调度（按时间切换优先级）
+
+「方案组」就是一份有序的方案名单，**列表顺序即优先级，第一条是组头**。调度功能让你预先排列**多套**这样的名单（命名方案组），再用**时间规则**决定此刻用哪一套。
+
+规则粒度是**星期几 + 时段**，两个协议（Anthropic / Responses）各有一张独立的规则表，**不跨协议排序**。规则表**自上而下匹配，第一条命中的生效**，所以顺序就是优先级；设置页里可以上下移动规则。时段为左闭右开，`start > end` 表示跨午夜，且**窗口归属开始的那一天**（`周六 22:00-02:00` 在周日凌晨 1 点仍然命中，它属于周六那条规则）。时间一律按北京时间判定。
+
+```
+规则 1  周六、周日   全天            → 周末        （DeepSeek 排前面）
+规则 2  周一~周五   09:00-13:00     → 工作日早     （GLM 排前面）
+规则 3  周一~周五   13:00-18:00     → 工作日下午   （火山引擎 Coding Plan 排前面）
+规则 4  周一~周五   18:00-23:59     → 默认方案组   （@base，回到侧栏基础组的顺序）
+```
+
+几个要点：
+
+- **只改路由，不改配置。** 调度生效期间不会改写侧栏的基础组，不重建任何运行时，也不需要重载配置——规则在每次请求内求值，跟高峰时段配额倍率一样。
+- **未命中任何规则时，行为与未配置调度完全一致**：用侧栏基础组（「默认方案组」/「Responses 方案组」）的当前顺序。三个调度键都为空时功能完全惰性。
+- 规则里的 `@base` 是保留字，指「侧栏基础组的当前顺序」，所以可以让某些时段明确落回基础组，也可以放在前面去覆盖后面的宽规则。因此组名不允许以 `@` 开头，最长 24 字（组名同时就是 UI 标签）。
+- **手动指定**：临时把某个协议钉到某一套组上，覆盖调度规则；**到下一个时间边界自动收回**（跨过下一个会改变生效组的时刻，或规则表为空时的下一个北京 00:00）。视图里会显示收回时刻，也可以随时手动取消。由此有一条限制：**手动指定的寿命止于下一个时间边界**，无法用它表达「今天一整天都用 A」。
+- **删除被规则引用的方案组会被拒绝**（先改规则再删组），避免配置里留下指向不存在组的悬空引用。方案被重命名或删除时会自动同步到各调度组的成员表。
+- **「限制直连」的作用范围随之扩大**：勾选后，**基础组与全部命名调度组的成员**都不允许带 `/方案后缀` 直连。否则只在某个调度组里出现的方案可以绕过 failover 直连，等于绕开限额降级。某个协议只要存在一个成员数 ≥2 的组，这条守卫就对该协议生效。
+- **调度切换会写审计**（`schedule.group_switch`，区别于 `failover.switch`）：计划内的切换不会被记成「组头被限流/熔断」。请求日志里额外记 `group` / `groupSource`，用于解释「这一次为什么走了火山引擎」。
 
 ### 流式空闲看门狗
 
@@ -456,7 +493,7 @@ Bob     离线   380k      20% ██    -           2小时前
 | 页面 | 地址 | 说明 |
 | --- | --- | --- |
 | 管理面板 | `http://localhost:6789/dashboard` | 单屏查看指标、图表、用户、周期明细、方案和错误；顶部"全部 / Anthropic / OpenAI"三段开关可按协议切换全部统计视角 |
-| 设置 | `http://localhost:6789/settings` | 双标签页（Anthropic / OpenAI）分别管理各自协议的方案、默认入口与方案组 |
+| 设置 | `http://localhost:6789/settings` | 双标签页（Anthropic / OpenAI）分别管理各自协议的方案、默认入口与方案组；侧栏「方案组调度」进入按时间切换优先级的规则表 |
 | 个人用量 | `http://localhost:6789/usage/虚拟Key` | 指定成员的用量页面，方案下拉标注所属协议 |
 | Key 查询 | `http://localhost:6789/my-usage` | 输入虚拟 Key 查询 |
 | 健康检查 | `http://localhost:6789/health` | 服务与熔断状态 |
@@ -502,6 +539,12 @@ Anthropic Messages 代理使用虚拟 Key 鉴权。管理类写入接口除登�
 | `/api/profile/save` | POST | 创建方案 |
 | `/api/profile/default` | POST | 设置方案组默认入口 |
 | `/api/profile/delete` | POST | 删除方案 |
+| `/api/schedule` | GET | 读取调度状态：每协议的组、规则、当前生效组、下次切换时刻、手动指定与配置告警 |
+| `/api/schedule/groups` | POST | 整体替换某协议的命名方案组（成员不存在则剪掉，全部成员无效或删掉被规则引用的组则拒绝） |
+| `/api/schedule/groups/delete` | POST | 删除一个命名方案组（被规则引用时拒绝） |
+| `/api/schedule/groups/rename` | POST | 重命名命名方案组，并同步改写规则里的引用 |
+| `/api/schedule/rules` | POST | 整体替换某协议的时间规则表（逐条严格校验，出错点名第几条） |
+| `/api/schedule/override` | POST | 设置或取消手动指定（到下一个时间边界自动收回） |
 | `/api/global-user/save` | POST | 保存用户与方案分配 |
 | `/api/global-user/delete` | POST | 删除用户及其可识别历史 |
 | `/api/data-import/preview` | POST | 预览旧数据与方案映射 |

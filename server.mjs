@@ -600,15 +600,36 @@ function profilePeakHoursMap() {
   const before = JSON.stringify([config.scheduleGroups, config.scheduleRules, config.scheduleOverride]);
   const notes = [];
 
+  // 0) 旧扁平格式 → 按协议分桶。旧存储是全局一张表 { 组名: {protocol, members} }，组名
+  //    全局唯一 —— 两协议建同名组时后者静默覆盖前者（「Anthropic 方案组消失」的根因）。
+  //    新存储两协议各一桶，同名合法；组对象内的 protocol 字段保留（求值链路依赖它）。
+  if (config.scheduleGroups && typeof config.scheduleGroups === "object" && !Array.isArray(config.scheduleGroups)
+      && Object.values(config.scheduleGroups).some((v) => v && typeof v === "object" && !Array.isArray(v) && typeof v.protocol === "string")) {
+    const flat = config.scheduleGroups;
+    config.scheduleGroups = {};
+    for (const proto of ["anthropic", "responses"]) {
+      config.scheduleGroups[proto] = {};
+      for (const [name, g] of Object.entries(flat)) {
+        if (g && g.protocol === proto) config.scheduleGroups[proto][name] = g;
+      }
+    }
+  }
+
   // 1) 命名组。成员被剪空的组**保留**（通常来自「组里的方案被删了」）—— 连组带规则一起
   //    静默丢掉会让用户配置凭空消失，留着并由设置页标红才是诚实的失败方式。
-  const groups = normalizeScheduleGroups(config.scheduleGroups, protoOfProfile);
+  //    分桶后逐协议归一：normalizeScheduleGroups 面向单协议的扁平表（读 value.protocol
+  //    校验成员），收窄到各自桶内调用即可复用。
+  const groups = {};
+  for (const proto of ["anthropic", "responses"]) {
+    const bucket = config.scheduleGroups && typeof config.scheduleGroups === "object" ? config.scheduleGroups[proto] : null;
+    groups[proto] = normalizeScheduleGroups(bucket && typeof bucket === "object" && !Array.isArray(bucket) ? bucket : {}, protoOfProfile);
+  }
   // 2) 规则：按协议分桶保序归一。@base 恒合法；其余必须指向**本协议**已存在的组。
   const rulesIn = (config.scheduleRules && typeof config.scheduleRules === "object" && !Array.isArray(config.scheduleRules)) ? config.scheduleRules : {};
   const rulesOut = {};
   for (const proto of ["anthropic", "responses"]) {
     rulesOut[proto] = normalizeScheduleRules(rulesIn[proto], (name) => {
-      const g = groups[name];
+      const g = groups[proto][name];
       return !!(g && g.protocol === proto);
     });
   }
@@ -629,7 +650,7 @@ function profilePeakHoursMap() {
         ? (Array.isArray(config.responsesProfileGroup) ? config.responsesProfileGroup : [])
         : (Array.isArray(config.defaultProfileGroup) ? config.defaultProfileGroup : []);
     } else {
-      const grp = groups[g];
+      const grp = groups[proto][g];
       if (grp && grp.protocol === proto) members = grp.members;
     }
     if (!g || !Number.isFinite(until) || until <= Date.now() || !members || members.length === 0) {
@@ -639,14 +660,20 @@ function profilePeakHoursMap() {
     overrideOut[proto] = o;
   }
 
-  config.scheduleGroups = groups;
+  // 空桶不落盘：全新安装保持 scheduleGroups === {}（与升级前逐字一致），省得给手改配置的人
+  // 多一层没必要的嵌套；消费端一律 `(config.scheduleGroups || {})[proto] || {}`，两种形状都安全。
+  config.scheduleGroups = {};
+  for (const proto of ["anthropic", "responses"]) {
+    if (Object.keys(groups[proto]).length > 0) config.scheduleGroups[proto] = groups[proto];
+  }
   config.scheduleRules = rulesOut;
   config.scheduleOverride = overrideOut;
   const after = JSON.stringify([config.scheduleGroups, config.scheduleRules, config.scheduleOverride]);
   if (before !== after || notes.length > 0) {
     saveConfig(config);
     const summary = Object.entries(rulesOut).map(([p, rs]) => `${p}=${rs.length}`).join(", ");
-    console.log(`[MIGRATE] 方案组调度已归一：组 ${Object.keys(groups).length} 个，规则 ${summary}（规则为空时行为与升级前完全一致）`,
+    const groupCount = Object.values(groups).reduce((n, m) => n + Object.keys(m).length, 0);
+    console.log(`[MIGRATE] 方案组调度已归一：组 ${groupCount} 个，规则 ${summary}（规则为空时行为与升级前完全一致）`,
       notes.length ? `；${notes.join("；")}` : "");
   }
 })();
@@ -1351,7 +1378,8 @@ function resolveRequestGroup(protocol, date = new Date(), ignoreOverride = false
   try {
     return resolveEffectiveGroup({
       baseGroup,
-      groups: config.scheduleGroups || {},
+      // 分桶存储：只把**本协议**的桶交给求值器（桶内组对象仍带 protocol 字段）。
+      groups: ((config.scheduleGroups || {})[protocol]) || {},
       rules: ((config.scheduleRules || {})[protocol]) || [],
       override: ignoreOverride ? null : ((config.scheduleOverride || {})[protocol] || null),
     }, protocol, date);
@@ -2404,8 +2432,9 @@ function buildScheduleState() {
       ? (Array.isArray(config.responsesProfileGroup) ? config.responsesProfileGroup : [])
       : (Array.isArray(config.defaultProfileGroup) ? config.defaultProfileGroup : []);
     const groups = {};
-    for (const [name, g] of Object.entries(config.scheduleGroups || {})) {
-      if (!g || typeof g !== "object" || g.protocol !== proto) continue;
+    // 分桶存储：本协议的桶直接就是这张表，无需再按 protocol 过滤。
+    for (const [name, g] of Object.entries((config.scheduleGroups || {})[proto] || {})) {
+      if (!g || typeof g !== "object") continue;
       // protocol 必须留着：describeScheduleHealth 按它过滤，前端也按它分区段渲染。
       // 少了这个字段，health 会把每个组都当成「不存在」，于是每条规则都被报成
       // unknown_group —— 一个永久误报的警告，比不报还糟。
@@ -3075,12 +3104,11 @@ const server = http.createServer((req, res) => {
           const counts = gone.map(n => `"${n}"（${config.scheduleRules[proto].filter(r => r && r.group === n).length} 条）`);
           throw new Error(`方案组 ${counts.join("、")} 正被时间规则引用，请先修改或删除这些规则`);
         }
-        // 其它协议的组原样保留。
-        const merged = {};
-        for (const [name, g] of Object.entries(config.scheduleGroups || {})) {
-          if (g && g.protocol !== proto) merged[name] = g;
-        }
-        config.scheduleGroups = { ...merged, ...next };
+        // 其它协议的组在**各自的桶里**，与本协议保存天然互不干扰 —— 分桶前的扁平表在这里
+        // 用「保留其它协议 + 展开本次提交」合并，同名组被 spread 顺序静默覆盖（根因）。
+        if (!config.scheduleGroups || typeof config.scheduleGroups !== "object" || Array.isArray(config.scheduleGroups)) config.scheduleGroups = {};
+        if (!config.scheduleGroups[proto] || typeof config.scheduleGroups[proto] !== "object") config.scheduleGroups[proto] = {};
+        config.scheduleGroups[proto] = next;
         saveConfig(config);
         resetFailoverTracking();
         recordAdminAudit(req, "schedule.groups", `${proto} 组`, `设置${proto === "responses" ? "OpenAI (Responses)" : "Anthropic"}调度组：${Object.entries(next).map(([n, g]) => `${n}[${g.members.join(" → ")}]`).join("，") || "（空）"}`);
@@ -3103,14 +3131,16 @@ const server = http.createServer((req, res) => {
     if (!checkCsrf(req)) { res.writeHead(403); res.end("CSRF validation failed"); return; }
     readBody(req, 10_000).then(buf => {
       try {
-        const { name } = JSON.parse(buf.toString());
-        const g = (config.scheduleGroups || {})[String(name || "")];
+        const { protocol, name } = JSON.parse(buf.toString());
+        // 分桶后组名只在本协议内唯一，必须带协议定位（两协议同名组并存是合法状态）。
+        const proto = normalizeProfileProtocol(protocol);
+        const bucket = (config.scheduleGroups || {})[proto] || {};
+        const g = bucket[String(name || "")];
         if (!g) throw new Error(`方案组 "${name}" 不存在`);
-        const proto = g.protocol;
         const refs = (Array.isArray((config.scheduleRules || {})[proto]) ? config.scheduleRules[proto] : [])
           .filter(r => r && r.group === name).length;
         if (refs > 0) throw new Error(`方案组 "${name}" 正被 ${refs} 条时间规则引用，请先修改或删除这些规则`);
-        delete config.scheduleGroups[name];
+        delete config.scheduleGroups[proto][name];
         saveConfig(config);
         resetFailoverTracking();
         recordAdminAudit(req, "schedule.groups", String(name), `删除调度组 "${name}"（${proto}）`);
@@ -3132,27 +3162,31 @@ const server = http.createServer((req, res) => {
     if (!checkCsrf(req)) { res.writeHead(403); res.end("CSRF validation failed"); return; }
     readBody(req, 10_000).then(buf => {
       try {
-        const { name, to } = JSON.parse(buf.toString());
-        const g = (config.scheduleGroups || {})[String(name || "")];
+        const { protocol, name, to } = JSON.parse(buf.toString());
+        // 分桶后组名只在本协议内唯一，必须带协议定位（两协议同名组并存是合法状态）。
+        const proto = normalizeProfileProtocol(protocol);
+        if (!config.scheduleGroups || typeof config.scheduleGroups !== "object" || Array.isArray(config.scheduleGroups)) config.scheduleGroups = {};
+        if (!config.scheduleGroups[proto] || typeof config.scheduleGroups[proto] !== "object") config.scheduleGroups[proto] = {};
+        const g = config.scheduleGroups[proto][String(name || "")];
         if (!g) throw new Error(`方案组 "${name}" 不存在`);
         const newName = normalizeScheduleGroupName(to);
         if (newName === name) throw new Error("新名称与原名相同");
-        if (config.scheduleGroups[newName]) throw new Error(`方案组 "${newName}" 已存在`);
+        if (config.scheduleGroups[proto][newName]) throw new Error(`方案组 "${newName}" 已存在`);
         // 同步重写规则里的引用（照 /api/profile/rename 重写组数组的手法）。漏了这一步，
         // 改名会让引用它的规则全部变成指向不存在的组，从而被静默跳过。
-        const rules = (config.scheduleRules || {})[g.protocol];
+        const rules = (config.scheduleRules || {})[proto];
         let touched = 0;
         if (Array.isArray(rules)) {
           for (const r of rules) {
             if (r && r.group === name) { r.group = newName; touched++; }
           }
         }
-        // 保序重建，让改名不改变组在对象里的位置（设置页按插入序渲染）。
+        // 保序重建，让改名不改变组在对象里的位置（设置页按插入序渲染）。只在**本协议桶内**重建。
         const rebuilt = {};
-        for (const [k, v] of Object.entries(config.scheduleGroups)) rebuilt[k === name ? newName : k] = v;
-        config.scheduleGroups = rebuilt;
+        for (const [k, v] of Object.entries(config.scheduleGroups[proto])) rebuilt[k === name ? newName : k] = v;
+        config.scheduleGroups[proto] = rebuilt;
         // 手动指定若指向该组，一并跟随改名。
-        const o = (config.scheduleOverride || {})[g.protocol];
+        const o = (config.scheduleOverride || {})[proto];
         if (o && o.group === name) o.group = newName;
         saveConfig(config);
         recordAdminAudit(req, "schedule.groups", newName, `调度组 "${name}" 重命名为 "${newName}"${touched ? `，同步更新 ${touched} 条规则引用` : ""}`);
@@ -3180,7 +3214,7 @@ const server = http.createServer((req, res) => {
         const proto = normalizeProfileProtocol(protocol);
         if (!Array.isArray(rules)) throw new Error("rules 必须是数组");
         const groupExists = (name) => {
-          const g = (config.scheduleGroups || {})[name];
+          const g = ((config.scheduleGroups || {})[proto] || {})[name];
           return !!(g && g.protocol === proto);
         };
         const next = [];
@@ -3250,7 +3284,7 @@ const server = http.createServer((req, res) => {
         const name = typeof group === "string" ? group.trim() : "";
         if (!name) throw new Error("请选择要指定的方案组");
         if (name !== BASE_GROUP_TOKEN) {
-          const g = (config.scheduleGroups || {})[name];
+          const g = ((config.scheduleGroups || {})[proto] || {})[name];
           if (!g || g.protocol !== proto) throw new Error(`方案组 "${name}" 不存在或不是 ${proto} 协议组`);
         }
         const rules = Array.isArray((config.scheduleRules || {})[proto]) ? config.scheduleRules[proto] : [];
@@ -3499,11 +3533,15 @@ const server = http.createServer((req, res) => {
         // 也从全部调度组里剪掉。**组因此变空时保留该组**（由设置页标红「此组没有有效成员」）——
         // 连带把组和引用它的规则一起删掉，会让用户的配置在删一个方案时凭空消失一大块。
         // 规则留着，求值时会被跳过（见 lib/schedule.mjs 的空组继续往下找）。
+        // 分桶后两协议各自一桶；两协议可能同名，变空提示要带协议标注。
         const emptiedGroups = [];
-        for (const [gname, g] of Object.entries(config.scheduleGroups || {})) {
-          if (!g || !Array.isArray(g.members) || !g.members.includes(profile)) continue;
-          g.members = g.members.filter(n => n !== profile);
-          if (g.members.length === 0) emptiedGroups.push(gname);
+        for (const [proto, bucket] of Object.entries(config.scheduleGroups || {})) {
+          if (!bucket || typeof bucket !== "object") continue;
+          for (const [gname, g] of Object.entries(bucket)) {
+            if (!g || !Array.isArray(g.members) || !g.members.includes(profile)) continue;
+            g.members = g.members.filter(n => n !== profile);
+            if (g.members.length === 0) emptiedGroups.push(`"${gname}"（${proto === "responses" ? "OpenAI" : "Anthropic"}）`);
+          }
         }
         // An orphaned pool has no members to draw on it and its limits are dead
         // weight — drop it. A pool still referenced elsewhere is left alone.
@@ -3554,8 +3592,11 @@ const server = http.createServer((req, res) => {
         for (const key of ["defaultProfileGroup", "responsesProfileGroup"]) {
           if (Array.isArray(config[key])) config[key] = config[key].map(n => (n === profile ? newName : n));
         }
-        for (const g of Object.values(config.scheduleGroups || {})) {
-          if (g && Array.isArray(g.members)) g.members = g.members.map(n => (n === profile ? newName : n));
+        for (const bucket of Object.values(config.scheduleGroups || {})) {
+          if (!bucket || typeof bucket !== "object") continue;
+          for (const g of Object.values(bucket)) {
+            if (g && Array.isArray(g.members)) g.members = g.members.map(n => (n === profile ? newName : n));
+          }
         }
         // Auto-pool case: an empty quotaPool means the pool is named after the
         // profile — pin it to the existing pool key so the rename doesn't orphan

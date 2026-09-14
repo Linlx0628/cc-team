@@ -1310,7 +1310,7 @@ function scheduleRenameGroup(proto,gi){
   const nn=to.trim();
   if(!nn||nn===name)return;
   let r2,data;
-  fetch('/api/schedule/groups/rename',{method:'POST',headers:csrfHeaders({'Content-Type':'application/json'}),body:JSON.stringify({name:name,to:nn})})
+  fetch('/api/schedule/groups/rename',{method:'POST',headers:csrfHeaders({'Content-Type':'application/json'}),body:JSON.stringify({protocol:proto,name:name,to:nn})})
     .then(function(r){r2=r;return r.json().catch(function(){return {}})})
     .then(function(d){
       data=d;
@@ -1324,7 +1324,7 @@ function scheduleDeleteGroup(proto,gi){
   const names=Object.keys(schedGroups[proto]||{}),name=names[gi];
   if(!name)return;
   if(!confirm('确定删除方案组「'+name+'」？正被时间规则引用的组会被服务端拒绝，请先修改规则。'))return;
-  fetch('/api/schedule/groups/delete',{method:'POST',headers:csrfHeaders({'Content-Type':'application/json'}),body:JSON.stringify({name:name})})
+  fetch('/api/schedule/groups/delete',{method:'POST',headers:csrfHeaders({'Content-Type':'application/json'}),body:JSON.stringify({protocol:proto,name:name})})
     .then(function(r){return r.json().catch(function(){return {}}).then(function(d){
       if(!r.ok){alert('删除失败: '+(d&&d.error?d.error:r.status));return}
       rememberScheduleViewForReload();

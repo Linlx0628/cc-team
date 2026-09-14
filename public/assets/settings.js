@@ -86,15 +86,17 @@ function openUserModal(){const sfx=document.getElementById('profileSuffixInput')
 function closeUserModal(){document.getElementById('userModal').classList.remove('open')}
 document.getElementById('userModal').addEventListener('click',function(e){if(e.target===this)closeUserModal()});
 function openProfileModal(protocol){document.getElementById('profileModal').classList.add('open');if(protocol){var sel=document.getElementById('newProfileProtocol');sel.value=protocol;updateNewProfileProtocolHint()}document.getElementById('newProfileName').focus()}
-// 限制直连 is ONE shared setting rendered in both protocol panes — keep the
-// two checkboxes in sync whichever one is toggled, and persist the choice
+// 限制直连 is ONE shared setting rendered in both protocol panes — keep all
+// checkboxes in sync whichever one is toggled, and persist the choice
 // right away: the checkboxes live outside both forms, so an unsaved toggle
 // used to be lost (or silently flipped by the next form save). On failure
-// roll both checkboxes back to the previous state and surface the error.
+// roll all checkboxes back to the previous state and surface the error.
+// The schedule dock hint blocks carry their own copy (class-based), so this
+// must NOT key off the two original ids alone.
 function setRestrictGroupSuffix(checked){
-  var a=document.getElementById('restrictGroupSuffixCb'),b=document.getElementById('restrictGroupSuffixCb2');
+  var cbs=document.querySelectorAll('.restrict-group-suffix-cb');
   var prev=!checked; // checkboxes are kept in sync, so the prior state is the inverse
-  if(a)a.checked=checked;if(b)b.checked=checked;
+  cbs.forEach(function(cb){cb.checked=checked});
   fetch('/api/restrict-group-suffix',{method:'POST',headers:csrfHeaders({'Content-Type':'application/json'}),body:JSON.stringify({on:checked})})
     .then(function(r){return r.text().then(function(t){
       var j=null;try{j=JSON.parse(t)}catch(e){}
@@ -102,7 +104,7 @@ function setRestrictGroupSuffix(checked){
     })})
     .then(function(){toast(checked?'限制直连已开启':'限制直连已关闭')})
     .catch(function(err){
-      if(a)a.checked=prev;if(b)b.checked=prev;
+      cbs.forEach(function(cb){cb.checked=prev});
       toast('保存失败:'+(err&&err.message?err.message:'未知错误'));
     });
 }
@@ -1115,6 +1117,30 @@ const SCHED_DAY_ORDER=[1,2,3,4,5,6,0];
 // 而组名是用户输入（最长 24 字）。没有它，一个长组名会把整行顶出去，在窄屏上变成横向滚动。
 const SCHED_SEL_STYLE='width:auto;min-width:0;max-width:100%;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:3px 6px;border-radius:4px;font-size:12px';
 let schedState=(SETTINGS.schedule&&SETTINGS.schedule.protocols)||{};
+// 调度正在接管某协议（active 指向命名组）时，侧栏 dock 的基础组编辑器被只读提示替换。
+// 编辑器 DOM 仍是服务端渲染那份，状态翻回来时直接撤掉 hidden，无需重建。
+// 切换只翻转 [hidden]，不能用 .sidebar-global[data-proto] 选择器定位编辑器 ——
+// 提示块同名同属性会一起命中；也不能给 .sidebar-global 加 display: CSS（会压过 [hidden]）。
+function schedDockSteers(proto){
+  var st=schedState[proto],a=st&&st.active;
+  return !!(a&&a.group&&a.group!==SCHED_BASE);
+}
+function applyScheduleDockState(){
+  SCHED_PROTOS.forEach(function(proto){
+    var on=schedDockSteers(proto);
+    var hint=document.getElementById('schedDockHint-'+proto);
+    var list=document.getElementById(proto==='responses'?'responsesGroupList':'defaultGroupList');
+    var editor=list?list.closest('.sidebar-global'):null;
+    if(hint){
+      hint.hidden=!on;
+      if(on){
+        var a=schedState[proto].active,t=document.getElementById('schedDockHintText-'+proto);
+        if(t)t.textContent=a.source==='manual'?('手动指定：'+(a.group||'')):(a.ruleSummary||a.group||'');
+      }
+    }
+    if(editor)editor.hidden=on;
+  });
+}
 let schedGroups={};   // proto → { 组名: [方案名...] }：提交前的编辑副本
 let schedDirty={};    // proto → 规则表有未保存的重排；此时不回显「命中」徽章，免得张冠李戴
 function schedProfileByName(n){return (SETTINGS.profiles||[]).filter(function(p){return p.name===n})[0]||null}
@@ -1463,6 +1489,8 @@ async function updateScheduleStatus(){
   if(!r.ok||!data||!data.protocols)return;
   schedState=data.protocols;
   SCHED_PROTOS.forEach(function(proto){if(document.getElementById('schedActive-'+proto))renderScheduleStatus(proto)});
+  // dock 不依赖调度视图存在，无条件刷新 —— #schedActive-* 只在调度视图里才有。
+  applyScheduleDockState();
 }
 function renderScheduleStatus(proto){
   const st=schedState[proto];
@@ -1516,8 +1544,10 @@ function renderScheduleStatus(proto){
     else{badge.textContent=''}
   });
 }
+// 30s 轮询不再局限于调度视图打开时：侧栏 dock 的「调度生效中」提示也依赖这份状态，
+// 设置页停在方案表单上跨过时间边界时，侧栏要自己变回基础组编辑器。
 setInterval(function(){
-  if(document.getElementById('planScheduleView')&&!document.getElementById('planScheduleView').hidden)updateScheduleStatus();
+  updateScheduleStatus();
 },30000);
 // Editing an alias's target model changes the set of models the rate rows can
 // point at, so keep those dropdowns in sync with every keystroke.
@@ -1536,6 +1566,9 @@ try{if(sessionStorage.getItem('tm_return_pool_view')==='1'){sessionStorage.remov
 // Same one-shot for the 方案组调度 view: an admin adjusting several groups/rules in a
 // row shouldn't be kicked back to the profile form after each save.
 try{if(sessionStorage.getItem('tm_return_schedule_view')==='1'){sessionStorage.removeItem('tm_return_schedule_view');openPlanScheduleView()}}catch(e){}
+// 侧栏 dock 的调度提示切换。与服务端渲染的 hidden 属性幂等（同一判定函数），
+// 放在 init 末尾是因为它只读 schedState，不依赖别的前置状态。
+applyScheduleDockState();
 })();
 document.addEventListener("keydown",e=>{if(e.key==="Enter"&&e.target.tagName!=="TEXTAREA"&&e.target.tagName!=="INPUT")e.preventDefault()});
 // ─── 产出与成本设置(参考牌价表 + 产出解析开关;走 /api/production/settings,独立于 settings-save 表单)───

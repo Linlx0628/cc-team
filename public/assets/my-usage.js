@@ -742,6 +742,17 @@ function actScopeNote(d,unit){
   }
   return {notes:out,ths:ths};
 }
+// 脚注块。第 1 条永远是 actScopeNote() 放在首位的「统计范围 …」—— 它是这一块的题头,和后面的
+// 披露事项不是一类东西,所以单独给个类名让它重一档。两个面板共用一份渲染,免得两处各写一份 map
+// 再慢慢长歪(它们的长句文案已经有好几条了)。
+function notesHtml(notes){
+  return '<div class="sess-note-list">'+notes.map(function(t,i){
+    return '<div'+(i===0?' class="sess-note-scope"':'')+'>'+t+'</div>';
+  }).join('')+'</div>';
+}
+// 指标格只放数字,单位与口径集中在表格下方说一次。5 张卡的说明文字删掉之后,「单轮新增」是什么、
+// 量纲是什么,只剩这里能说 —— 不说,那两个数字就没有解释了。
+const UNIT_NOTE='指标口径:单轮新增 = 每轮平均新增 token · 净产出 = 增行减删行(单位:行)';
 function renderProjDist(){
   const box=document.getElementById('projDist'),tb=document.querySelector('#projDistTable tbody'),note=document.getElementById('projDistNote');
   if(!box||!tb)return;
@@ -761,56 +772,95 @@ function renderProjDist(){
   if(d.crossSessions>0){
     sc.notes.push('有 '+fmtT(d.crossSessions)+' 个会话横跨多个项目:token 是按会话记的,整段算在了它的主项目名下,次项目的 token 会因此偏低');
   }
-  note.innerHTML='<div class="sess-note-list">'+sc.notes.map(function(t){return '<div>'+t+'</div>'}).join('')+'</div>';
+  note.innerHTML=notesHtml(sc.notes);
 }
 function renderSessSummary(){
   const el=document.getElementById('sessSummary');
   if(!el)return;
   const d=ACT.data,s=d.sessionSummary||{},sc=actScopeNote(d,'会话');
   const share=s.fragment_share==null?null:s.fragment_share;
+  // 每张卡只留三件东西:标签、数字、以及**属于这张卡的数据**(碎片数、平均轮数、工具调用总数
+  // 都是别处拿不到的)。「越高说明上下文复用得越好」「越低越省:每轮重发的量」是纯谓语、一个
+  // 数字都没有 —— 每张卡挂一句解释,5 处重复比 1 处集中说明更难扫。单轮新增与净产出的口径
+  // 改由表下那一行 UNIT_NOTE 承担。
   const card=(l,v,sub)=>'<div class="card"><div class="l">'+l+'</div><div class="v">'+v+'</div>'
     +(sub?'<div style="margin-top:6px;font-size:10px;color:var(--dim)">'+sub+'</div>':'')+'</div>';
   el.innerHTML=
     card('会话数',fmtT(s.sessions||0),'碎片 '+(s.fragments||0)+' 个'+(share==null?'':' · '+Math.round(share*100)+'%'))
     +card('总轮数',fmtT(s.requests||0),'平均每会话 '+(s.sessions?Math.round(s.requests/s.sessions*10)/10:0)+' 轮')
-    +card('缓存率',ratioCell(s.cache_rate,sc.ths),'越高说明上下文复用得越好')
-    +card('平均单轮新增上下文',perTurnCell(s.new_input_per_turn,sc.ths),'越低越省:每轮重发的量')
+    +card('缓存率',ratioCell(s.cache_rate,sc.ths))
+    +card('平均单轮新增上下文',perTurnCell(s.new_input_per_turn,sc.ths))
     +card('工具失败率',s.fail_rate==null?DASH:'<span style="color:'+(s.fail_rate<.1?'var(--green)':s.fail_rate<.3?'var(--orange)':'var(--red)')+'">'+(s.fail_rate*100).toFixed(1)+'%</span>',fmtT(s.tool_calls||0)+' 次工具调用');
 }
+// 会话卡片。三层:身份行 / 指标格 / 建议列表,靠两条分隔线分层(表格顶部实线、建议顶部虚线)。
+// title 属性覆盖每一格的完整口径与未缩写原值 —— fmtTk 会把 1,234,567 缩成 1.2M,原数只在这儿拿得回。
 function renderSessBoard(){
   const board=document.getElementById('sessBoard');
   if(!board)return;
   const d=ACT.data,rows=d.sessions||[];
   if(!rows.length){board.innerHTML='<div class="lb-msg">近 7 天还没有可归属到会话的请求</div>';return}
   const ths=Object.assign({},THS_FALLBACK,d.thresholds||{});
-  board.innerHTML=rows.map(function(s){
+  // 一格。标签恒在、数值恒在:缺值写「—」而不是把这一格省掉,否则列会塌、行与行就对不齐。
+  // dim=true 表示「—」或「测到了就是 0」,压成一档灰退后,但仍然占满一整格宽。
+  const cell=function(label,val,dim,title){
+    return '<div class="sess-m'+(dim?' na':'')+'" title="'+title+'"><i>'+label+'</i><b>'+val+'</b></div>';
+  };
+  // 卡片之间要有间隙:#sessBoard 原来是裸 div、没有任何规则命中,行与行的边框直接相贴连成一整片
+  // (排行榜那边是靠 .lb-list{gap:6px} 拉开的)。间隙补在这一层,不用去动 pages.mjs。
+  board.innerHTML='<div class="sess-list">'+rows.map(function(s){
     const g=GRADE_CLS[s.grade]||'none';
     // 会话名(本机 Claude Code 的 ai-title,后端现读)优先当主标题;没有才退回项目标签,
-    // 再没有才是「纯问答」占位。有会话名时项目标签降到后面那行小字 —— 主标题只有一行,
-    // 项目与标识都是辅助信息,让给标题。标识串任何时候都保留:它是唯一能对上盘上文件的键。
+    // 再没有才是「纯问答」占位。项目与标识都是辅助信息,降到下面那行小字。标识串任何时候都
+    // 保留:它是唯一能对上盘上文件的键。
     const name=s.title?esc(s.title):(s.project?esc(s.project):'<span style="color:var(--dim)">纯问答 · 无代码产出</span>');
     const idLine=(s.title&&s.project?esc(s.project)+' · ':'')+esc(sessShort(s.session));
     const when=s.first_seen===s.last_seen?cnStamp(s.first_seen):(cnStamp(s.first_seen)+' → '+cnStamp(s.last_seen));
-    const parts=[];
-    parts.push(s.requests?fmtT(s.requests)+' 轮':'轮数未知');
-    parts.push(s.duration_ms!=null?fmtDur(s.duration_ms):null);
-    parts.push(s.token_data?fmtTk(s.tokens)+' token':null);
-    parts.push('单轮新增 '+(s.new_input_per_turn==null?'—':fmtT(Math.round(s.new_input_per_turn))));
-    if(s.tool_calls)parts.push('工具 '+fmtT(s.tool_calls)+' 次');
-    if(s.files)parts.push(s.files+' 个文件');
-    if(s.net_lines!=null&&s.net_lines!==0)parts.push((s.net_lines>0?'+':'')+fmtT(s.net_lines)+' 行');
-    if(s.cross_projects>0)parts.push('跨 '+s.cross_projects+' 个项目');
-    const adv=(s.advice||[]).map(function(a){return esc(a)}).join('；');
-    return '<div class="lb-row sess-row '+g+'">'
-      +'<span class="sess-grade">'+(s.gradeLabel?esc(s.gradeLabel):'—')+'</span>'
-      +'<div class="lb-who"><div class="lb-name">'+name+' <span style="font-weight:400;color:var(--dim);font-size:10.5px">'+idLine+'</span></div>'
-      +'<div class="lb-det">'+esc(when)+(when?' · ':'')+parts.filter(Boolean).join(' · ')+'</div>'
-      +(adv?'<div class="sess-adv">'+adv+'</div>':'')
+    // 时长是八格里最宽的一格(fmtDur 的空格是给「一句话里读」加的,进了定宽格会白占宽度,
+    // 去掉后实测 70.6px;次宽的 Token 只有 56.8)。列宽分档就是按 70.6 定的,见 my-usage.css
+    // 里 .sess-grid 上方那段。完整写法带空格,留在 title 里。
+    const dur=s.duration_ms!=null?fmtDur(s.duration_ms).replace(/\s+/g,''):null;
+    const nit=s.new_input_per_turn==null?null:Math.round(s.new_input_per_turn);
+    const nx=s.net_lines==null?null:(s.net_lines>0?'+':'')+fmtT(s.net_lines);
+    // 跨项目:后端给的是 `p ? p.cross : 0`(lib/sessions.mjs),**没有项目归属时也是 0**,不是
+    // 「测到了 0」。必须先看 project 在不在,否则纯问答会话会被标成「跨 0 个项目」—— 假数据。
+    const cross=s.project==null?null:(s.cross_projects||0);
+    const cells=
+      (s.requests?cell('轮数',fmtT(s.requests),false,'轮数 '+fmtT(s.requests)+' 轮')
+                 :cell('轮数','未知',true,'轮数未知(这个会话只有工具记录,没有请求计数)'))
+      +(dur!=null?cell('时长',dur,false,'会话跨度 '+fmtDur(s.duration_ms))
+                 :cell('时长','—',true,'时长无数据(首末时刻缺失)'))
+      +(s.token_data?cell('Token',fmtTk(s.tokens),false,'Token '+fmtT(s.tokens))
+                    :cell('Token','—',true,'该会话早于 token 按会话采集上线,没有 token 记录'))
+      +(nit!=null?cell('单轮新增',fmtT(nit),false,'单轮新增 '+fmtT(nit)+' token/轮')
+                 :cell('单轮新增','—',true,'单轮新增无数据(轮数为 0,或没有输入记录)'))
+      +(s.tool_calls!=null?cell('工具',fmtT(s.tool_calls),s.tool_calls===0,'工具调用 '+fmtT(s.tool_calls)+' 次')
+                          :cell('工具','—',true,'没有这个会话的工具记录'))
+      +(s.files!=null?cell('文件',fmtT(s.files),s.files===0,'涉及文件 '+fmtT(s.files)+' 个')
+                     :cell('文件','—',true,'没有这个会话的文件记录'))
+      +(nx!=null?cell('净产出',nx,s.net_lines===0,'净产出 '+fmtT(s.net_lines)+' 行(增行减删行)')
+                :cell('净产出','—',true,'没有这个会话的代码行记录'))
+      +(cross!=null?cell('跨项目',fmtT(cross),cross===0,'跨 '+fmtT(cross)+' 个项目')
+                   :cell('跨项目','—',true,'这个会话没有项目归属,跨项目数未知'));
+    // 缓存率留在右上原位,不并进指标格:它是这一行唯一带阈值配色的结论性数字,并进去就跟 466、
+    // 377 一样大,权重被打平;而且窄屏退成两行时它会被甩到第三行,偏偏它是最该先看到的数字。
+    const cache=s.cache_rate==null
+      ?'<div class="sess-cache none"><b>缓存率 —</b></div>'
+      :'<div class="sess-cache"><b style="color:'+(s.cache_rate>=ths.cache_rate_good?'var(--green)':s.cache_rate>=ths.cache_rate_warn?'var(--orange)':'var(--red)')+'">'+(s.cache_rate*100).toFixed(0)+'%</b><span>缓存率</span></div>';
+    // 建议逐条一行。原来 .join('；') 挤成一段散文 —— 一条一行之后不需要分隔符,那个 join 整个消失。
+    const adv=s.advice||[];
+    return '<div class="sess-row '+g+'">'
+      +'<div class="sess-hd">'
+        +'<span class="sess-grade">'+(s.gradeLabel?esc(s.gradeLabel):'—')+'</span>'
+        +'<div class="sess-id"><div class="sess-title">'+name+'</div>'
+          +'<div class="sess-meta">'+idLine+'</div>'
+          +(when?'<div class="sess-meta">'+esc(when)+'</div>':'')
+        +'</div>'
+        +cache
       +'</div>'
-      +'<div class="lb-val'+(s.cache_rate==null?' none':'')+'">'
-      +(s.cache_rate==null?'<b>缓存率 —</b>':'<b style="color:'+(s.cache_rate>=ths.cache_rate_good?'var(--green)':s.cache_rate>=ths.cache_rate_warn?'var(--orange)':'var(--red)')+'">'+(s.cache_rate*100).toFixed(0)+'%</b><span>缓存率</span>')
-      +'</div></div>';
-  }).join('');
+      +'<div class="sess-grid">'+cells+'</div>'
+      +(adv.length?'<ul class="sess-adv">'+adv.map(function(a){return '<li>'+esc(a)+'</li>'}).join('')+'</ul>':'')
+      +'</div>';
+  }).join('')+'</div>';
 }
 function renderActivity(){
   const pd=document.getElementById('projDist');
@@ -842,7 +892,8 @@ function renderActivity(){
     if(tless>0)sc.notes.push('有 '+fmtT(tless)+' 个会话早于 token 按会话采集上线,只有工具数据,token 与缓存率显示「—」');
     if(d.fragments_note)sc.notes.push(esc(d.fragments_note));
     if(d.truncated)sc.notes.push('会话流水只显示最近 '+fmtT((d.sessions||[]).length)+' 条');
-    nt.innerHTML='<div class="sess-note-list">'+sc.notes.map(function(t){return '<div>'+t+'</div>'}).join('')+'</div>';
+    sc.notes.splice(1,0,UNIT_NOTE);   // 口径说明紧跟范围行,排在披露事项之前
+    nt.innerHTML=notesHtml(sc.notes);
   }
 }
 async function fetchActivity(){

@@ -249,19 +249,89 @@ table{width:100%;border-collapse:collapse;min-width:560px}th{text-align:left;pad
    而输掉,reduced-motion 用户照样看动画,而且不报错。 */
 @media (prefers-reduced-motion:reduce){.lb-podium.anim .lb-pod{animation:none}}
 /* ── 项目分布 / 会话使用情况 ──
-   会话行沿用 .lb-row 的骨架(左边框 + 上下两行),只是把「名次圆牌」换成「档位牌」:
-   这里没有名次,行与行之间只有健康度可比。档位是服务端下发的,前端只做颜色映射。 */
+   会话行**不再寄生 .lb-row**。那张骨架是给排行榜「一人一行」用的:.lb-det 写死了 nowrap + 省略号,
+   8 个指标串成一条被截断的线 —— 那正是「密密麻麻」的来源。那个截断对排行榜是对的,不能为了会话行
+   松开它(松了排行榜每行明细都会换行)。而 .lb-row 的 display:flex 又与这里的三段竖排直接冲突,
+   用 .sess-row 去覆盖它要靠源码顺序赌胜负(560 区块里两条 padding-top 的注释记过同一个坑)。
+   所以会话行用自己的类名;下面这三条是 .lb-row 原来白送、现在自己补的卡片外观,值与原值一字不差。 */
+.sess-list{display:flex;flex-direction:column;gap:7px}
+.sess-row{display:block;background:var(--surface-subtle);border:1px solid var(--border);border-left:3px solid var(--border-strong);border-radius:6px;padding:11px 14px}
 .sess-row.good{border-left-color:var(--green)}
 .sess-row.warn{border-left-color:var(--orange)}
 .sess-row.bad{border-left-color:var(--red)}
-.sess-grade{flex:none;min-width:46px;text-align:center;font-size:10px;font-weight:650;padding:3px 7px;border-radius:4px;background:var(--surface);border:1px solid var(--border);color:var(--dim)}
+/* 第一层:身份行。align-items:flex-start 让档位牌贴住标题那一行 —— 默认的 center 会被三行文字的
+   高度拉到垂直居中,档位牌看着像悬在行中间。 */
+.sess-hd{display:flex;align-items:flex-start;gap:10px}
+.sess-grade{flex:none;min-width:46px;text-align:center;font-size:10px;font-weight:650;line-height:1.4;padding:3px 7px;border-radius:4px;background:var(--surface);border:1px solid var(--border);color:var(--dim)}
 .sess-row.good .sess-grade{color:var(--green);border-color:var(--green)}
 .sess-row.warn .sess-grade{color:var(--orange);border-color:var(--orange)}
 .sess-row.bad .sess-grade{color:var(--red);border-color:var(--red)}
-/* 会话行要放建议文案,不能像 .lb-det 那样单行截断 */
-.sess-adv{font-size:10.5px;color:var(--dim);margin-top:4px;white-space:normal;line-height:1.5}
-.sess-note-list{font-size:11px;color:var(--dim);line-height:1.75}
-.sess-note-list div{margin-top:2px}
+.sess-id{flex:1;min-width:0}
+/* 标题独占一行后不再跟标识抢宽度,所以**换行代替省略号** —— 截断才是内容丢失。 */
+.sess-title{font-size:13px;font-weight:650;line-height:1.35;overflow-wrap:break-word}
+.sess-meta{font-size:10.5px;color:var(--dim);line-height:1.5;font-variant-numeric:tabular-nums;overflow-wrap:break-word}
+/* 缓存率留在右上原位,不并进指标格:它是这一行唯一带阈值配色的结论性数字,并进去就跟 466、377
+   一样大,权重被打平;而且窄屏退成两行时它会被甩到第三行,偏偏它是最该先看到的数字。
+   label 落在数字**下面**(与指标格「标签在上」刻意相反),表明它是这块的头牌而不是网格里的一格。 */
+.sess-cache{flex:none;display:flex;flex-direction:column;align-items:flex-end;gap:2px;text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}
+.sess-cache b{font-size:17px;font-weight:700;line-height:1}
+.sess-cache span{font-size:10px;color:var(--dim)}
+.sess-cache.none b{font-size:12px;font-weight:600;color:var(--dim)}
+/* 第二层:指标格。桌面 8 列,缺值写「—」占满一格 —— 列宽一致,行与行才能横向比。
+   为什么用 grid 而不是 flex + 定宽:
+   1) 每行是一个独立容器,flex 的百分比宽度**不吃 gap**:width:12.5% 加 column-gap:12px 一定溢出
+      (8×12.5% 已经是 100%,还要再加 7 个 gap),只能写 calc(12.5% - 10.5px) 这种差一像素就错位的
+      表达式;grid 的 1fr 是先扣 gap 再均分。
+   2) 换列数只改一条 grid-template-columns(实际用了 8/4/2 三档,分档依据见本块下方)。
+   3) 标签与数值、行与行这两个间距要分开控制,grid 有 row-gap/column-gap;flex 只有一个 gap。
+   4) 不能用 max-content/auto 做列宽:每行是独立 grid,auto 会各按各行的内容算宽,行与行就对不齐了
+      —— 必须是 1fr,这样所有行的轨道宽完全相同。 */
+.sess-grid{display:grid;grid-template-columns:repeat(8,minmax(0,1fr));column-gap:12px;row-gap:8px;margin-top:10px;padding-top:9px;border-top:1px solid var(--border)}
+.sess-m{min-width:0}
+.sess-m i{display:block;font-style:normal;font-size:9.5px;color:var(--dim);line-height:1.4;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.sess-m b{display:block;font-size:12.5px;font-weight:650;line-height:1.35;font-variant-numeric:tabular-nums;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+/* 「—」与「测到了就是 0」压成同一档灰:两者都不该抢注意力,但都必须占满一格宽。
+   --dim2 只用在数字上,不用在整句文字上(#92928c 在 #f1f1ec 上约 3.2:1,够不着 4.5:1)。 */
+.sess-m.na i{color:var(--dim2)}
+.sess-m.na b{color:var(--dim2);font-weight:550}
+/* 第三层:建议。逐条一行,前面一个**CSS 画的**短横,不是字符 —— U+25AA(黑小方块)实测落在
+   Unicode Extended_Pictographic 内,会被 tests/multi-profile-default-ux.test.mjs 的象形符扫描
+   扫掉;U+25AB 与 U+25B6 同样命中。这里连那几个字符的字形都不写,正是因为那是一道**按码位扫
+   全文**的检查 —— 注释里出现一样会挂,跟写在 CSS 值里没有区别。
+   flex + margin-top 让标记落在首行的光学中线上(line-height 1.6 × 11px ≈ 17.6px,(17.6-2)/2 ≈ 8px),
+   比 position:absolute 少一个要跟着字号走的魔数。 */
+.sess-adv{list-style:none;margin-top:9px;padding-top:8px;border-top:1px dashed var(--border)}
+.sess-adv li{display:flex;gap:7px;font-size:11px;line-height:1.6;color:var(--text)}
+.sess-adv li+li{margin-top:4px}
+.sess-adv li::before{content:"";flex:none;width:5px;height:2px;border-radius:1px;background:var(--dim2);margin-top:8px}
+/* 脚注块。上边加一道分隔线把「表的补充说明」与「上面那些卡片」切开 —— 原来两者都是 11px 灰字上下
+   相贴,读起来像最后一张卡的第七行。行距 1.75→1.6、条间距 2px→3px:全页唯一一处松紧双向动的地方,
+   松开条与条之间,同时收紧行内。 */
+.sess-note-list{font-size:11px;color:var(--dim);line-height:1.6;border-top:1px solid var(--border);padding-top:9px}
+.sess-note-list div{margin-top:3px}
+.sess-note-list div:first-child{margin-top:0}
+/* 第 1 条是「统计范围 …」——这块的题头,不是披露事项。给正文色与 550 字重,让下面几条灰的披露
+   读起来是「细节」。 */
+.sess-note-scope{color:var(--text);font-weight:550}
+/* 指标格的列数分档。只在 8 / 4 / 2 三档里切:8 个格子在三种列数下都正好占满整行,不会剩孤零零
+   的一格。这一点排除了 6 列(8 = 6 + 2)和 auto-fit(会在 7+1、5+3 之间乱跳)。
+
+   下面的数字是**实测**的,不是估的 —— 把页面内联成自包含 HTML 再用 headless Chrome 逐格量
+   Range 框宽得到的。最宽的一格是「时长」70.6px(3 个汉字 + 4 位数字;tabular-nums 让位数不影响
+   宽度,所以「23小时59分」与「168小时0分」同宽,7 天窗口下这已经是上界);次宽「Token」56.8;
+   再次「净产出」53.8。**按「1小时45分」估出来的 58px 是错的**,断点要按 70.6 定。
+
+   每档留 ≥10% 余量 —— 跨平台字体度量有差异(PingFang SC 与 Microsoft YaHei 的数字前进宽度
+   不同),按实测值卡到小数点是自找截断:
+   · 8 列需轨道 ≥77.7px → 视口 ≥1100(实测 1080 时 77.5,刚好压线)
+   · 4 列需内容宽 ≥4×77.7+36 = 346.8 → 侧栏折起后视口 ≥419,侧栏占 228px 时视口 ≥719
+   · 2 列需内容宽 ≥167.4 → 视口 ≥239,任何手机都够
+
+   侧栏在 680 以下折成顶部横条,内容宽在 680/681 之间有个断层:681px 时只剩 308.8px,4 列每格
+   68.2px,低于 70.6,**会截断**。这个「侧栏还占着 228px、视口又窄」的夹缝只能单独罩住 —— 下面
+   第二条里那个 min-width:681px 就是为它写的,不是笔误。 */
+@media(max-width:1099px){.sess-grid{grid-template-columns:repeat(4,minmax(0,1fr))}}
+@media(max-width:418px),(min-width:681px) and (max-width:718px){.sess-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}
 /* 移动端:侧栏折成顶部横向菜单,内容照常滚。settings.css 已踩过同一块地。 */
 @media(max-width:680px){
   body{overflow:auto;height:auto}
@@ -280,4 +350,11 @@ table{width:100%;border-collapse:collapse;min-width:560px}th{text-align:left;pad
   .lb-pod-1{padding-top:38px}.lb-pod-2{padding-top:24px}.lb-pod-3{padding-top:8px}
   /* 375px 下每张卡的内容宽只剩 ~86px,「138.9k」+「token/次」并排必定折行,一折行就把
      台阶的高度差顶乱。改成上下摞,数字一行、单位一行 —— 比把单位藏掉好,单位不丢。 */
-  .lb-pod-value{display:flex;flex-direction:column;align-items:center;line-height:1.15}.lb-pod-value b{font-size:15px}.lb-pod-value span{margin-left:0;font-size:9px}}
+  .lb-pod-value{display:flex;flex-direction:column;align-items:center;line-height:1.15}.lb-pod-value b{font-size:15px}.lb-pod-value span{margin-left:0;font-size:9px}
+  /* 会话行在 375px 下每格只剩 66px,是全程最紧的一档,所以字号也要收。这几条必须排在文件末尾
+     —— .sess-m b 的基础规则是 (0,1,0),这里也是 (0,1,0),靠源码顺序决胜负。 */
+  .sess-row{padding:10px 11px}
+  .sess-grid{column-gap:8px;row-gap:7px;margin-top:9px;padding-top:8px}
+  .sess-m b{font-size:12px}
+  .sess-title{font-size:12.5px}
+  .sess-cache b{font-size:15px}}

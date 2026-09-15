@@ -1217,6 +1217,26 @@ function parseRateLimitReset(text) {
   return Number.isFinite(ms) ? ms : null;
 }
 
+// English-store 429 bodies put the same thing in prose:
+//   "You have exceeded the 5-hour usage quota. It will reset at 2026-09-15 19:05:46 +0800 CST."
+// 与中文那条分开:**不**并进 parseRateLimitReset —— 那个函数的调用点在频率判据之前,
+// 通用的 "reset at" 放进去会把「每分钟限速、正文顺带写着重置时刻」的报文误判成套餐耗尽。
+// 这条只在 looksLikePlanLimit 判定通过之后用(见 classifyRateLimit)。
+const RATE_LIMIT_RESET_EN_RE = /reset(?:s|ting)?\s+at\s+(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2}(?::\d{2})?)(?:\s*(Z|[+-]\d{2}:?\d{2}))?/i;
+function parseRateLimitResetEn(text) {
+  if (!text) return null;
+  const m = String(text).match(RATE_LIMIT_RESET_EN_RE);
+  if (!m) return null;
+  let hhmmss = m[2];
+  if (/^\d{2}:\d{2}$/.test(hhmmss)) hhmmss += ":00";   // HH:mm → HH:mm:ss
+  // 显式时区按原样用;缺时区才当北京时间(与中文那条同约定)。"+0800 CST" 里的 CST 由正则忽略。
+  const off = m[3]
+    ? (m[3].toUpperCase() === "Z" ? "+00:00" : m[3].replace(/^([+-]\d{2})(\d{2})$/, "$1:$2"))
+    : "+08:00";
+  const ms = Date.parse(`${m[1]}T${hhmmss}${off}`);
+  return Number.isFinite(ms) ? ms : null;
+}
+
 function fallbackResumeAtMs() {
   const secs = Number(gProxy.rateLimitFallbackSeconds) || 120;
   return Date.now() + secs * 1000;
@@ -1251,9 +1271,15 @@ function classifyRateLimit(statusCode, text, headers) {
   const isFrequencyLimit = /"code"\s*:\s*13(02|05)|速率限制|请求频率|too many requests|requests per|Requests rate limit exceeded|Throttling\.RateQuota/i.test(body);
   if (isFrequencyLimit) return null;
   // Plan exhaustion: GLM 1310 用量上限 / 1113 欠费 / 1311 套餐未开放模型权限,
-  // Aliyun Throttling.AllocationQuota (free allocated quota exceeded), DeepSeek 429 quota.
-  const looksLikePlanLimit = /"code"\s*:\s*1(310|311|113)|使用上限|usage limit|plan limit|额度已耗尽|quota exceeded|AllocationQuota|free allocated quota/i.test(body);
+  // Aliyun Throttling.AllocationQuota (free allocated quota exceeded), DeepSeek 429 quota,
+  // 火山/英文站 AccountQuotaExceeded("You have exceeded the 5-hour usage quota." —— 错误码
+  // 无空格、语序相反,所以 "quota exceeded" 与 "usage limit" 都盖不住)。频率类在上一步已排除,
+  // 所以这里出现 "usage quota" 只可能是套餐级。
+  const looksLikePlanLimit = /"code"\s*:\s*1(310|311|113)|使用上限|usage limit|usage quota|plan limit|额度已耗尽|quota exceeded|AccountQuotaExceeded|AllocationQuota|free allocated quota/i.test(body);
   if (!looksLikePlanLimit) return null;
+  // 正文里的精确恢复时刻优先于 Retry-After(5 小时级的窗口,响应头那种分钟级估值差太远)。
+  const resetAt = parseRateLimitResetEn(body);
+  if (resetAt) return { resumeAt: resetAt, source: "reset-time" };
   const retryAfter = clampRetryAfterMs(parseRetryAfterMs(headers?.["retry-after"]));
   return retryAfter
     ? { resumeAt: Date.now() + retryAfter, source: "retry-after" }

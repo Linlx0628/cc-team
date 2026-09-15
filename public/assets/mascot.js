@@ -79,12 +79,14 @@
     btn.style.cssText = 'position:relative;display:block;width:140px;height:140px;padding:0;border:0;'
       + 'background:transparent;appearance:none;cursor:pointer;user-select:none;-webkit-user-select:none;';
     btn.innerHTML = '<span style="position:relative;display:block;width:100%;height:100%;transform-origin:50% 78%">'
-      + '<span data-layer="dir" style="' + layerCss + '"></span>'
-      + '<span data-layer="re" style="' + layerCss + 'opacity:0"></span>'
+      + '<span data-layer="sprite" style="' + layerCss + '"></span>'
       + '</span>';
     var squashEl = btn.firstChild;
-    var dirLayer = btn.querySelector('[data-layer="dir"]');
-    var reLayer = btn.querySelector('[data-layer="re"]');
+    // 单层精灵:方向表和表情表共用一个图层,按状态切 background-image/position。
+    // 原版 page-mascot 用两层(方向层垫底、表情层置顶)只为让表情图常驻加载,但表情
+    // 精灵四周留透明,方向层会从下面透出来叠成重影 —— 预加载(new Image)同样能保住
+    // 「第一次表情不闪加载」,所以合并成一层,重影这一类问题就不存在了。
+    var sprite = btn.querySelector('[data-layer="sprite"]');
 
     // 换角色入口:吉祥物右上角的小圆钮。桌面端平时完全透明、悬停吉祥物时淡入;
     // 触屏没有 hover,低透明度常驻保证可发现。图标是内联 SVG 的双向箭头。
@@ -131,21 +133,28 @@
       for (var i = 0; i < CHARS.length; i++) if (CHARS[i][0] === name) return CHARS[i][1];
       return '吉祥物';
     }
-    // 角色切换只改两张 background-image:没被选中的精灵图永远不会被下载。
+    // 角色切换:先把两张精灵图都预拉进缓存(表达式/方向切换无闪烁),再涂方向表。
     function applyChar(name) {
-      dirLayer.style.backgroundImage = 'url(' + sheetUrl(name, 'directions') + ')';
-      reLayer.style.backgroundImage = 'url(' + sheetUrl(name, 'reactions') + ')';
+      preload(sheetUrl(name, 'directions'));
+      preload(sheetUrl(name, 'reactions'));
+      sprite.style.backgroundImage = 'url(' + sheetUrl(name, 'directions') + ')';
       btn.setAttribute('aria-label', '摸摸' + charLabel(name));
     }
+    function preload(url) {
+      var im = new Image();
+      im.src = url;
+    }
     applyChar(picked);
+    paintReaction(); // 初始落位:方向表正中格(不涂会停在精灵图 0% 0% 的左上格)
 
     // —— 视线跟随(仅精确指针设备;触屏没有 hover,直接跳过,点击表情不受影响) ——
     var sector = -1;
     var pointer = null;
     var dirIndex = 4; // center
     function paintDir() {
-      // 有表情在播时方向层是隐藏的,等表情结束再涂也能落到正确一格。
-      dirLayer.style.backgroundPosition = cellPos(dirIndex);
+      // 表情在播时整层显示的是表情表,方向变化只记下标,等表情结束 paint 再落图。
+      if (reactionIdx != null) return;
+      sprite.style.backgroundPosition = cellPos(dirIndex);
     }
     function aim() {
       if (!pointer) return;
@@ -179,9 +188,14 @@
     var boopAt = 0;
     var reactionIdx = null;
     function paintReaction() {
-      // 常驻第二层而不是现挂:精灵图在首次渲染就拉好,第一次点击不会闪加载。
-      reLayer.style.backgroundPosition = cellPos(reactionIdx == null ? 0 : reactionIdx);
-      reLayer.style.opacity = reactionIdx == null ? 0 : 1;
+      // 单层按状态切表:有表情显示表情表对应格,没有则回方向表(方向格沿用 dirIndex)。
+      if (reactionIdx == null) {
+        sprite.style.backgroundImage = 'url(' + sheetUrl(picked, 'directions') + ')';
+        sprite.style.backgroundPosition = cellPos(dirIndex);
+      } else {
+        sprite.style.backgroundImage = 'url(' + sheetUrl(picked, 'reactions') + ')';
+        sprite.style.backgroundPosition = cellPos(reactionIdx);
+      }
     }
     function later(ms, fn) { timers.push(window.setTimeout(fn, ms)); }
     function boop() {

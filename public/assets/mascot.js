@@ -2,7 +2,8 @@
 // 原生 JS 改写自开源组件 page-mascot:https://github.com/nilbuild/page-mascot
 // (MIT License, Copyright (c) Kamran Ahmed),精灵图为 3x3 网格的两张 webp,
 // 静态托管在本目录(角色名-directions.webp / 角色名-reactions.webp)。
-// 本文件自包含:不依赖 ui.js/my-usage.js,样式全部内联,找不到 #mascotDock 就整体不挂。
+// 本文件自包含:不依赖 ui.js/my-usage.js,样式以内联为主(另注入一小段弹层悬停样式),
+// 找不到 #mascotDock 就整体不挂。
 (function () {
   'use strict';
 
@@ -81,25 +82,41 @@
     var dirLayer = btn.querySelector('[data-layer="dir"]');
     var reLayer = btn.querySelector('[data-layer="re"]');
 
-    // 换角色入口:小字按钮,与浮层一起叠在吉祥物上方。
+    // 换角色入口:吉祥物右上角的小圆钮。桌面端平时完全透明、悬停吉祥物时淡入;
+    // 触屏没有 hover,低透明度常驻保证可发现。图标是内联 SVG 的双向箭头。
+    var canHover = window.matchMedia && window.matchMedia('(hover: hover) and (pointer: fine)').matches;
     var swap = document.createElement('button');
     swap.type = 'button';
-    swap.textContent = '换角色';
-    swap.style.cssText = 'margin-top:2px;align-self:flex-end;font-size:11px;color:var(--dim,#8888);cursor:pointer;'
-      + 'background:transparent;border:0;padding:2px 6px;';
+    swap.setAttribute('aria-label', '换角色');
+    swap.setAttribute('aria-haspopup', 'menu');
+    swap.innerHTML = '<svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">'
+      + '<path d="M6.99 11 3 15l3.99 4v-3H14v-2H6.99v-3zM21 9l-3.99-4v3H10v2h7.01v3L21 13V9z"/></svg>';
+    swap.style.cssText = 'position:absolute;top:-4px;right:-4px;width:24px;height:24px;border-radius:50%;cursor:pointer;'
+      + 'display:flex;align-items:center;justify-content:center;padding:0;'
+      + 'border:1px solid var(--border-strong,#ccc);background:var(--bg,#fff);color:var(--dim,#666);'
+      + 'box-shadow:0 2px 8px rgba(24,24,22,.15);opacity:' + (canHover ? 0 : 0.45) + ';transition:opacity .15s;';
+    if (canHover) {
+      btn.addEventListener('mouseenter', function () { swap.style.opacity = 1; });
+      btn.addEventListener('mouseleave', function () { swap.style.opacity = 0; });
+    }
 
     var pop = document.createElement('div');
     // 开合用内联 display 控制:hidden 属性会被内联 display:grid 压过,弹层会常开。
     pop.setAttribute('role', 'menu');
     pop.style.cssText = 'display:none;position:absolute;right:0;bottom:178px;background:var(--bg,#fff);color:var(--text,#333);'
-      + 'border:1px solid var(--border-strong,#ccc);border-radius:10px;box-shadow:0 10px 28px rgba(24,24,22,.18);'
-      + 'padding:6px;grid-template-columns:1fr 1fr;gap:2px;z-index:2;';
+      + 'border:1px solid var(--border-strong,#ccc);border-radius:12px;box-shadow:0 10px 28px rgba(24,24,22,.18);'
+      + 'padding:8px;grid-template-columns:1fr 1fr;gap:4px;z-index:2;';
     pop.innerHTML = CHARS.map(function (c) {
       var on = c[0] === picked;
-      return '<button type="button" role="menuitem" data-char="' + esc(c[0]) + '" style="font-size:12px;text-align:left;'
-        + 'padding:4px 10px;border-radius:7px;border:0;background:' + (on ? 'var(--accent,#2f6e50)' : 'transparent') + ';'
-        + 'color:' + (on ? '#fff' : 'inherit') + ';cursor:pointer;">' + esc(c[1]) + '</button>';
+      return '<button type="button" role="menuitem" data-char="' + esc(c[0]) + '" data-on="' + (on ? 1 : 0) + '"'
+        + ' style="font-size:12px;text-align:left;padding:5px 12px;border-radius:8px;border:0;cursor:pointer;white-space:nowrap;'
+        + 'background:' + (on ? 'var(--accent,#2f6e50)' : 'transparent') + ';'
+        + 'color:' + (on ? '#fff' : 'inherit') + ';">' + esc(c[1]) + '</button>';
     }).join('');
+    // 未选中项的悬停态走一小段注入样式(内联样式表达不了 :hover);选中项用 data-on 排除。
+    var hoverCss = document.createElement('style');
+    hoverCss.textContent = '#mascotDock button[data-char][data-on="0"]:hover{background:rgba(24,24,22,.08)}';
+    document.head.appendChild(hoverCss);
 
     dock.style.cssText = 'position:fixed;right:18px;bottom:18px;z-index:40;display:flex;flex-direction:column;align-items:flex-end;';
     dock.appendChild(pop);
@@ -147,7 +164,7 @@
       pointer = { x: e.clientX, y: e.clientY };
       aim();
     }
-    if (window.matchMedia && window.matchMedia('(hover: hover) and (pointer: fine)').matches) {
+    if (canHover) {
       window.addEventListener('pointermove', onPointerMove, { passive: true });
       window.addEventListener('scroll', aim, { passive: true });
     }
@@ -203,6 +220,7 @@
       for (var i = 0; i < pop.children.length; i++) {
         var item = pop.children[i];
         var on = item.getAttribute('data-char') === picked;
+        item.setAttribute('data-on', on ? 1 : 0);  // 与注入的 :hover 规则联动
         item.style.background = on ? 'var(--accent,#2f6e50)' : 'transparent';
         item.style.color = on ? '#fff' : 'inherit';
       }

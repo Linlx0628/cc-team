@@ -465,7 +465,7 @@ function render(){
     pieLabels=idx.map(i=>clientLabel(names[i]));pieVals=idx.map(i=>vals[i]);
     document.getElementById("pieTitle").textContent="客户端分布";
   }else{
-    const tot=uks.map(u=>{let t=0;for(const[date,ud]of Object.entries(fd)){const s=ud[u];if(s)t+=val(s)}return t});
+    const tot=uks.map(u=>{let t=0;for(const[date,ud]of Object.entries(fd)){if(date<eb.start||date>eb.end)continue;const s=ud[u];if(s)t+=val(s)}return t});
     const uIdx=tot.map((_,i)=>i).sort((a,b)=>tot[b]-tot[a]);
     pieLabels=uIdx.map(i=>D.users[uks[i]].name);pieVals=uIdx.map(i=>tot[i]);
     document.getElementById("pieTitle").textContent="用户分布";

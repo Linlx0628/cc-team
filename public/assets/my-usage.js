@@ -181,26 +181,19 @@ function renderCalendar(){
   grid.onmouseleave=()=>{tip.style.display='none'};
 }
 // ── Mascot speech bubble ──
-// 未签到时让吉祥物口头提醒一次；已签到(或签到功能不可用)则改为时段问候 +
-// 一句话今日用量简报。两者各自用 localStorage 存北京日期做「每日一次」守卫——
-// 30s 轮询会反复进 load()，靠这个挡住；签到状态变了走另一条分支，互不干扰。
-function mascotBjToday(){return new Date(Date.now()+8*3600000).toISOString().slice(0,10)}
-function mascotOnceAday(key){
-  let seen=null;
-  try{seen=window.localStorage.getItem(key)}catch(e){/* 存不了就每次进页都说 */}
-  const today=mascotBjToday();
-  if(seen===today)return false;
-  try{window.localStorage.setItem(key,today)}catch(e){}
-  return true;
-}
+// 未签到时让吉祥物口头提醒；已签到(或签到功能不可用)则改为时段问候 + 一句话今日
+// 用量简报。每次进页/刷新都说一次:用内存标记做「单次」守卫挡住 30s 轮询反复进
+// load() 的重弹;切换侧栏菜单不刷新页面,天然不会重新触发。
+var mascotSaid = false;
 function mascotHello(){
+  if(mascotSaid)return;
   const c=D&&D.checkin;
   if(c&&c.available&&c.enabled===false)return;
+  mascotSaid=true;
   if(c&&c.available&&!c.checkedInToday){
-    if(mascotOnceAday('tm_mascot_tip'))setTimeout(()=>{window.Mascot&&Mascot.say('记得签到哦～，点上面的「签到领 token」领今日加量')},1500);
+    setTimeout(()=>{window.Mascot&&Mascot.say('记得签到哦～，点上面的「签到领 token」领今日加量')},1500);
     return;
   }
-  if(!mascotOnceAday('tm_mascot_greet'))return;
   setTimeout(()=>{window.Mascot&&Mascot.say(mascotHelloLine())},1500);
 }
 function mascotHelloLine(){

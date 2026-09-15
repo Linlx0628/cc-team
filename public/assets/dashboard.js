@@ -428,8 +428,8 @@ function render(){
   document.getElementById("meta").innerHTML='<span style="color:var(--accent);font-weight:600">方案: '+profileLabel+(protoSuffix?' · '+protoSuffix:'')+'</span>'+upstreamInfo+' &nbsp;|&nbsp; 更新于 '+(function(){const d=new Date();const utc=d.getTime()+d.getTimezoneOffset()*60000;return new Date(utc+8*3600000).toLocaleTimeString("zh-CN")})()+" (北京时间) | 每30秒刷新";
 
   // Charts —— 六图共用全局筛选：P 周期 / MT 指标 / MDL 模型 / USR 用户 / DS+DE 日期范围。
-  // 四张非 24h 图的窗口用 effBounds()(日期范围生效时优先,否则周期窗口);两张 24h 图恒用 winBounds()。
-  const wb=winBounds();
+  // 窗口规则:分布类图(用户/客户端分布、模型、两张 24 小时)用 effBounds() —— 日期范围
+  // 生效时优先,否则周期窗口;趋势与方案两张全史分桶图只在日期范围生效时收窄。
   const fd0=filteredDaily();
   const eb=effBounds();
   let fd=fd0;
@@ -491,13 +491,14 @@ function render(){
   const mIdx=mVal.map((_,i)=>i).sort((a,b)=>mVal[b]-mVal[a]);
   C.m=new Chart(document.getElementById("modelChart"),{type:"bar",data:{labels:mIdx.map(i=>mNames[i]),datasets:[{label:MT==="requests"?"请求数":"Token",data:mIdx.map(i=>mVal[i]),backgroundColor:mIdx.map((_,i)=>COL[i%COL.length]+"cc"),borderWidth:0,borderRadius:3,borderSkipped:false}]},options:{indexAxis:"y",responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false},tooltip:{callbacks:{label:ctx=>MT==="requests"?fmtT(ctx.raw)+" 次请求":fmtT(ctx.raw)+" tokens"}}},scales:{x:{ticks:{color:"#686863",callback:v=>fmtTk(v)},grid:{color:"rgba(24,24,22,.08)"}},y:{ticks:{color:"#686863",font:{size:11},autoSkip:false},grid:{display:false}}}}});
 
-  // 24小时趋势图：周期窗口内逐日同半小时槽位累加（按日=当天真实曲线；周/月/年=各槽位累计分布）。
-  // 不受日期范围筛选影响（date input 只作用于其余四图）。
-  // 槽位映射与旧格式的阶梯兜底都在 ui.js 的 halfHourSlots 里,与下面那张模型图共用同一份。
+  // 24小时趋势图：有效窗口内逐日同半小时槽位累加（按日=当天真实曲线；周/月/年=各槽位
+  // 累计分布;日期范围生效时窗口收窄到 [开始,结束],48 槽在范围内累加 —— 早于服务端取数
+  // 下界 hourlyChartFloor 的日期无数据）。槽位映射与旧格式的阶梯兜底都在 ui.js 的
+  // halfHourSlots 里,与下面那张模型图共用同一份。
   const hrs=halfHourLabels();
   const hAgg=Array.from({length:48},()=>({requests:0,tokens:0}));
   for(const [date,hours] of Object.entries(D.hourly||{})){
-    if(date<wb.wStart||date>wb.td)continue;
+    if(date<eb.start||date>eb.end)continue;
     for(const [i,v,w] of halfHourSlots(hours)){
       hAgg[i].requests+=(v.requests||0)*w;hAgg[i].tokens+=totalTokens(v)*w;
     }
@@ -511,7 +512,7 @@ function render(){
   // 槽位数与上面那张图共用 halfHourLabels(),两图必须同步 —— 标签 48 配数据 24 只会画在轴左半边,不报错。
   const hmAgg=Array.from({length:48},()=>({}));
   for(const [date,hours] of Object.entries(D.hourlyModels||{})){
-    if(date<wb.wStart||date>wb.td)continue;
+    if(date<eb.start||date>eb.end)continue;
     for(const [i,models,w] of halfHourSlots(hours)){
       for(const [m,v] of Object.entries(models)){
         if(!hmAgg[i][m])hmAgg[i][m]={requests:0,tokens:0};

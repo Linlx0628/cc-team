@@ -2,8 +2,10 @@
 // 原生 JS 改写自开源组件 page-mascot:https://github.com/nilbuild/page-mascot
 // (MIT License, Copyright (c) Kamran Ahmed),精灵图为 3x3 网格的两张 webp,
 // 静态托管在本目录(角色名-directions.webp / 角色名-reactions.webp)。
-// 本文件自包含:不依赖 ui.js/my-usage.js,样式以内联为主(另注入一小段弹层悬停样式),
+// 本文件自包含:不依赖 ui.js/my-usage.js,样式以内联为主(另注入一小段弹层/气泡样式),
 // 找不到 #mascotDock 就整体不挂。
+// 对外暴露 window.Mascot.say(text, opts):让吉祥物说一句话(头顶气泡 + 表情),
+// 供页面做签到提醒等趣味互动;#mascotDock 不存在时是 no-op,调用方无需判空。
 (function () {
   'use strict';
 
@@ -19,6 +21,8 @@
   var DIRECTIONS = ['up-left', 'up', 'up-right', 'left', 'center', 'right', 'down-left', 'down', 'down-right'];
   // 表情层同款顺序:blink/heart/sparkle/surprised/wink/bashful/sleepy/dizzy/delighted。
   var REACTIONS = ['blink', 'heart', 'sparkle', 'surprised', 'wink', 'bashful', 'sleepy', 'dizzy', 'delighted'];
+  // 表情名 -> 精灵图下标,say(text, {mood:'wink'}) 用名字取。
+  var REACT = { blink: 0, heart: 1, sparkle: 2, surprised: 3, wink: 4, bashful: 5, sleepy: 6, dizzy: 7, delighted: 8 };
 
   // —— 以下常量与 page-mascot 原版一致 ——
   // 从右开始顺时针,匹配 y 向下的 atan2。
@@ -209,6 +213,7 @@
     function closePop() { pop.style.display = 'none'; }
     swap.addEventListener('click', function (e) {
       e.stopPropagation();
+      hideBubble(); // 弹层和气泡同占吉祥物上方,开弹层先收气泡
       pop.style.display = pop.style.display === 'grid' ? 'none' : 'grid';
     });
     pop.addEventListener('click', function (e) {
@@ -229,7 +234,58 @@
     document.addEventListener('click', function (e) {
       if (pop.style.display === 'grid' && !dock.contains(e.target)) closePop();
     });
+
+    // —— 对话气泡:window.Mascot.say(text, opts) 的载体 ——
+    // 与角色弹层互斥(两者都悬在吉祥物正上方,同时显示会叠在一起)。
+    var sayTimer = 0;
+    var moodTimer = 0;
+    var bubble = document.createElement('div');
+    bubble.style.cssText = 'position:absolute;right:0;bottom:150px;max-width:220px;padding:8px 12px;'
+      + 'background:var(--bg,#fff);color:var(--text,#333);border:1px solid var(--border-strong,#ccc);'
+      + 'border-radius:12px;box-shadow:0 6px 18px rgba(24,24,22,.14);font-size:12px;line-height:1.5;'
+      + 'opacity:0;visibility:hidden;pointer-events:none;cursor:pointer;user-select:none;-webkit-user-select:none;'
+      + 'transition:opacity .18s,visibility .18s;z-index:3;';
+    // 小尾巴:旋转 45° 的小方块,只露出下半的两条边,与弹层同款视觉语言。
+    bubble.innerHTML = '<span data-bubble-text></span>'
+      + '<span style="position:absolute;right:22px;bottom:-5.5px;width:10px;height:10px;'
+      + 'background:var(--bg,#fff);border-right:1px solid var(--border-strong,#ccc);'
+      + 'border-bottom:1px solid var(--border-strong,#ccc);transform:rotate(45deg);"></span>';
+    var bubbleText = bubble.querySelector('[data-bubble-text]');
+    bubble.addEventListener('click', hideBubble);
+    dock.appendChild(bubble);
+
+    // 开合用 opacity/visibility 而不是 display:hidden 属性会被内联样式压过,
+    // display 切换又没有过渡;气泡常驻文档流外(absolute),不挡点击靠 pointer-events。
+    function hideBubble() {
+      bubble.style.opacity = 0;
+      bubble.style.visibility = 'hidden';
+      bubble.style.pointerEvents = 'none';
+      window.clearTimeout(moodTimer);
+      reactionIdx = null;
+      paintReaction();
+    }
+    function say(text, opts) {
+      opts = opts || {};
+      closePop();
+      bubbleText.textContent = String(text == null ? '' : text);
+      bubble.style.opacity = 1;
+      bubble.style.visibility = 'visible';
+      bubble.style.pointerEvents = 'auto';
+      // mood:REACT[key] 给下标,缺省 delighted;表情与气泡同寿,收起时一并回正。
+      var idx = REACT.hasOwnProperty(opts.mood) ? REACT[opts.mood] : 8;
+      window.clearTimeout(moodTimer);
+      reactionIdx = idx;
+      paintReaction();
+      var stay = opts.duration > 0 ? opts.duration : 8000;
+      moodTimer = window.setTimeout(hideBubble, stay);
+      window.clearTimeout(sayTimer);
+      sayTimer = window.setTimeout(hideBubble, stay);
+    }
+
+    return { say: say };
   }
 
-  init(document.getElementById('mascotDock'));
+  var api = init(document.getElementById('mascotDock'));
+  // 没挂载点时兜底成 no-op,页面调用 window.Mascot.say() 无需判空。
+  window.Mascot = api || { say: function () {} };
 })();

@@ -37,6 +37,7 @@ async function doCheckIn(){
     const j=await r.json();
     if(!r.ok)throw new Error(j.error||'签到失败');
     toast('签到成功！获得 '+fmtTk(j.amount)+' token，已加入 '+j.pools.length+' 个额度池');
+    window.Mascot&&Mascot.say('签到成功，今天领到 '+fmtTk(j.amount)+' token！',{mood:'delighted'});
     await load();
   }catch(e){
     toast(e.message||'签到失败');
@@ -179,6 +180,20 @@ function renderCalendar(){
   };
   grid.onmouseleave=()=>{tip.style.display='none'};
 }
+// ── Mascot speech bubble ──
+// 未签到时让吉祥物口头提醒一次。localStorage 存北京日期做「每日一次」守卫——
+// 30s 轮询会反复进 load()，靠这个挡住；签到完成后条件不成立，也不会再弹。
+function mascotBjToday(){return new Date(Date.now()+8*3600000).toISOString().slice(0,10)}
+function mascotCheckinTip(){
+  const c=D&&D.checkin;
+  if(!c||!c.available||c.enabled===false||c.checkedInToday)return;
+  let seen=null;
+  try{seen=window.localStorage.getItem('tm_mascot_tip')}catch(e){/* 存不了就每次进页都提醒 */}
+  const today=mascotBjToday();
+  if(seen===today)return;
+  try{window.localStorage.setItem('tm_mascot_tip',today)}catch(e){}
+  setTimeout(()=>{window.Mascot&&Mascot.say('记得签到哦～，点上面的「签到领 token」领今日加量')},1500);
+}
 async function load(){
   try{
     const qs=['profile='+encodeURIComponent(currentProfile)];
@@ -197,6 +212,7 @@ async function load(){
     // 日历会落到 9px 下限。所以各自只在所属面板可见时画,切过去时由 paintSection() 补画。
     if(SECTION==='overview')renderCalendar();
     if(SECTION==='analysis')renderAnalysisPane();
+    mascotCheckinTip();
   }catch(e){document.getElementById('meta').textContent='Error: '+e.message}
 }
 function switchProfile(v){currentProfile=v||'all';load()}

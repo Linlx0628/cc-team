@@ -16,6 +16,7 @@ Claude Code 走 Anthropic Messages 协议（`/v1/messages`），Codex 走 OpenAI
 - Codex 透传接入：OpenAI Responses 协议（`/v1/responses`），上游需为原生 Responses 端点（如智谱 `https://open.bigmodel.cn/api/v1`）
 - Responses 方案组独立 failover，与 Anthropic 方案严格隔离
 - 方案组调度：预先排列多套方案组，按「星期几 + 时段」自动切换优先级（周末把便宜的排前面、工作日早上用 A 下午用 B），两个协议各一套规则表，互不影响
+- 方案代码：把一套方案导出成可粘贴的 JSON，在另一套环境的「新增方案」里粘贴即可重建（模型别名、峰谷时段、各类配额倍率、上下文窗口、多模态、图片桥一并带走；不含用户分配与额度池，真实上游 Key 不出机器，额度池在目标环境复用同名或新建）
 - 每位成员使用独立的 `jx-` 虚拟 Key，真实上游 Key 不暴露
 - 按成员、方案、模型、日期和小时统计 Token 用量（含缓存 token）
 - 方案级与成员级每日配额，北京时间零点重置
@@ -537,6 +538,8 @@ Anthropic Messages 代理使用虚拟 Key 鉴权。管理类写入接口除登�
 | `/api/settings` | GET / POST | 读取或更新设置 |
 | `/api/settings-save` | POST | 保存设置页表单 |
 | `/api/profile/save` | POST | 创建方案 |
+| `/api/profile/export` | POST | 导出方案代码（可粘贴 JSON，含方案全部配置，不含用户分配与额度池） |
+| `/api/profile/import` | POST | 粘贴方案代码创建方案（额度池复用同名或新建，只新建不覆盖） |
 | `/api/profile/default` | POST | 设置方案组默认入口 |
 | `/api/profile/delete` | POST | 删除方案 |
 | `/api/schedule` | GET | 读取调度状态：每协议的组、规则、当前生效组、下次切换时刻、手动指定与配置告警 |

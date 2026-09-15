@@ -28,6 +28,10 @@ function h(v){return String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;
 function openDateTimePicker(input){if(typeof input.showPicker==='function'){try{input.showPicker()}catch{}}}
 let pendingImportData=null;
 let pendingImportPreview=null;
+// 「新增方案」弹窗里粘贴的"方案代码"（已解析成对象）。非 null 时提交走
+// /api/profile/import 而不是 /api/profile/save——这个模式必须看得见（提交按钮会改成
+// "从代码导入"），藏起来的模式状态正是这个弹窗以前的毛病。
+let pendingProfileCode=null;
 function setImportStatus(message,type){const el=document.getElementById('dataImportStatus');el.textContent=message||'';el.className='inline-status '+(type||'')}
 async function previewDataImport(){
   const file=document.getElementById('dataImportFile').files[0];
@@ -85,7 +89,46 @@ async function clearAllData(){
 function openUserModal(){const sfx=document.getElementById('profileSuffixInput').value||SETTINGS.selectedProfileSuffix;document.getElementById('userProfileSel').value=sfx;renderProfileUsers(sfx);document.getElementById('userModal').classList.add('open')}
 function closeUserModal(){document.getElementById('userModal').classList.remove('open')}
 document.getElementById('userModal').addEventListener('click',function(e){if(e.target===this)closeUserModal()});
-function openProfileModal(protocol){document.getElementById('profileModal').classList.add('open');if(protocol){var sel=document.getElementById('newProfileProtocol');sel.value=protocol;updateNewProfileProtocolHint()}document.getElementById('newProfileName').focus()}
+// 当前该用哪个协议：以可见的面板为准（无参调用的侧栏"新增方案"按钮就该跟着眼前的
+// 标签页走），没有可见面板时退回记住的标签页。
+function activeProtoTab(){
+  var visible=[].slice.call(document.querySelectorAll('.proto-pane[data-proto]')).filter(function(p){return p.style.display!=='none'});
+  if(visible.length)return visible[0].dataset.proto==='responses'?'responses':'anthropic';
+  var t='';try{t=localStorage.getItem('tm_settings_proto_tab')||''}catch(e){}
+  return t==='responses'?'responses':'anthropic';
+}
+// 弹窗里各字段的"出厂值"（服务端渲染出来的默认上游、默认协议等）。复位时必须还原：
+// 否则粘贴过一次代码后关掉弹窗，下次打开看到的是另一个环境的地址，还以为是新建。
+var profileFieldDefaults=null;
+function profileDefaults(){
+  if(profileFieldDefaults)return profileFieldDefaults;
+  var ids=['newProfileName','newProfileSuffix','newProfileProtocol','newProfileUpstream','newProfileResponsesPath','newProfilePool'];
+  var out={};
+  ids.forEach(function(id){var el=document.getElementById(id);if(el)out[id]=el.value});
+  profileFieldDefaults=out;
+  return out;
+}
+// 弹窗复位：粘贴框、待导入的代码、表单字段、提交按钮文案、协议提示全部回到"新建"的白纸状态。
+function resetProfileCode(){
+  pendingProfileCode=null;
+  var ta=document.getElementById('profileCodePaste');if(ta)ta.value='';
+  var st=document.getElementById('profileCodeStatus');if(st){st.textContent='';st.className='inline-status'}
+  var btn=document.getElementById('createProfileBtn');if(btn)btn.textContent='创建方案';
+  var clr=document.getElementById('profileCodeClear');if(clr)clr.style.display='none';
+  var defs=profileDefaults();
+  Object.keys(defs).forEach(function(id){var el=document.getElementById(id);if(el)el.value=defs[id]});
+  updateNewProfileProtocolHint();
+}
+// 协议提示以前只在传了 protocol 时才刷新，而侧栏底部那个"新增方案"是无参调用——
+// 于是提示文案与 Responses 路径块可能停留在上一次的协议上。现在无条件刷新。
+function openProfileModal(protocol){
+  resetProfileCode();
+  var sel=document.getElementById('newProfileProtocol');
+  sel.value=protocol||activeProtoTab();
+  updateNewProfileProtocolHint();
+  document.getElementById('profileModal').classList.add('open');
+  document.getElementById('newProfileName').focus();
+}
 // 限制直连 is ONE shared setting rendered in both protocol panes — keep all
 // checkboxes in sync whichever one is toggled, and persist the choice
 // right away: the checkboxes live outside both forms, so an unsaved toggle
@@ -119,8 +162,10 @@ function switchProtoTab(tab){
   var first=(SETTINGS.profiles||[]).find(function(p){return (p.protocol==='responses')===(tab==='responses')});
   if(first&&first.name)editProfile(first.name);
 }
-function closeProfileModal(){document.getElementById('profileModal').classList.remove('open')}
+function closeProfileModal(){resetProfileCode();document.getElementById('profileModal').classList.remove('open')}
 document.getElementById('profileModal').addEventListener('click',function(e){if(e.target===this)closeProfileModal()});
+function closeCodeModal(){document.getElementById('codeModal').classList.remove('open')}
+document.getElementById('codeModal').addEventListener('click',function(e){if(e.target===this)closeCodeModal()});
 async function switchToProfile(n){
   // No longer exclusive switch — just reload the profile into the form
   editProfile(n);
@@ -706,18 +751,35 @@ function updateNewProfileProtocolHint(){
   document.getElementById('newProfileProtocolNote').textContent=isResp?'Codex 走 /v1/responses，上游必须是原生 Responses 端点（如智谱 /api/v1）。':'Claude Code 走 /v1/messages；Codex 走 /v1/responses。两种协议的方案完全隔离。';
   document.getElementById('newProfileResponsesPathBlock').style.display=isResp?'':'none';
 }
+// 一个新弹窗两种模式：粘了方案代码就"从代码导入"（走 /api/profile/import，把表单装
+// 不下的字段也从代码里带过来），否则还是原来的"新建"（走 /api/profile/save）。表单里
+// 可见的那几项在导入时同样说了算——服务端会拿它们覆盖代码里的同名值。
 async function createProfile(){
   const name=document.getElementById('newProfileName').value.trim();
   const suffix=document.getElementById('newProfileSuffix').value.trim();
   const upstream=document.getElementById('newProfileUpstream').value.trim();
   const protocol=document.getElementById('newProfileProtocol').value;
+  const pool=document.getElementById('newProfilePool')?document.getElementById('newProfilePool').value:'';
+  const responsesPath=protocol==='responses'?(document.getElementById('newProfileResponsesPath').value||'').trim():'';
   if(!name||!suffix||!upstream){alert('方案名称、URL 后缀和上游 API 地址必填');return}
-  const r=await fetch('/api/profile/save',{method:'POST',headers:csrfHeaders({'Content-Type':'application/json'}),body:JSON.stringify({
-    profile:name,suffix:suffix,upstream:upstream,
-    protocol:protocol,quotaPool:document.getElementById('newProfilePool')?.value||'',
-    responsesPath:protocol==='responses'?(document.getElementById('newProfileResponsesPath').value||'').trim():''
-  })});
-  if(r.ok)toastThen('方案已创建 — 点击左侧方案配置模型别名',()=>location.reload());else{const e=await r.json();alert('创建失败: '+e.error)}
+  const paste=document.getElementById('profileCodePaste');
+  const importing=!!pendingProfileCode&&!!(paste&&paste.value.trim());
+  const r=await fetch(importing?'/api/profile/import':'/api/profile/save',{method:'POST',headers:csrfHeaders({'Content-Type':'application/json'}),body:JSON.stringify(
+    importing
+      ?{code:pendingProfileCode,name:name,suffix:suffix,upstream:upstream,protocol:protocol,quotaPool:pool,responsesPath:responsesPath}
+      :{profile:name,suffix:suffix,upstream:upstream,protocol:protocol,quotaPool:pool,responsesPath:responsesPath}
+  )});
+  if(!r.ok){
+    const e=await r.json().catch(()=>({}));
+    // 粘贴出错是"改一下再试"的事，摆在内联提示里比弹窗顺手。
+    if(importing)setProfileCodeStatus('导入失败：'+(e.error||('HTTP '+r.status)),'error');
+    else alert('创建失败: '+(e.error||('HTTP '+r.status)));
+    return;
+  }
+  if(!importing){toastThen('方案已创建 — 点击左侧方案配置模型别名',()=>location.reload());return}
+  const j=await r.json().catch(()=>({}));
+  const warn=(j.warnings&&j.warnings.length)?'。注意：'+j.warnings.join('；'):'';
+  toastThen('方案已导入（额度池'+(j.poolAction==='reused'?'复用 ':'新建 ')+(j.quotaPool||'')+'；不含用户分配，请分配真实Key并加入故障转移分组）'+warn,()=>location.reload());
 }
 async function setDefaultProfile(n,protocol){
   const r=await fetch('/api/profile/default',{method:'POST',headers:csrfHeaders({'Content-Type':'application/json'}),body:JSON.stringify({profile:n,protocol:protocol||'anthropic'})});
@@ -740,6 +802,71 @@ async function cloneProfile(n){
   const r=await fetch('/api/profile/clone',{method:'POST',headers:csrfHeaders({'Content-Type':'application/json'}),body:JSON.stringify({profile:n})});
   if(r.ok)toastThen('方案已复制（用户与真实Key不复制）',()=>location.reload());else{const e=await r.json().catch(()=>({}));alert('复制失败: '+(e.error||''))}
 }
+// 把方案导出成可粘贴的"方案代码"放进剪贴板。含该方案的全部配置，但不含用户分配
+// （真实Key 不出机器）与额度池（目标环境自选）。剪贴板写不进去时（明文 http 下
+// navigator.clipboard 不存在）退到弹窗让用户手动复制，而不是静默失败。
+async function copyProfileCode(btn,n){
+  const r=await fetch('/api/profile/export',{method:'POST',headers:csrfHeaders({'Content-Type':'application/json'}),body:JSON.stringify({profile:n})});
+  if(!r.ok){const e=await r.json().catch(()=>({}));alert('导出失败: '+(e.error||('HTTP '+r.status)));return}
+  const j=await r.json().catch(()=>({}));
+  if(!j.code||!j.code.profile){alert('导出失败: 返回内容不完整');return}
+  const text=JSON.stringify(j.code,null,2);
+  const warnings=(j.warnings||[]).join('；');
+  const ok=await copyText(text,btn);
+  if(!ok)showCodeModal(text,warnings);
+  else if(warnings)toast(warnings);
+}
+function showCodeModal(text,warnings){
+  const ta=document.getElementById('codeModalText');
+  ta.value=text;
+  const note=document.getElementById('codeModalNote');
+  if(note)note.textContent=(warnings?warnings+'。':'')+'浏览器不允许本页直接写剪贴板，请手动全选复制下面这段 JSON。它可以粘贴到另一套环境的「新增方案」里重建同名方案，不含用户分配与额度池。';
+  document.getElementById('codeModal').classList.add('open');
+  ta.focus();ta.select();
+}
+async function copyCodeModalText(btn){
+  const ta=document.getElementById('codeModalText');
+  const ok=await copyText(ta.value,btn);
+  if(ok){toast('方案代码已复制');closeCodeModal()}
+  else{ta.focus();ta.select();alert('复制失败，请手动全选复制（Ctrl/Cmd+C）')}
+}
+function setProfileCodeStatus(msg,type){const el=document.getElementById('profileCodeStatus');el.textContent=msg||'';el.className='inline-status '+(type||'')}
+// 粘贴/编辑粘贴框时解析：成功就填满表单并切到"导入"模式，失败只提示、不改模式。
+function applyProfileCode(){
+  const raw=(document.getElementById('profileCodePaste').value||'').trim();
+  if(!raw){resetProfileCode();return}
+  let code=null;
+  try{code=JSON.parse(raw)}catch(e){code=null}
+  if(!code||typeof code!=='object'||Array.isArray(code)||code.codeFormat!=='token-monitor-profile'||!code.profile||typeof code.profile!=='object'){
+    pendingProfileCode=null;
+    document.getElementById('createProfileBtn').textContent='创建方案';
+    document.getElementById('profileCodeClear').style.display='';
+    setProfileCodeStatus('不是有效的方案代码：这里要粘「复制代码」导出的那段 JSON','error');
+    return;
+  }
+  pendingProfileCode=code;
+  const p=code.profile;
+  const name=String(code.name||'').trim();
+  const proto=p.protocol==='responses'?'responses':'anthropic';
+  document.getElementById('newProfileName').value=name;
+  document.getElementById('newProfileSuffix').value=String(code.suffix||'').trim();
+  document.getElementById('newProfileProtocol').value=proto;
+  updateNewProfileProtocolHint();
+  // 上游必须显式覆盖：弹窗是服务端渲染的，默认填着当前方案的上游。少这一步就会把
+  // 新方案悄悄指到另一个供应商去。
+  document.getElementById('newProfileUpstream').value=String(p.upstream||'');
+  document.getElementById('newProfileResponsesPath').value=String(p.responsesPath||'/v1/responses');
+  // 额度池默认"同名池存在则复用"：下拉里正好有与方案同名的池就选中它，否则留在
+  // "＋ 新建额度池（与方案同名）"那一项上。
+  const poolSel=document.getElementById('newProfilePool');
+  const sameNamed=[].slice.call(poolSel.options).some(function(o){return o.value===name});
+  poolSel.value=sameNamed?name:'';
+  document.getElementById('createProfileBtn').textContent='从代码导入';
+  document.getElementById('profileCodeClear').style.display='';
+  const aliasCount=Object.keys(p.modelAliases||{}).length;
+  setProfileCodeStatus('已识别「'+name+'」（'+(proto==='responses'?'OpenAI Responses':'Anthropic')+'，'+(aliasCount?aliasCount+' 条模型别名':'无模型别名')+'）；额度池：'+(sameNamed?'复用同名池 '+name:'新建同名池'),'ok');
+}
+function clearProfileCode(){resetProfileCode();document.getElementById('profileCodePaste').focus()}
 async function saveDefaultGroup(group){
   const r=await fetch('/api/profile/default-group',{method:'POST',headers:csrfHeaders({'Content-Type':'application/json'}),body:JSON.stringify({group:group,protocol:'anthropic'})});
   if(r.ok)toastThen('默认方案组已保存',()=>location.reload());else{const e=await r.json().catch(()=>({}));alert('保存失败: '+(e.error||''))}

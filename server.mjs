@@ -91,6 +91,21 @@ const assets = loadAssets(path.join(__dirname, "public", "assets"));
 const RESERVED_SUFFIXES = new Set(["dashboard", "settings", "api", "health", "usage", "my-usage", "v1", "login", "logout", "favicon", "robots", "js", "css", "responses", "models", "leaderboard", "sessions", "my-activity"]);
 const PROFILE_SUFFIX_RE = /^[a-z0-9_-]{2,20}$/;
 
+// 「方案代码」——把一套方案的配置搬到别的环境时用的可粘贴 JSON。格式标记和版本
+// 一起放在信封里（而不是混进 profile 对象），导入时先验它：粘错了东西能立刻得到
+// 一句人话，而不是一个字段残缺的方案。信封结构：
+//   { codeFormat, codeVersion, name, suffix, profile: {…除了 users/quotaPool/suffix…} }
+const PROFILE_CODE_FORMAT = "token-monitor-profile";
+const PROFILE_CODE_VERSION = 1;
+
+// 这几个名字在 `obj[name] = v` 时不会变成普通属性：`__proto__` 会改写原型（此后所有
+// 按名字查表都可能认错），另两个会让"这个键存在吗"之类的判断走岔。方案名与池名都是
+// 配置对象上的键，而且可能来自粘贴进来的代码，所以一律拒收。
+const UNSAFE_CONFIG_KEYS = new Set(["__proto__", "constructor", "prototype"]);
+function hasOwnKey(obj, key) {
+  return !!obj && Object.prototype.hasOwnProperty.call(obj, key);
+}
+
 // A profile serves exactly one client protocol. The two pools are strictly
 // isolated: routing, default groups and failover never cross protocols.
 function normalizeProfileProtocol(value) {
@@ -157,6 +172,28 @@ function validateProfileSuffix(suffix, currentProfileName = null) {
   return sfx;
 }
 
+// Every profile needs a pool; accept an existing one or create a same-named one so
+// quota enforcement never runs against nothing (= unlimited). Returns which branch
+// ran so the caller can tell the admin which pool the profile ended up sharing.
+// 注意 requestedPool 只在"点名了一个已存在的池"时才算数：选择"新建"（空值）时
+// 一定新建，重名就顺着 -2/-3 排下去，绝不悄悄并进一个同名池——新建弹窗里那个
+// 选项承诺的是"独立额度"。
+function resolveOrCreateQuotaPool(requestedPool, profileName) {
+  const requested = normalizeQuotaPoolName(requestedPool);
+  if (requested && hasOwnKey(config.quotaPools, requested)) return { poolName: requested, action: "reused" };
+  const rawBase = normalizeQuotaPoolName(profileName) || "pool";
+  const base = UNSAFE_CONFIG_KEYS.has(rawBase) ? "pool" : rawBase;
+  let poolName = base;
+  // 候选名要给序号留位置：先按整名截断再拼序号的话，40 字的方案名会切回原名，
+  // 循环永远退不出去。
+  for (let i = 2; hasOwnKey(config.quotaPools, poolName); i++) {
+    const tail = `-${i}`;
+    poolName = base.slice(0, Math.max(1, QUOTA_POOL_NAME_MAX - tail.length)) + tail;
+  }
+  config.quotaPools[poolName] = { label: profileName, dailyTokenLimit: null, users: {} };
+  return { poolName, action: "created" };
+}
+
 function legacyDefaultModelAliases(defaultModels = {}) {
   const aliases = {};
   if (defaultModels.sonnet) aliases["jx-sonnet"] = String(defaultModels.sonnet).trim();
@@ -207,6 +244,49 @@ function formatModelAliasesInput(aliases = {}) {
   return Object.entries(normalizeModelAliases(aliases))
     .map(([alias, target]) => `${alias}=${target}`)
     .join("\n");
+}
+
+// 下面三个归一化器只为「导入方案代码」而存在：那三个字段的写入路径本来只有设置
+// 表单（值是表单构造出来的，形状天然正确），而从剪贴板粘进来的 JSON 是手改过的，
+// 形状不对会一路带到运行期。
+
+// 别名 → 正整数（modelContextWindows）。非对象/非正数一律丢弃。
+function normalizeNumberMap(value) {
+  const out = {};
+  if (!value || typeof value !== "object" || Array.isArray(value)) return out;
+  for (const [k, v] of Object.entries(value)) {
+    const n = Math.floor(Number(v));
+    if (k && Number.isFinite(n) && n > 0) out[k] = n;
+  }
+  return out;
+}
+
+// 别名 → 布尔（modelMultimodal）。字符串 "false"/"0"/"off"/"no" 也算假，因为手写
+// JSON 里这几种写法都很常见。读取方按 `!== false` 判真，所以值必须真是布尔。
+function normalizeBooleanMap(value) {
+  const out = {};
+  if (!value || typeof value !== "object" || Array.isArray(value)) return out;
+  for (const [k, v] of Object.entries(value)) {
+    if (!k) continue;
+    out[k] = typeof v === "string" ? !["", "0", "false", "off", "no"].includes(v.trim().toLowerCase()) : !!v;
+  }
+  return out;
+}
+
+// 图片桥配置：真正被读的只有 .model（lib/vision-bridge.mjs），enabled 之类别的键
+// 原样留着；model 清空时删掉该键，与设置表单的写法一致。
+function normalizeImageBridge(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+  const out = { ...value };
+  const model = String(out.model || "").trim();
+  if (model) out.model = model; else delete out.model;
+  return out;
+}
+
+// Responses 出站端点：与设置表单同一套写法（去尾斜杠、补前导斜杠，空则无）。
+function normalizeResponsesPath(value) {
+  const v = String(value || "").trim().replace(/\/+$/, "");
+  return v ? (v.startsWith("/") ? v : `/${v}`) : undefined;
 }
 
 // ─── Profile System ──────────────────────────────────────────────────────────
@@ -3513,15 +3593,7 @@ const server = http.createServer((req, res) => {
           if (m && !models.includes(m)) models.push(m);
         }
         const validBilling = ["coding_plan", "token_plan", "on_demand"].includes(billingType) ? billingType : "on_demand";
-        // Every profile needs a pool; accept an existing one or create a same-named
-        // one so quota enforcement never runs against nothing (= unlimited).
-        const requestedPool = normalizeQuotaPoolName(quotaPool);
-        let poolName = requestedPool && config.quotaPools[requestedPool] ? requestedPool : "";
-        if (!poolName) {
-          poolName = normalizeQuotaPoolName(name) || "pool";
-          for (let i = 2; config.quotaPools[poolName]; i++) poolName = `${normalizeQuotaPoolName(name)}-${i}`.slice(0, QUOTA_POOL_NAME_MAX);
-          config.quotaPools[poolName] = { label: name, dailyTokenLimit: null, users: {} };
-        }
+        const { poolName } = resolveOrCreateQuotaPool(quotaPool, name);
         config.profiles[name] = {
           upstream: upstream || rt?.upstream || "",
           allowedModels: models,
@@ -3722,6 +3794,142 @@ const server = http.createServer((req, res) => {
         recordAdminAudit(req, "profile.clone", newName, `复制方案 "${profile}" → "${newName}"（后缀 /${newSuffix}，共享额度池 ${clone.quotaPool || "无"}，不复制用户）`);
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ ok: true, profile: newName, suffix: newSuffix }));
+      } catch (err) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: err.message }));
+      }
+    }).catch(() => {
+      res.writeHead(413); res.end("Request too large");
+    });
+    return;
+  }
+
+  // Profile: export a portable 「方案代码」 for recreating this profile in another
+  // environment. Two things are deliberately NOT exported: users (real upstream
+  // keys must never leave this box) and quotaPool (the target environment picks
+  // its own). Reads the RAW config — never listProfiles(), which injects
+  // never-stored defaults, drops toolPatternCompat, and whose quotaPool
+  // resolution can create a pool as a side effect of a read.
+  if (req.method === "POST" && req.url === "/api/profile/export") {
+    if (!checkAuth(req)) { res.writeHead(401); res.end("Unauthorized"); return; }
+    if (!checkCsrf(req)) { res.writeHead(403); res.end("CSRF validation failed"); return; }
+    readBody(req).then(buf => {
+      try {
+        const { profile } = JSON.parse(buf.toString());
+        const src = config.profiles[profile];
+        if (!hasOwnKey(config.profiles, profile)) throw new Error(`Profile "${profile}" not found`);
+        const body = JSON.parse(JSON.stringify(src));
+        delete body.users;
+        delete body.quotaPool;
+        // 名称与后缀走信封，不进 profile 体：粘贴回来的那份代码里每个字段只有
+        // 一个来源，导入时不必猜哪个说了算。
+        delete body.suffix;
+        const warnings = [];
+        if (/^https?:\/\/[^/?#@]*:[^/?#@]*@/.test(String(body.upstream || ""))) {
+          warnings.push("该方案的上游地址里带账号密码（user:pass@host），代码会原样带出，分享前请留意");
+        }
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({
+          ok: true,
+          code: {
+            codeFormat: PROFILE_CODE_FORMAT,
+            codeVersion: PROFILE_CODE_VERSION,
+            name: profile,
+            suffix: normalizeProfileSuffix(src.suffix),
+            profile: body,
+          },
+          warnings,
+        }));
+      } catch (err) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: err.message }));
+      }
+    }).catch(() => {
+      res.writeHead(413); res.end("Request too large");
+    });
+    return;
+  }
+
+  // Profile: import a 「方案代码」 pasted from another environment. Everything the
+  // create endpoint cannot carry (peak windows, every quota rate, context
+  // windows, the multimodal map, the image bridge, toolPatternCompat,
+  // contextWindow) comes from the code; the visible form fields win where they
+  // overlap. The quota pool is never part of the code — the caller picks one.
+  if (req.method === "POST" && req.url === "/api/profile/import") {
+    if (!checkAuth(req)) { res.writeHead(401); res.end("Unauthorized"); return; }
+    if (!checkCsrf(req)) { res.writeHead(403); res.end("CSRF validation failed"); return; }
+    readBody(req).then(buf => {
+      try {
+        const { code, name: rawName, suffix, protocol, upstream, quotaPool, responsesPath } = JSON.parse(buf.toString());
+        if (!code || typeof code !== "object" || Array.isArray(code)) throw new Error("方案代码格式不正确：需要一段 JSON 对象");
+        if (code.codeFormat !== PROFILE_CODE_FORMAT) throw new Error("不是有效的方案代码（缺少 codeFormat 标记），请粘贴「复制代码」导出的内容");
+        if (code.codeVersion !== PROFILE_CODE_VERSION) throw new Error(`方案代码版本不支持（${code.codeVersion}），请用同一版本的「复制代码」重新导出`);
+        const src = code.profile;
+        if (!src || typeof src !== "object" || Array.isArray(src)) throw new Error("方案代码里没有 profile 内容");
+        const name = String(rawName || code.name || "").trim();
+        if (!name) throw new Error("方案名称不能为空");
+        if (name.length > 40) throw new Error("方案名称过长（最多 40 字）");
+        if (UNSAFE_CONFIG_KEYS.has(name)) throw new Error(`方案名称不能是 "${name}"`);
+        if (hasOwnKey(config.profiles, name)) throw new Error(`方案 "${name}" 已存在`);
+        const sfx = validateProfileSuffix(suffix || code.suffix || name, name);
+        const proto = normalizeProfileProtocol(protocol || src.protocol);
+        // 上游必填且必须真能解析：空/非法地址会让 createProfileRuntime 里的
+        // new URL() 抛错，而 initAllRuntimes 把那个错吞了，结果是一个永不初始化
+        // 的"死方案"——没有任何提示。宁可在导入这一步就拦下。也刻意不沿用新建
+        // 路径的"留空则继承默认方案"回退：那会把方案悄悄指到另一个上游。
+        const up = String(upstream || src.upstream || "").trim();
+        if (!/^https?:\/\/[^\s]+/.test(up)) throw new Error("上游 API 地址无效，方案代码可能不完整");
+        try { new URL(up); } catch { throw new Error(`上游 API 地址无法解析：${up}`); }
+        const aliases = normalizeModelAliases(src.modelAliases || {});
+        const peakAliases = normalizeModelAliases(src.peakModelAliases || {});
+        // 允许模型列表原样搬（只做去重与剔除非字符串），绝不按别名目标重算：
+        // 它是运行期真正读的那一份（checkModelAllowed），而按别名重算是设置表单
+        // 的约定。两边都空更危险——空列表在 checkModelAllowed 里等于"放行一切"，
+        // 与"复制一份受限方案"的意图正好相反，所以直接拒绝。
+        const allowedModels = Array.isArray(src.allowedModels)
+          ? [...new Set(src.allowedModels.filter(m => typeof m === "string" && m.trim()).map(m => m.trim()))]
+          : [];
+        if (allowedModels.length === 0 && Object.keys(aliases).length === 0 && Object.keys(peakAliases).length === 0) {
+          throw new Error("方案代码里既没有模型别名也没有允许模型列表，导入后会放行所有模型；请先在源环境把别名配好再导出");
+        }
+        const warnings = [];
+        if (Object.keys(aliases).length === 0) warnings.push("代码里没有模型别名，下次保存该方案设置时必须先配别名（否则保存会被拒绝）");
+        const prof = JSON.parse(JSON.stringify(src));
+        // 手改过的代码不该能把这几个键带进 config 对象。
+        for (const k of ["__proto__", "constructor", "prototype"]) delete prof[k];
+        prof.suffix = sfx;
+        prof.protocol = proto;
+        prof.users = {};
+        prof.isDefault = false;
+        prof.upstream = up;
+        prof.allowedModels = allowedModels;
+        prof.modelAliases = aliases;
+        prof.peakModelAliases = peakAliases;
+        prof.peakHours = normalizePeakHours(prof.peakHours);
+        prof.peakQuotaRate = normalizeQuotaRate(prof.peakQuotaRate);
+        prof.offPeakQuotaRate = normalizeQuotaRate(prof.offPeakQuotaRate);
+        prof.modelQuotaRates = normalizeModelQuotaRates(prof.modelQuotaRates || {});
+        prof.cacheReadQuotaRate = normalizeCacheReadQuotaRate(prof.cacheReadQuotaRate);
+        prof.modelContextWindows = normalizeNumberMap(prof.modelContextWindows);
+        prof.modelMultimodal = normalizeBooleanMap(prof.modelMultimodal);
+        prof.imageBridge = normalizeImageBridge(prof.imageBridge);
+        prof.billingType = ["coding_plan", "token_plan", "on_demand"].includes(prof.billingType) ? prof.billingType : "on_demand";
+        // 垃圾值会让运行期静默失效（createProfileRuntime 里直接归一化它），所以也过一遍。
+        prof.toolPatternCompat = toolPatternApi.normalizeToolPatternCompat(prof.toolPatternCompat);
+        // 表单字段优先，空则回退代码里的值；anthropic 方案上直接清掉，免得留一个
+        // 从 responses 方案带过来的陈旧端点。
+        prof.responsesPath = proto === "responses"
+          ? normalizeResponsesPath(responsesPath || prof.responsesPath)
+          : undefined;
+        const { poolName, action } = resolveOrCreateQuotaPool(quotaPool, name);
+        prof.quotaPool = poolName;
+        config.profiles[name] = prof;
+        saveConfig(config);
+        reloadAllRuntimes();
+        console.log(`[PROFILE] Imported profile code "${name}" (suffix: ${sfx}, protocol: ${proto}, pool: ${poolName}/${action})`);
+        recordAdminAudit(req, "profile.import", name, `导入方案代码创建 "${name}"（后缀 /${sfx}，协议 ${proto === "responses" ? "OpenAI Responses" : "Anthropic"}，额度池 ${poolName}（${action === "reused" ? "复用" : "新建"}），不含用户分配，未加入故障转移分组）`);
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: true, profile: name, suffix: sfx, protocol: proto, quotaPool: poolName, poolAction: action, warnings }));
       } catch (err) {
         res.writeHead(400, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ error: err.message }));

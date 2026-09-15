@@ -7,6 +7,32 @@ function quotaBar(pct){var value=Math.max(0,Math.min(100,Number(pct)||0));var cl
 function runCountUps(root){(root||document).querySelectorAll('[data-cu]').forEach(function(el){var raw=Number(el.dataset.cu)||0;el.textContent=el.hasAttribute('data-cu-k')?formatCompact(raw):raw.toLocaleString('zh-CN');el.dataset.cur=String(raw)})}
 function hpBar(pct){return quotaBar(pct)}
 
+// ── 剪贴板 ───────────────────────────────────────────────────────────────────
+// 明文 http 访问下 navigator.clipboard 根本不存在（本应用常这样就进来了），所以不能
+// 只写一行 writeText 了事。三级兜底：clipboard API → 隐藏 textarea + execCommand →
+// 交给调用方（把内容摆给用户手动复制）。返回是否写成功，按钮有的话顺带做"已复制"反馈。
+function execCopyViaTextarea(text){
+  var ta=document.createElement('textarea');
+  ta.value=text;ta.setAttribute('readonly','');
+  // 不能 display:none —— 选不中的元素复制出来是空的。
+  ta.style.position='fixed';ta.style.top='-1000px';ta.style.left='0';ta.style.opacity='0';
+  document.body.appendChild(ta);
+  var ok=false;
+  try{ta.select();ta.setSelectionRange(0,ta.value.length);ok=document.execCommand('copy')}catch(e){ok=false}
+  ta.remove();
+  return ok;
+}
+function copyText(text,btn){
+  const flash=function(ok){
+    if(ok&&btn){const old=btn.textContent;btn.textContent='已复制';setTimeout(function(){btn.textContent=old},1500)}
+    return ok;
+  };
+  if(navigator.clipboard&&navigator.clipboard.writeText){
+    return navigator.clipboard.writeText(text).then(function(){return flash(true)},function(){return flash(execCopyViaTextarea(text))});
+  }
+  return Promise.resolve(flash(execCopyViaTextarea(text)));
+}
+
 function toast(msg){
   let wrap=document.getElementById('toastWrap');
   if(!wrap){wrap=document.createElement('div');wrap.id='toastWrap';document.body.appendChild(wrap)}

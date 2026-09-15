@@ -722,7 +722,10 @@ function listProfiles() {
     billingType: config.profiles[name].billingType || "on_demand",
     upstream: config.profiles[name].upstream,
     responsesPath: config.profiles[name].responsesPath || "/v1/responses",
-    userCount: Object.keys(config.profiles[name].users || {}).length,
+    // 用户管理表格给每个全局用户都渲染一行，保存时未填真实Key的行会落成
+    // {key:""} 占位；数条目会让每个方案都显示同一个「全局用户数」。空占位在
+    // 请求侧一律被 hasProfileRealKey 拒绝，所以这里只数真正分配了真实Key的。
+    userCount: Object.values(config.profiles[name].users || {}).filter(hasRealKey).length,
     allowedModels: config.profiles[name].allowedModels || [],
     modelAliases: getConfigurableModelAliases(config.profiles[name]),
     peakModelAliases: normalizeModelAliases(config.profiles[name].peakModelAliases || {}),
@@ -1735,11 +1738,18 @@ function getProfileUser(apiKey, _rt) {
   return runtime.users[resolveUserKey(apiKey, runtime)] || null;
 }
 
+// 一个方案用户条目是否携带真实Key（空/纯空白 = 占位，不可用此方案）。
+// 这是「能不能用这个方案」的唯一判据：canUseProfile 靠它拒绝，额度池的
+// memberUsers 也用它过滤。兼容 {key} 与史前的纯字符串两种格式。
+function hasRealKey(u) {
+  const k = typeof u === "string" ? u : (u && u.key);
+  return !!(k && String(k).trim());
+}
+
 function hasProfileRealKey(apiKey, _rt) {
   const pu = getProfileUser(apiKey, _rt);
   if (!pu) return false;
-  if (typeof pu === "string") return !!pu.trim();
-  return !!(pu.key && String(pu.key).trim());
+  return hasRealKey(pu);
 }
 
 // 超级用户：全局用户表里 superUser=true 的虚拟Key，可绕过方案分配与限制直连。

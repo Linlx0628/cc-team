@@ -2567,6 +2567,16 @@ const PAGE_DEPS = {
 // Codex 一键接入脚本构建器（lib/codex-setup-script.mjs）的依赖注入对象。
 const CODEX_DEPS = { config, canUseProfile, runtimes };
 
+// 我的用量页内「配置 Codex」分区所需的服务端数据:是否分配了 Responses 方案 +
+// 模型目录。口径与 /setup 路由一致;invalid 场景在该页不存在(渲染前 Key 已验证)。
+function personalCodexExtras(vk) {
+  const hasResp = getAccessibleProfiles(vk).some(p => p.protocol === "responses");
+  return {
+    noProfile: !hasResp,
+    catalog: hasResp ? buildCodexModelCatalog(CODEX_DEPS, vk) : null,
+  };
+}
+
 // /api/stats 读模型聚合（lib/stats.mjs）的依赖注入对象。db/stmts 在 initDb
 // 阶段才就绪，必须用 getter 延迟读取；其余为稳定绑定，按值捕获即可。
 const STATS_DEPS = {
@@ -4779,7 +4789,7 @@ const server = http.createServer((req, res) => {
       return;
     }
     res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
-    res.end(personalUsageHtml(PAGE_DEPS, vk));
+    res.end(personalUsageHtml(PAGE_DEPS, vk, personalCodexExtras(vk)));
     return;
   }
   if (req.method === "GET" && req.url.startsWith("/my-usage")) {
@@ -4791,7 +4801,7 @@ const server = http.createServer((req, res) => {
       return;
     }
     res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
-    res.end(personalUsageHtml(PAGE_DEPS, vk));
+    res.end(personalUsageHtml(PAGE_DEPS, vk, personalCodexExtras(vk)));
     return;
   }
 

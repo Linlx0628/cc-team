@@ -625,11 +625,12 @@ load();setInterval(load,30000);
 
 
 // ── 面板切换 ──
-// 菜单按功能划分,五块:概览(含使用日历、各方案配额、产出画像)/ 配额价目表 /
-// 用量分析(图表、模型表、客户端用量、项目分布)/ 会话使用情况 / 团队排行榜。
+// 菜单按功能划分,六块:概览(含使用日历、各方案配额、产出画像)/ 配额价目表 /
+// 用量分析(图表、模型表、客户端用量、项目分布)/ 会话使用情况 / 团队排行榜 /
+// 配置 Codex(/setup 页搬进来的内嵌分区)。
 // 顺序即导航顺序,id 由 setSection() 按 'mu-tab-'+s / 'mu-panel-'+s 硬拼 ——
 // 增删菜单必须与 lib/pages.mjs 的按钮和面板同时改,否则切换会静默失效。
-const SECTIONS=['overview','rates','analysis','sessions','leaderboard'];
+const SECTIONS=['overview','rates','analysis','sessions','leaderboard','codex'];
 function setSection(name,focus){
   if(SECTIONS.indexOf(name)<0)name='overview';
   SECTION=name;

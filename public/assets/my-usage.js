@@ -183,8 +183,9 @@ async function load(){
   try{
     const qs=['profile='+encodeURIComponent(currentProfile)];
     if(currentProfile==='all'&&PROTO)qs.push('protocol='+PROTO);
-    // 用量分析的自定义范围(ANA 筛选):缺一头时服务端会自动补齐(end 缺省今天)。
-    if(ANA.start||ANA.end){qs.push('start='+encodeURIComponent(ANA.start||''));qs.push('end='+encodeURIComponent(ANA.end||''))}
+    // 用量分析的日期窗口(ANA):默认档「今日」也照常传 start/end,口径由服务端回显。
+    qs.push('start='+encodeURIComponent(ANA.start||''));
+    qs.push('end='+encodeURIComponent(ANA.end||''));
     const r=await fetch('/api/my-usage?'+qs.join('&'),{headers:{'Authorization':'Bearer '+VK}});
     if(!r.ok){document.getElementById('meta').textContent='认证失败';return}
     D=await r.json();
@@ -525,8 +526,14 @@ let calRz;window.addEventListener('resize',function(){clearTimeout(calRz);calRz=
 // 今日 / 本周(周一起)/ 本月(1 日起)/ 今年(1 月 1 日起),均北京时间。
 const DAY=86400000;
 const RANGE_PRESETS=[['today','今日'],['week','本周'],['month','本月'],['year','今年']];
-const ANA={preset:'',start:'',end:''};   // 用量分析:/api/my-usage 的趋势 + 模型/客户端表
-const SESS={preset:'',start:'',end:''};  // 会话使用情况:/api/my-activity(项目分布随之)
+// 两个面板各带默认选中档:用量分析默认「今日」,会话使用情况默认「本周」。
+// 边界在脚本载入时算一次;跨天挂着不刷新的话窗口会停在昨天,重选一次预设即恢复。
+function initState(def){
+  const b=presetBounds(def);
+  return{def:def,preset:def,start:b.start,end:b.end};
+}
+const ANA=initState('today');   // 用量分析:/api/my-usage 的趋势 + 模型/客户端表
+const SESS=initState('week');   // 会话使用情况:/api/my-activity(项目分布随之)
 function presetBounds(p){
   const shifted=new Date(Date.now()+8*3600000);
   const td=shifted.toISOString().slice(0,10);
@@ -572,7 +579,8 @@ function renderRangeCtl(boxId,state,onChange){
       renderRangeCtl(boxId,state,onChange);onChange();return;
     }
     if(e.target.closest('button[data-reset]')){
-      state.preset='';state.start='';state.end='';
+      // 重置回到本面板的默认档(用量分析=今日,会话=本周),不是清空筛选。
+      const b=presetBounds(state.def);state.preset=state.def;state.start=b.start;state.end=b.end;
       renderRangeCtl(boxId,state,onChange);onChange();
     }
   };
@@ -994,10 +1002,8 @@ async function fetchActivity(){
   ACT.loading=true;
   if(!ACT.data){const b=document.getElementById('sessBoard');if(b)b.innerHTML='<div class="lb-msg">加载中…</div>'}
   try{
-    // SESS 有自定义范围就带 start/end,否则维持原有 7 天预设参数。
-    const qp=(SESS.start||SESS.end)
-      ?'start='+encodeURIComponent(SESS.start||'')+'&end='+encodeURIComponent(SESS.end||'')
-      :'range=7d';
+    // 会话面板的日期窗口(SESS):默认档「本周」也照常传 start/end。
+    const qp='start='+encodeURIComponent(SESS.start||'')+'&end='+encodeURIComponent(SESS.end||'');
     const r=await fetch('/api/my-activity?'+qp,{headers:{'Authorization':'Bearer '+VK}});
     const j=await r.json();
     if(!r.ok)throw new Error(j.error||('HTTP '+r.status));

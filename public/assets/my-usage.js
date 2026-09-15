@@ -183,6 +183,8 @@ async function load(){
   try{
     const qs=['profile='+encodeURIComponent(currentProfile)];
     if(currentProfile==='all'&&PROTO)qs.push('protocol='+PROTO);
+    // 用量分析的自定义范围(ANA 筛选):缺一头时服务端会自动补齐(end 缺省今天)。
+    if(ANA.start||ANA.end){qs.push('start='+encodeURIComponent(ANA.start||''));qs.push('end='+encodeURIComponent(ANA.end||''))}
     const r=await fetch('/api/my-usage?'+qs.join('&'),{headers:{'Authorization':'Bearer '+VK}});
     if(!r.ok){document.getElementById('meta').textContent='认证失败';return}
     D=await r.json();
@@ -362,6 +364,9 @@ function renderModelTable(){
   // rate change that lands between the two configured values, which is correct.
   const mt=document.querySelector("#modelTable tbody");
   const models=Object.entries(D.models||{}).sort((a,b)=>b[1].requests-a[1].requests);
+  // 倍率列展示的是「实际计权比例」(weighted/原始),weighted 是落表时算好的历史值,
+  // 区间求和依然精确 —— 只有措辞跟窗口变(今日 / 区间)。
+  const scopeW=D.usageRange?'区间实际计权比例':'今日实际计权比例';
   const anyWeighted=models.some(([,d])=>d.weighted!=null&&d.weighted!==d.total);
   if(!models.length){mt.innerHTML='<tr><td colspan="5" style="text-align:center;color:var(--dim)">暂无数据</td></tr>'}else{
     mt.innerHTML=models.map(([m,d])=>{
@@ -371,7 +376,7 @@ function renderModelTable(){
       // Show the realised ratio, and flag when the live rate differs from it (rate
       // changed today, or the day spanned a peak boundary).
       const rateCell=realised==null?'<span style="color:var(--dim)">-</span>'
-        :'<span'+(realised!==1?' style="color:var(--accent)"':'')+' title="今日实际计权比例'+(now!=null&&now!==realised?'；当前时段该模型为 ×'+now:'')+'">×'+realised+(now!=null&&now!==realised?' <span style="color:var(--dim);font-size:10px">(现 ×'+now+')</span>':'')+'</span>';
+        :'<span'+(realised!==1?' style="color:var(--accent)"':'')+' title="'+scopeW+(now!=null&&now!==realised?'；当前时段该模型为 ×'+now:'')+'">×'+realised+(now!=null&&now!==realised?' <span style="color:var(--dim);font-size:10px">(现 ×'+now+')</span>':'')+'</span>';
       return '<tr><td style="color:var(--blue)">'+m+(d.rateIsDefault===false?' <span class="tag" style="font-size:9px">单独定价</span>':'')+'</td>'
         +'<td class="n">'+fmtT(d.requests)+'</td>'
         +'<td class="n" title="输入 '+fmtT(d.inputTokens||0)+' / 输出 '+fmtT(d.outputTokens||0)+'">'+fmtTk(raw)+'</td>'
@@ -385,7 +390,7 @@ function renderModelTable(){
     ?' <span style="white-space:nowrap">Responses 链路缓存命中 '+fmtTk(qq.cacheRead)+' 已剔除、不计入配额。</span>'
     :'';
   note.innerHTML=(anyWeighted
-    ?'「实际 Token」是真实消耗，「计入配额」是按配额口径（各模型倍率；Responses/Codex 链路再剔除缓存命中）折算后从每日额度里扣掉的数额。倍率列为今日实际计权比例，跨高峰边界或期间调整过倍率时会落在两档之间。'
+    ?'「实际 Token」是真实消耗，「计入配额」是按配额口径（各模型倍率；Responses/Codex 链路再剔除缓存命中）折算后从每日额度里扣掉的数额。倍率列为'+scopeW+'，跨高峰边界或期间调整过倍率时会落在两档之间。'
     :'当前没有倍率或缓存规则造成差异，实际消耗与计入配额相同。')
     +cacheClause;
 }
@@ -419,6 +424,14 @@ function renderClientTable(){
 function renderAnalysisPane(){
   if(!D)return;
   const hc=document.getElementById("hourChart"),tc=document.getElementById("trendChart");
+  // 口径标题:趋势图与模型表跟 ANA 日期筛选走(以服务端回显的 usageRange 为准);
+  // 24 小时图恒为今天 —— D.hourly 没有日期维度,不参与筛选。
+  const rangeEcho=D.usageRange||null;
+  const rangeText=rangeEcho?('范围 '+rangeEcho.start+' ~ '+rangeEcho.end):'';
+  const tt=document.getElementById('trendTitle');
+  if(tt)tt.textContent=rangeEcho?rangeText:'近 7 天';
+  const mtl=document.getElementById('modelTitle');
+  if(mtl)mtl.textContent=rangeEcho?rangeText:'今日';
   // Hourly chart
   // 半小时槽位("HH:MM")同图上的 x 轴标签是同一个字符串,旧整点行的阶梯兜底在 ui.js 的 halfHourSlots 里。
   // D.hourly 是**只有今天**的一层 {hour: value} map(lib/personal-usage.mjs),没有日期维度,不做窗口过滤。
@@ -434,9 +447,22 @@ function renderAnalysisPane(){
   // 两个轴的 title 块刻意不加 —— .chart-row .box canvas 限高 190px,轴标题会吃掉约 15% 的绘图区,
   // 而图例已经写明两个单位,信息没有损失。图例同样沿用本页的内联写法,不引 dashboard 的 trendLegend()。
   if(hc)C.h=new Chart(hc,{type:"line",data:{labels:hrs,datasets:[{label:"请求数",data:hData.map(d=>d.req),borderColor:"#2f6e50",backgroundColor:"rgba(47,110,80,.12)",fill:true,tension:.28,pointRadius:0,pointHitRadius:10,pointBackgroundColor:"#2f6e50",pointHoverRadius:4,borderWidth:2,yAxisID:"y"},{label:"Token(输入+输出)",data:hData.map(d=>d.tokens),borderColor:"#181816",backgroundColor:"rgba(24,24,22,.08)",fill:true,tension:.28,pointRadius:0,pointHitRadius:10,pointBackgroundColor:"#181816",pointHoverRadius:4,borderWidth:2,yAxisID:"y1"}]},options:{responsive:true,maintainAspectRatio:false,interaction:{mode:"index",intersect:false},plugins:{legend:{labels:{color:"#686863",font:{size:10}}},tooltip:{callbacks:{label:ctx=>ctx.dataset.label+": "+fmtT(ctx.raw)}}},scales:{x:{ticks:{color:"#686863",font:{size:9},maxRotation:0,autoSkip:true,maxTicksLimit:12},grid:{display:false}},y:{type:"linear",position:"left",ticks:{color:"#2f6e50"},grid:{color:"rgba(24,24,22,.08)"}},y1:{type:"linear",position:"right",ticks:{color:"#181816",callback:v=>fmtTk(v)},grid:{drawOnChartArea:false}}}}});
-  // Trend chart
+  // Trend chart —— 服务端恒给逐日序列;窗口跨度超过 92 天时按月合并再画,
+  // 逐日点会密到没有可读性(月份标签保留 YYYY-MM 全串,与日的 MM-DD 区分开)。
+  const trows=D.trend||[];
+  let tlabels=trows.map(d=>d.date.slice(5)),tdata=trows.map(d=>d.total);
+  if(trows.length>1&&(Date.parse(trows[trows.length-1].date+'T00:00:00Z')-Date.parse(trows[0].date+'T00:00:00Z'))/DAY>92){
+    const byMonth={};
+    for(const r of trows){
+      const k=r.date.slice(0,7);
+      if(!byMonth[k])byMonth[k]={total:0};
+      byMonth[k].total+=r.total;
+    }
+    const months=Object.keys(byMonth).sort();
+    tlabels=months;tdata=months.map(k=>byMonth[k].total);
+  }
   if(C.t){C.t.destroy();C.t=null}
-  if(tc)C.t=new Chart(tc,{type:"line",data:{labels:D.trend.map(d=>d.date.slice(5)),datasets:[{label:"总Token(含缓存)",data:D.trend.map(d=>d.total),borderColor:COL[0],backgroundColor:"rgba(47,110,80,.12)",fill:true,tension:.28,pointRadius:2,borderWidth:2}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{labels:{color:"#686863",font:{size:10}}}},scales:{x:{ticks:{color:"#686863"},grid:{display:false}},y:{ticks:{color:"#686863",callback:v=>fmtTk(v)},grid:{color:"rgba(24,24,22,.08)"}}}}});
+  if(tc)C.t=new Chart(tc,{type:"line",data:{labels:tlabels,datasets:[{label:"总Token(含缓存)",data:tdata,borderColor:COL[0],backgroundColor:"rgba(47,110,80,.12)",fill:true,tension:.28,pointRadius:2,borderWidth:2}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{labels:{color:"#686863",font:{size:10}}}},scales:{x:{ticks:{color:"#686863"},grid:{display:false}},y:{ticks:{color:"#686863",callback:v=>fmtTk(v)},grid:{color:"rgba(24,24,22,.08)"}}}}});
   renderModelTable();
   renderClientTable();
 }
@@ -492,6 +518,67 @@ let calRz;window.addEventListener('resize',function(){clearTimeout(calRz);calRz=
     })
     .catch(()=>{const el=document.getElementById('prodProfile');if(el)el.style.display='none'});
 })();
+// ── 日期范围筛选(用量分析 / 会话使用情况,两个面板各自独立)──────────────
+// preset 为空 = 服务端默认窗口(两块都是近 7 天),请求不带日期参数;
+// 选了预设或手填日期则带 start/end(北京日期串),由服务端 parseDateRange 校验归一
+// (非法 400、起止倒换对调、跨度上限 400 天)。预设窗口与 dashboard 周期 tabs 同语义:
+// 今日 / 本周(周一起)/ 本月(1 日起)/ 今年(1 月 1 日起),均北京时间。
+const DAY=86400000;
+const RANGE_PRESETS=[['today','今日'],['week','本周'],['month','本月'],['year','今年']];
+const ANA={preset:'',start:'',end:''};   // 用量分析:/api/my-usage 的趋势 + 模型/客户端表
+const SESS={preset:'',start:'',end:''};  // 会话使用情况:/api/my-activity(项目分布随之)
+function presetBounds(p){
+  const shifted=new Date(Date.now()+8*3600000);
+  const td=shifted.toISOString().slice(0,10);
+  if(p==='today')return{start:td,end:td};
+  if(p==='week'){
+    const dow=(shifted.getUTCDay()+6)%7;  // 周一=0
+    return{start:new Date(Date.UTC(shifted.getUTCFullYear(),shifted.getUTCMonth(),shifted.getUTCDate()-dow)).toISOString().slice(0,10),end:td};
+  }
+  if(p==='month')return{start:shifted.toISOString().slice(0,7)+'-01',end:td};
+  if(p==='year')return{start:shifted.toISOString().slice(0,4)+'-01-01',end:td};
+  return null;
+}
+// 两个面板共用同一个控件构建:pill-seg 预设 + 起止 date input + 重置。state 直接读写
+// 传入对象(ANA/SESS),控件重画只是回填与高亮,不持有自己的状态。
+function renderRangeCtl(boxId,state,onChange){
+  const box=document.getElementById(boxId);
+  if(!box)return;
+  const dateCss='font-size:11px;padding:2px 4px;border:1px solid var(--border-strong);border-radius:6px;background:transparent;color:var(--text)';
+  box.innerHTML='<div class="pill-seg" role="tablist" aria-label="快捷周期">'
+    +RANGE_PRESETS.map(function(p){
+      return '<button type="button" role="tab" aria-selected="'+(p[0]===state.preset)+'" data-preset="'+p[0]+'"'+(p[0]===state.preset?' class="on"':'')+'>'+p[1]+'</button>';
+    }).join('')+'</div>'
+    +'<div style="display:flex;align-items:center;gap:6px;font-size:11px;color:var(--dim)">'
+    +'<input type="date" aria-label="开始日期" data-edge="start" value="'+esc(state.start)+'" style="'+dateCss+'">'
+    +'<span>~</span>'
+    +'<input type="date" aria-label="结束日期" data-edge="end" value="'+esc(state.end)+'" style="'+dateCss+'">'
+    +'<button type="button" data-reset="1" style="font-size:11px;color:var(--dim);background:none;border:1px solid var(--border-strong);border-radius:6px;padding:2px 8px;cursor:pointer">重置</button>'
+    +'</div>';
+  box.onchange=function(e){
+    const inp=e.target.closest('input[data-edge]');
+    if(!inp)return;
+    if(inp.dataset.edge==='start')state.start=inp.value||'';else state.end=inp.value||'';
+    if(state.start&&state.end&&state.start>state.end){const t=state.start;state.start=state.end;state.end=t}
+    state.preset=(state.start||state.end)?'custom':'';
+    renderRangeCtl(boxId,state,onChange);  // 重画:回填对调后的值、同步预设高亮
+    onChange();
+  };
+  box.onclick=function(e){
+    const p=e.target.closest('button[data-preset]');
+    if(p&&!p.classList.contains('on')){
+      state.preset=p.dataset.preset;
+      const b=presetBounds(state.preset);state.start=b.start;state.end=b.end;
+      renderRangeCtl(boxId,state,onChange);onChange();return;
+    }
+    if(e.target.closest('button[data-reset]')){
+      state.preset='';state.start='';state.end='';
+      renderRangeCtl(boxId,state,onChange);onChange();
+    }
+  };
+}
+function analysisRangeChanged(){load()}
+function sessRangeChanged(){ACT.data=null;fetchActivity()}
 load();setInterval(load,30000);
 
 
@@ -694,7 +781,7 @@ function ensureLeaderboard(){if(!LB.data&&!LB.loading)fetchLeaderboard()}
 //     否则读者会把上表的合计当成全量。
 //   · crossSessions → 横跨多个项目的会话,其 token 只能整段记在主项目名下,
 //     次项目的 token 因此偏低。不写出来,那个数字会被当成错的。
-const ACT={data:null,error:'',loading:false};
+const ACT={data:null,error:'',loading:false,queued:false};
 const DASH='<span style="color:var(--dim)">—</span>';
 const GRADE_CLS={good:'good',warn:'warn',bad:'bad'};
 const THS_FALLBACK={cache_rate_good:.9,cache_rate_warn:.8,new_input_good:3000,new_input_bad:8000,fragment_max_requests:2};
@@ -759,6 +846,10 @@ function renderProjDist(){
   const d=ACT.data,rows=d.projects||[];
   if(!rows.length){box.style.display='none';return}
   box.style.display='';
+  // 项目分布的数据来自 /api/my-activity,日期随「会话使用情况」面板的筛选走 ——
+  // 在这里写明,免得被读成「分析面板的日期筛选对它失效了」。
+  const ps=document.getElementById('projScope');
+  if(ps)ps.textContent=' · 日期随「会话使用情况」面板的筛选';
   const sc=actScopeNote(d,'项目');
   tb.innerHTML=rows.map(function(p){
     return '<tr>'
@@ -798,7 +889,7 @@ function renderSessBoard(){
   const board=document.getElementById('sessBoard');
   if(!board)return;
   const d=ACT.data,rows=d.sessions||[];
-  if(!rows.length){board.innerHTML='<div class="lb-msg">近 7 天还没有可归属到会话的请求</div>';return}
+  if(!rows.length){board.innerHTML='<div class="lb-msg">'+esc(d.from)+' ~ '+esc(d.to)+' 还没有可归属到会话的请求</div>';return}
   const ths=Object.assign({},THS_FALLBACK,d.thresholds||{});
   // 一格。标签恒在、数值恒在:缺值写「—」而不是把这一格省掉,否则列会塌、行与行就对不齐。
   // dim=true 表示「—」或「测到了就是 0」,压成一档灰退后,但仍然占满一整格宽。
@@ -899,19 +990,28 @@ function renderActivity(){
   }
 }
 async function fetchActivity(){
-  if(ACT.loading)return;
+  if(ACT.loading){ACT.queued=true;return}
   ACT.loading=true;
   if(!ACT.data){const b=document.getElementById('sessBoard');if(b)b.innerHTML='<div class="lb-msg">加载中…</div>'}
   try{
-    const r=await fetch('/api/my-activity?range=7d',{headers:{'Authorization':'Bearer '+VK}});
+    // SESS 有自定义范围就带 start/end,否则维持原有 7 天预设参数。
+    const qp=(SESS.start||SESS.end)
+      ?'start='+encodeURIComponent(SESS.start||'')+'&end='+encodeURIComponent(SESS.end||'')
+      :'range=7d';
+    const r=await fetch('/api/my-activity?'+qp,{headers:{'Authorization':'Bearer '+VK}});
     const j=await r.json();
     if(!r.ok)throw new Error(j.error||('HTTP '+r.status));
     ACT.data=j;ACT.error='';
   }catch(e){ACT.error=e.message||'加载失败';ACT.data=null}
   ACT.loading=false;
   renderActivity();
+  // 拉取期间筛选又被改过(queued):按最新参数再拉一次,别让旧窗口的产物留在页面上。
+  if(ACT.queued){ACT.queued=false;fetchActivity()}
 }
 // 首次进入「用量分析」或「会话使用情况」才拉,不挂 30 秒轮询 —— 与排行榜同一处理
 function ensureActivity(){if(!ACT.data&&!ACT.loading)fetchActivity()}
 
 setSection('overview',false);
+// 日期筛选控件放在最后初始化:两个面板此刻都还隐藏,只写 innerHTML 不读宽度,安全。
+renderRangeCtl('anaRangeCtl',ANA,analysisRangeChanged);
+renderRangeCtl('sessRangeCtl',SESS,sessRangeChanged);

@@ -10,7 +10,7 @@ import { initProductionDb, createProductionTracker, rangeFromTo, productionSumma
   productionProjects, productionAlerts, markAlertSeen, pruneProductionData, DEFAULT_COST_RATES,
   computeCosts, contextHealth, buildReportHTML, ALERT_KIND_LABEL, alertDetailText,
   sessionProjectLabels, sessionToolStats, sessionKey } from "./production.mjs";
-import { cnNow, cnDate, cnHalfHour, secondsUntilNextCnMidnight, cnWeekStartIso, cnWeekStartDate, cnDayStartIso } from "./lib/time.mjs";
+import { cnNow, cnDate, cnHalfHour, secondsUntilNextCnMidnight, cnWeekStartIso, cnWeekStartDate, cnDayStartIso, parseDateRange } from "./lib/time.mjs";
 import { parsePeakTimeMinutes, normalizePeakHours, isInPeakHours, formatPeakHoursSummary,
   BASE_GROUP_TOKEN, resolveEffectiveGroup, formatScheduleRuleSummary,
   normalizeScheduleGroups, normalizeScheduleRules, normalizeScheduleRule, normalizeScheduleGroupName,
@@ -4935,9 +4935,11 @@ const server = http.createServer((req, res) => {
     }
     try {
       const url = new URL(req.url, "http://localhost");
-      const { from, to } = rangeFromTo(url.searchParams.get("range") || "7d");
+      // start/end 显式给了就覆盖 range 预设(前者优先);parseDateRange 返回 null 表示都没给。
+      const dr = parseDateRange(url.searchParams.get("start"), url.searchParams.get("end"));
+      const fb = dr || rangeFromTo(url.searchParams.get("range") || "7d");
       const payload = sessionsApi.getMyActivity({
-        from, to,
+        from: dr ? dr.start : fb.from, to: dr ? dr.end : fb.to,
         userKey: resolveUserKey(apiKey, rt),
         limit: url.searchParams.get("limit") || undefined,
       });
@@ -4967,7 +4969,9 @@ const server = http.createServer((req, res) => {
       return;
     }
     try {
-      const payload = usageApi.getPersonalUsageData(apiKey, profileSuffix, protocolParam);
+      // 可选自定义日期范围(用量分析面板的趋势/模型/客户端表);null = 都没给,走默认窗口。
+      const usageRange = parseDateRange(url.searchParams.get("start"), url.searchParams.get("end"));
+      const payload = usageApi.getPersonalUsageData(apiKey, profileSuffix, protocolParam, usageRange);
       res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
       res.end(JSON.stringify(payload, null, 2));
     } catch (err) {

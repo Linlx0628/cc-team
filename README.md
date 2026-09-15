@@ -248,7 +248,7 @@ Codex 使用 OpenAI Responses 协议。先在设置页创建一个接口协议�
 - **模型目录来自方案配置**：models.json 完全由成员可访问的 Responses 方案里的别名（`modelAliases` + `peakModelAliases`，按配置顺序）生成，默认模型取第一个别名；方案未配任何别名时才回退到 `allowedModels`。管理员改别名后成员重新执行一次脚本即可同步
 - **上下文窗口在设置页选**：每个方案可配置「模型上下文窗口」（32K/64K/128K/200K/256K/400K/1M 下拉选择，默认 128K），生成 models.json 时写入每个别名的 `context_window`，Codex 用它显示上下文用量与做压缩阈值
 - **手动配置**：复制页面上生成好的 config.toml 片段与 models.json 全文
-- **cc-switch 用户**：把生成的 provider TOML 粘贴为自定义供应商；顶层键（`model_catalog_json` 等）建议放进 cc-switch 的公共配置段，切换后注意确认仍在
+- **cc-switch 用户**：页面上的「一键导入」按钮会打开 `ccswitch://v1/import…` 深链，cc-switch 弹确认框后供应商列表里就多出一项 `CC Team`；按钮被浏览器拦住时，页面同时给出那条链接的全文可以手动导入。也可以用生成的 provider TOML 手工添加自定义供应商；顶层键（`model_catalog_json` 等）建议放进 cc-switch 的公共配置段，切换后注意确认仍在
 
 服务器地址自动取自成员打开页面时使用的地址（`window.location.host`），可手动修改——成员怎么访问到页面，Codex 就怎么访问网关。个人用量页顶部也有「配置 Codex 接入」入口。
 
@@ -272,6 +272,18 @@ experimental_bearer_token = "jx-your-virtual-key"
 ```
 
 指定方案时把 base_url 改为带后缀地址（`http://localhost:6789/<suffix>/v1`，如 `http://localhost:6789/glmcodex/v1`）。
+
+## 接入 Claude Code（成员自助）
+
+管理员把个人用量页链接发给成员（`http://<服务器地址>:6789/usage/<成员的虚拟Key>` 或 `/my-usage?key=<Key>`），侧栏「配置 Claude Code」里有与 Codex 对称的三种方式：
+
+- **一键脚本**：终端执行 `curl -fsSL "http://<服务器地址>:6789/api/claude-setup/<Key>" | sh`（Windows 用 `/api/claude-setup-win/<Key>` 走 PowerShell）——先备份，再把 `ANTHROPIC_BASE_URL` 与 `ANTHROPIC_AUTH_TOKEN` **合并**进 `~/.claude/settings.json` 的 `env` 段，其余键（permissions / hooks / statusLine / model / 其他 env 键）逐字保留；写完前会真解析校验一次，失败自动回滚。脚本幂等可重复执行；本机没有 `node` / `python3` / `jq` 时**拒绝改动**并直接打印要手动粘贴的内容（宁可没配上，也不留下半截 JSON）
+- **为什么写文件而不是 export 环境变量**：`settings.json` 的 `env` 段优先于 shell 环境变量——只要它存在，终端里 `export ANTHROPIC_*` 就不生效。页面上把文件放第一位，`export` 只作为临时手段
+- **手动配置**：复制页面上生成好的 `settings.json` `env` 片段（网关地址 + 虚拟 Key），以及该 Key 可用的模型别名——别名填进 `ANTHROPIC_MODEL`，网关会换成上游的真实模型
+- **入口地址按成员算**：在默认/调度方案组里的成员用不带后缀的地址（组内按序 failover）；不在任何组里的成员，页面与脚本都会给出带自己方案后缀的地址（默认方案组的成员方案不允许带后缀直连）
+- **cc-switch 用户**：与 Codex 同款「一键导入」深链（`app=claude`，载荷就是 Claude Code 的 `settings.json` 内容）。切换供应商会重写 `~/.claude/settings.json`，建议把 `permissions` / `hooks` / `statusLine` 放进 cc-switch 的公共配置段
+
+一键脚本的连通检查走 `GET /api/my-usage`（只读、不转上游），不用 `/v1/models`——后者是 Responses 池的探测口，纯 Anthropic 成员在那里拿不到验证。
 
 ### 图片识别桥接（Claude Code 与 Codex 通用）
 
@@ -495,7 +507,7 @@ Bob     离线   380k      20% ██    -           2小时前
 | --- | --- | --- |
 | 管理面板 | `http://localhost:6789/dashboard` | 单屏查看指标、图表、用户、周期明细、方案和错误；顶部"全部 / Anthropic / OpenAI"三段开关可按协议切换全部统计视角 |
 | 设置 | `http://localhost:6789/settings` | 双标签页（Anthropic / OpenAI）分别管理各自协议的方案、默认入口与方案组；侧栏「方案组调度」进入按时间切换优先级的规则表 |
-| 个人用量 | `http://localhost:6789/usage/虚拟Key` | 指定成员的用量页面，方案下拉标注所属协议 |
+| 个人用量 | `http://localhost:6789/usage/虚拟Key` | 指定成员的用量页面，方案下拉标注所属协议；侧栏含「配置 Claude Code」与「配置 Codex」两份接入指南 |
 | Key 查询 | `http://localhost:6789/my-usage` | 输入虚拟 Key 查询 |
 | 健康检查 | `http://localhost:6789/health` | 服务与熔断状态 |
 
@@ -536,6 +548,7 @@ Anthropic Messages 代理使用虚拟 Key 鉴权。管理类写入接口除登�
 | `/api/quota-request/grant` | POST | 发放加量并标记已处理（管理端） |
 | `/api/quota-request/update` | POST | 驳回或标记申请（管理端） |
 | `/api/settings` | GET / POST | 读取或更新设置 |
+| `/api/claude-setup/:vk`、`/api/claude-setup-win/:vk` | GET | Claude Code 接入脚本（需虚拟 Key，成员自助） |
 | `/api/settings-save` | POST | 保存设置页表单 |
 | `/api/profile/save` | POST | 创建方案 |
 | `/api/profile/export` | POST | 导出方案代码（可粘贴 JSON，含方案全部配置，不含用户分配与额度池） |

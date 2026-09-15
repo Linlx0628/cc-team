@@ -6,7 +6,9 @@ body>div{max-width:880px;margin-left:auto;margin-right:auto}
 .top h1{font-size:26px;font-weight:650;margin-bottom:6px}.top .sub{font-size:12px;color:var(--dim)}
 .host-row{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:16px;font-size:13px}
 .host-row code{font-size:11px;color:var(--dim)}
-#hostInput{font-size:13px;background:var(--surface);color:var(--text);border:1px solid var(--border);border-radius:5px;padding:7px 10px;width:240px;font-family:var(--font-mono)}
+/* 用属性选择器而不是 id：引导块内部一律不写 id（同页会有两个引导块，重复 id 会让
+   getElementById 静默拿错元素，见 public/assets/setup-guide.js 的文件头注释）。 */
+.host-row [data-role="hostInput"]{font-size:13px;background:var(--surface);color:var(--text);border:1px solid var(--border);border-radius:5px;padding:7px 10px;width:240px;font-family:var(--font-mono)}
 .tabs{display:flex;gap:6px;margin-bottom:14px}
 .tabs button{font-size:13px;font-weight:600;padding:8px 16px;border:1px solid var(--border);border-radius:6px;background:var(--surface);color:var(--dim);cursor:pointer}
 .tabs button.on{border-color:var(--accent);background:var(--accent-soft);color:var(--accent)}
@@ -19,3 +21,5 @@ pre{position:relative;background:var(--bg);border:1px solid var(--border);border
 .copy-btn:hover{border-color:var(--accent);color:var(--accent)}
 .note{font-size:11px;color:var(--dim);line-height:1.7}
 .warn{background:#fff7e6;border:1px solid #ffe1a6;color:#a1662f;padding:8px 12px;border-radius:5px;font-size:12px;margin-top:10px}
+.cc-import-btn{display:inline-block;margin:10px 0 4px;font-size:13px;font-weight:600;padding:9px 18px;border:1px solid var(--accent);border-radius:6px;background:var(--accent-soft);color:var(--accent);text-decoration:none;cursor:pointer}
+.cc-import-btn:hover{background:var(--accent);color:#fff}

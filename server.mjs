@@ -23,6 +23,7 @@ import { loadAssets } from "./lib/assets.mjs";
 import { escHtml, escJs } from "./lib/html.mjs";
 import { settingsHtml, dashboardHtml, loginHtml, personalUsageLandingHtml, codexSetupHtml, personalUsageHtml } from "./lib/pages.mjs";
 import { buildCodexModelCatalog, buildCodexSetupScript, buildCodexSetupScriptWin } from "./lib/codex-setup-script.mjs";
+import { buildAnthropicSetupHints, buildClaudeSetupScript, buildClaudeSetupScriptWin } from "./lib/claude-setup-script.mjs";
 import { createStatsReader, hourlyChartFloor } from "./lib/stats.mjs";
 import { createSettingsWriter } from "./lib/settings-write.mjs";
 import { createUsageReader } from "./lib/personal-usage.mjs";
@@ -2693,6 +2694,21 @@ function personalCodexExtras(vk) {
   };
 }
 
+// Claude Code 一键接入脚本构建器（lib/claude-setup-script.mjs）的依赖注入对象。
+// 与 CODEX_DEPS 同形但独立命名：两边将来各自加依赖是常态，共用一个对象会让
+// 「给 codex 加依赖」静默变成「给 claude 也加」。
+const CLAUDE_DEPS = { config, canUseProfile, runtimes };
+
+// 我的用量页内「配置 Claude Code」分区所需的服务端数据：是否分配了 Anthropic 方案 +
+// 该 Key 可用的别名/方案（推荐入口按成员算，见 lib/claude-setup-script.mjs）。
+function personalClaudeExtras(vk) {
+  const hasAnthropic = getAccessibleProfiles(vk).some(p => p.protocol === "anthropic");
+  return {
+    noProfile: !hasAnthropic,
+    hints: hasAnthropic ? buildAnthropicSetupHints(CLAUDE_DEPS, vk) : null,
+  };
+}
+
 // /api/stats 读模型聚合（lib/stats.mjs）的依赖注入对象。db/stmts 在 initDb
 // 阶段才就绪，必须用 getter 延迟读取；其余为稳定绑定，按值捕获即可。
 const STATS_DEPS = {
@@ -5021,6 +5037,35 @@ const server = http.createServer((req, res) => {
     else res.end(buildCodexSetupScript(vk, host, username, catalog.json, catalog.defaultModel, proto));
     return;
   }
+  // Claude Code installer scripts, personalized per member key. 与 codex 那两条同一套
+  // host/scheme 推导与鉴权口径，差别只在「必须有 Anthropic 方案」与脚本内容。
+  // 注意这里**只有 404、没有 401**：`curl … | sh` 会把 401 的正文当脚本执行，
+  // 所以错误正文用 # 前缀的中文 —— 它在 shell 里天然是注释，只打印不执行。
+  if (req.method === "GET" && (req.url.startsWith("/api/claude-setup/") || req.url.startsWith("/api/claude-setup-win/"))) {
+    const isWin = req.url.startsWith("/api/claude-setup-win/");
+    const vk = decodeURIComponent(req.url.slice((isWin ? "/api/claude-setup-win/" : "/api/claude-setup/").length).split("?")[0]);
+    const assignedRuntime = Object.values(runtimes).find(r => r.protocol === "anthropic" && r.users[vk]);
+    const profileUser = assignedRuntime ? assignedRuntime.users[vk] : null;
+    const profileUserDisabled = profileUser && typeof profileUser === "object" ? !!profileUser.disabled : false;
+    const username = config.users?.[vk]?.username || vk;
+    const globallyDisabled = !config.users?.[vk] || !!config.users[vk].disabled;
+    if (!assignedRuntime || globallyDisabled || profileUserDisabled) {
+      res.writeHead(404, { "Content-Type": "text/plain; charset=utf-8" });
+      res.end("# 无效的虚拟 Key 或该 Key 未分配到 Anthropic(Claude Code) 方案");
+      return;
+    }
+    const rawHost = String(req.headers.host || "");
+    const host = /^[A-Za-z0-9._:\-\[\]]+$/.test(rawHost) ? rawHost : `localhost:${port}`;
+    const xfProto = String(req.headers["x-forwarded-proto"] || "").split(",")[0].trim();
+    const proto = xfProto === "https" || req.socket.encrypted ? "https" : "http";
+    // 推荐入口按成员算（在默认/调度方案组里就用无后缀入口，否则用自己方案的后缀）——
+    // 与页面上给的地址必须是同一个判定，否则成员照脚本装完却和页面写的不一样。
+    const { basePath } = buildAnthropicSetupHints(CLAUDE_DEPS, vk);
+    res.writeHead(200, { "Content-Type": "text/plain; charset=utf-8" });
+    if (isWin) res.end(buildClaudeSetupScriptWin(vk, host, username, proto, basePath));
+    else res.end(buildClaudeSetupScript(vk, host, username, proto, basePath));
+    return;
+  }
 
   const keyNotFoundHtml = "<!DOCTYPE html><html lang=\"zh-CN\"><head><meta charset=\"UTF-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1.0\"><title>Key 不存在 - CC Team</title><link rel=\"icon\" type=\"image/svg+xml\" href=\"data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%2096%2096%22%3E%3Crect%20width%3D%2296%22%20height%3D%2296%22%20rx%3D%2222%22%20fill%3D%22%232f6e50%22%2F%3E%3Cg%20fill%3D%22none%22%20stroke%3D%22%23fbfbf8%22%20stroke-width%3D%2213%22%20stroke-linecap%3D%22round%22%20stroke-linejoin%3D%22round%22%20transform%3D%22translate(48%2048)%20scale(0.88)%20translate(-48%20-48)%22%3E%3Cpath%20d%3D%22M37%2026.5H31.5Q20.5%2026.5%2020.5%2037.5V58.5Q20.5%2069.5%2031.5%2069.5H37%22%2F%3E%3Cpath%20d%3D%22M59%2026.5H64.5Q75.5%2026.5%2075.5%2037.5V58.5Q75.5%2069.5%2064.5%2069.5H59%22%2F%3E%3C%2Fg%3E%3Ccircle%20cx%3D%2248%22%20cy%3D%2248%22%20r%3D%226.2%22%20fill%3D%22%23fbfbf8%22%2F%3E%3C%2Fsvg%3E\"><style>*{margin:0;padding:0;box-sizing:border-box}body{min-height:100vh;display:flex;align-items:center;justify-content:center;background:#f7f7f3;color:#181816;font-family:-apple-system,BlinkMacSystemFont,\"SF Pro Text\",\"PingFang SC\",\"Microsoft YaHei\",\"Segoe UI\",sans-serif}.card{text-align:center;padding:42px 52px;background:#fff;border:1px solid #deded8;border-radius:14px}.card svg{display:block;margin:0 auto 16px}h1{font-size:19px;font-weight:650;margin-bottom:7px}p{font-size:13px;color:#686863}</style></head><body><div class=\"card\"><svg class=\"brand-logo\" width=\"44\" height=\"44\" viewBox=\"0 0 96 96\" aria-hidden=\"true\"><rect width=\"96\" height=\"96\" rx=\"22\" fill=\"#2f6e50\"/><g fill=\"none\" stroke=\"#fbfbf8\" stroke-width=\"11\" stroke-linecap=\"round\" stroke-linejoin=\"round\" transform=\"translate(48 48) scale(0.9) translate(-48 -48)\"><path d=\"M37 26.5H31.5Q20.5 26.5 20.5 37.5V58.5Q20.5 69.5 31.5 69.5H37\"/><path d=\"M59 26.5H64.5Q75.5 26.5 75.5 37.5V58.5Q75.5 69.5 64.5 69.5H59\"/></g><circle cx=\"48\" cy=\"48\" r=\"4.95\" fill=\"#fbfbf8\"/></svg><h1>Key 不存在</h1><p>请检查你的虚拟 Key 是否正确。</p></div></body></html>";
 
@@ -5033,7 +5078,7 @@ const server = http.createServer((req, res) => {
       return;
     }
     res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
-    res.end(personalUsageHtml(PAGE_DEPS, vk, personalCodexExtras(vk)));
+    res.end(personalUsageHtml(PAGE_DEPS, vk, personalCodexExtras(vk), personalClaudeExtras(vk)));
     return;
   }
   if (req.method === "GET" && req.url.startsWith("/my-usage")) {
@@ -5045,7 +5090,7 @@ const server = http.createServer((req, res) => {
       return;
     }
     res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
-    res.end(personalUsageHtml(PAGE_DEPS, vk, personalCodexExtras(vk)));
+    res.end(personalUsageHtml(PAGE_DEPS, vk, personalCodexExtras(vk), personalClaudeExtras(vk)));
     return;
   }
 

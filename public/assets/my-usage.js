@@ -181,18 +181,36 @@ function renderCalendar(){
   grid.onmouseleave=()=>{tip.style.display='none'};
 }
 // ── Mascot speech bubble ──
-// 未签到时让吉祥物口头提醒一次。localStorage 存北京日期做「每日一次」守卫——
-// 30s 轮询会反复进 load()，靠这个挡住；签到完成后条件不成立，也不会再弹。
+// 未签到时让吉祥物口头提醒一次；已签到(或签到功能不可用)则改为时段问候 +
+// 一句话今日用量简报。两者各自用 localStorage 存北京日期做「每日一次」守卫——
+// 30s 轮询会反复进 load()，靠这个挡住；签到状态变了走另一条分支，互不干扰。
 function mascotBjToday(){return new Date(Date.now()+8*3600000).toISOString().slice(0,10)}
-function mascotCheckinTip(){
-  const c=D&&D.checkin;
-  if(!c||!c.available||c.enabled===false||c.checkedInToday)return;
+function mascotOnceAday(key){
   let seen=null;
-  try{seen=window.localStorage.getItem('tm_mascot_tip')}catch(e){/* 存不了就每次进页都提醒 */}
+  try{seen=window.localStorage.getItem(key)}catch(e){/* 存不了就每次进页都说 */}
   const today=mascotBjToday();
-  if(seen===today)return;
-  try{window.localStorage.setItem('tm_mascot_tip',today)}catch(e){}
-  setTimeout(()=>{window.Mascot&&Mascot.say('记得签到哦～，点上面的「签到领 token」领今日加量')},1500);
+  if(seen===today)return false;
+  try{window.localStorage.setItem(key,today)}catch(e){}
+  return true;
+}
+function mascotHello(){
+  const c=D&&D.checkin;
+  if(c&&c.available&&c.enabled===false)return;
+  if(c&&c.available&&!c.checkedInToday){
+    if(mascotOnceAday('tm_mascot_tip'))setTimeout(()=>{window.Mascot&&Mascot.say('记得签到哦～，点上面的「签到领 token」领今日加量')},1500);
+    return;
+  }
+  if(!mascotOnceAday('tm_mascot_greet'))return;
+  setTimeout(()=>{window.Mascot&&Mascot.say(mascotHelloLine())},1500);
+}
+function mascotHelloLine(){
+  const h=Number(new Date(Date.now()+8*3600000).getUTCHours());
+  const greet=h<5?'夜深了':h<11?'早上好':h<13?'中午好':h<18?'下午好':'晚上好';
+  const c=D&&D.checkin,t=D&&D.today;
+  let line=greet+'，'+(D&&D.username?D.username:'')+'！';
+  if(t)line+='今日已用 '+fmtTk(ioTokens(t))+' tokens · '+(t.requests||0)+' 次请求';
+  if(c&&c.checkedInToday&&c.todayAmount)line+=(t?'，':'')+'签到的 '+fmtTk(c.todayAmount)+' token 已到账';
+  return line;
 }
 async function load(){
   try{
@@ -212,7 +230,7 @@ async function load(){
     // 日历会落到 9px 下限。所以各自只在所属面板可见时画,切过去时由 paintSection() 补画。
     if(SECTION==='overview')renderCalendar();
     if(SECTION==='analysis')renderAnalysisPane();
-    mascotCheckinTip();
+    mascotHello();
   }catch(e){document.getElementById('meta').textContent='Error: '+e.message}
 }
 function switchProfile(v){currentProfile=v||'all';load()}

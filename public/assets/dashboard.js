@@ -517,14 +517,18 @@ function render(){
   }
   C.m=new Chart(document.getElementById("modelChart"),{type:"bar",data:{labels:mLabels,datasets:[{label:MT==="requests"?"请求数":"Token",data:mVal,backgroundColor:mVal.map((_,i)=>COL[i%COL.length]+"cc"),borderWidth:0,borderRadius:3,borderSkipped:false}]},options:{indexAxis:"y",responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false},tooltip:{callbacks:{label:ctx=>MT==="requests"?fmtT(ctx.raw)+" 次请求":fmtT(ctx.raw)+" tokens"}}},scales:{x:{ticks:{color:"#686863",callback:v=>fmtTk(v)},grid:{color:"rgba(24,24,22,.08)"}},y:{ticks:{color:"#686863",font:{size:11},autoSkip:false},grid:{display:false}}}}});
 
-  // 24小时趋势图：有效窗口内逐日同半小时槽位累加（按日=当天真实曲线；周/月/年=各槽位
-  // 累计分布;日期范围生效时窗口收窄到 [开始,结束],48 槽在范围内累加 —— 早于服务端取数
-  // 下界 hourlyChartFloor 的日期无数据）。槽位映射与旧格式的阶梯兜底都在 ui.js 的
-  // halfHourSlots 里,与下面那张模型图共用同一份。
+  // 两张 24 小时图只做「单日」统计:按日=今天;日期范围生效时要求开始=结束(同一天,只填
+  // 今天开始那一头也算)。选了周/月/年、或范围跨多天时不统计 —— 数据留空(坐标轴照常渲染),
+  // 图头 note 给出原因。跨天累加同槽位的口径(半小时是"各槽位累计分布"而非"当天真实曲线")
+  // 容易误读,所以收窄到单日。服务端取数下界 hourlyChartFloor 与槽位映射 halfHourSlots 不变。
+  const hDay=eb.ranged?(eb.start===eb.end?eb.start:null):(P==="day"?winBounds().td:null);
+  const hourNoteText=hDay?"":"仅统计单日：选「按日」，或将开始/结束日期设为同一天";
+  document.getElementById("hourNote").textContent=hourNoteText;
+  document.getElementById("hourModelNote").textContent=hourNoteText;
   const hrs=halfHourLabels();
   const hAgg=Array.from({length:48},()=>({requests:0,tokens:0}));
   for(const [date,hours] of Object.entries(D.hourly||{})){
-    if(date<eb.start||date>eb.end)continue;
+    if(!hDay||date!==hDay)continue;
     for(const [i,v,w] of halfHourSlots(hours)){
       hAgg[i].requests+=(v.requests||0)*w;hAgg[i].tokens+=totalTokens(v)*w;
     }
@@ -532,13 +536,13 @@ function render(){
   const hReq=hAgg.map(a=>a.requests),hTokens=hAgg.map(a=>a.tokens);
   C.h=new Chart(document.getElementById("hourChart"),{type:"line",data:{labels:hrs,datasets:[{label:"请求数",data:hReq,borderColor:"#2f6e50",backgroundColor:"rgba(47,110,80,.12)",fill:true,tension:.28,pointRadius:0,pointHitRadius:10,pointBackgroundColor:"#2f6e50",pointHoverRadius:4,borderWidth:2,yAxisID:"y"},{label:"总 Token",data:hTokens,borderColor:"#181816",backgroundColor:"rgba(24,24,22,.08)",fill:true,tension:.28,pointRadius:0,pointHitRadius:10,pointBackgroundColor:"#181816",pointHoverRadius:4,borderWidth:2,yAxisID:"y1"}]},options:{responsive:true,maintainAspectRatio:false,interaction:{mode:"index",intersect:false},plugins:{legend:{labels:{color:"#686863",font:{size:11},usePointStyle:true,pointStyle:"circle"}},tooltip:{callbacks:{label:ctx=>ctx.dataset.label+": "+fmtT(ctx.raw)}}},scales:{x:{ticks:{color:"#686863",font:{size:9},maxRotation:0,autoSkip:true,maxTicksLimit:12},grid:{display:false}},y:{type:"linear",position:"left",ticks:{color:"#2f6e50"},grid:{color:"rgba(24,24,22,.08)"},title:{display:true,text:"请求数",color:"#2f6e50",font:{size:10}}},y1:{type:"linear",position:"right",ticks:{color:"#181816",callback:v=>fmtTk(v)},grid:{drawOnChartArea:false},title:{display:true,text:"Tokens",color:"#181816",font:{size:10}}}}}});
 
-  // 24小时模型使用趋势：窗口内同半小时槽位累加，按模型分 series 的折线，Y 轴跟随指标筛选。
-  // 模型取窗口总量 Top6，其余合并为「其他」，避免 legend 过长。数据自 usage_hourly_model 表启用日起累积。
-  // 必须**先按槽聚合、再算总量**：兜底的旧行有 0.5 权重,先算总量会把跨天的同模型拆成两份口径。
+  // 24小时模型使用趋势：与上面那张 24 小时图同一份单日口径(hDay),仅单日才统计。
+  // 模型取当日总量 Top6，其余合并为「其他」，避免 legend 过长。数据自 usage_hourly_model 表启用日起累积。
+  // 必须**先按槽聚合、再算总量**：兜底的旧行有 0.5 权重,先算总量会把同模型拆成两份口径。
   // 槽位数与上面那张图共用 halfHourLabels(),两图必须同步 —— 标签 48 配数据 24 只会画在轴左半边,不报错。
   const hmAgg=Array.from({length:48},()=>({}));
   for(const [date,hours] of Object.entries(D.hourlyModels||{})){
-    if(date<eb.start||date>eb.end)continue;
+    if(!hDay||date!==hDay)continue;
     for(const [i,models,w] of halfHourSlots(hours)){
       for(const [m,v] of Object.entries(models)){
         if(!hmAgg[i][m])hmAgg[i][m]={requests:0,tokens:0};

@@ -36,6 +36,10 @@
 
 装了 [cc-switch](https://github.com/farion1231/cc-switch) 的话，配置页提供**一键导入深链**：点击后 cc-switch 自动把 CC Team 的配置作为一个供应商导入，之后在 cc-switch 里切换即可。Claude Code 与 Codex 都支持。
 
+## 方式四：MCP 接入（进阶）
+
+装好基础接入后，还可以把 CC Team 的能力接入 Claude 本身：查配额、看价目表、签到、申请加量、翻手册——详见 [MCP 接入](mcp.md)。
+
 ## 接入之后
 
 - 用 `claude` 或 `codex` 正常干活，用量自动进统计

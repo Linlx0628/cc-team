@@ -25,6 +25,7 @@ CC Team 是一套**团队 AI 编码网关**：一个服务同时代理 Claude Co
 - [用户与配额管理](users.md) — 虚拟 Key、临时额度、加量申请审批
 - [我的用量页](my-usage.md) — 成员侧的签到、日历、用量分析、排行榜
 - [接入配置（Claude Code / Codex）](setup-guide.md) — 一键脚本、手动配置、cc-switch 导入
+- [MCP 接入](mcp.md) — 把配额查询/签到/价目表/手册接入 Claude 的 MCP 端点
 - [配额与计费机制](mechanism-quota.md) — weighted_tokens 公式、额度池判定、AUTO 调整算法、429 结构
 - [代理与调度机制](mechanism-proxy.md) — 超时重试、熔断状态机、限流、failover、粘性会话、调度求值
 - [指标口径参考](metrics-reference.md) — 每个数字怎么算出来的：图表口径、指标公式、告警阈值、保留期

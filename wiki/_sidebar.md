@@ -12,6 +12,7 @@
 - **成员指南**
   - [我的用量页](my-usage.md)
   - [接入配置（Claude Code / Codex）](setup-guide.md)
+  - [MCP 接入（让 Claude 用上 CC Team）](mcp.md)
 
 - **机制与口径**
   - [配额与计费机制](mechanism-quota.md)

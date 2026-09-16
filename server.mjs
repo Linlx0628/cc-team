@@ -89,7 +89,7 @@ const backupDir = path.join(__dirname, "backups");
 // 页面静态资源（public/assets/）在启动时读入内存并按内容生成 ?v= 版本号；
 // 引用见各页面模板的 assets.url(...)，服务路由在 createServer 入口处。
 const assets = loadAssets(path.join(__dirname, "public", "assets"));
-const RESERVED_SUFFIXES = new Set(["dashboard", "settings", "api", "health", "usage", "my-usage", "v1", "login", "logout", "favicon", "robots", "js", "css", "responses", "models", "leaderboard", "sessions", "my-activity", "wiki"]);
+const RESERVED_SUFFIXES = new Set(["dashboard", "settings", "api", "health", "usage", "my-usage", "v1", "login", "logout", "favicon", "robots", "js", "css", "responses", "models", "leaderboard", "sessions", "my-activity", "wiki", "mcp"]);
 const PROFILE_SUFFIX_RE = /^[a-z0-9_-]{2,20}$/;
 
 // ─── Docsify Wiki（静态使用手册）────────────────────────────────────────────
@@ -132,6 +132,151 @@ function serveWiki(wikiPath, res) {
   }
   res.writeHead(200, { "Content-Type": mime, "Cache-Control": "no-cache" });
   res.end(body);
+}
+
+// ─── MCP 端点（/mcp，成员级工具 + wiki 资源）────────────────────────────────
+// 手写的无状态 streamable HTTP 实现（JSON-RPC 2.0）：每个 POST 独立处理、无会话，
+// 不提供 SSE（GET → 405，规范允许）。成员接入方式见 wiki/mcp.md：
+//   claude mcp add cc-team --transport http https://网关/mcp \
+//     --header "Authorization: Bearer jx-虚拟Key"
+// 鉴权与成员 API 同约定：未知 key → 401，已知但无可用方案 → 403。
+const MCP_PROTOCOL_VERSIONS = ["2025-06-18", "2025-03-26", "2024-11-05"];
+const MCP_LATEST = "2025-06-18";
+const MCP_WIKI_DESC = {
+  "README.md": "手册首页与全站导航",
+  "quick-start.md": "快速上手：管理员与成员各自的第一步",
+  "concepts.md": "核心概念与术语表：方案/额度池/倍率/熔断/粘性会话…",
+  "mechanism-quota.md": "配额与计费机制：weighted_tokens 公式、额度池判定、429 结构",
+  "mechanism-proxy.md": "代理与调度机制：重试、熔断、failover、粘性会话、调度求值",
+  "metrics-reference.md": "指标口径参考：每个数字怎么算出来的",
+  "my-usage.md": "我的用量页：签到、日历、用量分析、排行榜",
+  "setup-guide.md": "接入配置：Claude Code / Codex 三种接入方式",
+  "faq.md": "常见问题：429 的几种含义、报表与扣额对不上等",
+};
+const MCP_TOOLS = [
+  { name: "my_quota", description: "查询我的配额与状态：各额度池的余额（已用/上限/剩余/当前峰谷倍率/临时加量）、今日用量合计、签到状态、本周加量申请余额。开始大任务前或收到 429 之后调用，确认还剩多少额度。", inputSchema: { type: "object", properties: {}, required: [] } },
+  { name: "price_list", description: "查询当前时段的模型倍率价目表：rate 越低越便宜（配额扣减 = 真实 token × rate）。挑选模型前调用，选便宜又够用的。", inputSchema: { type: "object", properties: {}, required: [] } },
+  { name: "check_in", description: "每日签到：随机领取一笔 token 奖励（计入当日配额）。每天一次，已签到会如实提示。", inputSchema: { type: "object", properties: {}, required: [] } },
+  { name: "request_quota", description: "向管理员提交加量申请（写操作）。每北京日限提交 1 次、每周被处理数有上限；不限量的池无需申请。", inputSchema: { type: "object", properties: { reason: { type: "string", description: "申请理由（必填，200 字以内）" }, pool: { type: "string", description: "额度池名（可选，缺省取第一个可申请的池）" } }, required: ["reason"] } },
+  { name: "my_usage", description: "查询我的 token 用量明细：今日（或指定日期范围）合计、按模型统计（真实 token 与计入配额的计权值并排）、24 小时请求分布、按客户端统计。用户问「我今天用了多少/花在哪」时调用。", inputSchema: { type: "object", properties: { start: { type: "string", description: "起始日期 YYYY-MM-DD（北京时间，可选）" }, end: { type: "string", description: "结束日期 YYYY-MM-DD（可选，缺省=起始日）" }, protocol: { type: "string", enum: ["anthropic", "responses"], description: "可选协议过滤" } }, required: [] } },
+  { name: "leaderboard", description: "团队排行榜：7 个维度（cache_rate 缓存率 / code_quality 代码质量 / code_lines 代码行数 / tokens 用量 / efficiency 效率比 / context_health 上下文健康度 / activity 活跃度）× 时间窗（today/week/month）。", inputSchema: { type: "object", properties: { dimension: { type: "string", enum: ["cache_rate", "code_quality", "code_lines", "tokens", "efficiency", "context_health", "activity"] }, window: { type: "string", enum: ["today", "week", "month"] } }, required: [] } },
+];
+
+function mcpWikiResources() {
+  let files = [];
+  try {
+    files = fs.readdirSync(WIKI_DIR).filter(f => f.endsWith(".md") && f !== "_sidebar.md").sort();
+  } catch { /* wiki 目录缺失时资源为空,不影响工具 */ }
+  return files.map(f => ({ uri: "wiki://" + f, name: f.replace(/\.md$/, ""), title: f, mimeType: "text/markdown", description: MCP_WIKI_DESC[f] || "使用手册页面" }));
+}
+
+function mcpRpcSend(res, id, key, value) {
+  res.writeHead(200, { "Content-Type": "application/json" });
+  res.end(JSON.stringify({ jsonrpc: "2.0", id, [key]: value }));
+}
+function mcpRpcResult(res, id, result) { mcpRpcSend(res, id, "result", result); }
+function mcpRpcError(res, id, code, message) { mcpRpcSend(res, id, "error", { code, message }); }
+// 聚合视图的 remaining 无限时是 Infinity,JSON.stringify 会变 null —— 统一转 "unlimited"。
+const mcpQuotaRow = p => ({
+  pool: p.profile, type: p.type,
+  limit: p.limit, used: p.used,
+  remaining: Number.isFinite(p.remaining) ? p.remaining : "unlimited",
+  pct: p.pct, rate: p.rate, inPeak: p.inPeak, nextRateChange: p.nextRateChange,
+  bonus: p.bonus || 0, resetApplied: !!p.resetApplied,
+});
+
+function handleMcpPost(res, body, ctx) {
+  let msg;
+  try { msg = JSON.parse(body.toString() || ""); } catch { mcpRpcError(res, null, -32700, "Parse error"); return; }
+  const { id, method, params } = msg || {};
+  if (!method || typeof method !== "string") { mcpRpcError(res, id ?? null, -32600, "Invalid Request"); return; }
+  // 通知(无 id):202 空响应,规范允许无-body 应答
+  if (method.startsWith("notifications/")) { res.writeHead(202); res.end(); return; }
+  if (method === "initialize") {
+    const requested = params?.protocolVersion;
+    mcpRpcResult(res, id, {
+      protocolVersion: MCP_PROTOCOL_VERSIONS.includes(requested) ? requested : MCP_LATEST,
+      capabilities: { tools: {}, resources: {} },
+      serverInfo: { name: "cc-team", version: "1.0.0" },
+    });
+    return;
+  }
+  if (method === "ping") { mcpRpcResult(res, id, {}); return; }
+  if (method === "tools/list") { mcpRpcResult(res, id, { tools: MCP_TOOLS }); return; }
+  if (method === "tools/call") {
+    const name = params?.name, args = params?.arguments || {};
+    try {
+      let out;
+      if (name === "my_quota") {
+        const payload = usageApi.getPersonalUsageData(ctx.apiKey, "all", "", null);
+        out = {
+          username: payload.username,
+          quotas: (payload.profileQuotas || []).map(mcpQuotaRow),
+          today: payload.today,
+          checkin: payload.checkin ? { checkedInToday: !!payload.checkin.checkedInToday, streak: payload.checkin.streak, todayAmount: payload.checkin.todayAmount } : undefined,
+          quotaRequest: payload.quotaRequest ? { remainingThisWeek: payload.quotaRequest.remaining, pools: payload.quotaRequest.pools } : undefined,
+        };
+      } else if (name === "price_list") {
+        const payload = usageApi.getPersonalUsageData(ctx.apiKey, "all", "", null);
+        out = (payload.rateCards || []).map(rc => ({
+          profile: rc.profile, inPeak: rc.inPeak, defaultPeak: rc.defaultPeak, defaultOffPeak: rc.defaultOffPeak,
+          models: (rc.rows || []).map(r => ({ alias: r.alias, model: r.model, currentRate: r.rate, custom: !!r.custom, peak: r.peak, offPeak: r.offPeak })),
+        }));
+      } else if (name === "check_in") {
+        const result = memberRewardsApi.performCheckIn(ctx.apiKey, ctx.ip);
+        out = { success: true, amount: result.amount, pools: result.pools, streak: result.streak, totalCheckIns: result.totalCheckIns, totalTokens: result.totalTokens };
+      } else if (name === "request_quota") {
+        const reason = String(args.reason || "").trim();
+        if (!reason) throw new Error("必须填写加量申请理由");
+        let pool = String(args.pool || "").trim();
+        if (!pool) {
+          const st = memberRewardsApi.getQuotaRequestStatus(ctx.apiKey);
+          const first = (st.pools || []).find(p => p.limited);
+          if (!first) throw new Error("你的池均未设置配额上限，无需申请加量");
+          pool = first.name;
+        }
+        const result = memberRewardsApi.createQuotaRequest(ctx.apiKey, reason, pool, ctx.ip);
+        out = { success: true, justCreated: !!result.justCreated, remainingThisWeek: result.remaining, myRecent: (result.myRecent || []).slice(0, 5).map(r => ({ poolLabel: r.poolLabel, status: r.status, adminNote: r.adminNote || "", createdAt: r.createdAt })) };
+      } else if (name === "my_usage") {
+        const protocol = args.protocol === "anthropic" || args.protocol === "responses" ? args.protocol : "";
+        const payload = usageApi.getPersonalUsageData(ctx.apiKey, "all", protocol, parseDateRange(args.start || null, args.end || null));
+        out = {
+          range: payload.usageRange || undefined,
+          today: payload.today,
+          models: Object.entries(payload.models || {}).map(([model, v]) => ({ model, requests: v.requests || 0, tokens: (v.inputTokens || 0) + (v.outputTokens || 0), weighted: v.weighted, rate: v.rate })).sort((a, b) => b.requests - a.requests),
+          // 小时分布是半小时键("HH:00"/"HH:30",共 48 槽),压成 48 元素请求数数组省 token
+          hourlyRequests: payload.hourly ? Array.from({ length: 48 }, (_, i) => payload.hourly[`${String(Math.floor(i / 2)).padStart(2, "0")}:${i % 2 ? "30" : "00"}`]?.requests || 0) : undefined,
+          clients: payload.clients ? Object.entries(payload.clients).map(([client, v]) => ({ client, requests: v.requests || 0, tokens: (v.inputTokens || 0) + (v.outputTokens || 0) })) : undefined,
+        };
+      } else if (name === "leaderboard") {
+        const payload = leaderboardApi.getLeaderboard({ dimension: String(args.dimension || ""), window: String(args.window || ""), meKey: resolveUserKey(ctx.apiKey) });
+        out = {
+          dimension: payload.dimensionLabel, direction: payload.direction, unit: payload.unit,
+          hint: payload.hint, cohort: payload.cohort, note: payload.note || undefined,
+          rows: (payload.rows || []).map(r => ({ rank: r.rank, name: r.user_name, value: r.value, isMe: !!r.isMe })),
+        };
+      } else {
+        mcpRpcResult(res, id, { content: [{ type: "text", text: `未知工具: ${name}` }], isError: true });
+        return;
+      }
+      mcpRpcResult(res, id, { content: [{ type: "text", text: JSON.stringify(out) }] });
+    } catch (err) {
+      // 业务规则失败(已签到/日限/周限/池不限量等)按规范回 isError 的工具结果,让人话文案进模型上下文。
+      mcpRpcResult(res, id, { content: [{ type: "text", text: err.message }], isError: true });
+    }
+    return;
+  }
+  if (method === "resources/list") { mcpRpcResult(res, id, { resources: mcpWikiResources() }); return; }
+  if (method === "resources/read") {
+    const uri = String(params?.uri || "");
+    const known = mcpWikiResources().find(r => r.uri === uri);
+    if (!known) { mcpRpcError(res, id, -32602, `Unknown resource: ${uri}`); return; }
+    let text;
+    try { text = fs.readFileSync(path.join(WIKI_DIR, known.title), "utf8"); } catch { mcpRpcError(res, id, -32602, `Resource unavailable: ${uri}`); return; }
+    mcpRpcResult(res, id, { contents: [{ uri, mimeType: "text/markdown", text }] });
+    return;
+  }
+  mcpRpcError(res, id, -32601, `Method not found: ${method}`);
 }
 
 // 「方案代码」——把一套方案的配置搬到别的环境时用的可粘贴 JSON。格式标记和版本
@@ -2979,6 +3124,26 @@ const server = http.createServer((req, res) => {
     const wikiPath = req.url.split("?")[0];
     if (wikiPath === "/wiki") { res.writeHead(301, { Location: "/wiki/" }); res.end(); return; }
     if (wikiPath.startsWith("/wiki/")) { serveWiki(wikiPath, res); return; }
+  }
+
+  // MCP 端点（/mcp，streamable HTTP，成员虚拟 Key 鉴权，见 handleMcpPost 上方注释）。
+  if (req.url.split("?")[0] === "/mcp") {
+    if (req.method !== "POST") {
+      res.writeHead(405, { "Content-Type": "application/json", Allow: "POST" });
+      res.end(JSON.stringify({ error: "POST only (stateless streamable HTTP)" }));
+      return;
+    }
+    const mcpKey = getApiKey(req);
+    if (!getAccessibleProfiles(mcpKey).length) {
+      const knownUser = hasGlobalUser(mcpKey);
+      res.writeHead(knownUser ? 403 : 401, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: knownUser ? "User is not allowed to view any profile." : "认证失败：请提供有效的虚拟Key (Authorization: Bearer jx-...)" }));
+      return;
+    }
+    readBody(req, 100_000).then(buf => {
+      handleMcpPost(res, buf, { apiKey: mcpKey, ip: getClientIp(req) });
+    }).catch(() => { res.writeHead(413); res.end("Request too large"); });
+    return;
   }
 
   // Auto quota evaluation (once per day)

@@ -18,6 +18,9 @@ services:
     volumes:
       - ../config.json:/app/config.json
       - ../data.db:/app/data.db
+      # wiki 使用手册(docsify 静态站点)只读挂载:改 wiki/ 下的 md 文档后重启容器即生效,
+      # 无需重新 build 镜像。镜像内 COPY wiki/ 的副本仅在未挂载时兜底。
+      - ../wiki:/app/wiki:ro
       # data.json 挂载已移除:它是首启 data.json -> data.db 一次性迁移用的,迁移早已完成。
       # 留着反而致命 —— 挂载源不存在时 Docker 会在宿主侧建一个同名**目录**,
       # entrypoint 的 `echo '{}' > /app/data.json` 随即报 "Is a directory",

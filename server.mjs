@@ -89,8 +89,50 @@ const backupDir = path.join(__dirname, "backups");
 // 页面静态资源（public/assets/）在启动时读入内存并按内容生成 ?v= 版本号；
 // 引用见各页面模板的 assets.url(...)，服务路由在 createServer 入口处。
 const assets = loadAssets(path.join(__dirname, "public", "assets"));
-const RESERVED_SUFFIXES = new Set(["dashboard", "settings", "api", "health", "usage", "my-usage", "v1", "login", "logout", "favicon", "robots", "js", "css", "responses", "models", "leaderboard", "sessions", "my-activity"]);
+const RESERVED_SUFFIXES = new Set(["dashboard", "settings", "api", "health", "usage", "my-usage", "v1", "login", "logout", "favicon", "robots", "js", "css", "responses", "models", "leaderboard", "sessions", "my-activity", "wiki"]);
 const PROFILE_SUFFIX_RE = /^[a-z0-9_-]{2,20}$/;
+
+// ─── Docsify Wiki（静态使用手册）────────────────────────────────────────────
+// wiki/ 目录是一套 docsify 静态站点（/wiki/ 访问），面向使用者的功能手册。
+// 有意不鉴权：内容只有公开的功能说明，不含密钥或按请求数据（同 /assets 定位）。
+// 每次请求直接读盘，编辑 wiki/ 下文档即时生效，无需重启进程。
+const WIKI_DIR = path.join(__dirname, "wiki");
+const WIKI_MIME = {
+  ".md": "text/markdown; charset=utf-8",
+  ".html": "text/html; charset=utf-8",
+  ".css": "text/css; charset=utf-8",
+  ".js": "text/javascript; charset=utf-8",
+  ".json": "application/json; charset=utf-8",
+  ".svg": "image/svg+xml",
+  ".png": "image/png",
+  ".jpg": "image/jpeg",
+  ".jpeg": "image/jpeg",
+  ".webp": "image/webp",
+  ".ico": "image/x-icon",
+};
+
+function serveWiki(wikiPath, res) {
+  let rel = wikiPath.replace(/^\/wiki\//, "");
+  if (!rel) rel = "index.html";
+  const filePath = path.resolve(WIKI_DIR, rel);
+  const mime = WIKI_MIME[path.extname(filePath).toLowerCase()];
+  // 只允许解析后仍落在 wiki/ 目录内、且扩展名在白名单里的文件（防穿越、防误读 config/data）。
+  if (!mime || (filePath !== WIKI_DIR && !filePath.startsWith(WIKI_DIR + path.sep))) {
+    res.writeHead(404, { "Content-Type": "text/plain; charset=utf-8" });
+    res.end("Not found");
+    return;
+  }
+  let body;
+  try {
+    body = fs.readFileSync(filePath);
+  } catch {
+    res.writeHead(404, { "Content-Type": "text/plain; charset=utf-8" });
+    res.end("Not found");
+    return;
+  }
+  res.writeHead(200, { "Content-Type": mime, "Cache-Control": "no-cache" });
+  res.end(body);
+}
 
 // 「方案代码」——把一套方案的配置搬到别的环境时用的可粘贴 JSON。格式标记和版本
 // 一起放在信封里（而不是混进 profile 对象），导入时先验它：粘错了东西能立刻得到
@@ -2916,7 +2958,7 @@ const server = http.createServer((req, res) => {
   res.setHeader("X-Frame-Options", "DENY");
   res.setHeader("Referrer-Policy", "strict-origin-when-cross-origin");
   res.setHeader("X-XSS-Protection", "0");
-  res.setHeader("Content-Security-Policy", "default-src 'self'; script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; img-src 'self' data:; connect-src 'self'");
+  res.setHeader("Content-Security-Policy", "default-src 'self'; script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com https://cdn.jsdelivr.net; font-src 'self' https://fonts.gstatic.com; img-src 'self' data:; connect-src 'self'");
   if (isSecureRequest(req)) {
     res.setHeader("Strict-Transport-Security", "max-age=31536000; includeSubDomains");
   }
@@ -2930,6 +2972,13 @@ const server = http.createServer((req, res) => {
     res.writeHead(200, { "Content-Type": asset.contentType, "Cache-Control": "public, max-age=604800" });
     res.end(asset.body);
     return;
+  }
+
+  // Docsify wiki 使用手册（/wiki/，免登录，见 serveWiki 上方注释）。
+  if (req.method === "GET") {
+    const wikiPath = req.url.split("?")[0];
+    if (wikiPath === "/wiki") { res.writeHead(301, { Location: "/wiki/" }); res.end(); return; }
+    if (wikiPath.startsWith("/wiki/")) { serveWiki(wikiPath, res); return; }
   }
 
   // Auto quota evaluation (once per day)

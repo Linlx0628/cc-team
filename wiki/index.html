@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>CC Team 使用手册</title>
+  <link rel="icon" type="image/svg+xml" href="favicon.svg">
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/docsify@4.13.1/lib/themes/vue.css">
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", "Segoe UI", sans-serif; }
+    .markdown-section h1 { font-weight: 700; }
+    .markdown-section table { display: table; width: 100%; }
+    .markdown-section pre { background: #f6f8fa; }
+    aside.sidebar { padding-top: 48px; }
+    .app-name-link { font-weight: 700; }
+  </style>
+</head>
+<body>
+  <div id="app">手册加载中…</div>
+  <script>
+    window.$docsify = {
+      name: 'CC Team 使用手册',
+      basePath: '/wiki/',
+      loadSidebar: true,
+      subMaxLevel: 3,
+      auto2top: true,
+      // 站点内所有页面共用根目录的 _sidebar.md
+      alias: { '/.*/_sidebar.md': '/_sidebar.md' },
+      search: {
+        paths: 'auto',
+        placeholder: '搜索手册…',
+        noData: '没有找到相关结果',
+        depth: 3
+      }
+    }
+  </script>
+  <script src="https://cdn.jsdelivr.net/npm/docsify@4.13.1/lib/docsify.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/docsify@4.13.1/lib/plugins/search.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/docsify-copy-code@3.0.2/dist/docsify-copy-code.min.js"></script>
+</body>
+</html>

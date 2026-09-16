@@ -3,7 +3,7 @@ Chart.defaults.color='#686863';Chart.defaults.font.family='-apple-system,BlinkMa
 // 页面内联引导脚本先注入 toast() 及 UI_HELPERS 提供的辅助函数再加载本文件；
 // 全部数据经 /api/* 运行时拉取，文件不含任何密钥，可长期强缓存（?v= 内容版本号）。
 let D=null,P="day",C={t:null,p:null,m:null,h:null,hm:null,pr:null},errPage=1,autoRefresh=true,refreshTimer=null,currentProfile="all",PROTO="";
-let MDL="all",USR="all",MT="tokens",PIEDIM="user";
+let MDL="all",USR="all",MT="tokens",PIEDIM="user",MDLDIM="model";
 let DS="",DE="";
 let activeWorkspaceTab="users";
 let quotaFocus=(function(){try{return localStorage.getItem('tm_quota_focus')==='1'}catch(e){return false}})();
@@ -377,6 +377,10 @@ document.querySelectorAll("#protoSeg button").forEach(b=>b.addEventListener("cli
 // dailyClients 与 daily/dailyModels 一起来自 /api/stats,已经在 D 里了。
 function setPieDim(dim){PIEDIM=dim==="client"?"client":"user";document.querySelectorAll("#pieDim button").forEach(b=>b.classList.toggle("on",b.dataset.dim===PIEDIM));if(D)render()}
 document.querySelectorAll("#pieDim button").forEach(b=>b.addEventListener("click",()=>setPieDim(b.dataset.dim)));
+// 模型请求分布图的维度切换(按模型 / 按方案),与用户分布图的 seg 同款。只重画不重新拉数
+// —— profileDailyModels(方案×日期×模型聚合)与 dailyModels 一样已在 /api/stats 返回里。
+function setModelDim(dim){MDLDIM=dim==="profile"?"profile":"model";document.querySelectorAll("#modelDim button").forEach(b=>b.classList.toggle("on",b.dataset.dim===MDLDIM));if(D)render()}
+document.querySelectorAll("#modelDim button").forEach(b=>b.addEventListener("click",()=>setModelDim(b.dataset.dim)));
 const protoLabel=proto=>proto==="anthropic"?"Anthropic":proto==="responses"?"OpenAI":"";
 function render(){
   if(!D)return;
@@ -472,24 +476,46 @@ function render(){
   }
   C.p=new Chart(document.getElementById("pie"),{type:"bar",data:{labels:pieLabels,datasets:[{label:MT==="requests"?"请求数":"总 Token",data:pieVals,backgroundColor:pieVals.map((_,i)=>COL[i%COL.length]+"cc"),borderWidth:0,borderRadius:3,borderSkipped:false}]},options:{indexAxis:"y",responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false},tooltip:{callbacks:{label:ctx=>MT==="requests"?fmtT(ctx.raw)+" 次请求":fmtT(ctx.raw)+" tokens"}}},scales:{x:{ticks:{color:"#686863",callback:v=>fmtTk(v)},grid:{color:"rgba(24,24,22,.08)"}},y:{ticks:{color:"#686863",font:{size:11},autoSkip:false},grid:{display:false}}}}});
 
-  // 模型请求分布：按有效窗口(日期范围优先,否则周期窗口,北京时间)基于 usage_daily_model
-  // 保留约 400 天的按日模型数据求和，可按用户与指标筛选。横向柱状图便于读取模型名。
-  const dm=D.dailyModels||{};
-  const mAgg={};
-  for(const [date,users] of Object.entries(dm)){
-    if(date<eb.start||date>eb.end)continue;
-    for(const [u,models] of Object.entries(users)){
-      if(USR!=="all"&&u!==USR)continue;
-      for(const [m,v] of Object.entries(models)){
-        if(!mAgg[m])mAgg[m]={requests:0,tokens:0};
-        mAgg[m].requests+=(v.requests||0);mAgg[m].tokens+=((v.inputTokens||0)+(v.outputTokens||0));
+  // 模型请求分布：按有效窗口(日期范围优先,否则周期窗口,北京时间)求和，可按指标筛选。
+  // seg 切两个维度:按模型(usage_daily_model,可按用户筛选) / 按方案(profileDailyModels,
+  // 方案×日期×模型聚合,无 user 维度所以不响应 USR —— 与「方案请求情况」图口径一致;
+  // 两源都不含缓存 Token)。横向柱状图便于读取名称。
+  let mLabels,mVal;
+  if(MDLDIM==="profile"){
+    const sfxName={};for(const p of (Array.isArray(D.profiles)?D.profiles:[]))sfxName[p.suffix]=p.name;
+    const pAgg={};
+    for(const [sfx,days] of Object.entries(D.profileDailyModels||{})){
+      for(const [date,models] of Object.entries(days)){
+        if(date<eb.start||date>eb.end)continue;
+        if(!pAgg[sfx])pAgg[sfx]={requests:0,tokens:0};
+        for(const v of Object.values(models||{})){
+          pAgg[sfx].requests+=(v.requests||0);pAgg[sfx].tokens+=((v.inputTokens||0)+(v.outputTokens||0));
+        }
       }
     }
+    const pNames=Object.keys(pAgg);
+    const pVal=pNames.map(s=>MT==="requests"?pAgg[s].requests:pAgg[s].tokens);
+    const pIdx=pVal.map((_,i)=>i).sort((a,b)=>pVal[b]-pVal[a]);
+    mLabels=pIdx.map(i=>sfxName[pNames[i]]||pNames[i]);mVal=pIdx.map(i=>pVal[i]);
+  }else{
+    const dm=D.dailyModels||{};
+    const mAgg={};
+    for(const [date,users] of Object.entries(dm)){
+      if(date<eb.start||date>eb.end)continue;
+      for(const [u,models] of Object.entries(users)){
+        if(USR!=="all"&&u!==USR)continue;
+        for(const [m,v] of Object.entries(models)){
+          if(!mAgg[m])mAgg[m]={requests:0,tokens:0};
+          mAgg[m].requests+=(v.requests||0);mAgg[m].tokens+=((v.inputTokens||0)+(v.outputTokens||0));
+        }
+      }
+    }
+    const mNames=Object.keys(mAgg);
+    const mv=mNames.map(m=>MT==="requests"?mAgg[m].requests:mAgg[m].tokens);
+    const mIdx=mv.map((_,i)=>i).sort((a,b)=>mv[b]-mv[a]);
+    mLabels=mIdx.map(i=>mNames[i]);mVal=mIdx.map(i=>mv[i]);
   }
-  const mNames=Object.keys(mAgg);
-  const mVal=mNames.map(m=>MT==="requests"?mAgg[m].requests:mAgg[m].tokens);
-  const mIdx=mVal.map((_,i)=>i).sort((a,b)=>mVal[b]-mVal[a]);
-  C.m=new Chart(document.getElementById("modelChart"),{type:"bar",data:{labels:mIdx.map(i=>mNames[i]),datasets:[{label:MT==="requests"?"请求数":"Token",data:mIdx.map(i=>mVal[i]),backgroundColor:mIdx.map((_,i)=>COL[i%COL.length]+"cc"),borderWidth:0,borderRadius:3,borderSkipped:false}]},options:{indexAxis:"y",responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false},tooltip:{callbacks:{label:ctx=>MT==="requests"?fmtT(ctx.raw)+" 次请求":fmtT(ctx.raw)+" tokens"}}},scales:{x:{ticks:{color:"#686863",callback:v=>fmtTk(v)},grid:{color:"rgba(24,24,22,.08)"}},y:{ticks:{color:"#686863",font:{size:11},autoSkip:false},grid:{display:false}}}}});
+  C.m=new Chart(document.getElementById("modelChart"),{type:"bar",data:{labels:mLabels,datasets:[{label:MT==="requests"?"请求数":"Token",data:mVal,backgroundColor:mVal.map((_,i)=>COL[i%COL.length]+"cc"),borderWidth:0,borderRadius:3,borderSkipped:false}]},options:{indexAxis:"y",responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false},tooltip:{callbacks:{label:ctx=>MT==="requests"?fmtT(ctx.raw)+" 次请求":fmtT(ctx.raw)+" tokens"}}},scales:{x:{ticks:{color:"#686863",callback:v=>fmtTk(v)},grid:{color:"rgba(24,24,22,.08)"}},y:{ticks:{color:"#686863",font:{size:11},autoSkip:false},grid:{display:false}}}}});
 
   // 24小时趋势图：有效窗口内逐日同半小时槽位累加（按日=当天真实曲线；周/月/年=各槽位
   // 累计分布;日期范围生效时窗口收窄到 [开始,结束],48 槽在范围内累加 —— 早于服务端取数
@@ -590,7 +616,7 @@ document.querySelectorAll(".tab").forEach(b=>b.addEventListener("click",()=>{doc
 document.getElementById("metricSel").addEventListener("change",e=>{MT=e.target.value;render()});
 document.getElementById("modelSel").addEventListener("change",e=>{MDL=e.target.value;resetDetailGrouping();render()});
 document.getElementById("userSel").addEventListener("change",e=>{USR=e.target.value;render()});
-function resetChartFilters(){P="day";MT="tokens";MDL="all";USR="all";DS="";DE="";PROTO="";setPieDim("user");setProtoSeg("");document.querySelectorAll("#globalTabs .tab").forEach(x=>x.classList.toggle("on",x.dataset.p==="day"));document.getElementById("metricSel").value="tokens";document.getElementById("modelSel").value="all";document.getElementById("userSel").value="all";document.getElementById("dateStart").value="";document.getElementById("dateEnd").value="";if(currentProfile!=="all"){currentProfile="all";document.getElementById("profileSel").value="all"}resetDetailGrouping();load()}
+function resetChartFilters(){P="day";MT="tokens";MDL="all";USR="all";DS="";DE="";PROTO="";setPieDim("user");setModelDim("model");setProtoSeg("");document.querySelectorAll("#globalTabs .tab").forEach(x=>x.classList.toggle("on",x.dataset.p==="day"));document.getElementById("metricSel").value="tokens";document.getElementById("modelSel").value="all";document.getElementById("userSel").value="all";document.getElementById("dateStart").value="";document.getElementById("dateEnd").value="";if(currentProfile!=="all"){currentProfile="all";document.getElementById("profileSel").value="all"}resetDetailGrouping();load()}
 document.querySelectorAll(".workspace-tab").forEach(button=>{button.addEventListener("click",()=>setWorkspaceTab(button.id.replace("workspace-tab-","")));button.addEventListener("keydown",handleWorkspaceTabKeydown)});
 document.getElementById("clearErrors").addEventListener("click",async()=>{if(confirm("确定清除所有错误记录？")){const csrf=(document.cookie.match(/tm_csrf=([^;]+)/)||[])[1]||'';await fetch("/api/clear-errors",{method:"POST",headers:{"x-csrf-token":csrf}});toast('错误记录已清除');errPage=1;load()}});
 // ── 产出质量 tab(懒加载:首次切到该 tab 才拉数据)──

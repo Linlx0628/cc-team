@@ -5272,6 +5272,68 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+  // 明细记录下钻:某用户在某时段的 24 小时(半小时粒度)请求分布。刻意做成点击时才拉取
+  // 的独立接口 —— 每用户×每日期的小时明细若随 /api/stats 预下发,载荷会大得毫无必要。
+  if (req.method === "GET" && req.url.startsWith("/api/user-hours")) {
+    if (!checkAuth(req)) { res.writeHead(401); res.end("Unauthorized"); return; }
+    try {
+      const url = new URL(req.url, "http://localhost");
+      const masked = (url.searchParams.get("user") || "").trim();
+      const start = (url.searchParams.get("start") || "").trim();
+      const end = (url.searchParams.get("end") || start).trim();
+      // 口径与 /api/stats 一致:profile 单选优先,protocol 只在 all 视图生效。
+      const profileSuffix = url.searchParams.get("profile") || "all";
+      const protocolParam = url.searchParams.get("protocol");
+      let profileFilter = null;
+      if (profileSuffix !== "all") {
+        const sfx = normalizeProfileSuffix(profileSuffix);
+        if (runtimes[sfx]) profileFilter = [sfx];
+      } else if (protocolParam === "anthropic" || protocolParam === "responses") {
+        profileFilter = statsApi.protocolSuffixes(protocolParam);
+      }
+      // 掩码还原:前端只拿得到 sanitizeStore 的掩码串(前 8 位 + "****")。运行时把所有
+      // 方案的用户 key 重新掩码一遍建映射;命中后同时查完整 key 与 12 字符桩 ——
+      // 未知 key 落库时存的是桩(resolveUserKey),两处都可能有真实用量。
+      const candidates = new Set();
+      if (masked.endsWith("****")) {
+        for (const rt2 of Object.values(runtimes)) {
+          for (const k of [...Object.keys(rt2.users || {}), ...Object.keys(rt2.globalUsers || {})]) {
+            if (k.slice(0, 8) + "****" === masked) { candidates.add(k); candidates.add(k.slice(0, 12)); }
+          }
+        }
+      } else if (masked) {
+        candidates.add(masked);
+      }
+      const hours = {};
+      if (candidates.size && start) {
+        const keys = [...candidates];
+        const conds = [`date BETWEEN ? AND ?`, `user_key IN (${keys.map(() => "?").join(",")})`];
+        const params = [start, end, ...keys];
+        if (profileFilter && profileFilter.length) {
+          conds.push(`profile IN (${profileFilter.map(() => "?").join(",")})`);
+          params.push(...profileFilter);
+        }
+        const rows = db.prepare(`SELECT hour, SUM(requests) AS requests, SUM(input_tokens) AS input_tokens, SUM(output_tokens) AS output_tokens, SUM(cache_creation) AS cache_creation, SUM(cache_read) AS cache_read FROM usage_daily_hourly WHERE ${conds.join(" AND ")} GROUP BY hour`).all(...params);
+        for (const r of rows) {
+          hours[r.hour] = { requests: r.requests, inputTokens: r.input_tokens, outputTokens: r.output_tokens, cacheCreationTokens: r.cache_creation, cacheReadTokens: r.cache_read };
+        }
+      }
+      // usage_daily_hourly 只保留 7 天(pruneDailyHourly),retentionStart 供前端提示「更早无明细」。
+      const retentionStart = new Date(Date.now() - 7 * 86400000 + 8 * 3600000).toISOString().slice(0, 10);
+      res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+      res.end(JSON.stringify({ start, end, hours, retentionStart }));
+    } catch (err) {
+      if (!res.headersSent) {
+        res.writeHead(err.statusCode || 500, { "Content-Type": "application/json; charset=utf-8" });
+        res.end(JSON.stringify({ error: err.message }));
+      } else {
+        console.log(`[user-hours-api] 响应已开始但出错: ${err.message}`);
+        if (!res.writableEnded) res.end();
+      }
+    }
+    return;
+  }
+
   // 成员的活动视图:项目分布 + 会话使用情况。鉴权与 /api/leaderboard 同款。
   if (req.method === "GET" && req.url.startsWith("/api/my-activity")) {
     const apiKey = getApiKey(req);

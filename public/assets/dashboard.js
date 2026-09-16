@@ -11,6 +11,13 @@ const ERR_PAGE_SIZE=20;
 const DETAIL_PAGE_SIZE=10;
 let detailPage=1,detailQuery="",detailRange="all",detailSort="time",detailInitialized=false;
 const expandedDetailPeriods=new Set();
+// 明细记录下钻:点击用户行展开该时段的 24 小时(半小时粒度)请求分布。数据走
+// /api/user-hours 懒加载 —— 点击时才请求,绝不随 /api/stats 预取(每用户×每日期的
+// 小时明细塞进大载荷会白白拖慢首屏)。expandedUserHours 键 = period+""+掩码key;
+// hoursCache 按 key 缓存接口载荷;hoursCharts 持有展开行内的 Chart 实例(renderDetail
+// 全量重画 tbody,重画前必须逐一 destroy)。
+const expandedUserHours=new Set(),hoursCache=new Map(),hoursCharts=new Map(),hoursLoading=new Set();
+let hoursChartSeq=0;
 const COL=["#2f6e50","#4a6fa5","#c2604f","#c4a23a","#7a6bb0","#d4824a","#4a9ba8","#c47a99","#6ba368","#5a6bc4","#8a6db5","#5a9b8e"];
 const escH=s=>String(s??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 const fmtT=n=>n.toLocaleString("zh-CN");
@@ -333,12 +340,30 @@ function detailTokens(row){return ioTokens(row)}
 function detailPeriodLabel(key){if(P==="day")return key;if(P==="week")return key+" 周";if(P==="month")return key;return key+" 年"}
 function detailRangeDaily(daily){if(detailRange==="all")return daily;const days=Number(detailRange)||0;const cutoff=new Date(Date.now()+8*3600000-Math.max(0,days-1)*86400000).toISOString().slice(0,10);return Object.fromEntries(Object.entries(daily).filter(([date])=>date>=cutoff))}
 function detailTotals(members){const total={requests:0,inputTokens:0,outputTokens:0,cacheCreationTokens:0,cacheReadTokens:0};for(const member of members){const row=member.data;total.requests+=row.requests||0;total.inputTokens+=row.inputTokens||0;total.outputTokens+=row.outputTokens||0;total.cacheCreationTokens+=row.cacheCreationTokens||0;total.cacheReadTokens+=row.cacheReadTokens||0}return total}
-function resetDetailGrouping(){detailPage=1;expandedDetailPeriods.clear();detailInitialized=false}
+function resetDetailGrouping(){detailPage=1;expandedDetailPeriods.clear();for(const c of hoursCharts.values())c.destroy();hoursCharts.clear();expandedUserHours.clear();hoursCache.clear();hoursLoading.clear();detailInitialized=false}
 function updateDetailFilters(){const nextQuery=document.getElementById("detailQuery").value.trim().toLowerCase(),nextRange=document.getElementById("detailRange").value,nextSort=document.getElementById("detailSort").value;const groupingChanged=nextQuery!==detailQuery||nextRange!==detailRange;detailQuery=nextQuery;detailRange=nextRange;detailSort=nextSort;detailPage=1;if(groupingChanged){expandedDetailPeriods.clear();detailInitialized=false}renderDetail()}
 function resetDetailFilters(){detailQuery="";detailRange="all";detailSort="time";document.getElementById("detailQuery").value="";document.getElementById("detailRange").value="all";document.getElementById("detailSort").value="time";resetDetailGrouping();renderDetail()}
 function setDetailPage(page){detailPage=page;renderDetail()}
 function setErrorPage(page){errPage=page;render();requestAnimationFrame(()=>{document.getElementById("errorSecBody").scrollTop=0})}
 function toggleDetailPeriod(period){if(expandedDetailPeriods.has(period))expandedDetailPeriods.delete(period);else expandedDetailPeriods.add(period);detailInitialized=true;renderDetail()}
+// 周期 key → 该周期覆盖的日期区间(北京时间,闭区间)。周 key 是周一,月 key 是 "YYYY-MM"。
+// 月末直接取 "-31":BETWEEN 是字符串比较,"2026-09-31" 能正确兜住整个九月且不越界。
+function detailPeriodRange(key){if(P==="week"){const t=new Date(key+"T00:00:00Z");t.setUTCDate(t.getUTCDate()+6);return{start:key,end:t.toISOString().slice(0,10)}}if(P==="month")return{start:key+"-01",end:key+"-31"};if(P==="year")return{start:key+"-01-01",end:key+"-12-31"};return{start:key,end:key}}
+function toggleUserHours(periodKey,userKey){
+  const id=periodKey+""+userKey;
+  if(expandedUserHours.has(id)){expandedUserHours.delete(id);const c=hoursCharts.get(id);if(c){c.destroy();hoursCharts.delete(id)}}
+  else expandedUserHours.add(id);
+  renderDetail();
+}
+function loadUserHours(periodKey,userKey){
+  const id=periodKey+""+userKey;
+  if(hoursLoading.has(id))return;
+  hoursLoading.add(id);
+  const {start,end}=detailPeriodRange(periodKey);
+  const qs=new URLSearchParams({user:userKey,start,end});
+  if(currentProfile!=="all")qs.set("profile",currentProfile);else if(PROTO)qs.set("protocol",PROTO);
+  fetch("/api/user-hours?"+qs).then(r=>r.json()).then(payload=>{hoursCache.set(id,payload||{start,end,hours:{}})}).catch(()=>{hoursCache.set(id,{start,end,hours:{},error:true})}).finally(()=>{hoursLoading.delete(id);if(expandedUserHours.has(id))renderDetail()});
+}
 function renderDetail(){
   if(!D)return;
   const grouped=grp(detailRangeDaily(D.daily||{}),P);
@@ -355,13 +380,50 @@ function renderDetail(){
   const totalPages=Math.max(1,Math.ceil(periods.length/DETAIL_PAGE_SIZE));
   detailPage=Math.max(1,Math.min(detailPage,totalPages));
   const pagePeriods=periods.slice((detailPage-1)*DETAIL_PAGE_SIZE,detailPage*DETAIL_PAGE_SIZE);
-  const rows=[];
+  const rows=[];const hoursChartPending=[];
   for(const period of pagePeriods){
     const open=expandedDetailPeriods.has(period.key),total=period.total;
     rows.push('<tr class="detail-group" data-period="'+escH(period.key)+'" tabindex="0" aria-expanded="'+open+'" onclick="toggleDetailPeriod(this.dataset.period)" onkeydown="if(event.keyCode===13||event.keyCode===32){event.preventDefault();toggleDetailPeriod(this.dataset.period)}"><td class="detail-sticky"><span class="detail-period"><span class="detail-period-toggle '+(open?'open':'')+'"></span><span>'+escH(detailPeriodLabel(period.key))+'</span><span class="detail-period-meta">'+period.members.length+' 位用户</span></span></td><td class="n">'+fmtT(total.requests)+'</td><td class="n">'+fmtT(total.inputTokens)+'</td><td class="n">'+fmtT(total.outputTokens)+'</td><td class="n">'+fmtT(total.cacheCreationTokens)+'</td><td class="n">'+fmtT(total.cacheReadTokens)+'</td><td class="n hl">'+fmtT(detailTokens(total))+'</td></tr>');
-    if(open){for(const member of period.members){const data=member.data,totalTokens=detailTokens(data),share=detailTokens(total)>0?Math.round(totalTokens/detailTokens(total)*100):0;rows.push('<tr class="detail-member"><td class="detail-sticky"><span class="detail-user"><span class="detail-user-name">'+escH(member.name)+'</span><span class="detail-key">'+escH(maskDetailKey(member.key))+'</span></span></td><td class="n">'+fmtT(data.requests||0)+'</td><td class="n">'+fmtT(data.inputTokens||0)+'</td><td class="n">'+fmtT(data.outputTokens||0)+'</td><td class="n">'+fmtT(data.cacheCreationTokens||0)+'</td><td class="n">'+fmtT(data.cacheReadTokens||0)+'</td><td class="n hl">'+fmtT(totalTokens)+'<span class="detail-share">'+share+'%</span></td></tr>')}}
+    if(open){for(const member of period.members){
+      const data=member.data,totalTokens=detailTokens(data),share=detailTokens(total)>0?Math.round(totalTokens/detailTokens(total)*100):0;
+      const hoursId=period.key+""+member.key;
+      rows.push('<tr class="detail-member"><td class="detail-sticky"><span class="detail-user detail-user-click" title="点击查看该时段 24 小时请求分布" onclick="toggleUserHours(\''+escH(period.key)+'\',\''+escH(member.key)+'\')"><span class="detail-user-name">'+escH(member.name)+'</span><span class="detail-key">'+escH(maskDetailKey(member.key))+'</span></span></td><td class="n">'+fmtT(data.requests||0)+'</td><td class="n">'+fmtT(data.inputTokens||0)+'</td><td class="n">'+fmtT(data.outputTokens||0)+'</td><td class="n">'+fmtT(data.cacheCreationTokens||0)+'</td><td class="n">'+fmtT(data.cacheReadTokens||0)+'</td><td class="n hl">'+fmtT(totalTokens)+'<span class="detail-share">'+share+'%</span></td></tr>');
+      // 下钻行:点击用户名才拉取(懒加载)。缓存命中直接画;否则占位 + 异步请求,回来重画。
+      if(expandedUserHours.has(hoursId)){
+        const payload=hoursCache.get(hoursId);
+        if(!payload){
+          rows.push('<tr class="detail-hours-row"><td colspan="7"><div class="detail-hours-note">24 小时分布加载中…</div></td></tr>');
+          if(!hoursLoading.has(hoursId))setTimeout(()=>loadUserHours(period.key,member.key),0);
+        }else{
+          const agg=Array(48).fill(0),aggTk=Array(48).fill(0);
+          // 注意:此处处于成员循环内,局部 const totalTokens 遮蔽了 ui.js 的全局 totalTokens(),
+          // 所以 token 合计必须内联求和,不能调用 totalTokens(v)。
+          for(const[i,v,w] of halfHourSlots(payload.hours||{})){agg[i]+=(v.requests||0)*w;aggTk[i]+=(((v.inputTokens||0)+(v.outputTokens||0)+(v.cacheCreationTokens||0)+(v.cacheReadTokens||0)))*w}
+          if(!agg.some(x=>x>0)){
+            const outOfRetention=payload.retentionStart&&detailPeriodRange(period.key).end<payload.retentionStart;
+            rows.push('<tr class="detail-hours-row"><td colspan="7"><div class="detail-hours-note">'+(outOfRetention?'该时段超出小时明细保留期（小时数据仅保留近 7 天）':'该时段暂无小时明细')+'</div></td></tr>');
+          }else{
+            const idx=hoursChartSeq++;
+            rows.push('<tr class="detail-hours-row"><td colspan="7"><div class="detail-hours"><div class="detail-hours-title">'+escH(member.name)+' · '+escH(detailPeriodLabel(period.key))+' 24 小时请求分布（半小时粒度 · 柱=请求数，线=总 Token · 点击用户名收起）</div><div class="detail-hours-canvas"><canvas id="hoursCanvas-'+idx+'"></canvas></div></div></td></tr>');
+            hoursChartPending.push({id:hoursId,idx,agg,aggTk});
+          }
+        }
+      }
+    }}
   }
+  // tbody 即将被整体替换:旧展开行的 Chart 实例先销毁,再重建(数据在 hoursCache 里,不会重新请求)。
+  for(const c of hoursCharts.values())c.destroy();hoursCharts.clear();
   document.querySelector("#dTable tbody").innerHTML=rows.length?rows.join(""):'<tr><td colspan="7" class="empty">'+(detailQuery?'没有匹配的用户记录':'暂无数据')+'</td></tr>';
+  for(const {id,idx,agg,aggTk} of hoursChartPending){
+    const canvas=document.getElementById("hoursCanvas-"+idx);
+    if(!canvas)continue;
+    // 双轴:柱=请求数(左),线=总 Token(输入+输出+缓存,右)——口径与面板「24 小时趋势」一致。
+    const chart=new Chart(canvas,{type:"bar",data:{labels:halfHourLabels(),datasets:[
+      {label:"请求数",data:agg,backgroundColor:COL[0]+"cc",borderRadius:2,borderSkipped:false,yAxisID:"y"},
+      {label:"总 Token",data:aggTk,type:"line",borderColor:COL[1],backgroundColor:COL[1]+"22",fill:true,tension:.28,pointRadius:0,pointHitRadius:10,pointBackgroundColor:COL[1],pointHoverRadius:4,borderWidth:2,yAxisID:"y1"}
+    ]},options:{responsive:true,maintainAspectRatio:false,interaction:{mode:"index",intersect:false},plugins:{legend:{labels:{color:"#686863",font:{size:10},usePointStyle:true,pointStyle:"circle"}},tooltip:{callbacks:{label:ctx=>ctx.dataset.label+": "+fmtT(ctx.raw)+(ctx.datasetIndex===0?" 次请求":" tokens")}}},scales:{x:{ticks:{color:"#686863",font:{size:9},maxRotation:0,autoSkip:true,maxTicksLimit:12},grid:{display:false}},y:{beginAtZero:true,ticks:{color:"#686863",callback:v=>fmtTk(v)},grid:{color:"rgba(24,24,22,.08)"},title:{display:true,text:"请求数",color:"#686863",font:{size:10}}},y1:{beginAtZero:true,position:"right",ticks:{color:"#686863",callback:v=>fmtTk(v)},grid:{drawOnChartArea:false},title:{display:true,text:"Tokens",color:"#686863",font:{size:10}}}}}});
+    hoursCharts.set(id,chart);
+  }
   document.getElementById("detailHint").textContent=periods.length+' 个周期 · '+memberCount+' 条用户记录';
   document.getElementById("workspaceCountDetail").textContent=periods.length;
   document.getElementById("detailPages").innerHTML=periods.length?'<span>第 '+detailPage+' / '+totalPages+' 页</span><button type="button" onclick="setDetailPage('+(detailPage-1)+')" '+(detailPage<=1?'disabled':'')+'>上一页</button><button type="button" onclick="setDetailPage('+(detailPage+1)+')" '+(detailPage>=totalPages?'disabled':'')+'>下一页</button>':'';

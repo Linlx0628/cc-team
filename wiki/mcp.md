@@ -4,6 +4,8 @@ CC Team 内置 MCP（Model Context Protocol）端点。接入后，你的 Claude
 
 ## 一条命令接入
 
+> 入口：「我的用量」页 → 侧栏「**配置 MCP**」分区——页面会按你的虚拟 Key 与当前访问地址**自动生成**下面的命令，直接复制即可，无需手改。
+
 ```bash
 claude mcp add cc-team --transport http https://你的服务器地址:6789/mcp --header "Authorization: Bearer jx-你的虚拟Key"
 ```

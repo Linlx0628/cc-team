@@ -1,6 +1,6 @@
 # 我的用量页
 
-成员侧主页，地址 `/usage/<你的虚拟Key>`（也可在 `/my-usage` 输入 Key 跳转）。**无需登录后台**，持有 Key 即可查看自己的用量。左侧栏七个分区 + 右下角吉祥物挂件。
+成员侧主页，地址 `/usage/<你的虚拟Key>`（也可在 `/my-usage` 输入 Key 跳转）。**无需登录后台**，持有 Key 即可查看自己的用量。左侧栏八个分区 + 右下角吉祥物挂件。
 
 ## 概览
 
@@ -38,6 +38,10 @@
 
 - **配置 Claude Code**：一键脚本（macOS/Linux 与 Windows PowerShell 两个平台）、手动 `settings.json` 片段、**cc-switch 一键导入**深链；入口地址按你是否在某个方案组内自动计算
 - **配置 Codex**：页内分区不跳转，一键脚本 / 手动 `config.toml` + `models.json` / **cc-switch 一键导入**；模型目录来自管理员的方案别名配置
+
+## 配置 MCP
+
+第三个接入指南分区：把 CC Team 的 MCP 端点接进你的 Claude Code / Codex，让 Claude 能查你的配额、看价目表、帮你签到、提交加量申请、翻使用手册。页面按你的虚拟 Key 与访问地址**现算**接入命令（Claude Code 一条命令、Codex 一段 `config.toml`），复制执行即可。工具清单与安全说明见 [MCP 接入](mcp.md)。
 
 ## 申请加量
 

@@ -77,6 +77,12 @@ function createSetupGuide(g){
     set('schemeLabel',sch+'://');
     set('curlCmd','curl -fsSL "'+origin+g.install+g.key+'" | sh');
     set('psCmd','[Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12; irm "'+origin+g.win+g.key+'" | iex');
+    if(g.guide==='mcp'){
+      // MCP 分区:Claude Code 一条命令;Codex 一段 config.toml。Key 即身份,命令由页面现算。
+      set('mcpClaudeCmd','claude mcp add cc-team --transport http '+origin+'/mcp --header "Authorization: Bearer '+g.key+'"');
+      set('mcpCodexToml','[mcp_servers.ccteam]\nurl = "'+origin+'/mcp"\nhttp_headers = { "Authorization" = "Bearer '+g.key+'" }');
+      return;
+    }
     if(g.guide==='codex'){
       set('tomlBlock',setupCodexConfigText(g,h,sch));
       set('tomlBlock2',setupCodexProviderToml(h,sch,g.key));

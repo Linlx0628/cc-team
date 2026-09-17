@@ -26,14 +26,16 @@ function setupB64(str){
 }
 // Codex 的两段文本必须与 lib/codex-setup-script.mjs 的 codexTopKeysToml / codexProviderToml
 // 逐字同形（那边给一键脚本用，这边给页面与深链用）。测试里交叉断言，改一处必须改两处。
-function setupCodexTopKeys(g){
-  return 'model_provider = "ccteam"\n'+(g.defaultModel?'model = "'+g.defaultModel+'"\n':'')+'model_catalog_json = "~/.codex/models.json"\n';
+// topKeys 的第四行 openai_base_url:网关已支持 remote compact 的 WS 通道,内置通道统一
+// 指向网关(凭据由 auth.json 的虚拟 Key 提供,一键脚本会同步写入)。
+function setupCodexTopKeys(g,baseUrl){
+  return 'model_provider = "ccteam"\n'+(g.defaultModel?'model = "'+g.defaultModel+'"\n':'')+'model_catalog_json = "~/.codex/models.json"\nopenai_base_url = "'+baseUrl+'"';
 }
 function setupCodexProviderToml(h,sch,key){
   return '[model_providers.ccteam]\nname = "CC Team Gateway"\nbase_url = "'+sch+'://'+h+'/v1"\nwire_api = "responses"\nrequires_openai_auth = false\nsupports_websockets = false\nexperimental_bearer_token = "'+key+'"';
 }
 function setupCodexConfigText(g,h,sch){
-  return setupCodexTopKeys(g)+'\n'+setupCodexProviderToml(h,sch,g.key);
+  return setupCodexTopKeys(g,sch+'://'+h+'/v1')+'\n'+setupCodexProviderToml(h,sch,g.key);
 }
 // Claude Code 的 settings.json 内容。与 lib/claude-setup-script.mjs 的 claudeEnvJson 同形。
 function setupClaudeEnvJson(base,key){

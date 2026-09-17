@@ -20,6 +20,9 @@ import { sanitizeJson } from "./lib/sanitize.mjs";
 import { QUOTA_RATE_MAX, normalizeQuotaRate, normalizeCacheReadQuotaRate, normalizeModelQuotaRates, lookupModelQuotaRate, currentQuotaRate, nextRateChangeHint, QUOTA_POOL_NAME_MAX, normalizeQuotaPoolName, canonicalJson, shortDigest, applyStickyReorder, buildPoolResolver, quotaExceededMessage, quotaErrorDetail, buildQuotaCore } from "./lib/quota.mjs";
 import { CB_MAX_BACKOFF_FACTOR, CB_MAX_COOLDOWN_MS, CircuitBreaker } from "./lib/circuit.mjs";
 import { loadAssets } from "./lib/assets.mjs";
+import { wsAcceptUpgrade, wsRejectUpgrade, WsConn } from "./lib/ws-server.mjs";
+import { PassThrough } from "node:stream";
+import { EventEmitter } from "node:events";
 import { escHtml, escJs } from "./lib/html.mjs";
 import { settingsHtml, dashboardHtml, loginHtml, personalUsageLandingHtml, codexSetupHtml, personalUsageHtml } from "./lib/pages.mjs";
 import { buildCodexModelCatalog, buildCodexSetupScript, buildCodexSetupScriptWin } from "./lib/codex-setup-script.mjs";
@@ -277,6 +280,207 @@ function handleMcpPost(res, body, ctx) {
     return;
   }
   mcpRpcError(res, id, -32601, `Method not found: ${method}`);
+}
+
+// ─── Codex remote compact 的 WebSocket 通道(/v1/responses upgrade)──────────────
+// Codex 的 remote compact(会话压缩)走私有 WS 协议且只认内置通道(顶层 openai_base_url
+// + auth.json):连接建立后客户端发一帧 response.create JSON(帧体=标准 Responses 请求),
+// 服务端把它合成一次普通 POST /v1/responses 走 proxyRequest 全链路(鉴权/配额/failover/
+// 记账全部复用),再把上游 SSE 的每个 data: 事件 JSON 作为 WS 文本帧回传;连接保持复用。
+// 普通 Codex 客户端(自定义 provider)先探测 WS、404 则回落 HTTPS POST+SSE —— 所以这条
+// 通道与 HTTP 完全并存,不接 upgrade 时旧行为不变(协议情报来自 codex-proxy 的实测实现)。
+const WS_STRIP_HEADERS = new Set(["connection", "host", "upgrade", "sec-websocket-key",
+  "sec-websocket-version", "sec-websocket-extensions", "sec-websocket-protocol",
+  "content-length", "transfer-encoding"]);
+
+function wsErrorFrame(conn, type, code, message) {
+  try { conn.send(JSON.stringify({ type: "error", error: { type, code, message } })); } catch { /* 连接已死 */ }
+}
+
+// proxyRequest 的 res 替身:实现它用到的最小面(writeHead/write/end/headersSent/
+// writableEnded/statusCode + error/close/finish 事件)。SSE 字节流在这里按空行分帧、
+// 抽 data: 行转 WS 文本帧;非流式(错误 JSON / 理论上的整读整写)整体作单帧或 error 帧。
+// 「finish」事件是 proxy-core 里 attachRequestLogger 的请求日志钩子;WS 客户端断开时
+// emit "close"(writableEnded=false)触发 markClientAborted 销毁上游 —— 两条隐式链路都接上。
+class WsResponder extends EventEmitter {
+  constructor(conn) {
+    super();
+    this.conn = conn;
+    this.statusCode = 0;
+    this._headersSent = false;
+    this._writableEnded = false;
+    this._doneEmitted = false;
+    this._mode = "unknown";
+    this._sseBuf = "";
+    this._jsonChunks = [];
+    this._pendingRaw = [];
+  }
+  get headersSent() { return this._headersSent; }
+  get writableEnded() { return this._writableEnded; }
+  writeHead(status, headers) {
+    if (this._headersSent) return;
+    this.statusCode = status;
+    this._headersSent = true;
+    // 注意:proxy 对 200 流式响应一律强制 content-type: text/event-stream(见
+    // proxy-core 的 h 构造),上游回的单个 JSON 也会顶着 SSE 头 —— 所以真实路由
+    // 不看头,看内容嗅探(_route 里首个非空白字符)。这里只记录状态码。
+  }
+  write(chunk) {
+    const text = typeof chunk === "string" ? chunk : chunk.toString("utf8");
+    this._route(text);
+    return true;
+  }
+  // 内容嗅探路由:首段内容以 { 或 [ 开头 → 整包按 JSON 单帧;否则按 SSE 逐事件解析。
+  // 未定型前缓冲在 _pendingRaw,首段到达即定型并回放。
+  _route(text) {
+    if (this._mode === "unknown") {
+      this._pendingRaw.push(text);
+      const head = this._pendingRaw.join("").trimStart();
+      if (!head) return;
+      this._mode = (head[0] === "{" || head[0] === "[") ? "json" : "sse";
+      const pending = this._pendingRaw.splice(0).join("");
+      this._mode === "json" ? this._jsonChunks.push(pending) : this._feedSse(pending);
+      return;
+    }
+    if (this._mode === "json") this._jsonChunks.push(text);
+    else this._feedSse(text);
+  }
+  _feedSse(text) {
+    this._sseBuf += text;
+    let idx;
+    while ((idx = this._sseBuf.indexOf("\n\n")) >= 0) {
+      const block = this._sseBuf.slice(0, idx);
+      this._sseBuf = this._sseBuf.slice(idx + 2);
+      this._emitSseBlock(block);
+    }
+  }
+  _emitSseBlock(block) {
+    for (const line of block.split("\n")) {
+      const t = line.trim();
+      if (!t.startsWith("data:")) continue;          // event:/注释/空行不回传
+      const payload = t.slice(5).trim();
+      if (!payload || payload === "[DONE]") continue;
+      if (this.conn.closed) return;
+      this.conn.send(payload);
+    }
+  }
+  end(body) {
+    if (body !== undefined && body !== null) this.write(body);
+    if (this._writableEnded) return;
+    this._writableEnded = true;
+    if (this._mode === "unknown") {
+      // 整个响应没有任何内容:按空 JSON 处理(错误状态码仍回 error 帧)
+      this._mode = "json";
+      this._jsonChunks.push(...this._pendingRaw.splice(0));
+    }
+    if (this._mode === "sse") {
+      // 上游流可能没有以空行收尾,残留块也要回传
+      if (this._sseBuf.trim()) this._emitSseBlock(this._sseBuf);
+      if (this.statusCode >= 400) wsErrorFrame(this.conn, "server_error", "upstream_error", `upstream error ${this.statusCode}`);
+    } else {
+      const text = this._jsonChunks.join("");
+      this._sendJsonOutcome(text);
+    }
+    this.emit("finish");
+    this._done();
+  }
+  _sendJsonOutcome(text) {
+    if (this.conn.closed) return;
+    const trimmed = text.trim();
+    if (!trimmed) {
+      if (this.statusCode >= 400) wsErrorFrame(this.conn, "server_error", "upstream_error", `upstream error ${this.statusCode}`);
+      return;
+    }
+    try {
+      const parsed = JSON.parse(trimmed);
+      const errObj = parsed && typeof parsed.error === "object" && parsed.error ? parsed.error : null;
+      if (this.statusCode >= 400 || errObj) {
+        wsErrorFrame(this.conn,
+          (errObj && errObj.type) || "server_error",
+          (errObj && errObj.code) || "upstream_error",
+          (errObj && errObj.message) || trimmed.slice(0, 500));
+      } else {
+        this.conn.send(trimmed);
+      }
+    } catch {
+      wsErrorFrame(this.conn, "server_error", "upstream_error", trimmed.slice(0, 500));
+    }
+  }
+  // WS 客户端断开而请求未完成:emit close 让代理杀上游(abort 日志也由 logger 的 close 钩子落)
+  clientGone() {
+    if (!this._writableEnded) {
+      this.emit("close");
+      this._done();
+    }
+  }
+  _done() { if (!this._doneEmitted) { this._doneEmitted = true; this.emit("done"); } }
+}
+
+// 一帧 response.create → 合成 POST 喂 proxyRequest。一条连接同时只跑一帧(协议约定)。
+function dispatchWsFrame(conn, upReq, pathname, frameText) {
+  if (conn._busy) {
+    wsErrorFrame(conn, "server_error", "connection_busy", "A response.create is already in progress on this connection");
+    return;
+  }
+  conn._busy = true;
+  const release = () => { conn._busy = false; };
+  let bodyObj;
+  try {
+    bodyObj = JSON.parse(frameText);
+  } catch {
+    release();
+    wsErrorFrame(conn, "invalid_request_error", "invalid_json", "帧不是合法 JSON");
+    return;
+  }
+  // 真实帧形状(经 codex 0.145 真机抓帧确认):顶层 {"type":"response.create","model":…,
+  // "input":…,"tools":…} —— 平铺的 Responses 请求体加一个 type 标记;个别版本可能嵌套
+  // 在 response:{…} 里。两种都剥掉协议包装(type 字段不能透传上游),拿到纯请求体。
+  if (bodyObj && typeof bodyObj === "object" && !Array.isArray(bodyObj) && bodyObj.type === "response.create") {
+    bodyObj = (bodyObj.response && typeof bodyObj.response === "object") ? bodyObj.response : { ...bodyObj };
+    delete bodyObj.type;
+  }
+  if (bodyObj && typeof bodyObj === "object" && !Array.isArray(bodyObj)) bodyObj = { ...bodyObj, stream: true };
+  const headers = { "content-type": "application/json", accept: "text/event-stream" };
+  for (const [k, v] of Object.entries(upReq.headers)) {
+    if (typeof v === "string" && !WS_STRIP_HEADERS.has(k)) headers[k] = v;
+  }
+  headers.authorization = "Bearer " + (conn._apiKey || "");
+  const mockReq = new PassThrough();
+  mockReq.method = "POST";
+  mockReq.url = pathname;                    // ?key= 已剥,不会再透传给上游
+  mockReq.headers = headers;
+  mockReq.socket = { remoteAddress: upReq.socket.remoteAddress };   // getClientIp 的兜底读点
+  const responder = new WsResponder(conn);
+  responder.once("done", release);
+  conn.once("close", () => responder.clientGone());
+  proxyCoreApi.proxyRequest(mockReq, responder);
+  mockReq.end(Buffer.from(JSON.stringify(bodyObj), "utf8"));
+}
+
+function handleResponsesWsUpgrade(req, socket, head) {
+  let pathname = "", queryKey = "";
+  try {
+    const u = new URL(req.url || "/", "http://localhost");
+    pathname = u.pathname;
+    queryKey = u.searchParams.get("key") || "";
+  } catch { socket.destroy(); return; }
+  // 只接 responses 入口(默认与带方案后缀两种);其余 upgrade 一律断开,不与未来可能的
+  // 其他 WS 用途抢连接。方案合法性交给 proxyRequest 内部再校一遍。
+  if (!/^\/(?:[a-zA-Z0-9_-]{2,20}\/)?v1\/responses\/?$/.test(pathname)) { socket.destroy(); return; }
+  // 握手鉴权:Authorization/x-api-key 优先;?key= 兜底(浏览器式 WS 客户端设不了自定义头)。
+  // 认证用哪个 key,合成请求就带哪个 —— 不透传 upgrade 头里可能过期的原值。
+  const headerKey = getApiKey(req);
+  const apiKey = (headerKey && headerKey !== "unknown") ? headerKey : queryKey;
+  if (!getAccessibleProfiles(apiKey).length) {
+    const known = hasGlobalUser(apiKey);
+    wsRejectUpgrade(socket, known ? 403 : 401, known ? "User is not allowed to view any profile." : "认证失败：请提供有效的虚拟Key (Authorization: Bearer jx-... 或 ?key=jx-...)");
+    return;
+  }
+  if (!wsAcceptUpgrade(req, socket)) { socket.destroy(); return; }
+  const conn = new WsConn(socket);
+  conn._apiKey = apiKey;
+  if (head && head.length) conn._feed(head);
+  conn.on("text", (frame) => { try { dispatchWsFrame(conn, req, pathname, frame); } catch (err) { wsErrorFrame(conn, "server_error", "internal_error", err.message); } });
 }
 
 // 「方案代码」——把一套方案的配置搬到别的环境时用的可粘贴 JSON。格式标记和版本
@@ -5593,6 +5797,10 @@ server.listen(port, "0.0.0.0", () => {
   console.log(`[团队AI Coding监控] Users: ${Object.values(rt?.globalUsers || {}).map(u => u.username || "").join(", ")}`);
   toolPatternApi.scheduleToolPatternProbes();
 });
+
+// Codex remote compact 的 WebSocket 通道:只接 /v1/responses(含方案后缀)的 upgrade,
+// 其余路径一律断开。协议与实现见 handleResponsesWsUpgrade 上方注释。
+server.on("upgrade", handleResponsesWsUpgrade);
 
 // Server timeouts
 const serverTimeout = Math.max(gProxy.streamTimeout, gProxy.timeout) + 60000;

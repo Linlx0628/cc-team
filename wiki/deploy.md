@@ -63,6 +63,20 @@ node server.mjs
 
 `GET /health` 返回服务状态与各方案熔断状态的 JSON，适合接监控探针。
 
+## 反向代理注意（WebSocket 透传）
+
+Codex 的 remote compact 走 WebSocket（`wss://…/v1/responses`）。若网关前面有 nginx 等反向代理，必须为该路径透传 upgrade 头，否则 compact 会报 404：
+
+```nginx
+location /v1/responses {
+    proxy_pass http://127.0.0.1:6789;
+    proxy_http_version 1.1;
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection "upgrade";
+    proxy_read_timeout 3600s;   # 压缩是长连接,给足读超时
+}
+```
+
 ## 升级与维护
 
 - **升级**：拉新代码后按原部署方式重启；启动时自动做数据库结构迁移（迁移前备份）

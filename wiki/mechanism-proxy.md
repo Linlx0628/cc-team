@@ -153,6 +153,20 @@ HALF_OPEN ─ 探测失败 → 冷却翻倍后继续 OPEN
 
 **下次切换时刻**的算法：扫描未来 8 天内所有规则的起止分钟 + 每天零点，取最早的「生效组名真正改变」的时刻——这就是调度视图里「下次切换时刻」和手动指定到期时间的来源。
 
+## WebSocket 通道（Codex remote compact）
+
+remote compact（会话压缩）是 Codex 的私有服务端压缩协议：客户端对 `wire_api="responses"` 的通道先探测 **WS upgrade**（GET + `Upgrade: websocket`），404 则回落 HTTPS POST+SSE——所以 WS 与 HTTP 并存，互不影响。网关在 `/v1/responses`（含方案后缀路径）上接住 upgrade：
+
+- **鉴权在握手时**：`Authorization: Bearer` / `x-api-key`（也支持 `?key=` 查询参数，给设不了自定义头的 WS 客户端），拒绝时向 socket 写普通 HTTP 401/403 后断开
+- **一帧一请求**：连接建立后等客户端发一帧 `response.create` JSON（帧体 = 标准 Responses 请求），合成一次**普通 POST** 走完整代理链路——鉴权、配额、failover、用量记账全部复用；一条连接同时只跑一帧（忙则回 `connection_busy` 错误帧）
+- **事件回传**：上游 SSE 的每个 `data:` 事件 JSON 作为 WS 文本帧逐个回传（`event:` 行/空行/`[DONE]` 不传）；错误统一归一化为 `{type:"error",error:{…}}` 帧
+- **断开即取消**：WS 客户端断开而请求未完成时，代理的客户端中断路径（markClientAborted）会销毁上游请求
+- **帧格式（经 codex CLI 0.145 真机抓帧验证）**：客户端帧为顶层 `{"type":"response.create","model":…,"input":…,"tools":…}`——**平铺**的 Responses 请求体加一个 `type` 标记（非嵌套 `response:{}`）；网关剥掉 `type` 后按普通请求转发。服务端回帧 = 每个 SSE `data:` 事件的 JSON 原文
+- **连接复用**：codex 在同一 WS 连接上用 `previous_response_id` 续会话多轮；打开连接时会先发一个 `input:[]` 的 warmup 空请求
+- **通道选择**：provider 声明 `supports_websockets = false` 时 codex 全程走 HTTP（含 compact）；声明 `true`（或内置通道未声明）时对话与 compact 都走 WS。本网关生成的 ccteam provider 模板保持 `false`（主对话走 HTTP 更成熟），WS 通道服务内置通道的 compact
+- compact 的**响应语义由上游负责**：网关只做传输与标准 Responses 转发；上游若不支持 Codex 的压缩响应约定，compact 结果可能被 codex 判为无效而重试
+- 传输层是手写的最小 RFC6455 实现（`lib/ws-server.mjs`，纯 text 帧、无压缩），零新依赖；握手已被真实 codex 客户端验证（sec-websocket-accept 计算正确）
+
 ## 相关页面
 
 - [方案组调度](schedule.md) — 调度功能的操作入口

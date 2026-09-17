@@ -37,6 +37,20 @@
 - Anthropic 协议：**缓存读与缓存写都不计入**（上游单独上报缓存读，配额基数本身就是缓存外口径）
 - OpenAI（Codex）协议：缓存命中默认从配额基数**剥离不计**（上游把它折在 input 里，系统先剥离再记账）；`cacheReadQuotaRate` 可选择按比例计回（0~1，默认 0 = 全免）
 
+## Codex 报「remote compact task」403 / 404 / wss 错误？
+
+remote compact（会话压缩）是 Codex 的**私有服务端压缩协议，走 WebSocket 连 `/v1/responses`**，且只认 Codex 的**内置通道**（顶层 `openai_base_url` + `~/.codex/auth.json` 的凭据），不看你配置的 `model_providers.ccteam`。**网关已支持该 WS 通道**，配好内置通道后压缩也走网关（token 进配额与统计）。
+
+历史上这类报错的成因与排查：
+
+| 报错 | 原因 |
+|---|---|
+| `403 Unknown API key` | 内置通道指向了网关，但 auth.json 里的 key 不是本网关的虚拟 Key |
+| `404 unsupported_endpoint`（url 是 `wss://…`） | 网关版本过旧、不支持 WS upgrade；或反向代理没透传 `Upgrade`/`Connection` 头 |
+| `401 Incorrect API key … api.openai.com` | 内置通道留在官方地址，但 auth.json 放的是虚拟 Key（官方当然不认） |
+
+**修法**：重新跑一遍「配置 Codex」的一键脚本——它会把顶层 `openai_base_url` 指向网关、并把 auth.json 的 `OPENAI_API_KEY` 写成你的虚拟 Key（原内容自动备份）。自建反向代理的参见[部署与运维](deploy.md)的 upgrade 透传说明。
+
 ## 为什么我的会话切换了方案？
 
 正常情况下**粘性会话**会把同一会话粘在同一方案上（优先级：`session_id` 头 → `prompt_cache_key` → 首轮内容摘要）。会话被切换通常是：粘住的方案限流/熔断了（failover 走了别的方案），或组头变更后回切。粘性绑定只指向组头位置，组头恢复自然回切。

@@ -30,6 +30,8 @@
 - **Claude Code**：`~/.claude/settings.json` 的 `env` 片段（`ANTHROPIC_BASE_URL` 指向网关、`ANTHROPIC_AUTH_TOKEN` 填虚拟 Key、模型名用网关别名），配置页同时列出该方案可用的模型别名
 - **Codex**：`config.toml` + `models.json`，同样以虚拟 Key 鉴权、模型名用别名
 
+> Codex 用户：remote compact（会话压缩）走 Codex 内置通道的私有 WebSocket 协议，**网关已原生支持**——一键脚本会把顶层 `openai_base_url` 指向网关并同步 `auth.json` 的虚拟 Key，压缩的 token 也进配额与统计。报 403/404/wss 错误时的排查表见 [FAQ](faq.md#codex-报remote-compact-task403--404--wss-错误)。
+
 > 提示：Claude Code 对 `settings.json` 里 `env` 的 `ANTHROPIC_BASE_URL` 是认的；如果发现不生效，检查是否有其他配置层（如 `--settings` 参数）覆盖了它。
 
 ## 方式三：cc-switch 一键导入

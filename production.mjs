@@ -296,15 +296,30 @@ export function rangeFromTo(range) {
 // 文件工具谓词从 FILE_TOOLS 派生——与落库侧单一口径,防漂移
 const FILE_SQL = "tool IN (" + FILE_TOOLS.map(t => `'${t}'`).join(",") + ")";
 
+// 「文档类」扩展名:写这些文件不算代码产出(代码行数/代码质量/效率比口径)。
+// 列表刻意收窄,只收纯文档载体 —— .json/.yml 等配置与数据的边界模糊(锁文件、
+// 工程配置都是真实工作量),首版不动。extOf 落库时已统一小写,这里不用再处理大小写。
+export const DOC_EXTS = [".md", ".markdown", ".txt", ".rst", ".adoc"];
+const DOC_EXTS_SQL = "(" + DOC_EXTS.map(e => `'${e}'`).join(",") + ")";
+
+// 代码口径 = 文件工具 且 非文档扩展名。与 FILE_SQL 的分工:
+//   · CODE_FILE_SQL —— 产出/排名口径(productionSummary、sessionToolStats):衡量「写了多少代码」
+//   · FILE_SQL     —— 活动口径(告警扫描):idle_burn/error_loop 判的是「是否在推进」,
+//                     写文档同样是推进,换口径会把纯文档作者误报成空转/循环
+// 两个常量并存是有意为之,别顺手统一。
+// ext IS NULL 按代码计:文件类事件 ext 为空的只有 Dockerfile/Makefile 这类无扩展名
+// 源文件,排除它们等于漏掉最典型的「改工程文件」;storePaths=false 不影响 ext 落库。
+const CODE_FILE_SQL = `(${FILE_SQL} AND (ext IS NULL OR ext NOT IN ${DOC_EXTS_SQL}))`;
+
 export function productionSummary(db, { from, to }) {
   const rows = db.prepare(`
     SELECT user_key, MAX(COALESCE(NULLIF(user_name,''), user_key)) AS user_name,
       COUNT(*) AS tool_calls,
-      SUM(CASE WHEN ${FILE_SQL} THEN 1 ELSE 0 END) AS edit_count,
-      SUM(CASE WHEN ${FILE_SQL} THEN lines_add ELSE 0 END) AS lines_add,
-      SUM(CASE WHEN ${FILE_SQL} THEN lines_del ELSE 0 END) AS lines_del,
-      COUNT(DISTINCT CASE WHEN ${FILE_SQL} THEN file_path END) AS files,
-      SUM(CASE WHEN ${FILE_SQL} AND outcome='error' THEN 1 ELSE 0 END) AS edit_errors,
+      SUM(CASE WHEN ${CODE_FILE_SQL} THEN 1 ELSE 0 END) AS edit_count,
+      SUM(CASE WHEN ${CODE_FILE_SQL} THEN lines_add ELSE 0 END) AS lines_add,
+      SUM(CASE WHEN ${CODE_FILE_SQL} THEN lines_del ELSE 0 END) AS lines_del,
+      COUNT(DISTINCT CASE WHEN ${CODE_FILE_SQL} THEN file_path END) AS files,
+      SUM(CASE WHEN ${CODE_FILE_SQL} AND outcome='error' THEN 1 ELSE 0 END) AS edit_errors,
       SUM(CASE WHEN cmd_class IN ('test','lint') THEN 1 ELSE 0 END) AS verify_runs
     FROM tool_events WHERE date(time,'+8 hours') BETWEEN ? AND ?
     GROUP BY user_key ORDER BY lines_add DESC`).all(from, to);
@@ -442,10 +457,13 @@ function singleFileLabel(fp) {
 // —— 那些手工建表的既有测试因此不受影响。
 export function clusterSessions(db, { from, to, userKey } = {}) {
   // 会话为归组单位:同会话文件集合共同推导项目;session NULL 归 '' 桶。权重 = Σ(lines_add+lines_del)
+  // 用代码口径(CODE_FILE_SQL):项目分布是「产出」指标,文档行不与代码混算;
+  // 文档的行权重同时影响簇的推导,剔除后标签归属只按代码文件算。
   const stmt = db.prepare(`
     SELECT session, file_path, user_key,
       SUM(lines_add) AS la, SUM(lines_del) AS ld, COUNT(*) AS edits
-    FROM tool_events WHERE ${userKey ? "user_key=? AND " : ""}date(time,'+8 hours') BETWEEN ? AND ? AND file_path IS NOT NULL
+    FROM tool_events WHERE ${userKey ? "user_key=? AND " : ""}date(time,'+8 hours') BETWEEN ? AND ?
+      AND file_path IS NOT NULL AND ${CODE_FILE_SQL}
     GROUP BY session, file_path, user_key`);
   const rows = userKey ? stmt.all(userKey, from, to) : stmt.all(from, to);
   // 键是 (user_key, session) 而不是 session:正常部署里会话标识是客户端发的 UUID,
@@ -540,16 +558,16 @@ export function productionUserDetail(db, userKey, { from, to }) {
 }
 
 // —— Task 7: 告警查询/已读/90 天清理(API 任务消费)——
-// 会话 → 工具行为。与 productionSummary 同口径(同一个 FILE_SQL、同一个时间窗口),
+// 会话 → 工具行为。与 productionSummary 同口径(同一个 CODE_FILE_SQL、同一个时间窗口),
 // 差别只是分组键。usage_session 那边给出「烧了多少 token」,这边给出「做了什么」,
 // 两侧按 session 连接 —— extractSessionSignal 是同一个来源,键天然一致。
 export function sessionToolStats(db, { from, to, userKey } = {}) {
   const stmt = db.prepare(`
     SELECT user_key, session, COUNT(*) AS tool_calls,
-      SUM(CASE WHEN ${FILE_SQL} THEN 1 ELSE 0 END) AS edits,
-      SUM(CASE WHEN ${FILE_SQL} THEN lines_add ELSE 0 END) AS lines_add,
-      SUM(CASE WHEN ${FILE_SQL} THEN lines_del ELSE 0 END) AS lines_del,
-      COUNT(DISTINCT CASE WHEN ${FILE_SQL} THEN file_path END) AS files,
+      SUM(CASE WHEN ${CODE_FILE_SQL} THEN 1 ELSE 0 END) AS edits,
+      SUM(CASE WHEN ${CODE_FILE_SQL} THEN lines_add ELSE 0 END) AS lines_add,
+      SUM(CASE WHEN ${CODE_FILE_SQL} THEN lines_del ELSE 0 END) AS lines_del,
+      COUNT(DISTINCT CASE WHEN ${CODE_FILE_SQL} THEN file_path END) AS files,
       SUM(CASE WHEN outcome='error' THEN 1 ELSE 0 END) AS errors,
       MIN(time) AS first_time, MAX(time) AS last_time
     FROM tool_events WHERE ${userKey ? "user_key=? AND " : ""}date(time,'+8 hours') BETWEEN ? AND ?

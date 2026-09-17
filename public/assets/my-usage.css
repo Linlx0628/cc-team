@@ -164,6 +164,8 @@ table{width:100%;border-collapse:collapse;min-width:560px}th{text-align:left;pad
 .lb-note:empty{display:none}
 .lb-hint{display:block;font-size:11px;color:var(--dim);line-height:1.6}
 .lb-flag{display:block;font-size:11px;color:var(--orange);line-height:1.6;margin-top:3px}
+/* 行内「样本不足」小标:与 .tag 同尺度,橙色示警但不喧宾夺主 */
+.lb-low{font-size:10px;color:var(--orange);background:color-mix(in srgb,var(--orange) 10%,transparent);border-radius:4px;padding:1px 5px;margin-left:6px;vertical-align:1px;white-space:nowrap}
 .lb-cohort{font-size:11px;color:var(--dim);margin-bottom:9px}
 .lb-cohort b{color:var(--text);font-weight:650;font-variant-numeric:tabular-nums}
 .lb-list{display:flex;flex-direction:column;gap:6px}

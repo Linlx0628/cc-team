@@ -708,6 +708,15 @@ function lbValueHtml(cls,v,unit){
     +(has?'<b>'+fmtLbVal(v)+'</b><span>'+esc(unit||'')+'</span>':'<b>无数据</b>')
     +'</div>';
 }
+// 「样本不足」行内标。服务端已把不达标者排到达标者之后(low_sample),
+// 这里只负责把原因讲清:有值的是「有观测但样本不够」;没值还标 low_sample 的是
+// 质量分特例 —— 编辑过但不足门槛次数,不参与归一化,所以是「不评分」而非「无数据」。
+function lbLowHtml(r,d){
+  if(!r.low_sample)return'';
+  if(r.value!=null)return' · <span class="lb-low">样本不足</span>';
+  const ms=d.minSample||{};
+  return' · <span class="lb-low">编辑 '+fmtT(r.detail.edit_count||0)+' 次,不足 '+(ms.min||0)+' 次不评分</span>';
+}
 function renderLbSegs(){
   const dimBox=document.getElementById('lbDim');
   if(dimBox){
@@ -737,13 +746,14 @@ function renderLeaderboard(){
   if(note)note.innerHTML=(d.hint?'<span class="lb-hint">'+esc(d.hint)+'</span>':'')+(d.note?'<span class="lb-flag">'+esc(d.note)+'</span>':'');
   const rows=d.rows||[],c=d.cohort||{};
   if(!rows.length){board.innerHTML='<div class="lb-msg">本期还没有人产生用量</div>';return}
-  // 领奖台只在「够格」时才出现:排满三个人,而且三个人都有真实数字。
+  // 领奖台只在「够格」时才出现:排满三个人,而且三个人都有真实数字、都过了样本门槛。
   // 榜单常常只有一两行(lib/leaderboard.mjs 那边写着「那不是故障而是实情」),一行时立起
   // 一座戴皇冠的金卡,是把微不足道的「赢」渲染成一场比赛;两行时第 2 名会站到第 1 名左边、
-  // 第 3 个位置空着,像布局坏了。null 恒排末尾,所以前三名里出现 null 恰恰说明有数字的人
-  // 不足三个 —— 那也不该有领奖台。这两种情形整张榜退回原来的列表行,名次圆牌照旧上色。
+  // 第 3 个位置空着,像布局坏了。null 与样本不足者恒排达标者之后,所以前三名里出现他们
+  // 恰恰说明达标的人不足三个 —— 那也不该有领奖台。这两种情形整张榜退回原来的列表行,
+  // 名次圆牌照旧上色。
   const top=rows.slice(0,3);
-  const podium=rows.length>=3&&top.every(function(r){return r.value!=null});
+  const podium=rows.length>=3&&top.every(function(r){return r.value!=null&&!r.low_sample});
   const listed=podium?rows.slice(3):rows;
   let body='';
   if(podium){
@@ -754,7 +764,7 @@ function renderLeaderboard(){
         +(r.rank===1?LB_CROWN:'')
         +'<div class="lb-pod-rank">'+r.rank+'</div>'
         +'<div class="lb-pod-name"><span class="lb-pod-nm">'+esc(r.user_name)+'</span>'+(r.isMe?'<span class="tag">我</span>':'')+'</div>'
-        +'<div class="lb-pod-det">活跃 '+r.detail.active_days+' 天 · '+fmtT(r.detail.requests)+' 次请求'+(r.detail.has_edit?'':' · 无代码产出')+'</div>'
+        +'<div class="lb-pod-det">活跃 '+r.detail.active_days+' 天 · '+fmtT(r.detail.requests)+' 次请求'+(r.detail.has_edit?'':' · 无代码产出')+lbLowHtml(r,d)+'</div>'
         +lbValueHtml('lb-pod-value',r.value,d.unit)
         +'</div>';
     }).join('')+'</div>';
@@ -765,16 +775,21 @@ function renderLeaderboard(){
       return '<div class="lb-row'+(r.isMe?' me':'')+(r.rank<=3?' r'+r.rank:'')+'">'
         +'<span class="lb-rank">'+r.rank+'</span>'
         +'<div class="lb-who"><div class="lb-name">'+esc(r.user_name)+(r.isMe?' <span class="tag">我</span>':'')+'</div>'
-        +'<div class="lb-det">'+esc(r.user_key)+' · 活跃 '+r.detail.active_days+' 天 · '+fmtT(r.detail.requests)+' 次请求'+(r.detail.has_edit?'':' · 无代码产出')+'</div></div>'
+        +'<div class="lb-det">'+esc(r.user_key)+' · 活跃 '+r.detail.active_days+' 天 · '+fmtT(r.detail.requests)+' 次请求'+(r.detail.has_edit?'':' · 无代码产出')+lbLowHtml(r,d)+'</div></div>'
         +lbValueHtml('lb-val',r.value,d.unit)
         +'</div>';
     }).join('')+'</div>';
   }
   // 榜单常常只有一行(窗口内只有一个人在跑),那不是故障而是实情。cohort 那行把
   // 「本期 N 人活跃 · 共 M 人」摆出来,界面才说得出榜单为什么这么短。
+  // 有样本门槛的维度补一句达标人数;全员不达标时「按原始数值排序」的完整解释由
+  // note 行承担(服务端下发),这里不重复一遍。
   // 一次写进去:拆成两次 += 会重新解析整个 innerHTML,把刚建好的领奖台节点连同
   // 已经挂上的动效一起重建一遍。
-  board.innerHTML='<div class="lb-cohort">本期 <b>'+(c.active||0)+'</b> 人活跃 · 共 '+(c.total||0)+' 人 · 按「'+esc(d.dimensionLabel||'')+'」'+(d.direction==='asc'?'由低到高':'由高到低')+'排序'+(d.me?'':' · 你本期无数据')+'</div>'+body;
+  board.innerHTML='<div class="lb-cohort">本期 <b>'+(c.active||0)+'</b> 人活跃'
+    +(d.minSample?' · <b>'+(c.qualified||0)+'</b> 人达标':'')
+    +' · 共 '+(c.total||0)+' 人 · 按「'+esc(d.dimensionLabel||'')+'」'+(d.direction==='asc'?'由低到高':'由高到低')+'排序'
+    +(d.me?'':' · 你本期无数据')+'</div>'+body;
 }
 async function fetchLeaderboard(){
   if(LB.loading)return;

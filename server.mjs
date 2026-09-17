@@ -1420,6 +1420,19 @@ function checkAndRecordRate(key) {
   return true;
 }
 
+// ─── Per-profile in-flight counter(方案中心「使用状态」的数据源)────────────────
+// key 是 profile suffix —— users.profile / runtimes / stats 表全按 suffix 口径,
+// 方案改名也不受影响。计数在 proxy-core 的候选尝试作用域里 acquire/release。
+// Node 单线程,普通对象即可;重启自然清零,由 users.last_active 的 5 分钟窗口兜底。
+const profileInflight = {};
+function acquireProfileInflight(sfx) { profileInflight[sfx] = (profileInflight[sfx] || 0) + 1; }
+function releaseProfileInflight(sfx) {
+  // 归零即 delete:已删除方案的残留键不会在计数快照里堆积
+  if ((profileInflight[sfx] || 0) <= 1) delete profileInflight[sfx];
+  else profileInflight[sfx]--;
+}
+function getProfileInflight() { return { ...profileInflight }; }   // 快照,防读期间被改
+
 // ─── Global IP Rate Limiting ─────────────────────────────────────────────────
 const ipRateBucket = {};
 const IP_RATE_LIMIT = 120; // requests per minute per IP
@@ -3113,6 +3126,7 @@ const STATS_DEPS = {
   getProfileModelAliases,
   sanitizeStore,
   getRateLimitInfo,
+  getProfileInflight,
   canUseProfile,
   checkTokenQuota,
   listProfiles,
@@ -3244,6 +3258,7 @@ const sessionsApi = createSessionsReader(SESSIONS_DEPS);
 // 让 lib 在调用时读取当前值, 而非解构成快照。
 const PROXY_CORE_DEPS = {
   RateLimitedError,
+  acquireProfileInflight,
   applyStickyReorder,
   attachRequestLogger,
   borrowProfileRealKey,
@@ -3262,6 +3277,7 @@ const PROXY_CORE_DEPS = {
   getAvailableDefaultProfiles,
   getAvailableResponsesProfiles,
   getClientIp,
+  getProfileInflight,
   getRealKey,
   getStickyProfile,
   getUserName,
@@ -3284,6 +3300,7 @@ const PROXY_CORE_DEPS = {
   recordError,
   recordUsage,
   releaseConcurrency,
+  releaseProfileInflight,
   resolveModel,
   resolveProfile,
   resolveResponsesProfile,

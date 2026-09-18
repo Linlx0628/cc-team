@@ -1289,14 +1289,9 @@ function initAllRuntimes() {
   }
   console.log(`[RUNTIME] Initialized ${Object.keys(runtimes).length} profile(s): ${Object.values(runtimes).map(r => `"${r.profileName}"(${JSON.stringify(r.suffix)})`).join(", ")}`);
 }
-// 命中率计算要区分协议:Responses/Codex 的 input_tokens 含缓存读,Anthropic 不含。
-// 给 contextHealth 传「将其 input_tokens 视为含缓存的 profile 后缀集合」。
-// runtimes 的 key 与 usage_daily.profile 同用 normalizeProfileSuffix 规约,可直接比对。
-function responsesProfileSet() {
-  const s = new Set();
-  for (const [suffix, runtime] of Object.entries(runtimes)) if (runtime?.protocol === "responses") s.add(suffix);
-  return s;
-}
+// usage 存储口径已对齐(2026-09-18):所有协议的 input_tokens 都不含缓存读,
+// contextHealth / sessions 的缓存率公式不再需要按协议修正分母。
+// (旧的 responsesProfileSet 注入已随协议修正一起移除。)
 
 function reloadProfileRuntime(profileName) {
   const profile = config.profiles[profileName];
@@ -2495,22 +2490,20 @@ function recordUsage(apiKey, usage, model, suffix, _rt, session, client) {
   // the rate comes from the completion instant (same convention as cnHalfHour()
   // above), so a request spanning a peak boundary is priced by where it finished.
   const rate = currentQuotaRate(runtime, new Date(), m);
-  // Cache-hit accounting, aligned to the Anthropic protocol. Anthropic upstreams
-  // report cache reads SEPARATELY and never inside input_tokens, so their quota
-  // basis is already cache-free. Responses/OpenAI upstreams fold the cache-hit
-  // slice INTO input_tokens — before this, a Codex replay loop paid full price
-  // for ~95% cache hits on every turn. Strip that slice from the quota basis
-  // (mirroring Anthropic) unless the profile opts back in via cacheReadQuotaRate
-  // (>0 keeps a fraction billable). inp/cacheC/cacheR/out are still stored raw,
-  // so stats/trends show true tokens; only the quota currency (weighted) changes.
-  // Guard: strip only when cacheR is a positive subset of inp — an upstream that
-  // already returns cache-excluded input (cacheR > inp) is treated as aligned.
-  const includedCache = (runtime?.protocol === "responses" && cacheR > 0 && cacheR <= inp) ? cacheR : 0;
+  // 存储口径对齐(2026-09-18):Anthropic 上游单独上报缓存读,input_tokens 天然不含缓存;
+  // Responses/OpenAI 上游把缓存 slice 折叠进 input_tokens。落库前把这一 slice 剥掉,
+  // 两种协议的 input_tokens 从此同义(= 新鲜输入),缓存只进 cache_read 列 —— 所有
+  // 展示汇总(卡片/图表/排行榜/等值成本)无需任何协议知识即可跨协议比较,也不再
+  // 双重计数。历史数据由 initDb 的一次性迁移对齐(kv_meta: migrate:usage-input-align)。
+  // 配额(weighted)语义不变:cacheReadQuotaRate 仍决定缓存 slice 计入配额的比例。
+  // 守卫:cacheR > inp 视为上游已自行对齐,不动。
+  const cacheInInput = (runtime?.protocol === "responses" && cacheR > 0 && cacheR <= inp) ? cacheR : 0;
+  const storeInp = inp - cacheInInput;
   const cacheReadQuotaRate = runtime?.cacheReadQuotaRate ?? 0;
-  const billableInp = inp - includedCache + Math.round(includedCache * cacheReadQuotaRate);
+  const billableInp = storeInp + Math.round(cacheInInput * cacheReadQuotaRate);
   const weighted = Math.round((billableInp + out) * rate);
 
-  const p = { profile: sfx, key, name: getUserName(key, runtime), inp, out, cacheC, cacheR, m, tokenTotal: inp + out, weighted, today, hour, now: new Date().toISOString() };
+  const p = { profile: sfx, key, name: getUserName(key, runtime), inp: storeInp, out, cacheC, cacheR, m, tokenTotal: storeInp + out, weighted, today, hour, now: new Date().toISOString() };
   const tx = db.transaction(() => {
     stmts.upsertUser.run(p);
     stmts.upsertDaily.run(p);
@@ -3229,7 +3222,6 @@ const usageApi = createUsageReader(USAGE_DEPS);
 const LEADERBOARD_DEPS = {
   cnDate,
   cnWeekStartDate,
-  responsesProfileSet,
   knownUserKeys,
   productionSummary,
   contextHealth,
@@ -3239,9 +3231,8 @@ const LEADERBOARD_DEPS = {
 const leaderboardApi = createLeaderboardReader(LEADERBOARD_DEPS);
 
 // 会话使用情况(lib/sessions.mjs)。同 LEADERBOARD_DEPS 的规矩:db/stmts 用 getter。
-// 项目标签与工具聚合都注入 production.mjs 的导出函数 —— 路径解析、协议修正各只应有一处实现。
+// 项目标签与工具聚合都注入 production.mjs 的导出函数 —— 路径解析各只应有一处实现。
 const SESSIONS_DEPS = {
-  responsesProfileSet,
   sessionProjectLabels,
   sessionToolStats,
   productionProjects,
@@ -4901,7 +4892,7 @@ const server = http.createServer((req, res) => {
     try {
       const { from, to } = rangeFromTo(new URL(req.url, "http://localhost").searchParams.get("range") || "7d");
       const s = productionSummary(db, { from, to });
-      s.health = contextHealth(db, { from, to, responsesProfiles: responsesProfileSet() });
+      s.health = contextHealth(db, { from, to });
       s.range = { from, to };
       // 未读告警按 user 计数(初始 0 再累计 seen=0),供工作区表格末列展示
       s.alertCounts = Object.fromEntries(s.rows.map(r => [r.user_key, 0]));
@@ -5027,7 +5018,7 @@ const server = http.createServer((req, res) => {
         summary: productionSummary(db, { from, to }),
         projects: productionProjects(db, { from, to }),
         costs: computeCosts(db, config.costRates || DEFAULT_COST_RATES, { from, to, profilePeakHours: profilePeakHoursMap() }),
-        health: contextHealth(db, { from, to, responsesProfiles: responsesProfileSet() }),
+        health: contextHealth(db, { from, to }),
         alerts: productionAlerts(db, { from, to }),
         from, to,
       });
@@ -5576,7 +5567,7 @@ const server = http.createServer((req, res) => {
       const { from, to } = rangeFromTo(new URL(req.url, "http://localhost").searchParams.get("range") || "7d");
       const key = resolveUserKey(apiKey, rt);
       const detail = productionUserDetail(db, key, { from, to });
-      const health = contextHealth(db, { from, to, responsesProfiles: responsesProfileSet() }).find(h => h.user_key === key) || null;
+      const health = contextHealth(db, { from, to }).find(h => h.user_key === key) || null;
       res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
       res.end(JSON.stringify({ ...detail, health }));
     } catch (err) {

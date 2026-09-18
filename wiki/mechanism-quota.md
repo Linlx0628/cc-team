@@ -43,13 +43,10 @@ used      = 当日计权用量(weighted_tokens 求和) − 当日重置基线
 ```text
 rate = 当前倍率（峰谷判定 + 模型单独定价，见下节）
 
-# Anthropic 协议
-billableInput = input_tokens
-weighted      = round((billableInput + output_tokens) × rate)
-
-# OpenAI Responses 协议（缓存命中折叠在 input 里，先剥离）
-includedCache = cache_read（仅当 0 < cache_read ≤ input_tokens 时剥离）
-billableInput = input_tokens − includedCache + round(includedCache × cacheReadQuotaRate)
+# 两种协议同一公式 —— 存储口径已对齐（2026-09-18 起）
+# 落库的 input_tokens 一律 = 新鲜输入（Responses 上游折叠在 input 里的缓存
+# 命中在 recordUsage 落库前剥掉，缓存只进 cache_read 列；历史数据一次性迁移）
+billableInput = input_tokens + round(cache_read × cacheReadQuotaRate)   # 仅 Responses 方案 cache_read 参与
 weighted      = round((billableInput + output_tokens) × rate)
 ```
 
@@ -57,13 +54,13 @@ weighted      = round((billableInput + output_tokens) × rate)
 
 | 类型 | 计入配额基数？ | 说明 |
 |---|---|---|
-| input_tokens | ✅ 全额 | Anthropic 上游的 input **天然不含**缓存命中（缓存读单独上报） |
+| input_tokens | ✅ 全额 | **各协议均为新鲜输入**（Responses 的缓存命中已剥出，见上） |
 | output_tokens | ✅ 全额 | |
 | **cache_creation（缓存写入）** | ❌ **不计入** | 只落库存档、进报表，不参与计权 |
-| cache_read（Anthropic） | ❌ **不计入** | 上游单独报字段，配额基数本身就是缓存外口径 |
-| cache_read（Responses/OpenAI） | 默认剥离不计 | 上游把命中折在 input 里，先剥离（镜像 Anthropic 口径）；`cacheReadQuotaRate` 决定剥离后按多少比例计回 |
+| cache_read（Anthropic） | ❌ **不计入** | 上游单独报字段，天然在配额基数之外 |
+| cache_read（Responses/OpenAI） | 默认不计 | 存储对齐后已不在 input 里；`cacheReadQuotaRate` 决定按多少比例计回 |
 
-`cacheReadQuotaRate`（仅 Responses 协议方案有意义）：**默认 0 = 缓存命中完全免费**；0~1 部分计入；1 = 全额计费（旧口径）。守卫：仅当 `0 < cache_read ≤ input_tokens` 时才剥离——上游返回的缓存读大于 input（说明已排除过缓存）时视为口径已对齐，不再处理。
+`cacheReadQuotaRate`（仅 Responses 协议方案有意义）：**默认 0 = 缓存命中完全免费**；0~1 部分计入；1 = 全额计费（旧口径）。守卫：仅当 `0 < cache_read ≤ 上游原始 input` 时才剥离——上游返回的缓存读大于 input（说明已排除过缓存）时视为口径已对齐，不再处理。
 
 ### 数字示例
 
@@ -75,10 +72,11 @@ weighted = round((10000 + 4000) × 0.5) = 7000
 
 本次扣配额 **7000**——缓存写、缓存读都不进公式；但报表和图表显示全部真实 token。
 
-**Responses（Codex）方案**，倍率 ×1.0，`cacheReadQuotaRate = 0.1`，某次响应：input 100,000（其中缓存命中 90,000 折叠在内）/ output 2,000：
+**Responses（Codex）方案**，倍率 ×1.0，`cacheReadQuotaRate = 0.1`，某次响应：上游报 input 100,000（其中缓存命中 90,000 折叠在内）/ output 2,000：
 
 ```text
-billableInput = 100000 − 90000 + round(90000 × 0.1) = 19000
+落库 input = 100000 − 90000 = 10000（新鲜输入）
+billableInput = 10000 + round(90000 × 0.1) = 19000
 weighted      = round((19000 + 2000) × 1.0) = 21000
 ```
 

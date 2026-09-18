@@ -766,13 +766,13 @@ export function computeCosts(db, rates, { from, to, profilePeakHours } = {}) {
   }).sort((a, b) => b.total_cost - a.total_cost);
   return { rows, unpriced: [...unpricedSet] };
 }
-export function contextHealth(db, { from, to, responsesProfiles }) {
+export function contextHealth(db, { from, to }) {
   // 命中率 = 缓存读 / (缓存读 + 输入),分母不含输出、不含缓存写入。
-  // Anthropic 协议 input_tokens 本不含缓存读,公式即标准口径。
-  // Responses/Codex 协议把缓存命中折进 input_tokens(cached_tokens 是其子集),
-  // 此时若照搬公式,缓存读会被分母算两遍、命中率被系统性压低(纯缓存上限 50%)。
-  // responsesProfiles 传入这类方案的 profile 后缀集合,把它们的分母减去缓存读。
-  // 按 (user_key, profile) 分组以便逐方案判断协议,再按 user 聚合。
+  // usage 存储口径已对齐(2026-09-18):所有协议落库的 input_tokens 都不含缓存读
+  // (Responses 上游折叠在 input 里的缓存 slice 在 recordUsage 落库前剥掉,历史数据
+  // 由 initDb 一次性迁移对齐),所以这里不再需要按协议修正分母 —— 旧实现的
+  // 「responses 方案分母减 cr」如果保留,会把同一份缓存读减两次。
+  // 公式即标准口径,对所有协议一致。
   //
   // 关联 users 时**必须同时带上 profile**(users 主键就是 (profile,user_key))。只按
   // user_key 关联会让每条 usage_daily 按「该人绑定的方案数」复制若干份,SUM 随之放大
@@ -784,13 +784,13 @@ export function contextHealth(db, { from, to, responsesProfiles }) {
       SUM(ud.cache_read) cr, SUM(ud.input_tokens) i
     FROM usage_daily ud LEFT JOIN users u ON u.user_key=ud.user_key AND u.profile=ud.profile
     WHERE ud.date BETWEEN ? AND ? GROUP BY ud.user_key, ud.profile`).all(from, to);
-  const acc = new Map(); // user_key -> { user_name, cr, i(原始,供展示), denomI(口径修正后) }
+  const acc = new Map(); // user_key -> { user_name, cr, i, denomI(=i,口径统一后两者相同) }
   for (const r of rows) {
     let a = acc.get(r.user_key);
     if (!a) { a = { user_name: r.user_name, cr: 0, i: 0, denomI: 0 }; acc.set(r.user_key, a); }
     const cr = r.cr || 0, i = r.i || 0;
     a.cr += cr; a.i += i;
-    a.denomI += responsesProfiles?.has(r.profile) ? Math.max(0, i - cr) : i;
+    a.denomI += i;
   }
   const out = [];
   for (const [user_key, a] of acc) {
@@ -799,9 +799,8 @@ export function contextHealth(db, { from, to, responsesProfiles }) {
     a.advice = a.ratio >= 0.9 ? "缓存命中率优秀,会话结构良好"
       : a.ratio >= 0.8 ? "缓存命中率良好;长会话尽量连续使用、减少频繁切换可进一步提升"
       : "缓存命中率偏低:长会话尽量连续使用、避免反复粘贴大段上下文";
-    // denomI 一并返回:它是协议修正后的「新增输入」(Anthropic 即 input,Responses 扣除
-    // 缓存读)。排行榜的「平均单轮新增上下文」= denomI/请求数 直接用它,免得在别处再实现
-    // 一遍协议判断而与这里的口径漂移。
+    // denomI 一并返回:它是「新增输入」(对齐后与 input 相等)。排行榜的「平均单轮
+    // 新增上下文」= denomI/请求数 直接用它,免得在别处再实现一遍口径而漂移。
     out.push({ user_key, user_name: a.user_name, cr: a.cr, i: a.i, denomI: a.denomI, ratio: a.ratio, advice: a.advice });
   }
   return out;

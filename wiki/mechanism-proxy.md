@@ -162,7 +162,7 @@ remote compact（会话压缩）是 Codex 的私有服务端压缩协议：客�
 - **事件回传**：上游 SSE 的每个 `data:` 事件 JSON 作为 WS 文本帧逐个回传（`event:` 行/空行/`[DONE]` 不传）；错误统一归一化为 `{type:"error",error:{…}}` 帧
 - **断开即取消**：WS 客户端断开而请求未完成时，代理的客户端中断路径（markClientAborted）会销毁上游请求
 - **帧格式（经 codex CLI 0.145 真机抓帧验证）**：客户端帧为顶层 `{"type":"response.create","model":…,"input":…,"tools":…}`——**平铺**的 Responses 请求体加一个 `type` 标记（非嵌套 `response:{}`）；网关剥掉 `type` 后按普通请求转发。服务端回帧 = 每个 SSE `data:` 事件的 JSON 原文
-- **连接复用**：codex 在同一 WS 连接上用 `previous_response_id` 续会话多轮；打开连接时会先发一个 `input:[]` 的 warmup 空请求
+- **连接复用**：codex 在同一 WS 连接上用 `previous_response_id` 续会话多轮；打开连接时会先发一个 `input:[]` 的 warmup 空请求。⚠️ 部分第三方端点（如 DeepSeek）无状态且**拒绝空 input** —— 网关会自动注入占位（见下方「上游兼容自愈」），`previous_response_id` 则被这类端点静默忽略（上下文靠客户端全量回放历史，属该端点特性）
 - **通道选择**：provider 声明 `supports_websockets = false` 时 codex 全程走 HTTP（含 compact）；声明 `true`（或内置通道未声明）时对话与 compact 都走 WS。本网关生成的 ccteam provider 模板保持 `false`（主对话走 HTTP 更成熟），WS 通道服务内置通道的 compact
 - **compact 条目合成与回放翻译**（`lib/compact-bridge.mjs`）：客户端要求压缩响应里**恰好一个** `type:"compaction"` 输出条目（`encrypted_content` 必填、是不透明载荷），而第三方 Responses 兼容端点（火山/GLM/DeepSeek）不实现这个 OpenAI 私有类型，只回普通 `message` —— 客户端随即报 `remote compaction v2 expected exactly one compaction output item` 并中止压缩。网关做双向翻译：
   - **识别**：请求 `input` 末尾带 `{"type":"compaction_trigger"}` 即压缩请求（codex-rs 快照实证的固定标志）
@@ -171,6 +171,20 @@ remote compact（会话压缩）是 Codex 的私有服务端压缩协议：客�
   - ⚠️ 合成载荷只有本网关能解：会话中途从第三方方案切到真 OpenAI 方案时，旧压缩项的摘要会退化为占位文本（跨厂商压缩语义本就不可移植）
   - 该变换只在 WS 通道的响应侧生效（当前 codex 的 remote compact 只走 WS）；请求侧回放翻译在 HTTP 与 WS 两条通道都生效
 - 传输层是手写的最小 RFC6455 实现（`lib/ws-server.mjs`，纯 text 帧、无压缩），零新依赖；握手已被真实 codex 客户端验证（sec-websocket-accept 计算正确）
+
+## 上游兼容自愈（400 转可服务）
+
+第三方兼容端点常对同一份 OpenAI/Anthropic 请求有更严格的校验，网关在**确凿命中特定错误文案**时自动修体重发一次（每次请求至多一次，不叠加、不自旋），把用户看不到的兼容问题就地消化：
+
+| 自愈 | 触发 | 修法 | sticky |
+|---|---|---|---|
+| tool pattern | 400 文案指向上游不接受某类正则 | 剔除 tools 里的 lookaround pattern 重发（`lib/tool-pattern-compat.mjs`） | `toolPatternsActive` |
+| thinking 回传 | 400 含 `content[].thinking … must be passed back` | 去掉请求顶层 `thinking` 字段并清理历史 thinking 块重发（`lib/thinking-passback.mjs`） | 无 |
+| 空 input | 400 含 `Input items array must not be empty` | 给空 `input` 注入占位 message 重发（`lib/empty-input-compat.mjs`） | `requiresInputItems` |
+
+- **sticky 的含义**：被该上游实际拒绝过一次后，网关记住「这个上游有此要求」，此后同类请求**直接**按修好的形态发出，不再吃一次 400 往返；配置重载即清零重学（若上游升级后不再严格，行为自动回退）
+- 自愈发生时会打 `[自愈] …` 日志；**未命中**的 400 一律原样透传给客户端，并进「错误记录」（带方案与模型，便于定位是哪个上游的问题）
+- 空 input 自愈只对**真的拒绝它**的上游生效（GLM/火山等容忍空 input 的端点行为不变）；注入的占位请求会让上游生成一小段回复并照常计入用量——这是真实开销，如实记录
 
 ## 相关页面
 

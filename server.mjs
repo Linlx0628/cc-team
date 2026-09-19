@@ -1265,6 +1265,9 @@ function createProfileRuntime(profileName, profile) {
     protocol: normalizeProfileProtocol(profile.protocol),
     toolPatternCompat: toolPatternApi.normalizeToolPatternCompat(profile.toolPatternCompat),
     toolPatternsActive: toolPatternApi.computeToolPatternsActive(profile, upstreamUrl),
+    // 是否要求非空 input(Responses 协议)。默认 false;被上游以「Input items array
+    // must not be empty」拒绝一次后由 lib/empty-input-compat.mjs 置位(sticky,重载即清零)。
+    requiresInputItems: false,
     // Real `pattern` strings seen on this profile's live traffic, used by the
     // probe so it tests the upstream against evidence, not just a guess.
     toolPatternSamples: new Set(),

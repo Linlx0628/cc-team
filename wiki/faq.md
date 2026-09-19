@@ -42,6 +42,16 @@
 
 若仍复现：① 确认客户端连的是本网关且走 WS 通道（`openai_base_url` 指向网关，见接入指南）；② 到「错误记录」看同时间点是否有该方案的上游 4xx/5xx；③ 有的 Codex 版本对同一连接内的多轮压缩更敏感，重开一个会话通常可绕过。
 
+## Codex 走 DeepSeek 报 `Input items array must not be empty`？
+
+三方各有责任，但**该由网关消化**（已内置自愈）：
+
+- **DeepSeek（主因）**：其 Responses 端点**无状态**（`previous_response_id` / `store` 被静默忽略）且**严格拒绝空 `input` 数组**
+- **Codex（触发条件）**：客户端开场会先发一帧 `input:[]` 的 warmup 预热请求 —— 对 OpenAI 有状态后端合法，对无状态的 DS 就是非法请求
+- **网关**：现已在该 400 命中时自动**注入占位 input 重发**，并把「此方案要求非空 input」记成粘性标志（此后同类请求直接带占位，不再往返）。详见[上游兼容自愈](mechanism-proxy.md#上游兼容自愈400-转可服务)
+
+若仍复现：确认方案确实走本网关（`openai_base_url` 指向网关），并到「错误记录」看该时间点的方案/模型。⚠️ 另注：DS 静默忽略 `previous_response_id`，会话上下文靠客户端全量回放历史 —— 若在 DS 上感觉「像失忆」，是该端点无状态的特性，不是丢数据。
+
 ## Claude Code 报 `API Error: 400 The content[].thinking in the thinking mode must be passed back to the API` 然后停下？
 
 上游（第三方 Anthropic 兼容端点，如 GLM/DeepSeek）在 thinking 模式下要求：assistant 的工具调用轮必须把上一轮的 thinking 块原样回传，缺了就整单拒绝。两个常见触发源：

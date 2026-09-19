@@ -21,6 +21,8 @@ import { QUOTA_RATE_MAX, normalizeQuotaRate, normalizeCacheReadQuotaRate, normal
 import { CB_MAX_BACKOFF_FACTOR, CB_MAX_COOLDOWN_MS, CircuitBreaker } from "./lib/circuit.mjs";
 import { loadAssets } from "./lib/assets.mjs";
 import { wsAcceptUpgrade, wsRejectUpgrade, WsConn } from "./lib/ws-server.mjs";
+import { isCompactionRequest, transformCompactSseEvent } from "./lib/compact-bridge.mjs";
+import { tryThinkingPassbackSelfHeal } from "./lib/thinking-passback.mjs";
 import { PassThrough } from "node:stream";
 import { EventEmitter } from "node:events";
 import { escHtml, escJs } from "./lib/html.mjs";
@@ -303,7 +305,7 @@ function wsErrorFrame(conn, type, code, message) {
 // 「finish」事件是 proxy-core 里 attachRequestLogger 的请求日志钩子;WS 客户端断开时
 // emit "close"(writableEnded=false)触发 markClientAborted 销毁上游 —— 两条隐式链路都接上。
 class WsResponder extends EventEmitter {
-  constructor(conn) {
+  constructor(conn, opts = {}) {
     super();
     this.conn = conn;
     this.statusCode = 0;
@@ -314,6 +316,11 @@ class WsResponder extends EventEmitter {
     this._sseBuf = "";
     this._jsonChunks = [];
     this._pendingRaw = [];
+    // remote compact:压缩请求的响应要把普通 message 条目合成成客户端要求的
+    // compaction 条目(第三方上游不实现该私有类型,见 lib/compact-bridge.mjs 头注释)。
+    // 普通轮次保持零解析直通 —— 只有 compactMode 才解析每个 data 行。
+    this._compactMode = !!opts.compactMode;
+    this._compactState = { count: 0 };
   }
   get headersSent() { return this._headersSent; }
   get writableEnded() { return this._writableEnded; }
@@ -361,6 +368,16 @@ class WsResponder extends EventEmitter {
       const payload = t.slice(5).trim();
       if (!payload || payload === "[DONE]") continue;
       if (this.conn.closed) return;
+      if (this._compactMode) {
+        // 压缩请求:解析后按 compact-bridge 的规则转换(普通轮次不走这条,保零解析直通)
+        let out = payload;
+        try {
+          const json = JSON.parse(payload);
+          out = JSON.stringify(transformCompactSseEvent(json, this._compactState));
+        } catch { /* 非 JSON 帧原样转发 */ }
+        this.conn.send(out);
+        continue;
+      }
       this.conn.send(payload);
     }
   }
@@ -450,7 +467,8 @@ function dispatchWsFrame(conn, upReq, pathname, frameText) {
   mockReq.url = pathname;                    // ?key= 已剥,不会再透传给上游
   mockReq.headers = headers;
   mockReq.socket = { remoteAddress: upReq.socket.remoteAddress };   // getClientIp 的兜底读点
-  const responder = new WsResponder(conn);
+  const compactMode = isCompactionRequest(bodyObj);
+  const responder = new WsResponder(conn, { compactMode });
   responder.once("done", release);
   conn.once("close", () => responder.clientGone());
   proxyCoreApi.proxyRequest(mockReq, responder);

@@ -36,6 +36,21 @@
 
 正常，这是 2026-09-18 的**存储口径对齐**：此前 Responses/Codex 上游把缓存命中折叠在 `input_tokens` 里原样落库，与 Claude Code（input 天然不含缓存）同图比较时虚高数倍；对齐后 input 只存新鲜输入，缓存只进 `cache_read` 列，历史数据已一次性迁移（迁移前自动整库备份）。配额扣减口径一直是对的，不受影响。详见[指标口径参考](metrics-reference.md#先搞清两套-token-口径)。
 
+## Codex 报 `remote compaction v2 expected exactly one compaction output item, got 0 from N output items`？
+
+这是 Codex 客户端在**上下文自动压缩**时对响应的校验：压缩响应必须是**恰好一个** `type:"compaction"` 的输出条目，而第三方 Responses 兼容端点（火山/GLM/DeepSeek）不实现这个 OpenAI 私有类型，只回普通 message。网关已做双向翻译（`lib/compact-bridge.mjs`，详见[代理机制](mechanism-proxy.md#websocket-通道codex-remote-compact)）：识别压缩请求后把响应里的 message 合成成 compaction 条目，回放时再翻译回 message 给上游 —— 正常情况下这个报错不会再出现。
+
+若仍复现：① 确认客户端连的是本网关且走 WS 通道（`openai_base_url` 指向网关，见接入指南）；② 到「错误记录」看同时间点是否有该方案的上游 4xx/5xx；③ 有的 Codex 版本对同一连接内的多轮压缩更敏感，重开一个会话通常可绕过。
+
+## Claude Code 报 `API Error: 400 The content[].thinking in the thinking mode must be passed back to the API` 然后停下？
+
+上游（第三方 Anthropic 兼容端点，如 GLM/DeepSeek）在 thinking 模式下要求：assistant 的工具调用轮必须把上一轮的 thinking 块原样回传，缺了就整单拒绝。两个常见触发源：
+
+- **Claude Code 版本回归**：2.1.152 起有跨轮丢 thinking 块的已知问题（[anthropics/claude-code#62963](https://github.com/anthropics/claude-code/issues/62963)），升级或回退到正常版本即可
+- **会话中途换厂商**：不同厂商的 thinking 块互不认可 —— 本网关的 failover 与分时段组切换会自动造成
+
+网关已内置自愈：确凿命中该 400 文案时，自动**去掉本次请求的 thinking 字段**（并清理历史里的 thinking 块）重发一次，客户端通常无感（日志出现 `[自愈] thinking 回传修复后重试`）。模型侧的实际推理不受影响，只是这一轮不再要求回传 thinking 块。若去掉后上游仍拒绝，会把原始 400 如实回给客户端 —— 此时到「错误记录」看是哪个方案/模型，若是某方案上稳定复现，多为该方案的兼容性问题或 CC 版本回归。
+
 ## 缓存命中算配额吗？
 
 - Anthropic 协议：**缓存读与缓存写都不计入**（上游单独上报缓存读，配额基数本身就是缓存外口径）

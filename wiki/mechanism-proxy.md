@@ -164,7 +164,12 @@ remote compact（会话压缩）是 Codex 的私有服务端压缩协议：客�
 - **帧格式（经 codex CLI 0.145 真机抓帧验证）**：客户端帧为顶层 `{"type":"response.create","model":…,"input":…,"tools":…}`——**平铺**的 Responses 请求体加一个 `type` 标记（非嵌套 `response:{}`）；网关剥掉 `type` 后按普通请求转发。服务端回帧 = 每个 SSE `data:` 事件的 JSON 原文
 - **连接复用**：codex 在同一 WS 连接上用 `previous_response_id` 续会话多轮；打开连接时会先发一个 `input:[]` 的 warmup 空请求
 - **通道选择**：provider 声明 `supports_websockets = false` 时 codex 全程走 HTTP（含 compact）；声明 `true`（或内置通道未声明）时对话与 compact 都走 WS。本网关生成的 ccteam provider 模板保持 `false`（主对话走 HTTP 更成熟），WS 通道服务内置通道的 compact
-- compact 的**响应语义由上游负责**：网关只做传输与标准 Responses 转发；上游若不支持 Codex 的压缩响应约定，compact 结果可能被 codex 判为无效而重试
+- **compact 条目合成与回放翻译**（`lib/compact-bridge.mjs`）：客户端要求压缩响应里**恰好一个** `type:"compaction"` 输出条目（`encrypted_content` 必填、是不透明载荷），而第三方 Responses 兼容端点（火山/GLM/DeepSeek）不实现这个 OpenAI 私有类型，只回普通 `message` —— 客户端随即报 `remote compaction v2 expected exactly one compaction output item` 并中止压缩。网关做双向翻译：
+  - **识别**：请求 `input` 末尾带 `{"type":"compaction_trigger"}` 即压缩请求（codex-rs 快照实证的固定标志）
+  - **响应侧**：把响应里第一个带文本的 `message` 条目合成为 `{"type":"compaction","id":"cmp_<hash>","encrypted_content":"ccteam1:<base64 摘要全文>"}`；`output_item.done` 事件与 `response.completed.output[]` 用**同一条目**（同 id/载荷）。上游本身返回真 compaction 条目时一律原样透传，不再合成第二个
+  - **请求侧**：客户端把压缩条目存进历史、后续轮次原样回放时，网关把该条目翻译回带摘要原文的 `message` 再发上游（`ccteam1:` 前缀可解出原文；外部载荷——例如真 OpenAI 的——翻译为占位文本「更早的上下文已压缩」）
+  - ⚠️ 合成载荷只有本网关能解：会话中途从第三方方案切到真 OpenAI 方案时，旧压缩项的摘要会退化为占位文本（跨厂商压缩语义本就不可移植）
+  - 该变换只在 WS 通道的响应侧生效（当前 codex 的 remote compact 只走 WS）；请求侧回放翻译在 HTTP 与 WS 两条通道都生效
 - 传输层是手写的最小 RFC6455 实现（`lib/ws-server.mjs`，纯 text 帧、无压缩），零新依赖；握手已被真实 codex 客户端验证（sec-websocket-accept 计算正确）
 
 ## 相关页面

@@ -3,7 +3,18 @@
 // 懒加载:首次点开该 tab 才拉数据(与 costs / sessions 同款)。所有来自评审结果的
 // 文本都是**任意仓库的内容**,必须经 escH() 转义后再拼进 HTML —— 恶意仓库可以在
 // 代码里写 <img onerror>。这是本文件唯一的安全红线。
+//
+// 本文件只在 dashboard 上运行(与 dashboard.js 同页),**不加载 settings.js** —— 所以
+// csrfHeaders/getCsrf 在这里不存在,得自己读 tm_csrf cookie(与 dashboard.js 的写法一致)。
 let crLoaded = false, crData = null, crRuns = [], crOpenRun = null;
+
+function crCsrfHeaders(h) {
+  h = h || {};
+  const m = document.cookie.match(/(?:^|;\s*)tm_csrf=([^;]+)/);
+  h["x-csrf-token"] = m ? decodeURIComponent(m[1]) : "";
+  return h;
+}
+
 
 function crApi(path, opts) {
   return fetch(path, opts).then(async (r) => {
@@ -161,14 +172,14 @@ async function startReviewRun() {
   if (!repo) { crSetStatus("请先在设置页添加仓库", "error"); return; }
   crSetStatus("已提交,排队中…");
   try {
-    const r = await crApi("/api/code-review/runs/start", { method: "POST", headers: csrfHeaders({ "Content-Type": "application/json" }), body: JSON.stringify({ repo }) });
+    const r = await crApi("/api/code-review/runs/start", { method: "POST", headers: crCsrfHeaders({ "Content-Type": "application/json" }), body: JSON.stringify({ repo }) });
     crSetStatus(r.deduped ? "该仓库已有进行中的评审,已合并" : `已入队 #${r.runId}`, "ok");
     setTimeout(loadCodeReview, 1500);
   } catch (err) { crSetStatus(err.message, "error"); }
 }
 async function cancelReviewRun(id) {
   try {
-    const r = await crApi("/api/code-review/runs/cancel", { method: "POST", headers: csrfHeaders({ "Content-Type": "application/json" }), body: JSON.stringify({ id }) });
+    const r = await crApi("/api/code-review/runs/cancel", { method: "POST", headers: crCsrfHeaders({ "Content-Type": "application/json" }), body: JSON.stringify({ id }) });
     crSetStatus(r.canceled ? "已取消" : (r.note || "未取消"), r.canceled ? "ok" : "error");
     setTimeout(loadCodeReview, 800);
   } catch (err) { crSetStatus(err.message, "error"); }

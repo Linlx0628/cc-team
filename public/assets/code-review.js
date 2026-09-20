@@ -60,8 +60,8 @@ async function loadCodeReview() {
 
 function renderCodeReview() {
   const body = document.getElementById("crPanelBody");
-  const repos = (crData && crData.repos) ? crData.repos : [];
-  const repoOpts = repos.map((r) => `<option value="${escH(r.id)}">${escH(r.name)}</option>`).join("");
+  const repos = (crData && Array.isArray(crData.repoList)) ? crData.repoList : [];
+  const repoOpts = repos.map((r) => `<option value="${escH(r.id)}">${escH(r.name)}${r.enabled === false ? "（停用）" : ""}</option>`).join("");
   let html = '<div class="lb-ctl" style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">'
     + `<select id="crRunRepo" style="min-width:180px">${repoOpts || '<option value="">（未配置仓库）</option>'}</select>`
     + '<button type="button" class="btn btn-primary btn-sm" onclick="startReviewRun()">开始评审</button>'

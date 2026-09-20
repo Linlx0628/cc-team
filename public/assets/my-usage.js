@@ -1096,7 +1096,7 @@ loadReviewBadge();
 // ── 我的通知设置 ──────────────────────────────────────────────────────────
 const MN={prefs:null,loading:false};
 function ensureMyNotify(){if(!MN.prefs&&!MN.loading)loadMyNotify()}
-function mnStatus(text,cls){const el=document.getElementById('mnStatus');if(el){el.textContent=text||'';el.className='inline-status '+(cls||'')}}
+function mnStatus(text,cls){const el=document.getElementById('mnStatus');if(el){el.textContent=text||'';el.className='mn-status '+(cls||'')}}
 function loadMyNotify(){
   MN.loading=true;
   fetch('/api/my-notify',{headers:{'Authorization':'Bearer '+VK}}).then(function(r){return r.json()}).then(function(d){
@@ -1180,19 +1180,19 @@ function renderMyReview(){
     // 能看 ≠ 能触发:没开「允许在线触发」的仓库照样能看到结果,只是不能从外部发起
     const trig=r.canTrigger?'':' <span style="font-size:10px;color:var(--dim2)">(仅可查看,未开外部触发)</span>';
     return '<div class="lb-row"><div class="lb-who"><div class="lb-name">'+esc(r.name)+
-      ' <span class="pill pill-'+mrClass(r.lastStatus)+'">'+(r.lastStatus?(MR_LABEL[r.lastStatus]||r.lastStatus):'未评审')+'</span>'+trig+'</div>'+
+      ' <span class="mr-pill mr-pill-'+mrClass(r.lastStatus)+'">'+(r.lastStatus?(MR_LABEL[r.lastStatus]||r.lastStatus):'未评审')+'</span>'+trig+'</div>'+
       '<div class="lb-det">分支 '+esc(r.branch||'main')+' · 上次 '+(r.lastRunAt?esc(mrTime(r.lastRunAt)):'从未')+
       (r.consecutiveFailures?' · <span style="color:var(--red)">连续失败 '+r.consecutiveFailures+' 次</span>':'')+'</div></div></div>';
   }).join('')+'</div>';
   if(!d.runs.length){runs.innerHTML='<div class="lb-msg" style="margin-top:12px">还没有评审记录</div>';return}
   runs.innerHTML='<h3 style="font-size:13px;font-weight:650;margin:16px 0 8px">评审记录</h3><div class="lb-list">'+d.runs.map(function(r){
     return '<div class="lb-row"><div class="lb-who"><div class="lb-name">'+esc(r.repo)+
-      ' <span class="pill pill-'+mrClass(r.status)+'">'+esc(MR_LABEL[r.status]||r.status)+'</span></div>'+
+      ' <span class="mr-pill mr-pill-'+mrClass(r.status)+'">'+esc(MR_LABEL[r.status]||r.status)+'</span></div>'+
       '<div class="lb-det">'+esc(mrTime(r.createdAt))+' · '+esc(r.rangeMode==='single'?'单提交':'增量')+' '+
       esc(String(r.toCommit||'').slice(0,8))+' · 文件 '+r.filesReviewed+' · 意见 '+r.comments+' · '+fmtTk(r.tokens)+' token</div>'+
       (r.note?'<div class="lb-det" style="white-space:normal">'+esc(r.note)+'</div>':'')+
       (r.error?'<div class="lb-det" style="white-space:normal;color:var(--red)">'+esc(String(r.error).slice(0,160))+'</div>':'')+
-      '</div><button type="button" class="btn btn-outline btn-sm" onclick="openMyReviewRun('+r.id+')">详情</button></div>';
+      '</div><button type="button" class="mu-btn mu-btn-outline mu-btn-sm" onclick="openMyReviewRun('+r.id+')">详情</button></div>';
   }).join('')+'</div>';
 }
 function openMyReviewRun(id){

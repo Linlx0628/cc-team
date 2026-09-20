@@ -384,3 +384,41 @@ table{width:100%;border-collapse:collapse;min-width:560px}th{text-align:left;pad
 
 /* 成员通知设置:输入框等宽字体便于核对 webhook,与设置页的通知表单同款观感 */
 #mnFeishu,#mnDingtalk,#mnWecom,#mnServerchan,#mnBarkKey,#mnEmail{font-family:var(--font-mono);font-size:11px}
+
+/* ── 「我的用量」的通知设置表单 ────────────────────────────────────────────────
+   本页只加载 theme.css + my-usage.css:**settings.css 里的 .row / .btn / .note /
+   .inline-status 在这里全都不存在**。早先直接照搬那套类名,结果标签与输入框挤成一行、
+   输入框是原生尺寸、按钮是原生按钮(实测踩过)。这里给一套页面自己的表单类,
+   取值与 .qr-form(本页既有表单范式)一致,并补一档小按钮(本页只有偏大的 .btn-checkin)。 */
+.mn-note{font-size:11px;color:var(--dim);line-height:1.65;margin-bottom:14px}
+.mn-check{display:flex;align-items:center;gap:8px;margin-bottom:14px;cursor:pointer;font-size:12.5px;font-weight:600}
+.mn-check input{width:auto;accent-color:var(--accent)}
+.mn-grid{display:grid;grid-template-columns:1fr 1fr;gap:13px 16px}
+.mn-field{min-width:0}
+.mn-field label{display:block;font-size:11px;font-weight:600;color:var(--dim);margin-bottom:6px}
+.mn-field label .lbl-hint{font-weight:400;color:var(--dim2)}
+.mn-field input{width:100%;box-sizing:border-box;font-size:12px;font-family:var(--font-mono);background:var(--surface);color:var(--text);border:1px solid var(--border-strong);border-radius:5px;padding:8px 11px}
+.mn-field input:hover{border-color:#aaa9a2}
+.mn-field input:focus{outline:none;border-color:var(--accent)}
+.mn-field input::placeholder{color:var(--dim2)}
+.mn-actions{margin-top:16px;display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+/* 页面通用小按钮:本页原本只有偏大的 .btn-checkin(签到/提交申请用),
+   表单里的次级按钮没有合适的一档,故补这一套(mu- 前缀 = 本页通用,不是通知专用) */
+.mu-btn{font-size:12px;font-weight:600;padding:8px 16px;border-radius:5px;border:1px solid transparent;cursor:pointer;transition:background .15s,border-color .15s}
+.mu-btn:active{transform:translateY(1px)}
+.mu-btn-sm{padding:5px 11px;font-size:11px}
+.mu-btn-primary{background:var(--text);color:#fff}
+.mu-btn-primary:hover{background:#33332f}
+.mu-btn-outline{background:var(--surface);border-color:var(--border);color:var(--text)}
+.mu-btn-outline:hover{background:var(--surface-subtle);border-color:var(--border-strong)}
+/* 评审状态标签:取值照本页既有的 .qr-badge(状态标签范式),不再指望 dashboard.css 的 .pill */
+.mr-pill{display:inline-block;font-size:10px;padding:2px 7px;border-radius:4px;font-weight:600;border:1px solid transparent;white-space:nowrap}
+.mr-pill-ok{background:var(--accent-soft);color:var(--green)}
+.mr-pill-warn{background:#faf5e6;color:var(--orange)}
+.mr-pill-bad{background:#fbeae8;color:var(--red)}
+.mr-pill-run{background:var(--accent-soft);color:var(--accent);border-color:var(--accent)}
+.mr-pill-dim{background:var(--surface-subtle);color:var(--dim)}
+.mn-status{font-size:11.5px;color:var(--dim);margin-top:10px;min-height:16px}
+.mn-status.ok{color:var(--green)}
+.mn-status.error{color:var(--red)}
+@media(max-width:560px){.mn-grid{grid-template-columns:1fr}}

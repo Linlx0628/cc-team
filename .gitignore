@@ -24,3 +24,6 @@ tests/*.mjs
 .agents/*
 .code-review-graph/*
 
+
+# 代码评审工作区(仓库检出 + 评审产物,体积大且含源码)
+code-review-workspaces/

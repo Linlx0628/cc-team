@@ -299,28 +299,25 @@ function showProfileSettings(){
   const audit=document.getElementById('auditLogView');
   const pool=document.getElementById('quotaPoolView');
   const sched=document.getElementById('planScheduleView');
+  const qr=document.getElementById('quotaRequestView');
+  const cr=document.getElementById('codeReviewView');
   form.hidden=false;
-  view.hidden=true;
-  view.setAttribute('aria-hidden','true');
-  audit.hidden=true;
-  audit.setAttribute('aria-hidden','true');
-  if(pool){pool.hidden=true;pool.setAttribute('aria-hidden','true')}
-  if(sched){sched.hidden=true;sched.setAttribute('aria-hidden','true')}
-  document.getElementById('dataManagementNav').classList.remove('active');
-  document.getElementById('auditLogNav').classList.remove('active');
-  const pn=document.getElementById('quotaPoolNav');if(pn)pn.classList.remove('active');
-  const sn=document.getElementById('planScheduleNav');if(sn)sn.classList.remove('active');
+  [view,audit,pool,qr,sched,cr].forEach(function(el){if(el){el.hidden=true;el.setAttribute('aria-hidden','true')}});
+  ['dataManagementNav','auditLogNav','quotaPoolNav','quotaRequestNav','planScheduleNav','codeReviewNav'].forEach(function(id){
+    const el=document.getElementById(id);if(el)el.classList.remove('active');
+  });
 }
 function hideAllSecondaryViews(){
-  const dm=document.getElementById('dataManagementView'),audit=document.getElementById('auditLogView'),pool=document.getElementById('quotaPoolView'),qr=document.getElementById('quotaRequestView'),sched=document.getElementById('planScheduleView');
+  const cr=document.getElementById('codeReviewView'),dm=document.getElementById('dataManagementView'),audit=document.getElementById('auditLogView'),pool=document.getElementById('quotaPoolView'),qr=document.getElementById('quotaRequestView'),sched=document.getElementById('planScheduleView');
   dm.hidden=true;dm.setAttribute('aria-hidden','true');
   audit.hidden=true;audit.setAttribute('aria-hidden','true');
   if(pool){pool.hidden=true;pool.setAttribute('aria-hidden','true')}
   if(qr){qr.hidden=true;qr.setAttribute('aria-hidden','true')}
   if(sched){sched.hidden=true;sched.setAttribute('aria-hidden','true')}
+  if(cr){cr.hidden=true;cr.setAttribute('aria-hidden','true')}
   document.querySelectorAll('.pl-item').forEach(function(el){el.classList.remove('active')});
   // Nav buttons live outside .pl-item now, so clear their highlight explicitly.
-  ['quotaPoolNav','dataManagementNav','auditLogNav','quotaRequestNav','planScheduleNav'].forEach(function(id){
+  ['quotaPoolNav','dataManagementNav','auditLogNav','quotaRequestNav','planScheduleNav','codeReviewNav'].forEach(function(id){
     const el=document.getElementById(id);
     if(el)el.classList.remove('active');
   });
@@ -332,6 +329,19 @@ function openQuotaPoolView(){
   const view=document.getElementById('quotaPoolView');
   view.hidden=false;view.setAttribute('aria-hidden','false');
   document.getElementById('quotaPoolNav').classList.add('active');
+}
+// 代码评审是二级视图(左栏菜单进入):每次进入重新读一份配置并探测引擎 ——
+// 仓库保存后走 refreshReviewFromServer(),两边状态一致。
+function openCodeReviewView(){
+  const form=document.getElementById('settingsForm');
+  hideAllSecondaryViews();
+  form.hidden=true;
+  const view=document.getElementById('codeReviewView');
+  if(!view)return;
+  view.hidden=false;view.setAttribute('aria-hidden','false');
+  document.getElementById('codeReviewNav').classList.add('active');
+  initReviewForm();
+  probeReviewEngine();
 }
 // Reload should land back HERE, not on the profile form — admins adjusting
 // several pools in a row shouldn't be kicked out of the view each save.
@@ -1742,3 +1752,255 @@ function saveProdSettings(){
   if(names.length){names.forEach(m=>addCostRateRow(m,rates[m]))}
   else{addCostRateRow('',{input:0,output:0,cacheWrite:0,cacheRead:0})}
 })();
+
+// ─── 代码评审（二级视图，从左栏菜单进入）─────────────────────────────────────
+// 数据源是页面注入的 INITIAL_REVIEW(getPublicSettings().codeReview,已脱敏)。
+// 设计要点:管理员**不需要重复配置 API 信息** —— 评审就是经本网关发往所选方案,
+// 端点/协议由服务端按方案推导;评审账号一键创建(超级用户,借用方案已有的真实 Key)。
+let CR = { repos: [], editingRepoId: null };
+
+function crEl(id) { return document.getElementById(id); }
+function crSetStatus(text, cls) {
+  const el = crEl('crStatus');
+  if (el) { el.textContent = text || ''; el.className = 'inline-status ' + (cls || ''); }
+}
+function crSetRepoStatus(text, cls) {
+  const el = crEl('crRepoStatus');
+  if (el) { el.textContent = text || ''; el.className = 'inline-status ' + (cls || ''); }
+}
+function crApi(path, opts) {
+  return fetch(path, opts).then(async (r) => {
+    const text = await r.text();
+    let body = null; try { body = text ? JSON.parse(text) : null; } catch (e) {}
+    if (!r.ok) throw new Error((body && body.error) || ('HTTP ' + r.status));
+    return body;
+  });
+}
+async function refreshReviewFromServer() {
+  const r = await fetch('/api/settings', { headers: { 'Accept': 'application/json' } });
+  const data = await r.json();
+  INITIAL_REVIEW = data.codeReview || {};
+  initReviewForm();
+}
+function crProfiles() { return (INITIAL_REVIEW && INITIAL_REVIEW.profiles) || []; }
+function crSelectedProfile() { return crProfiles().find((p) => p.name === crEl('crProfile').value) || null; }
+
+// 换方案 → 重填模型下拉,并提示该方案有没有可用凭证
+function crOnProfileChange() {
+  const p = crSelectedProfile();
+  const sel = crEl('crModel');
+  if (!sel) return;
+  const models = p ? Array.from(new Set([].concat(p.aliases || [], p.allowedModels || []))) : [];
+  const prev = sel.value;
+  sel.innerHTML = models.length
+    ? models.map((m) => '<option value="' + h(m) + '">' + h(m) + '</option>').join('')
+    : '<option value="">（该方案没有可选模型）</option>';
+  if (models.indexOf(prev) >= 0) sel.value = prev;
+  if (p && !p.hasRealKey) crSetStatus('方案「' + p.name + '」还没有分配真实上游 Key —— 评审会拿不到凭证,请先在该方案下分配', 'error');
+  else crSetStatus('');
+}
+function crOnRepoSourceChange() {
+  const local = crEl('crRepoSource').value === 'local';
+  crEl('crRepoUrlLabel').textContent = local ? '本地仓库绝对路径' : '仓库地址';
+  crEl('crRepoUrl').placeholder = local ? '/srv/repos/my-project' : 'https://github.com/org/repo.git';
+}
+function initReviewForm() {
+  if (!crEl('crEnabled')) return;
+  const c = INITIAL_REVIEW || {};
+  CR.repos = (c.repos || []).map((x) => Object.assign({}, x));
+  crEl('crEnabled').checked = !!c.enabled;
+  crEl('crOcrPath').value = c.ocrPath || '';
+  crEl('crConcurrency').value = c.defaultConcurrency || 4;
+  crEl('crTimeout').value = c.defaultTimeoutMinutes || 30;
+  crEl('crBudget').value = c.defaultMaxTokensBudget || 0;
+  crEl('crParallel').value = c.maxParallelJobs || 2;
+  crEl('crRetention').value = c.runRetentionDays || 90;
+  crEl('crNotifyOn').value = c.notifyOn || 'always';
+  crEl('crExclude').value = (c.exclude || []).join(',');
+  crEl('crStoreComments').checked = c.storeComments !== false;
+  const pill = crEl('crStatusPill');
+  if (pill) { pill.textContent = c.enabled ? '已启用' : '未启用'; pill.className = 'status ' + (c.enabled ? 'status-ok' : ''); }
+  // 评审方案下拉(含模型联动)
+  const sel = crEl('crProfile');
+  const profiles = crProfiles();
+  sel.innerHTML = profiles.length
+    ? profiles.map((p) => '<option value="' + h(p.name) + '">' + h(p.name) + (p.hasRealKey ? '' : '（无真实 Key）') + '</option>').join('')
+    : '<option value="">（还没有方案）</option>';
+  if (c.providerProfile && profiles.some((p) => p.name === c.providerProfile)) sel.value = c.providerProfile;
+  crOnProfileChange();
+  if (c.providerModel) crEl('crModel').value = c.providerModel;
+  crEl('crKeyText').value = c.hasProviderKey ? (c.providerKeyMasked || '已创建') : '';
+  renderReviewRepoTable();
+  renderReviewApiKeys();
+  crEl('crRepoEditor').hidden = true;
+  CR.editingRepoId = null;
+}
+function renderReviewApiKeys() {
+  const body = crEl('crApiKeyBody');
+  if (!body) return;
+  const users = (SETTINGS && SETTINGS.globalUsers) || {};
+  const allowed = new Set((INITIAL_REVIEW && INITIAL_REVIEW.apiKeys) || []);
+  // 超级用户(含评审账号本身)本来就能触发,不需要也不该出现在成员授权列表里
+  const keys = Object.keys(users).filter((k) => !users[k].superUser);
+  if (!keys.length) { body.innerHTML = '<tr><td colspan="3" class="empty">还没有成员</td></tr>'; return; }
+  body.innerHTML = keys.map((k) => {
+    return '<tr><td><label style="display:inline-flex;align-items:center;margin:0;cursor:pointer">'
+      + '<input type="checkbox" class="cr-apikey" value="' + h(k) + '"' + (allowed.has(k) ? ' checked' : '') + ' style="width:auto;accent-color:var(--accent)"></label></td>'
+      + '<td>' + h(users[k].username || '—') + (users[k].disabled ? ' <span class="note">(已停用)</span>' : '') + '</td>'
+      + '<td style="font-family:var(--font-mono);font-size:11px;color:var(--dim)">' + h(k.slice(0, 12)) + '****</td></tr>';
+  }).join('');
+}
+function renderReviewRepoTable() {
+  const body = crEl('crRepoBody');
+  if (!body) return;
+  if (!CR.repos.length) { body.innerHTML = '<tr><td colspan="8" class="empty">还没有仓库 —— 点右上「＋ 添加仓库」</td></tr>'; return; }
+  body.innerHTML = CR.repos.map((r) => {
+    const cred = r.credential && r.credential.hasCredential ? '已配置 ' + (r.credential.hint || '') : '未配置';
+    const sched = r.schedule && r.schedule.mode !== 'off'
+      ? (r.schedule.mode === 'interval' ? '每 ' + r.schedule.intervalHours + ' 小时' : '每天 ' + r.schedule.at) : '关闭';
+    const src = r.source === 'remote' ? 'remote' : 'local';
+    return '<tr><td>' + h(r.name) + (r.enabled ? '' : ' <span class="note">(停用)</span>') + '</td><td>' + src + '</td>'
+      + '<td style="font-size:11px;color:var(--dim);max-width:320px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + h(r.source === 'remote' ? r.url : r.localPath) + '</td>'
+      + '<td>' + h(r.branch) + '</td><td>' + h(cred) + '</td><td>' + h(sched) + '</td><td>' + (r.apiTrigger ? '允许' : '—') + '</td>'
+      + '<td style="white-space:nowrap"><button type="button" class="btn btn-outline btn-sm" onclick="editReviewRepo(\'' + r.id + '\')">编辑</button> '
+      + '<button type="button" class="btn btn-outline btn-sm" onclick="testReviewRepo(\'' + r.id + '\')">测试</button> '
+      + '<button type="button" class="btn btn-outline btn-sm" onclick="deleteReviewRepo(\'' + r.id + '\')">删除</button></td></tr>';
+  }).join('');
+}
+function addReviewRepo() {
+  CR.editingRepoId = null;
+  crEl('crRepoName').value = ''; crEl('crRepoSource').value = 'remote'; crEl('crRepoUrl').value = '';
+  crEl('crRepoBranch').value = 'main'; crEl('crRepoAuth').value = 'none'; crEl('crRepoCred').value = '';
+  crEl('crRepoSched').value = 'off'; crEl('crRepoInterval').value = '6'; crEl('crRepoAt').value = '03:00';
+  crEl('crRepoApiTrigger').checked = false;
+  crOnRepoSourceChange();
+  crEl('crRepoEditor').hidden = false;
+  crSetRepoStatus('');
+}
+function editReviewRepo(id) {
+  const r = CR.repos.find((x) => x.id === id);
+  if (!r) return;
+  CR.editingRepoId = id;
+  crEl('crRepoName').value = r.name || '';
+  crEl('crRepoSource').value = r.source || 'remote';
+  crEl('crRepoUrl').value = r.source === 'remote' ? (r.url || '') : (r.localPath || '');
+  crEl('crRepoBranch').value = r.branch || 'main';
+  crEl('crRepoAuth').value = r.authType || 'none';
+  crEl('crRepoCred').value = '';
+  crEl('crRepoSched').value = (r.schedule && r.schedule.mode) || 'off';
+  crEl('crRepoInterval').value = (r.schedule && r.schedule.intervalHours) || 6;
+  crEl('crRepoAt').value = (r.schedule && r.schedule.at) || '03:00';
+  crEl('crRepoApiTrigger').checked = !!r.apiTrigger;
+  crOnRepoSourceChange();
+  crEl('crRepoEditor').hidden = false;
+  crSetRepoStatus('凭据留空 = 不修改原凭据');
+}
+function cancelReviewRepoEdit() {
+  crEl('crRepoEditor').hidden = true;
+  CR.editingRepoId = null;
+  crSetRepoStatus('');
+}
+function collectReviewSettings() {
+  const checked = Array.from(document.querySelectorAll('.cr-apikey')).filter((x) => x.checked).map((x) => x.value);
+  return {
+    enabled: crEl('crEnabled').checked,
+    providerProfile: crEl('crProfile').value,
+    providerModel: crEl('crModel') ? crEl('crModel').value : '',
+    ocrPath: crEl('crOcrPath').value.trim(),
+    defaultConcurrency: parseInt(crEl('crConcurrency').value, 10) || 4,
+    defaultTimeoutMinutes: parseInt(crEl('crTimeout').value, 10) || 30,
+    defaultMaxTokensBudget: parseInt(crEl('crBudget').value, 10) || 0,
+    maxParallelJobs: parseInt(crEl('crParallel').value, 10) || 2,
+    runRetentionDays: parseInt(crEl('crRetention').value, 10) || 90,
+    notifyOn: crEl('crNotifyOn').value,
+    exclude: crEl('crExclude').value.split(',').map((x) => x.trim()).filter(Boolean),
+    storeComments: crEl('crStoreComments').checked,
+    apiKeys: checked,
+    // 端点与协议由服务端按所选方案推导;这里带上现值只为保持载荷形状
+    providerProtocol: (INITIAL_REVIEW && INITIAL_REVIEW.providerProtocol) || 'anthropic',
+    providerUrl: (INITIAL_REVIEW && INITIAL_REVIEW.providerUrl) || '',
+    repos: CR.repos.map((r) => ({
+      id: r.id, name: r.name, source: r.source, url: r.url, localPath: r.localPath, branch: r.branch,
+      authType: r.authType, username: r.username, credential: '', enabled: r.enabled,
+      apiTrigger: r.apiTrigger, schedule: r.schedule, overrides: r.overrides, createdAt: r.createdAt,
+    })),
+  };
+}
+async function saveCodeReviewSettings() {
+  crSetStatus('保存中…');
+  try {
+    await crApi('/api/code-review/settings', { method: 'POST', headers: csrfHeaders({ 'Content-Type': 'application/json' }), body: JSON.stringify(collectReviewSettings()) });
+    crSetStatus('已保存', 'ok');
+    toast('代码评审设置已保存');
+    await refreshReviewFromServer();
+  } catch (e) { crSetStatus(e.message || '保存失败', 'error'); }
+}
+async function saveReviewRepo() {
+  const source = crEl('crRepoSource').value;
+  const repo = {
+    id: CR.editingRepoId || undefined,
+    name: crEl('crRepoName').value.trim(),
+    source,
+    url: source === 'remote' ? crEl('crRepoUrl').value.trim() : '',
+    localPath: source === 'local' ? crEl('crRepoUrl').value.trim() : '',
+    branch: crEl('crRepoBranch').value.trim() || 'main',
+    authType: crEl('crRepoAuth').value,
+    credential: crEl('crRepoCred').value,
+    apiTrigger: crEl('crRepoApiTrigger').checked,
+    enabled: true,
+    schedule: { mode: crEl('crRepoSched').value, intervalHours: parseInt(crEl('crRepoInterval').value, 10) || 6, at: crEl('crRepoAt').value.trim() || '03:00', weekdays: [] },
+  };
+  crSetRepoStatus('保存中…');
+  try {
+    await crApi('/api/code-review/repos/save', { method: 'POST', headers: csrfHeaders({ 'Content-Type': 'application/json' }), body: JSON.stringify({ repo }) });
+    crSetRepoStatus('已保存', 'ok');
+    await refreshReviewFromServer();
+  } catch (e) { crSetRepoStatus(e.message || '保存失败', 'error'); }
+}
+async function deleteReviewRepo(id) {
+  const r = CR.repos.find((x) => x.id === id);
+  if (!confirm('删除仓库「' + ((r && r.name) || id) + '」？工作区目录会保留,可在磁盘上手动清理。')) return;
+  try {
+    await crApi('/api/code-review/repos/delete', { method: 'POST', headers: csrfHeaders({ 'Content-Type': 'application/json' }), body: JSON.stringify({ id }) });
+    await refreshReviewFromServer();
+    toast('仓库已删除');
+  } catch (e) { crSetRepoStatus(e.message || '删除失败', 'error'); }
+}
+async function testReviewRepo(id) {
+  crSetRepoStatus('测试连接中…');
+  try {
+    const r = await crApi('/api/code-review/repos/test', { method: 'POST', headers: csrfHeaders({ 'Content-Type': 'application/json' }), body: JSON.stringify({ id }) });
+    crSetRepoStatus(r.ok ? ('连接成功：' + (r.detail || '')) : ('连接失败：' + (r.detail || '')), r.ok ? 'ok' : 'error');
+  } catch (e) { crSetRepoStatus(e.message || '测试失败', 'error'); }
+}
+// 一键创建评审账号:不需要任何 Key 输入 —— 账号是超级用户,运行期向所选方案借用
+// 已有的真实 Key(系统自身的既有语义)。
+async function createReviewAccount() {
+  const profile = crEl('crProfile').value;
+  if (!profile) { crSetStatus('请先选择评审用哪个方案', 'error'); return; }
+  if (!confirm('创建评审专用账号并绑定方案「' + profile + '」？账号会以代码评审身份调用网关,用量记在「代码评审」名下。')) return;
+  crSetStatus('创建中…');
+  try {
+    const r = await crApi('/api/code-review/key/create', { method: 'POST', headers: csrfHeaders({ 'Content-Type': 'application/json' }), body: JSON.stringify({ profile }) });
+    crSetStatus('已创建:' + r.key + '（明文只显示这一次,之后只显示掩码）', 'ok');
+    await refreshReviewFromServer();
+  } catch (e) { crSetStatus(e.message || '创建失败', 'error'); }
+}
+async function probeReviewEngine() {
+  const note = crEl('crEngineNote');
+  if (!note) return;
+  note.textContent = '检测引擎中…';
+  try {
+    const st = await crApi('/api/code-review/status');
+    const o = st.ocr || {};
+    const parts = [];
+    parts.push(o.installed ? o.version : '未检测到 ocr（需 npm i -g @alibaba-group/open-code-review）');
+    parts.push(o.gitOk ? o.git : (o.git ? o.git + '（需要 ≥ 2.41）' : '未检测到 git'));
+    parts.push('工作区 ' + (st.workspaceBytes / 1048576).toFixed(1) + 'MB');
+    parts.push('队列 ' + st.queue + ' · 运行中 ' + st.running);
+    note.textContent = '引擎：' + parts.join(' · ');
+    const pill = crEl('crStatusPill');
+    if (pill) pill.textContent = st.enabled ? (o.installed && o.gitOk ? '已启用' : '缺依赖') : '未启用';
+    if (pill) pill.className = 'status ' + (st.enabled ? (o.installed && o.gitOk ? 'status-ok' : 'status-warn') : '');
+  } catch (e) { note.textContent = '引擎检测失败：' + e.message; }
+}

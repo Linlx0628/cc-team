@@ -113,3 +113,9 @@ td{padding:8px;border-bottom:1px solid #ecece8;font-size:12px}
 .tag-row .m-tag{font-size:11px;font-family:var(--font-mono);background:var(--accent-soft);color:var(--accent);padding:3px 10px;border-radius:10px}
 .tag-row .m-empty{font-size:11px;color:var(--dim)}
 @media(max-width:680px){body{overflow:auto;height:auto}.layout{flex-direction:column;height:auto;min-height:100vh}.sidebar{width:100%;min-width:0;max-height:none;border-right:0;border-bottom:1px solid var(--border)}.sidebar-list{display:flex;gap:6px;overflow-x:auto}.sidebar-dock .sidebar-global{max-height:none;overflow-y:visible}.sidebar-global{padding:8px 12px}.pl-item{min-width:210px;margin:0}.main{overflow:visible;padding:22px 16px}.actions{left:0;padding-left:16px;padding-right:16px}.row,.row3{grid-template-columns:1fr}.modal{width:100%;max-height:90vh}.section{padding:15px;overflow-x:auto}.import-summary{grid-template-columns:1fr 1fr}.mapping-row{grid-template-columns:1fr}.mapping-arrow{display:none}.danger-copy{align-items:flex-start;flex-direction:column}}
+
+/* 表单小件:把「label 里的小字提示 / 复选框 / 勾选行」收成类,避免每处重复内联样式 */
+.lbl-hint{font-size:11px;color:var(--dim);font-weight:400}
+.cbx{width:auto;accent-color:var(--accent)}
+.checkline{display:flex;align-items:center;gap:6px;cursor:pointer;margin-top:12px}
+.checkline>span{font-size:12.5px}

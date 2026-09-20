@@ -23,6 +23,8 @@ import { loadAssets } from "./lib/assets.mjs";
 import { wsAcceptUpgrade, wsRejectUpgrade, WsConn } from "./lib/ws-server.mjs";
 import { isCompactionRequest, transformCompactSseEvent } from "./lib/compact-bridge.mjs";
 import { tryThinkingPassbackSelfHeal } from "./lib/thinking-passback.mjs";
+import { createCodeReviewOcr } from "./lib/code-review-ocr.mjs";
+import { createCodeReview, initCodeReviewDb, sanitizeCodeReviewConfig, maskCredential, TERMINAL, TERMINAL_OK } from "./lib/code-review.mjs";
 import { PassThrough } from "node:stream";
 import { EventEmitter } from "node:events";
 import { escHtml, escJs } from "./lib/html.mjs";
@@ -972,6 +974,17 @@ function profilePeakHoursMap() {
     config.productionTracking = { enabled: true, storeFilePaths: true };
     saveConfig(config);
     console.log("[MIGRATE] Added productionTracking config");
+  }
+})();
+
+// Auto-migrate: 代码评审配置(默认关闭)。全新安装没有这一段;补上后设置页与各接口
+// 都有稳定的字段形状(避免各处 `|| {}` 满天飞)。归一化走同一份 sanitize。
+(function migrateCodeReviewConfig() {
+  const next = sanitizeCodeReviewConfig(config.codeReview, config.port || 6789);
+  if (!config.codeReview || JSON.stringify(config.codeReview) !== JSON.stringify(next)) {
+    config.codeReview = next;
+    saveConfig(config);
+    console.log("[MIGRATE] Normalized codeReview config");
   }
 })();
 
@@ -2092,8 +2105,51 @@ function loadProfileSnapshot(suffix) {
 
 ({ db, stmts } = persistenceApi.initDb());
 initProductionDb(db);   // 产出质量表(tool_events / production_alerts),先于 tracker 建语句
+initCodeReviewDb(db);   // 代码评审表(runs / comments / repo_state);功能默认关闭,建表无害
 function productionEnabled() { return (config.productionTracking || {}).enabled !== false; }
 const productionTracker = createProductionTracker({ db, getConfig: () => config.productionTracking || {}, log: console.log });
+
+// 代码评审(可选功能):OCR 适配层 + 编排层。默认关闭;开启后由管理员在设置页配仓库。
+// 依赖注入照既有规矩:db/stmts 用 getter(它们在 initDb 阶段才就位),其余按值传。
+const reviewOcrApi = createCodeReviewOcr({
+  config,
+  appRoot: __dirname,
+  workspaceDir: () => (config.codeReview || {}).workspaceDir || path.join(__dirname, "code-review-workspaces"),
+  ocrHomeDir: () => path.join((config.codeReview || {}).workspaceDir || path.join(__dirname, "code-review-workspaces"), "ocr-home"),
+  repoDir: (id) => path.join((config.codeReview || {}).workspaceDir || path.join(__dirname, "code-review-workspaces"), "repos", String(id)),
+  log: console.log,
+});
+const codeReviewApi = createCodeReview({
+  config, saveConfig, ocr: reviewOcrApi, appRoot: __dirname, port,
+  notifyReview: (ev) => pushCodeReviewNotice(ev),
+  log: console.log,
+  get db() { return db; },
+});
+// 评审端点由**所选方案**推导,不允许管理员手填:系统本身是网关,评审必须经自己
+// 才会计入用量与配额;协议不同入口不同(anthropic → /v1,responses → /v1/responses)。
+function applyReviewEndpoint(crCfg) {
+  const prof = (config.profiles || {})[crCfg.providerProfile];
+  const proto = normalizeProfileProtocol(prof?.protocol);
+  crCfg.providerProtocol = proto === "responses" ? "openai-responses" : "anthropic";
+  crCfg.providerUrl = proto === "responses"
+    ? `http://127.0.0.1:${port}/v1/responses`
+    : `http://127.0.0.1:${port}/v1`;
+  return crCfg;
+}
+
+function pushCodeReviewNotice(ev) {  const c = config.codeReview || {};
+  const n = config.notifier || {};
+  if (!c.enabled || !n.enabled || c.notifyOn === "never") return;
+  const failed = ev.kind === "disk_full" || (ev.kind === "run" && TERMINAL.has(ev.report.status) && !TERMINAL_OK.has(ev.report.status));
+  if (failed === false && c.notifyOn === "failure") return;      // 只在失败时推
+  const msg = ev.kind === "disk_full"
+    ? `【代码评审】仓库「${ev.repo.name}」工作区磁盘超限,已拒绝入队\n—— ${notifierApi.beijingTimeString()}（token-monitor）`
+    : `【代码评审】${ev.repo.name} #${ev.runId} ${ev.report.status} · ${ev.report.comments.length} 条意见\n—— ${notifierApi.beijingTimeString()}（token-monitor）`;
+  for (const s of notifierApi.NOTIFY_SENDERS.filter(x => x.enabled(n))) {
+    s.send(n, msg).catch(err => console.error(`[通知] ${s.channel} 推送失败: ${err.message}`));
+  }
+}
+codeReviewApi.reapStale();   // 上一次进程留下的 queued/running 永远不会再推进
 
 // 产出质量:60s 告警扫描 + 过期清理(unref 不阻止进程退出);告警经既有通知渠道 webhook 推送。
 const prodNotifyCooldown = new Map();
@@ -3069,6 +3125,54 @@ function getPublicSettings() {
         console.warn(`[SCHEDULE] 生成调度状态失败，设置页退化为空调度: ${err.message}`);
         return { protocols: {} };
       }
+    })(),
+    // 代码评审：只下发脱敏信息（凭据 → hasCredential + 尾部提示），明文永不离开服务端
+    codeReview: (() => {
+      const c = config.codeReview || sanitizeCodeReviewConfig({}, port);
+      return {
+        enabled: !!c.enabled,
+        ocrPath: c.ocrPath || "",
+        workspaceDir: c.workspaceDir || "",
+        perRepoDiskLimitMB: c.perRepoDiskLimitMB,
+        maxParallelJobs: c.maxParallelJobs,
+        defaultTimeoutMinutes: c.defaultTimeoutMinutes,
+        defaultConcurrency: c.defaultConcurrency,
+        defaultMaxTokensBudget: c.defaultMaxTokensBudget,
+        dailyTokenBudget: c.dailyTokenBudget,
+        runRetentionDays: c.runRetentionDays,
+        keepRunsPerRepo: c.keepRunsPerRepo,
+        storeComments: c.storeComments !== false,
+        notifyOn: c.notifyOn || "always",
+        providerProfile: c.providerProfile || "",
+        providerName: c.providerName,
+        providerUrl: c.providerUrl,
+        providerProtocol: c.providerProtocol,
+        providerModel: c.providerModel || "",
+        providerKeyMasked: c.providerKey ? `${String(c.providerKey).slice(0, 8)}****` : "",
+        hasProviderKey: !!c.providerKey,
+        background: c.background || "",
+        exclude: Array.isArray(c.exclude) ? c.exclude : [],
+        // apiKeys 是「允许触发评审的成员 Key」白名单：与设置页其它成员 Key 同口径，
+        // 这里下发明文(该接口本来就要 checkAuth 管理员)，由界面自行掩码展示。
+        apiKeys: Array.isArray(c.apiKeys) ? c.apiKeys : [],
+        // 评审可选方案:供「评审方案 / 评审模型」两个下拉使用。hasRealKey 用来提示
+        // 「该方案还没分配真实 Key,评审会拿不到凭证」。
+        profiles: listProfiles().map((p) => {
+          const raw = config.profiles[p.name] || {};
+          return {
+            name: p.name, suffix: p.suffix, protocol: p.protocol,
+            aliases: Object.keys(raw.modelAliases || {}),
+            allowedModels: Array.isArray(raw.allowedModels) ? raw.allowedModels : [],
+            hasRealKey: Object.values(raw.users || {}).some((u) => (typeof u === "object" ? u.key : u)),
+          };
+        }),
+        repos: (c.repos || []).map((r) => ({
+          id: r.id, name: r.name, source: r.source, url: r.url, localPath: r.localPath, branch: r.branch,
+          authType: r.authType, username: r.username, enabled: r.enabled, apiTrigger: r.apiTrigger,
+          schedule: r.schedule, overrides: r.overrides, createdAt: r.createdAt,
+          credential: maskCredential(r.credential),
+        })),
+      };
     })(),
   };
 }
@@ -5274,6 +5378,192 @@ const server = http.createServer((req, res) => {
       res.writeHead(413, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ error: "Request too large" }));
     });
+    return;
+  }
+
+  // ─── 代码评审（管理员接口；成员级触发接口见 /api/code-review/trigger）────────
+  // 约定与其它管理接口一致:checkAuth + 写操作 checkCsrf;凭据只出掩码。
+  if (req.url.startsWith("/api/code-review/")) {
+    const crUrl = new URL(req.url, "http://localhost");
+    const crPath = crUrl.pathname;
+    const json = (code, obj) => { res.writeHead(code, { "Content-Type": "application/json" }); res.end(JSON.stringify(obj)); };
+    const adminGate = () => {
+      if (!checkAuth(req)) { res.writeHead(401); res.end("Unauthorized"); return false; }
+      return true;
+    };
+    const adminWriteGate = () => {
+      if (!adminGate()) return false;
+      if (!checkCsrf(req)) { res.writeHead(403); res.end("CSRF validation failed"); return false; }
+      return true;
+    };
+    const readJsonBody = (limit = 100_000) => readBody(req, limit).then((buf) => JSON.parse(buf.toString() || "{}"));
+
+    if (req.method === "GET" && crPath === "/api/code-review/status") {
+      if (!adminGate()) return;
+      (async () => {
+        // 始终探测:设置页要靠它显示「ocr 是否已安装 / git 版本」来指引配置,
+        // 功能没开时同样需要这两条信息(探测只是两个 --version 子进程,管理员接口)
+        const probe = await reviewOcrApi.probe();
+        json(200, { ...codeReviewApi.status(), ocr: probe, repoStates: codeReviewApi.repoStates() });
+      })().catch((err) => json(500, { error: err.message }));
+      return;
+    }
+
+    if (req.method === "GET" && crPath === "/api/code-review/runs") {
+      if (!adminGate()) return;
+      const { rows, total } = codeReviewApi.listRuns({
+        repoId: crUrl.searchParams.get("repo") || null,
+        status: crUrl.searchParams.get("status") || null,
+        limit: Number(crUrl.searchParams.get("limit")) || 50,
+        offset: Number(crUrl.searchParams.get("offset")) || 0,
+      });
+      json(200, { rows, total });
+      return;
+    }
+
+    if (req.method === "GET" && crPath === "/api/code-review/run") {
+      if (!adminGate()) return;
+      const run = codeReviewApi.getRun(crUrl.searchParams.get("id"));
+      if (!run) { json(404, { error: "运行不存在" }); return; }
+      json(200, { run, comments: codeReviewApi.listComments(run.id, { limit: Number(crUrl.searchParams.get("limit")) || 200 }) });
+      return;
+    }
+
+    if (req.method === "POST" && crPath === "/api/code-review/settings") {
+      if (!adminWriteGate()) return;
+      readJsonBody().then((body) => {
+        const next = sanitizeCodeReviewConfig(body, port);
+        // 凭据字段为空字符串时保留原值:界面回显的是掩码,不回传就不该被清空
+        const prev = config.codeReview || {};
+        next.repos = next.repos.map((r) => {
+          const old = (prev.repos || []).find((x) => x.id === r.id);
+          if (old && !r.credential) r.credential = old.credential || "";
+          return r;
+        });
+        if (!next.providerKey && prev.providerKey) next.providerKey = prev.providerKey;
+        // 引擎参数与仓库是两块独立的表单:payload 没带 repos 时保留现有仓库,
+        // 「只保存引擎设置」不能顺手清空仓库白名单
+        if (!Array.isArray(body.repos) && Array.isArray(prev.repos)) next.repos = prev.repos;
+        // 端点与协议不由管理员填写:按所选方案推导,且强制回环 —— 避免配出一个
+        // 打不到自己(或指向外部)的端点。评审请求必须经本网关才会计入用量。
+        applyReviewEndpoint(next);
+        config.codeReview = next;
+        saveConfig(config);
+        recordAdminAudit(req, "codereview.settings", "全局",
+          `保存代码评审设置（${next.enabled ? "已启用" : "已停用"}，方案 ${next.providerProfile || "未选"}，仓库 ${next.repos.length} 个，并发 ${next.maxParallelJobs}）`);
+        json(200, { ok: true });
+      }).catch((err) => json(400, { error: err.message }));
+      return;
+    }
+
+    if (req.method === "POST" && crPath === "/api/code-review/repos/save") {
+      if (!adminWriteGate()) return;
+      readJsonBody().then((body) => {
+        const next = sanitizeCodeReviewConfig(config.codeReview, port);
+        const repo = (sanitizeCodeReviewConfig({ repos: [body.repo || body] }, port).repos || [])[0];
+        if (!repo) { json(400, { error: "仓库配置不合法(检查地址协议/分支名)" }); return; }
+        const idx = next.repos.findIndex((r) => r.id === repo.id);
+        if (idx >= 0) {
+          if (!repo.credential) repo.credential = next.repos[idx].credential || "";   // 掩码回显不清空凭据
+          repo.createdAt = next.repos[idx].createdAt;
+          next.repos[idx] = repo;
+        } else {
+          next.repos.push(repo);
+        }
+        config.codeReview = next;
+        saveConfig(config);
+        recordAdminAudit(req, "codereview.repo.save", repo.name, `保存评审仓库（${repo.source === "remote" ? repo.url : repo.localPath}，分支 ${repo.branch}）`);
+        json(200, { ok: true, repo: { ...repo, credential: maskCredential(repo.credential) } });
+      }).catch((err) => json(400, { error: err.message }));
+      return;
+    }
+
+    if (req.method === "POST" && crPath === "/api/code-review/repos/delete") {
+      if (!adminWriteGate()) return;
+      readJsonBody().then((body) => {
+        const id = String(body.id || "");
+        const prev = config.codeReview || {};
+        const repo = (prev.repos || []).find((r) => r.id === id);
+        if (!repo) { json(404, { error: "仓库不存在" }); return; }
+        config.codeReview = { ...prev, repos: (prev.repos || []).filter((r) => r.id !== id) };
+        saveConfig(config);
+        recordAdminAudit(req, "codereview.repo.delete", repo.name, "删除评审仓库定义（工作区目录保留,可在设置页清理磁盘）");
+        json(200, { ok: true });
+      }).catch((err) => json(400, { error: err.message }));
+      return;
+    }
+
+    if (req.method === "POST" && crPath === "/api/code-review/repos/test") {
+      if (!adminWriteGate()) return;
+      readJsonBody().then(async (body) => {
+        const repo = codeReviewApi.findRepo(String(body.id || ""));
+        if (!repo) { json(404, { error: "仓库不存在" }); return; }
+        const r = await codeReviewApi.testRepo(repo);
+        json(200, r);
+      }).catch((err) => json(400, { error: err.message }));
+      return;
+    }
+
+    if (req.method === "POST" && crPath === "/api/code-review/runs/start") {
+      if (!adminWriteGate()) return;
+      readJsonBody().then((body) => {
+        try {
+          const r = codeReviewApi.enqueue(String(body.repo || ""), { trigger: "manual", actor: "admin" });
+          recordAdminAudit(req, "codereview.run", String(body.repo || ""), `手动触发代码评审（run #${r.runId}${r.deduped ? "，与进行中的任务合并" : ""}）`);
+          json(r.deduped ? 200 : 202, r);
+        } catch (err) {
+          json(err.statusCode || 400, { error: err.message });
+        }
+      }).catch((err) => json(400, { error: err.message }));
+      return;
+    }
+
+    if (req.method === "POST" && crPath === "/api/code-review/runs/cancel") {
+      if (!adminWriteGate()) return;
+      readJsonBody().then((body) => {
+        try {
+          const r = codeReviewApi.cancel(Number(body.id));
+          recordAdminAudit(req, "codereview.cancel", `run #${body.id}`, `取消代码评审（${r.canceled ? "已取消" : "未取消:" + r.note}）`);
+          json(200, r);
+        } catch (err) {
+          json(err.statusCode || 400, { error: err.message });
+        }
+      }).catch((err) => json(400, { error: err.message }));
+      return;
+    }
+
+    // 一键创建评审专用虚拟 Key:明文只在本次响应返回一次;真实上游 Key 由管理员提供
+    // (从某方案现有分配里选),因为 canUseProfile 要求该 Key 在某方案下有真实 Key。
+    if (req.method === "POST" && crPath === "/api/code-review/key/create") {
+      if (!adminWriteGate()) return;
+      readJsonBody().then((body) => {
+        const profileName = String(body.profile || "");
+        if (!profileName || !config.profiles?.[profileName]) { json(400, { error: "请选择评审用哪个方案" }); return; }
+        const prof = config.profiles[profileName];
+        const realKeys = Object.values(prof.users || {}).filter((u) => (typeof u === "object" ? u.key : u));
+        if (!realKeys.length) { json(400, { error: `方案「${profileName}」还没有分配任何真实上游 Key，评审会拿不到凭证` }); return; }
+        // 生成专用账号:设为**超级用户**并**不分配真实 Key** —— 运行期由既有的
+        // borrowProfileRealKey 向所选方案借用一把真实 Key(超级用户的既有语义),
+        // 管理员因此不必在这里再填一遍 API 信息。
+        const key = "jx-review-" + crypto.randomBytes(6).toString("hex");
+        config.users = config.users || {};
+        config.users[key] = { username: body.username || "代码评审", expiresAt: null, disabled: false, superUser: true };
+        const next = sanitizeCodeReviewConfig(config.codeReview, port);
+        next.providerKey = key;
+        next.providerProfile = profileName;
+        applyReviewEndpoint(next);
+        config.codeReview = next;
+        saveConfig(config);
+        // runtime.globalUsers 是创建时的快照({..config.users}),新账号必须重载方案
+        // 才对代理层可见 —— 否下一次评审报 "Unknown API key"
+        reloadAllRuntimes();
+        recordAdminAudit(req, "codereview.account.create", profileName, "创建代码评审专用账号（超级用户,借用方案 " + profileName + " 的真实 Key）");
+        json(200, { ok: true, key, masked: key.slice(0, 8) + "****" });
+      }).catch((err) => json(400, { error: err.message }));
+      return;
+    }
+
+    json(404, { error: "unknown code-review endpoint" });
     return;
   }
 

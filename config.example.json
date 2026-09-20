@@ -6,7 +6,9 @@
       "suffix": "glm",
       "isDefault": true,
       "upstream": "https://open.bigmodel.cn/api/anthropic",
-      "allowedModels": ["glm-5.1"],
+      "allowedModels": [
+        "glm-5.1"
+      ],
       "modelAliases": {
         "jx-sonnet": "glm-5.1",
         "jx-opus": "glm-5.1",
@@ -14,8 +16,14 @@
       },
       "dailyTokenLimit": 2000000,
       "peakHours": [
-        { "start": "09:00", "end": "12:00" },
-        { "start": "14:00", "end": "18:00" }
+        {
+          "start": "09:00",
+          "end": "12:00"
+        },
+        {
+          "start": "14:00",
+          "end": "18:00"
+        }
       ],
       "peakQuotaRate": 1,
       "offPeakQuotaRate": 1,
@@ -41,10 +49,45 @@
     "streamTimeout": 600000,
     "maxRetries": 3,
     "retryDelay": 1000,
-    "retryableStatusCodes": [429, 502, 503, 504],
+    "retryableStatusCodes": [
+      429,
+      502,
+      503,
+      504
+    ],
     "maxConcurrentPerUser": 5,
     "rateLimitPerMinute": 60,
     "circuitBreakerFailures": 5,
     "circuitBreakerCooldown": 30000
+  },
+  "codeReview": {
+    "enabled": false,
+    "ocrPath": "",
+    "workspaceDir": "",
+    "perRepoDiskLimitMB": 2048,
+    "maxParallelJobs": 2,
+    "defaultTimeoutMinutes": 30,
+    "defaultConcurrency": 4,
+    "defaultMaxTokensBudget": 2000000,
+    "dailyTokenBudget": 0,
+    "runRetentionDays": 90,
+    "keepRunsPerRepo": 50,
+    "storeComments": true,
+    "notifyOn": "always",
+    "providerKey": "",
+    "providerProfile": "",
+    "providerName": "cc-team",
+    "providerUrl": "http://127.0.0.1:6789/v1",
+    "providerProtocol": "anthropic",
+    "providerModel": "",
+    "background": "",
+    "exclude": [
+      "**/node_modules/**",
+      "**/dist/**",
+      "**/*.min.js",
+      "**/*.lock"
+    ],
+    "apiKeys": [],
+    "repos": []
   }
 }

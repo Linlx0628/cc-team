@@ -31,6 +31,25 @@ node server.mjs
 
 默认端口 **6789**。
 
+## 代码评审功能的系统依赖（可选功能）
+
+「代码评审」功能需要宿主机/容器里有：
+
+| 依赖 | 版本要求 | 安装 | 说明 |
+|---|---|---|---|
+| `git` | ≥ 2.41 | `apk add git` / `apt install git` | 系统用它 clone/fetch 仓库 |
+| `@alibaba-group/open-code-review`（`ocr`） | 见 `ocr version` | `npm i -g @alibaba-group/open-code-review` | 评审引擎；**网关不会自动安装**，未装时功能显示「未安装」与安装指引 |
+| `openssh-client` | — | `apk add openssh-client` | 仅当用 SSH 方式拉私有仓库时需要 |
+
+**实测结论（2026-09-19，macOS + open-code-review v1.12.3）**——这些直接决定网关怎么调用它：
+
+- **HOME 隔离成立**：以 `HOME=<工作区>/ocr-home` 运行时，`ocr config set` 与运行都只读写 `<HOME>/.opencodereview/`，宿主机 `~/.opencodereview/config.json` 的 hash 与 mtime 分毫未变 → 网关可以把自己的 provider 配置写进隔离目录，不碰管理员在宿主机上的全局配置
+- **自定义 provider 的 `url` 是 API base**：配 `url = http://127.0.0.1:<port>/v1` + `protocol = anthropic` 时，OCR 实际 POST 到 **`<url>/messages`**（即 `/v1/messages`），鉴权头为 `Authorization: Bearer <api_key>`，请求体为标准 Anthropic 形状（`max_tokens/messages/model/system/tools`）→ 直接指向本网关即可，评审消耗自然计入配额与用量
+- **`--exclude` 是逗号分隔的单值**（`--exclude "a,b"`），不是重复传参
+- **`--timeout` 是「每子任务」分钟数**（默认 15），不是总时长 → 网关侧另有独立的进程级硬超时
+- **`--max-tokens-budget`**：`0` = 不限；超预算时已完成的局部结果仍会发布且**退出码 0**，只有全部子任务失败才非零
+- **失败也会产出 JSON**：`status: "failed"` 且照常带 `summary` token 统计，退出码 1 → 以 JSON 里的 `status` 为准，退出码只作参考
+
 ## config.json 字段参考
 
 | 字段 | 说明 |

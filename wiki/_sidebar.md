@@ -4,10 +4,11 @@
 
 - **管理员指南**
   - [管理面板：顶栏与图表](dashboard.md)
-  - [管理面板：九个工作区](dashboard-workspaces.md)
+  - [管理面板：十个工作区](dashboard-workspaces.md)
   - [设置页：方案与全局配置](settings.md)
   - [方案组调度](schedule.md)
   - [用户与配额管理](users.md)
+  - [代码评审](code-review.md)
 
 - **成员指南**
   - [我的用量页](my-usage.md)

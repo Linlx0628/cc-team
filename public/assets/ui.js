@@ -137,3 +137,80 @@ function describeRuleDays(days){
   }
   return out.join('、');
 }
+
+// ── 通用详情弹层 + 分页列表 ───────────────────────────────────────────────────
+// 为什么放 ui.js:管理面板与「我的用量」各加载自己那份 CSS,但**都加载 theme.css 与 ui.js** ——
+// 弹层结构与分页逻辑只写一份,免得两页各写一套再各自长歪(这项目在这类「各写一份」上踩过坑)。
+//
+// 解决的痛点:详情原先堆在列表下面,意见一多就要一直往下滚,且一次把几百条(每条还带 <pre>)
+// 全塞进 DOM —— 既难看清又卡。现在弹层里**只渲染当前页**,并带搜索。
+function dlgOpen(id){
+  const el=document.getElementById(id);
+  if(!el)return;
+  el.classList.add('open');
+  document.body.style.overflow='hidden';
+  const s=document.getElementById(id+'Search');
+  if(s)setTimeout(function(){s.focus()},30);
+}
+function dlgClose(id){
+  const el=document.getElementById(id);
+  if(!el)return;
+  el.classList.remove('open');
+  document.body.style.overflow='';
+}
+// 点遮罩空白处 / 按 Esc 关闭。同一元素只绑一次。
+function dlgInit(id){
+  const el=document.getElementById(id);
+  if(!el||el.dataset.dlgBound)return;
+  el.dataset.dlgBound='1';
+  el.addEventListener('click',function(e){if(e.target===el)dlgClose(id)});
+  document.addEventListener('keydown',function(e){if(e.key==='Escape'&&el.classList.contains('open'))dlgClose(id)});
+}
+// 分页 + 搜索渲染器。返回的对象由调用方在打开弹层时喂数据。
+//   match(item)   → 参与搜索的文本(整串小写匹配)
+//   render(item)  → 单条的 HTML(调用方自己转义!)
+function dlgPager(opt){
+  const perPage=opt.perPage||20;
+  const searchable=opt.searchable!==false;   // false = 过滤由调用方自己管(如列表带状态下拉时)
+  const el=function(s){return document.getElementById(opt.prefix+s)};
+  let all=[],kw='',page=1;
+  function filtered(){
+    if(!searchable)return all;
+    const k=kw.trim().toLowerCase();
+    if(!k)return all;
+    return all.filter(function(x){return String(opt.match?opt.match(x):'').toLowerCase().indexOf(k)>=0});
+  }
+  function paint(){
+    const rows=filtered();
+    const pages=Math.max(1,Math.ceil(rows.length/perPage));
+    if(page>pages)page=pages;
+    const slice=rows.slice((page-1)*perPage,page*perPage);
+    const list=el('Body');
+    if(list){
+      list.innerHTML=slice.length
+        ? slice.map(opt.render).join('')
+        : '<div class="lb-msg">'+(kw?'没有匹配的内容':'没有内容')+'</div>';
+    }
+    const info=el('Info');
+    if(info)info.textContent=rows.length?rows.length+' 条 · 第 '+page+' / '+pages+' 页':'0 条';
+    const c=el('Count');
+    if(c)c.textContent=rows.length?rows.length+' 条':'';
+    const prev=el('Prev'),next=el('Next');
+    if(prev)prev.disabled=page<=1;
+    if(next)next.disabled=page>=pages;
+    list&&(list.scrollTop=0);
+  }
+  const search=searchable?el('Search'):null;
+  if(search&&!search.dataset.dlgBound){
+    search.dataset.dlgBound='1';
+    search.addEventListener('input',function(){kw=this.value;page=1;paint()});
+  }
+  const prev=el('Prev'),next=el('Next');
+  if(prev&&!prev.dataset.dlgBound){prev.dataset.dlgBound='1';prev.addEventListener('click',function(){page--;paint()})}
+  if(next&&!next.dataset.dlgBound){next.dataset.dlgBound='1';next.addEventListener('click',function(){page++;paint()})}
+  return {
+    // keepFilter:调用方在输入事件里反复 set() 时必须传,否则每敲一个字搜索框就被清空
+    set:function(items,keepFilter){all=items||[];if(!keepFilter){kw='';page=1;if(search)search.value=''}paint()},
+    paint:paint
+  };
+}

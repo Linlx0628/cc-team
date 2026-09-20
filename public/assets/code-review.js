@@ -107,37 +107,73 @@ function renderCodeReview(ocr) {
     body.innerHTML = html;
     return;
   }
-  html += '<div class="cr-runs">' + crRuns.map((r) => {
-    const cls = crStatusClass(r.status);
-    const active = ["queued", "syncing", "running", "parsing"].includes(r.status);
-    const trig = r.trigger && r.trigger !== "manual" ? `<span class="cr-run-trig">${escH(r.trigger)}</span>` : "";
-    const files = crParseFiles(r.files_json);
-    // 被评文件:列表里给前几个名字(比冷冰冰一个「文件 1」有用得多),更多用 +N 收口
-    const fileHint = files.length
-      ? `<div class="cr-run-files">${files.slice(0, 3).map((f) => `<span class="cr-file-chip" title="${escH(f)}">${escH(crBase(f))}</span>`).join("")}${files.length > 3 ? `<span class="cr-file-more">+${files.length - 3}</span>` : ""}</div>`
-      : "";
-    return `<div class="cr-run is-${cls}"><span class="cr-run-num">#${r.id}</span>`
-      + '<div class="cr-run-main"><div class="cr-run-title">'
-      + `<span class="cr-run-repo">${escH(r.repo_name)}</span>`
-      + `<span class="pill pill-${cls}">${escH(CR_STATUS_LABEL[r.status] || r.status)}</span>` + trig + '</div>'
-      + '<div class="cr-run-meta">' + escH(new Date(r.created_at).toLocaleString("zh-CN", { timeZone: "Asia/Shanghai", hour12: false }))
-      + " · " + escH(r.range_mode === "single" ? "单提交 " + crShort(r.to_commit) : `${crShort(r.from_commit)}→${crShort(r.to_commit)}`)
-      + ` · 文件 ${r.files_reviewed} · 意见 ${r.comments_count} · ${fmtT(r.input_tokens + r.output_tokens)} token · ${crDur(r.elapsed_ms)}`
-      + '</div>'
-      // 一句话结论(note):「已跳过」到底是没新提交还是别的原因,靠它说清楚
-      + (r.note ? `<div class="cr-run-note">${escH(r.note)}</div>` : "")
-      + (r.error ? `<div class="cr-run-note is-err">${escH(String(r.error).slice(0, 200))}</div>` : "")
-      + fileHint
-      + '</div>'
-      + '<div class="cr-run-actions">'
-      + `<button type="button" class="btn btn-outline btn-sm" onclick="openReviewRun(${r.id})">详情</button>`
-      + (active ? `<button type="button" class="btn btn-outline btn-sm" onclick="cancelReviewRun(${r.id})">取消</button>` : "")
-      + '</div></div>';
-  }).join("") + "</div>";
-  html += '<div id="crRunDetail"></div></div>';
+  // 运行列表:搜索 + 状态过滤 + 分页(复用 ui.js 的 dlgPager,只渲染当前页)
+  html += crRunsToolbar()
+    + '<div class="cr-runs" id="crRunsBody"></div>'
+    + '<div class="dlg-foot" style="padding:8px 2px 0"><span id="crRunsInfo"></span>'
+    + '<button type="button" class="pager-btn" id="crRunsPrev">← 上一页</button>'
+    + '<button type="button" class="pager-btn" id="crRunsNext">下一页 →</button></div>';
+  html += '</div>';
   body.innerHTML = html;
+  crBindRunsToolbar();
   // 渲染完就把当前选中仓库的分支列表拉出来(默认分支会被自动选中)
   crLoadBranches();
+}
+
+// 运行列表的筛选条:记录一多,一眼找不到目标就是常态 —— 搜索(仓库/结论/错误) + 状态过滤
+function crRunsToolbar() {
+  return '<div class="dlg-tools" style="background:transparent;padding:9px 2px;border:0;border-bottom:1px solid var(--border)">'
+    + '<input type="search" class="dlg-search" id="crRunsSearch" placeholder="搜索仓库名 / 结论 / 错误…" aria-label="搜索评审记录">'
+    + `<select id="crRunsStatus" class="dlg-search" style="flex:none;width:130px" aria-label="按状态过滤"><option value="">全部状态</option>`
+    + Object.entries(CR_STATUS_LABEL).map(([k, v]) => `<option value="${escH(k)}">${escH(v)}</option>`).join("")
+    + '</select></div>';
+}
+// 行渲染拆出来给 dlgPager 用(它每页只 render 一页的行)
+function crRunRow(r) {
+  const cls = crStatusClass(r.status);
+  const active = ["queued", "syncing", "running", "parsing"].includes(r.status);
+  const trig = r.trigger && r.trigger !== "manual" ? `<span class="cr-run-trig">${escH(r.trigger)}</span>` : "";
+  const files = crParseFiles(r.files_json);
+  // 被评文件:列表里给前几个名字(比冷冰冰一个「文件 1」有用得多),更多用 +N 收口
+  const fileHint = files.length
+    ? `<div class="cr-run-files">${files.slice(0, 3).map((f) => `<span class="cr-file-chip" title="${escH(f)}">${escH(crBase(f))}</span>`).join("")}${files.length > 3 ? `<span class="cr-file-more">+${files.length - 3}</span>` : ""}</div>`
+    : "";
+  return `<div class="cr-run is-${cls}"><span class="cr-run-num">#${r.id}</span>`
+    + '<div class="cr-run-main"><div class="cr-run-title">'
+    + `<span class="cr-run-repo">${escH(r.repo_name)}</span>`
+    + `<span class="pill pill-${cls}">${escH(CR_STATUS_LABEL[r.status] || r.status)}</span>` + trig + '</div>'
+    + '<div class="cr-run-meta">' + escH(new Date(r.created_at).toLocaleString("zh-CN", { timeZone: "Asia/Shanghai", hour12: false }))
+    + " · " + escH(r.range_mode === "single" ? "单提交 " + crShort(r.to_commit) : `${crShort(r.from_commit)}→${crShort(r.to_commit)}`)
+    + ` · 文件 ${r.files_reviewed} · 意见 ${r.comments_count} · ${fmtT(r.input_tokens + r.output_tokens)} token · ${crDur(r.elapsed_ms)}`
+    + '</div>'
+    // 一句话结论(note):「已跳过」到底是没新提交还是别的原因,靠它说清楚
+    + (r.note ? `<div class="cr-run-note">${escH(r.note)}</div>` : "")
+    + (r.error ? `<div class="cr-run-note is-err">${escH(String(r.error).slice(0, 200))}</div>` : "")
+    + fileHint
+    + '</div>'
+    + '<div class="cr-run-actions">'
+    + `<button type="button" class="btn btn-outline btn-sm" onclick="openReviewRun(${r.id})">详情</button>`
+    + (active ? `<button type="button" class="btn btn-outline btn-sm" onclick="cancelReviewRun(${r.id})">取消</button>` : "")
+    + '</div></div>';
+}
+let crRunsPager = null;
+function crBindRunsToolbar() {
+  const search = document.getElementById("crRunsSearch");
+  const status = document.getElementById("crRunsStatus");
+  const repaint = () => {
+    const kw = (search ? search.value : "").trim().toLowerCase();
+    const st = status ? status.value : "";
+    const rows = crRuns.filter((r) => (!st || r.status === st)
+      && (!kw || `${r.repo_name} ${r.note || ""} ${r.error || ""}`.toLowerCase().includes(kw)));
+    if (!crRunsPager) {
+      // searchable:false:过滤条件(搜索 + 状态)在这里,不在 dlgPager 里 —— 避免它反复重置输入框
+      crRunsPager = dlgPager({ prefix: "crRuns", perPage: 15, searchable: false, render: crRunRow });
+    }
+    crRunsPager.set(rows, true);
+  };
+  if (search && !search.dataset.crBound) { search.dataset.crBound = "1"; search.addEventListener("input", repaint); }
+  if (status && !status.dataset.crBound) { status.dataset.crBound = "1"; status.addEventListener("change", repaint); }
+  repaint();
 }
 
 // files_json / tool_calls_json 是 TEXT 列,解析失败一律当无数据(别让一条脏 JSON 把整页打挂)
@@ -154,26 +190,54 @@ function crToolText(t) {
   return `共 ${t.total} 次（${parts.join(" · ")}）` + (t.failure ? ` · 失败 ${t.failure}` : "");
 }
 
+// 详情弹层(不再堆在列表下面):弹层内带搜索 + 分页,意见再多也只渲染当前页。
+// 分页/搜索的公共实现在 ui.js 的 dlgPager —— 两页共用,别各写一套。
+let crDetailPager = null;
+function crDetailRender(c) {
+  const lines = c.start_line ? `:${c.start_line}${c.end_line && c.end_line !== c.start_line ? "–" + c.end_line : ""}` : "";
+  return '<div class="cr-comment"><div class="cr-comment-loc">' + escH(c.path) + escH(lines) + '</div>'
+    + '<div class="cr-comment-body">' + escH(c.content || "") + '</div>'
+    + (c.existing_code ? `<details><summary>原代码</summary><pre>${escH(c.existing_code)}</pre></details>` : "")
+    + (c.suggestion_code ? `<details open><summary>建议改法</summary><pre>${escH(c.suggestion_code)}</pre></details>` : "")
+    + (c.thinking ? `<details><summary>推理</summary><div class="cr-run-note" style="white-space:pre-wrap">${escH(c.thinking)}</div></details>` : "")
+    + '</div>';
+}
 async function openReviewRun(id) {
-  const box = document.getElementById("crRunDetail");
-  box.innerHTML = '<div class="lb-msg">加载中…</div>';
+  dlgInit("crDetailDlg");
+  dlgOpen("crDetailDlg");
+  const title = document.getElementById("crDetailDlgTitle");
+  const sub = document.getElementById("crDetailDlgSub");
+  const body = document.getElementById("crDetailDlgBody");
+  const exp = document.getElementById("crDetailExport");
+  if (sub) sub.textContent = "加载中…";
+  if (body) body.innerHTML = '<div class="lb-msg">加载中…</div>';
+  if (!crDetailPager) {
+    crDetailPager = dlgPager({
+      prefix: "crDetailDlg", perPage: 20,
+      match: (c) => `${c.path} ${c.start_line || ""} ${c.content || ""} ${c.suggestion_code || ""}`,
+      render: crDetailRender,
+    });
+  }
   try {
     const d = await crApi("/api/code-review/run?id=" + encodeURIComponent(id));
     const run = d.run, comments = d.comments || [];
     const files = crParseFiles(run.files_json);
     const tools = crParseTools(run.tool_calls_json);
-    let html = '<div class="cr-detail"><div class="cr-detail-head">'
-      + `<strong>运行 #${run.id} · ${escH(run.repo_name)}</strong>`
-      + `<span class="pill pill-${crStatusClass(run.status)}">${escH(CR_STATUS_LABEL[run.status] || run.status)}</span>`
-      + `<a class="btn btn-outline btn-sm" style="margin-left:auto" href="/api/code-review/report?id=${run.id}">导出报告</a></div>`;
+    if (title) title.textContent = `运行 #${run.id} · ${run.repo_name} ${CR_STATUS_LABEL[run.status] || run.status}`;
+    if (sub) sub.textContent = [
+      (run.range_mode === "single" ? "单提交 " : "增量 ") + crShort(run.to_commit),
+      run.author_name ? `提交人 ${run.author_name}` : "",
+      `${run.comments_count} 条意见 · ${run.files_reviewed} 个文件 · ${fmtT(run.input_tokens + run.output_tokens)} token · ${crDur(run.elapsed_ms)}`,
+    ].filter(Boolean).join(" · ");
+    if (exp) { exp.href = "/api/code-review/report?id=" + run.id; exp.style.display = ""; }
     // 结论 + 引擎实际干了多少活:这条是回答「有没有真干活」的关键
-    html += '<div class="cr-facts">'
+    let html = '<div class="cr-detail"><div class="cr-facts">'
       + crFact("结论", run.note || "—")
       + crFact("评审范围", (run.range_mode === "single" ? "单提交 " : "增量 ") + escH(crShort(run.from_commit) || "—") + " → " + escH(crShort(run.to_commit) || "—"))
       + (run.author_name || run.author_email ? crFact("提交人", escH(run.author_name || "—") + (run.author_email ? ` &lt;${escH(run.author_email)}&gt;` : "")) : "")
       + crFact("模型", escH(run.ocr_model || "—") + (run.ocr_provider ? `（${escH(run.ocr_provider)}）` : ""))
       + (tools ? crFact("引擎动作", escH(crToolText(tools))) : "")
-      + crFact("token", `网关计 ${fmtT(run.attributed_input + run.attributed_output)} · 引擎自报 ${fmtT(run.input_tokens + run.output_tokens)}（${fmtT(run.input_tokens)} 入 / ${fmtT(run.output_tokens)} 出）`)
+      + crFact("token", `网关计 ${fmtT(run.attributed_input + run.attributed_output)} · 引擎自报 ${fmtT(run.input_tokens + run.output_tokens)}`)
       + crFact("耗时", crDur(run.elapsed_ms))
       + '</div>';
     if (run.error) html += `<div class="cr-notice is-error" style="margin:0 0 12px">${escH(run.error)}</div>`;
@@ -186,25 +250,17 @@ async function openReviewRun(id) {
       + '</div>';
     if (!comments.length) {
       html += '<div class="cr-empty" style="padding:22px"><div class="cr-empty-ico">✓</div><div class="cr-empty-t">无意见</div><div class="cr-empty-d">本次范围(上面列出的文件)未发现需要修改的问题。</div></div></div>';
-      box.innerHTML = html;
+      body.innerHTML = html;
+      crDetailPager.set([]);
       return;
     }
-    const groups = {};
-    for (const c of comments) (groups[c.path] = groups[c.path || "(未标注路径)"] || []).push(c);
-    html += Object.entries(groups).map(([p, list]) => {
-      return `<div class="cr-file">▸ ${escH(p)}<span style="color:var(--dim2)">· ${list.length} 条</span></div>` + list.map((c) => {
-        const lines = c.start_line ? `:${c.start_line}${c.end_line && c.end_line !== c.start_line ? "–" + c.end_line : ""}` : "";
-        return '<div class="cr-comment"><div class="cr-comment-loc">' + escH(p) + escH(lines) + '</div>'
-          + '<div class="cr-comment-body">' + escH(c.content || "") + '</div>'
-          + (c.existing_code ? `<details><summary>原代码</summary><pre>${escH(c.existing_code)}</pre></details>` : "")
-          + (c.suggestion_code ? `<details open><summary>建议改法</summary><pre>${escH(c.suggestion_code)}</pre></details>` : "")
-          + (c.thinking ? `<details><summary>推理</summary><div class="note" style="white-space:pre-wrap;margin-top:6px">${escH(c.thinking)}</div></details>` : "")
-          + '</div>';
-      }).join("");
-    }).join("") + '</div>';
-    box.innerHTML = html;
+    html += `<div class="cr-files-title">评审意见（${comments.length} 条，可搜索、分页）</div></div>`;
+    body.innerHTML = html;
+    crDetailPager.set(comments);
   } catch (err) {
-    box.innerHTML = '<div class="lb-msg">加载失败：' + escH(err.message) + "</div>";
+    if (sub) sub.textContent = "";
+    if (body) body.innerHTML = '<div class="lb-msg">加载失败：' + escH(err.message) + "</div>";
+    crDetailPager.set([]);
   }
 }
 

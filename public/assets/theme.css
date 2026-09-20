@@ -29,3 +29,28 @@ button:active,.btn:active{transform:translateY(1px)}
 .toast{background:var(--green);color:#fff;padding:9px 18px;border-radius:6px;font-size:13px;font-weight:550;box-shadow:0 6px 18px rgba(0,0,0,.16);opacity:0;transform:translateY(-8px);transition:opacity .25s ease,transform .25s ease;max-width:80vw}
 .toast.show{opacity:1;transform:translateY(0)}
 @media (prefers-reduced-motion:reduce){.toast{transition:none}}
+
+/* ── 通用详情弹层 + 分页器(theme.css 是两页唯一共用的样式表) ──────────────────
+   场景:「点一行看详情」这类信息量不定的展示。早先是把详情直接堆在列表下面 ——
+   意见一多就要一直往下滚、还没分页没搜索,既难看又卡。结构放这里,两页共用一份。 */
+.dlg-overlay{display:none;position:fixed;inset:0;background:rgba(24,24,22,.38);z-index:60;align-items:center;justify-content:center;padding:20px}
+.dlg-overlay.open{display:flex}
+.dlg-card{background:var(--surface);border:1px solid var(--border);border-radius:8px;width:100%;max-width:940px;max-height:88vh;display:flex;flex-direction:column;overflow:hidden;box-shadow:0 18px 50px rgba(24,24,22,.2)}
+.dlg-head{display:flex;align-items:center;gap:10px;padding:12px 16px;border-bottom:1px solid var(--border);flex-wrap:wrap}
+.dlg-title{font-size:13.5px;font-weight:650;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.dlg-sub{font-size:11px;color:var(--dim);min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex-basis:100%;margin-top:2px}
+.dlg-spacer{flex:1}
+.dlg-close{background:transparent;border:0;font-size:15px;line-height:1;color:var(--dim);cursor:pointer;padding:5px 8px;border-radius:4px}
+.dlg-close:hover{background:var(--surface-subtle);color:var(--text)}
+.dlg-tools{display:flex;align-items:center;gap:10px;padding:9px 16px;border-bottom:1px solid var(--border);background:var(--surface-subtle)}
+.dlg-search{flex:1;min-width:0;font-size:12px;font-family:var(--font-body);padding:7px 10px;border:1px solid var(--border-strong);border-radius:5px;background:var(--surface);color:var(--text)}
+.dlg-search:hover{border-color:#aaa9a2}
+.dlg-search:focus{outline:none;border-color:var(--accent)}
+.dlg-count{font-size:11px;color:var(--dim);white-space:nowrap;font-variant-numeric:tabular-nums}
+.dlg-body{flex:1;min-height:0;overflow:auto;padding:14px 16px}
+.dlg-foot{display:flex;align-items:center;gap:7px;padding:8px 16px;border-top:1px solid var(--border);min-height:40px}
+.dlg-foot>span{font-size:11px;color:var(--dim);margin-right:auto;font-variant-numeric:tabular-nums}
+.pager-btn{font-size:11px;background:var(--surface);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:4px 11px;cursor:pointer;text-decoration:none;display:inline-block;line-height:1.5}
+.pager-btn:hover:not(:disabled){border-color:var(--border-strong);background:var(--surface-subtle)}
+.pager-btn:disabled{opacity:.4;cursor:default}
+@media(max-width:560px){.dlg-overlay{padding:10px}.dlg-card{max-height:93vh}.dlg-body{padding:11px}.dlg-tools{padding:8px 11px}}

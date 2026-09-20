@@ -1160,6 +1160,10 @@ function mrClass(s){
   return'bad';
 }
 function mrTime(iso){return iso?new Date(iso).toLocaleString('zh-CN',{timeZone:'Asia/Shanghai',hour12:false}):'—'}
+(function(){
+  const el=document.getElementById('mrRunSearch');
+  if(el)el.addEventListener('input',function(){if(MR.data)renderMyReview()});
+})();
 function fetchMyReview(){
   MR.loading=true;
   fetch('/api/my-review?limit=20',{headers:{'Authorization':'Bearer '+VK}}).then(function(r){return r.json()}).then(function(d){
@@ -1185,7 +1189,12 @@ function renderMyReview(){
       (r.consecutiveFailures?' · <span style="color:var(--red)">连续失败 '+r.consecutiveFailures+' 次</span>':'')+'</div></div></div>';
   }).join('')+'</div>';
   if(!d.runs.length){runs.innerHTML='<div class="lb-msg" style="margin-top:12px">还没有评审记录</div>';return}
-  runs.innerHTML='<h3 style="font-size:13px;font-weight:650;margin:16px 0 8px">评审记录</h3><div class="lb-list">'+d.runs.map(function(r){
+  const kw=(document.getElementById('mrRunSearch')?document.getElementById('mrRunSearch').value:'').trim().toLowerCase();
+  const rows=kw?d.runs.filter(function(r){return (r.repo+' '+(r.note||'')+' '+(r.error||'')).toLowerCase().indexOf(kw)>=0}):d.runs;
+  const cnt=document.getElementById('mrRunCount');
+  if(cnt)cnt.textContent=rows.length+' 条'+(kw&&rows.length!==d.runs.length?'(共 '+d.runs.length+')':'');
+  if(!rows.length){runs.innerHTML='<div class="lb-msg" style="margin-top:12px">没有匹配的记录</div>';return}
+  runs.innerHTML='<h3 style="font-size:13px;font-weight:650;margin:16px 0 8px">评审记录</h3><div class="lb-list">'+rows.map(function(r){
     return '<div class="lb-row"><div class="lb-who"><div class="lb-name">'+esc(r.repo)+
       ' <span class="mr-pill mr-pill-'+mrClass(r.status)+'">'+esc(MR_LABEL[r.status]||r.status)+'</span></div>'+
       '<div class="lb-det">'+esc(mrTime(r.createdAt))+' · '+esc(r.rangeMode==='single'?'单提交':'增量')+' '+
@@ -1195,32 +1204,56 @@ function renderMyReview(){
       '</div><button type="button" class="mu-btn mu-btn-outline mu-btn-sm" onclick="openMyReviewRun('+r.id+')">详情</button></div>';
   }).join('')+'</div>';
 }
+// 详情弹层(不再堆在列表下面):弹层内带搜索 + 分页,意见再多也只渲染当前页。
+// 分页/搜索的实现在 ui.js 的 dlgPager(两页共用),这里只提供渲染与口径。
+let MR_DETAIL_PAGER=null;
+function mrDetailRow(c){
+  const loc=c.start_line?(':'+c.start_line+(c.end_line&&c.end_line!==c.start_line?'-'+c.end_line:'')):'';
+  return '<div class="box" style="padding:10px 12px;margin-bottom:8px">'+
+    '<div class="lb-det" style="font-family:var(--font-mono)">'+esc(c.path)+esc(loc)+'</div>'+
+    '<div style="font-size:12.5px;margin:6px 0;white-space:pre-wrap">'+esc(c.content||'')+'</div>'+
+    (c.existing_code?'<details><summary class="lb-det" style="cursor:pointer">原代码</summary><pre style="white-space:pre-wrap;background:var(--surface-subtle);padding:8px;border-radius:4px;font-size:11.5px;overflow:auto">'+esc(c.existing_code)+'</pre></details>':'')+
+    (c.suggestion_code?'<details open><summary class="lb-det" style="cursor:pointer">建议改法</summary><pre style="white-space:pre-wrap;background:var(--surface-subtle);padding:8px;border-radius:4px;font-size:11.5px;overflow:auto">'+esc(c.suggestion_code)+'</pre></details>':'')+
+    '</div>';
+}
 function openMyReviewRun(id){
-  const box=document.getElementById('mrDetail');
-  if(!box)return;
-  box.innerHTML='<div class="lb-msg">加载中…</div>';
+  dlgInit('mrDetailDlg');
+  dlgOpen('mrDetailDlg');
+  const title=document.getElementById('mrDetailDlgTitle');
+  const sub=document.getElementById('mrDetailDlgSub');
+  const body=document.getElementById('mrDetailDlgBody');
+  if(sub)sub.textContent='加载中…';
+  if(body)body.innerHTML='<div class="lb-msg">加载中…</div>';
+  if(!MR_DETAIL_PAGER){
+    MR_DETAIL_PAGER=dlgPager({
+      prefix:'mrDetailDlg',perPage:20,
+      match:function(c){return (c.path||'')+' '+(c.start_line||'')+' '+(c.content||'')+' '+(c.suggestion_code||'')},
+      render:mrDetailRow
+    });
+  }
   fetch('/api/my-review/run?id='+id,{headers:{'Authorization':'Bearer '+VK}}).then(function(r){
     if(!r.ok)throw new Error('HTTP '+r.status);return r.json();
   }).then(function(d){
     const run=d.run,cs=d.comments||[];
-    let html='<h3 style="font-size:13px;font-weight:650;margin:16px 0 8px">运行 #'+run.id+' · '+esc(run.repo_name)+'</h3>';
-    html+='<div class="note" style="margin-bottom:10px">'+esc(run.note||'')+'</div>';
-    if(!cs.length){html+='<div class="lb-msg" style="color:var(--green)">本次没有提出意见</div>';box.innerHTML=html;return}
-    const byPath={};cs.forEach(function(c){(byPath[c.path]=byPath[c.path]||[]).push(c)});
-    html+=Object.keys(byPath).map(function(p){
-      return '<div class="lb-cohort" style="font-family:var(--font-mono)">'+esc(p)+' · '+byPath[p].length+' 条</div>'+
-        byPath[p].map(function(c){
-          const loc=c.start_line?(':'+c.start_line+(c.end_line&&c.end_line!==c.start_line?'-'+c.end_line:'')):'';
-          return '<div class="box" style="padding:10px 12px;margin-bottom:8px">'+
-            '<div class="lb-det" style="font-family:var(--font-mono)">'+esc(p)+esc(loc)+'</div>'+
-            '<div style="font-size:12.5px;margin:6px 0;white-space:pre-wrap">'+esc(c.content||'')+'</div>'+
-            (c.existing_code?'<details><summary class="note">原代码</summary><pre style="white-space:pre-wrap;background:var(--surface-subtle);padding:8px;border-radius:4px;font-size:11.5px;overflow:auto">'+esc(c.existing_code)+'</pre></details>':'')+
-            (c.suggestion_code?'<details open><summary class="note">建议改法</summary><pre style="white-space:pre-wrap;background:var(--surface-subtle);padding:8px;border-radius:4px;font-size:11.5px;overflow:auto">'+esc(c.suggestion_code)+'</pre></details>':'')+
-            '</div>';
-        }).join('');
-    }).join('');
-    box.innerHTML=html;
-  }).catch(function(e){box.innerHTML='<div class="lb-msg">加载失败:'+esc(e.message)+'</div>'});
+    if(title)title.textContent='运行 #'+run.id+' · '+run.repo_name;
+    if(sub)sub.textContent=[
+      (run.rangeMode==='single'?'单提交':'增量')+String(run.toCommit||'').slice(0,8),
+      run.comments+' 条意见 · '+run.filesReviewed+' 个文件'
+    ].filter(Boolean).join(' · ');
+    let html='<div class="note" style="margin-bottom:10px">'+esc(run.note||'')+'</div>';
+    if(!cs.length){
+      html+='<div class="lb-msg" style="color:var(--green)">本次没有提出意见</div>';
+      if(body)body.innerHTML=html;
+      MR_DETAIL_PAGER.set([]);
+      return;
+    }
+    if(body)body.innerHTML=html;
+    MR_DETAIL_PAGER.set(cs);
+  }).catch(function(e){
+    if(sub)sub.textContent='';
+    if(body)body.innerHTML='<div class="lb-msg">加载失败:'+esc(e.message)+'</div>';
+    MR_DETAIL_PAGER.set([]);
+  });
 }
 
 setSection('overview',false);

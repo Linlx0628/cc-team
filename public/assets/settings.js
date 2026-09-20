@@ -1945,9 +1945,10 @@ async function saveCodeReviewSettings() {
     await refreshReviewFromServer();
   } catch (e) { crSetStatus(e.message || '保存失败', 'error'); }
 }
-async function saveReviewRepo() {
+// 把编辑器里当前填的值拼成 repo 对象(保存与「测试连接」共用,保证测的就是要存的)
+function collectReviewRepoForm() {
   const source = crEl('crRepoSource').value;
-  const repo = {
+  return {
     id: CR.editingRepoId || undefined,
     name: crEl('crRepoName').value.trim(),
     source,
@@ -1966,6 +1967,20 @@ async function saveReviewRepo() {
       weekdays: crEl('crRepoWeekdays').value.split(',').map((x) => parseInt(x.trim(), 10)).filter((d) => d >= 1 && d <= 7),
     },
   };
+}
+// 保存前就地测连接:测的是编辑器里当前的值(还没落库),填错能当场看到,不用先存再改
+async function testReviewRepoForm() {
+  const repo = collectReviewRepoForm();
+  const addr = repo.source === 'remote' ? repo.url : repo.localPath;
+  if (!addr) { crSetRepoStatus(repo.source === 'remote' ? '请先填仓库地址' : '请先填本地路径', 'error'); return; }
+  crSetRepoStatus('测试连接中…');
+  try {
+    const r = await crApi('/api/code-review/repos/test', { method: 'POST', headers: csrfHeaders({ 'Content-Type': 'application/json' }), body: JSON.stringify({ repo }) });
+    crSetRepoStatus(r.ok ? ('连接成功：' + (r.detail || '')) : ('连接失败：' + (r.detail || '')), r.ok ? 'ok' : 'error');
+  } catch (e) { crSetRepoStatus(e.message || '测试失败', 'error'); }
+}
+async function saveReviewRepo() {
+  const repo = collectReviewRepoForm();
   crSetRepoStatus('保存中…');
   try {
     await crApi('/api/code-review/repos/save', { method: 'POST', headers: csrfHeaders({ 'Content-Type': 'application/json' }), body: JSON.stringify({ repo }) });
@@ -1983,11 +1998,13 @@ async function deleteReviewRepo(id) {
   } catch (e) { crSetRepoStatus(e.message || '删除失败', 'error'); }
 }
 async function testReviewRepo(id) {
-  crSetRepoStatus('测试连接中…');
+  // 表格行的「测试」在编辑器关着时点 —— crRepoStatus 藏在编辑器里看不见,所以走 toast
+  const repo = CR.repos.find((x) => x.id === id);
+  toast('测试「' + ((repo && repo.name) || id) + '」连接中…');
   try {
     const r = await crApi('/api/code-review/repos/test', { method: 'POST', headers: csrfHeaders({ 'Content-Type': 'application/json' }), body: JSON.stringify({ id }) });
-    crSetRepoStatus(r.ok ? ('连接成功：' + (r.detail || '')) : ('连接失败：' + (r.detail || '')), r.ok ? 'ok' : 'error');
-  } catch (e) { crSetRepoStatus(e.message || '测试失败', 'error'); }
+    toast(r.ok ? ('连接成功：' + (r.detail || '')) : ('连接失败：' + (r.detail || '')));
+  } catch (e) { toast(e.message || '测试失败'); }
 }
 // 一键创建评审账号:不需要任何 Key 输入 —— 账号是超级用户,运行期向所选方案借用
 // 已有的真实 Key(系统自身的既有语义)。

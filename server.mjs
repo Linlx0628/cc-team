@@ -5620,8 +5620,22 @@ const server = http.createServer((req, res) => {
     if (req.method === "POST" && crPath === "/api/code-review/repos/test") {
       if (!adminWriteGate()) return;
       readJsonBody().then(async (body) => {
-        const repo = codeReviewApi.findRepo(String(body.id || ""));
-        if (!repo) { json(404, { error: "仓库不存在" }); return; }
+        // 两种入口:①带 id → 测已保存的仓库(表格里的「测试」按钮);②带 repo 对象 →
+        // 测「编辑器里当前填的、还没保存」的值,这样填错能当场发现,不用先存再改。
+        let repo;
+        if (body.repo && typeof body.repo === "object") {
+          // 先按仓库白名单同一套规则校验(非法 URL/分支会被丢弃),避免把注入形态喂给 git
+          repo = sanitizeCodeReviewConfig({ repos: [body.repo] }, port).repos[0];
+          if (!repo) { json(400, { error: "仓库信息不合法：地址需为 https/ssh/git@（或 local 绝对路径），分支名不能含特殊字符" }); return; }
+          // 凭据留空 = 沿用已保存的(界面回显的是掩码);编辑已有仓库时才有原值可沿用
+          if (!repo.credential && body.repo.id) {
+            const old = codeReviewApi.findRepo(String(body.repo.id));
+            if (old && old.credential) repo.credential = old.credential;
+          }
+        } else {
+          repo = codeReviewApi.findRepo(String(body.id || ""));
+          if (!repo) { json(404, { error: "仓库不存在" }); return; }
+        }
         const r = await codeReviewApi.testRepo(repo);
         json(200, r);
       }).catch((err) => json(400, { error: err.message }));

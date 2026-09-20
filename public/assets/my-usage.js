@@ -624,7 +624,7 @@ load();setInterval(load,30000);
 // 配置 MCP(第三份 setup-guide 内嵌分区,见 setup-guide.js 的 mcp 分支)。
 // 顺序即导航顺序,id 由 setSection() 按 'mu-tab-'+s / 'mu-panel-'+s 硬拼 ——
 // 增删菜单必须与 lib/pages.mjs 的按钮和面板同时改,否则切换会静默失效。
-const SECTIONS=['overview','rates','analysis','sessions','leaderboard','claude','codex','mcp'];
+const SECTIONS=['overview','rates','analysis','sessions','leaderboard','review','claude','codex','mcp'];
 function setSection(name,focus){
   if(SECTIONS.indexOf(name)<0)name='overview';
   SECTION=name;
@@ -655,6 +655,8 @@ function paintSection(){
     ensureActivity();   // 已拉过是空操作;正在拉时 fetchActivity() 自己会早退
   }else if(SECTION==='leaderboard'){
     ensureLeaderboard();
+  }else if(SECTION==='review'){
+    ensureMyReview();
   }
 }
 (function bindMyUsageNav(){
@@ -1060,6 +1062,81 @@ async function fetchActivity(){
 }
 // 首次进入「用量分析」或「会话使用情况」才拉,不挂 30 秒轮询 —— 与排行榜同一处理
 function ensureActivity(){if(!ACT.data&&!ACT.loading)fetchActivity()}
+
+// ── 代码评审(成员视角)────────────────────────────────────────────────────────
+// 只看得到自己**是成员**的仓库;越权过滤在服务端(/api/my-review),这里不做假设。
+const MR={data:null,loading:false};
+function ensureMyReview(){if(!MR.data&&!MR.loading)fetchMyReview()}
+const MR_LABEL={queued:'排队中',syncing:'同步代码',running:'评审中',parsing:'解析结果',success:'完成',
+  completed_with_warnings:'完成(有警告)',completed_with_errors:'完成(有错误)',skipped:'已跳过',failed:'失败',timeout:'超时',canceled:'已取消'};
+function mrClass(s){
+  if(s==='success')return'ok';
+  if(s==='completed_with_warnings'||s==='completed_with_errors')return'warn';
+  if(s==='skipped')return'dim';
+  if(['queued','syncing','running','parsing'].indexOf(s)>=0)return'run';
+  return'bad';
+}
+function mrTime(iso){return iso?new Date(iso).toLocaleString('zh-CN',{timeZone:'Asia/Shanghai',hour12:false}):'—'}
+function fetchMyReview(){
+  MR.loading=true;
+  fetch('/api/my-review?limit=20',{headers:{'Authorization':'Bearer '+VK}}).then(function(r){return r.json()}).then(function(d){
+    MR.data=d||{repos:[],runs:[]};MR.loading=false;renderMyReview();
+  }).catch(function(){MR.loading=false;const n=document.getElementById('mrNote');if(n)n.textContent='加载失败';});
+}
+function renderMyReview(){
+  const d=MR.data||{repos:[],runs:[]};
+  const note=document.getElementById('mrNote'),repos=document.getElementById('mrRepos'),runs=document.getElementById('mrRuns');
+  if(!note||!repos||!runs)return;
+  if(!d.repos.length){
+    note.textContent='';
+    repos.innerHTML='<div class="lb-msg">你还不是任何仓库的成员 —— 需要管理员在设置页·代码评审里把你加入对应仓库的成员名单。</div>';
+    runs.innerHTML='';return;
+  }
+  note.textContent='你负责 '+d.repos.length+' 个仓库,以下是它们的评审情况(按时间倒序,最多 20 条)。';
+  repos.innerHTML='<div class="lb-list">'+d.repos.map(function(r){
+    return '<div class="lb-row"><div class="lb-who"><div class="lb-name">'+esc(r.name)+
+      ' <span class="pill pill-'+mrClass(r.lastStatus)+'">'+(r.lastStatus?(MR_LABEL[r.lastStatus]||r.lastStatus):'未评审')+'</span></div>'+
+      '<div class="lb-det">分支 '+esc(r.branch||'main')+' · 上次 '+(r.lastRunAt?esc(mrTime(r.lastRunAt)):'从未')+
+      (r.consecutiveFailures?' · <span style="color:var(--red)">连续失败 '+r.consecutiveFailures+' 次</span>':'')+'</div></div></div>';
+  }).join('')+'</div>';
+  if(!d.runs.length){runs.innerHTML='<div class="lb-msg" style="margin-top:12px">还没有评审记录</div>';return}
+  runs.innerHTML='<h3 style="font-size:13px;font-weight:650;margin:16px 0 8px">评审记录</h3><div class="lb-list">'+d.runs.map(function(r){
+    return '<div class="lb-row"><div class="lb-who"><div class="lb-name">'+esc(r.repo)+
+      ' <span class="pill pill-'+mrClass(r.status)+'">'+esc(MR_LABEL[r.status]||r.status)+'</span></div>'+
+      '<div class="lb-det">'+esc(mrTime(r.createdAt))+' · '+esc(r.rangeMode==='single'?'单提交':'增量')+' '+
+      esc(String(r.toCommit||'').slice(0,8))+' · 文件 '+r.filesReviewed+' · 意见 '+r.comments+' · '+fmtTk(r.tokens)+' token</div>'+
+      (r.note?'<div class="lb-det" style="white-space:normal">'+esc(r.note)+'</div>':'')+
+      (r.error?'<div class="lb-det" style="white-space:normal;color:var(--red)">'+esc(String(r.error).slice(0,160))+'</div>':'')+
+      '</div><button type="button" class="btn btn-outline btn-sm" onclick="openMyReviewRun('+r.id+')">详情</button></div>';
+  }).join('')+'</div>';
+}
+function openMyReviewRun(id){
+  const box=document.getElementById('mrDetail');
+  if(!box)return;
+  box.innerHTML='<div class="lb-msg">加载中…</div>';
+  fetch('/api/my-review/run?id='+id,{headers:{'Authorization':'Bearer '+VK}}).then(function(r){
+    if(!r.ok)throw new Error('HTTP '+r.status);return r.json();
+  }).then(function(d){
+    const run=d.run,cs=d.comments||[];
+    let html='<h3 style="font-size:13px;font-weight:650;margin:16px 0 8px">运行 #'+run.id+' · '+esc(run.repo_name)+'</h3>';
+    html+='<div class="note" style="margin-bottom:10px">'+esc(run.note||'')+'</div>';
+    if(!cs.length){html+='<div class="lb-msg" style="color:var(--green)">本次没有提出意见</div>';box.innerHTML=html;return}
+    const byPath={};cs.forEach(function(c){(byPath[c.path]=byPath[c.path]||[]).push(c)});
+    html+=Object.keys(byPath).map(function(p){
+      return '<div class="lb-cohort" style="font-family:var(--font-mono)">'+esc(p)+' · '+byPath[p].length+' 条</div>'+
+        byPath[p].map(function(c){
+          const loc=c.start_line?(':'+c.start_line+(c.end_line&&c.end_line!==c.start_line?'-'+c.end_line:'')):'';
+          return '<div class="box" style="padding:10px 12px;margin-bottom:8px">'+
+            '<div class="lb-det" style="font-family:var(--font-mono)">'+esc(p)+esc(loc)+'</div>'+
+            '<div style="font-size:12.5px;margin:6px 0;white-space:pre-wrap">'+esc(c.content||'')+'</div>'+
+            (c.existing_code?'<details><summary class="note">原代码</summary><pre style="white-space:pre-wrap;background:var(--surface-subtle);padding:8px;border-radius:4px;font-size:11.5px;overflow:auto">'+esc(c.existing_code)+'</pre></details>':'')+
+            (c.suggestion_code?'<details open><summary class="note">建议改法</summary><pre style="white-space:pre-wrap;background:var(--surface-subtle);padding:8px;border-radius:4px;font-size:11.5px;overflow:auto">'+esc(c.suggestion_code)+'</pre></details>':'')+
+            '</div>';
+        }).join('');
+    }).join('');
+    box.innerHTML=html;
+  }).catch(function(e){box.innerHTML='<div class="lb-msg">加载失败:'+esc(e.message)+'</div>'});
+}
 
 setSection('overview',false);
 // 日期筛选控件放在最后初始化:两个面板此刻都还隐藏,只写 innerHTML 不读宽度,安全。

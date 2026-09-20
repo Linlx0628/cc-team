@@ -1834,21 +1834,23 @@ function initReviewForm() {
   if (c.providerModel) crEl('crModel').value = c.providerModel;
   crEl('crKeyText').value = c.hasProviderKey ? (c.providerKeyMasked || '已创建') : '';
   renderReviewRepoTable();
-  renderReviewApiKeys();
+  renderReviewRepoMembers([]);
   crEl('crRepoEditor').hidden = true;
   CR.editingRepoId = null;
 }
-function renderReviewApiKeys() {
-  const body = crEl('crApiKeyBody');
+// 仓库编辑器的「成员」勾选表:列表里的成员 = 能触发这个仓库 + 能在「我的用量」页看它的结果。
+// 勾选状态在打开编辑器时按该仓库的 members 预置。
+function renderReviewRepoMembers(selected) {
+  const body = crEl('crRepoMemberBody');
   if (!body) return;
   const users = (SETTINGS && SETTINGS.globalUsers) || {};
-  const allowed = new Set((INITIAL_REVIEW && INITIAL_REVIEW.apiKeys) || []);
-  // 超级用户(含评审账号本身)本来就能触发,不需要也不该出现在成员授权列表里
+  const allowed = new Set(Array.isArray(selected) ? selected : []);
+  // 超级用户(含评审账号本身)本来就能触发,不需要也不该出现在成员列表里
   const keys = Object.keys(users).filter((k) => !users[k].superUser);
   if (!keys.length) { body.innerHTML = '<tr><td colspan="3" class="empty">还没有成员</td></tr>'; return; }
   body.innerHTML = keys.map((k) => {
     return '<tr><td><label style="display:inline-flex;align-items:center;margin:0;cursor:pointer">'
-      + '<input type="checkbox" class="cr-apikey" value="' + h(k) + '"' + (allowed.has(k) ? ' checked' : '') + ' style="width:auto;accent-color:var(--accent)"></label></td>'
+      + '<input type="checkbox" class="cr-member" value="' + h(k) + '"' + (allowed.has(k) ? ' checked' : '') + ' style="width:auto;accent-color:var(--accent)"></label></td>'
       + '<td>' + h(users[k].username || '—') + (users[k].disabled ? ' <span class="note">(已停用)</span>' : '') + '</td>'
       + '<td style="font-family:var(--font-mono);font-size:11px;color:var(--dim)">' + h(k.slice(0, 12)) + '****</td></tr>';
   }).join('');
@@ -1856,7 +1858,7 @@ function renderReviewApiKeys() {
 function renderReviewRepoTable() {
   const body = crEl('crRepoBody');
   if (!body) return;
-  if (!CR.repos.length) { body.innerHTML = '<tr><td colspan="8" class="empty">还没有仓库 —— 点右上「＋ 添加仓库」</td></tr>'; return; }
+  if (!CR.repos.length) { body.innerHTML = '<tr><td colspan="9" class="empty">还没有仓库 —— 点右上「＋ 添加仓库」</td></tr>'; return; }
   body.innerHTML = CR.repos.map((r) => {
     const cred = r.credential && r.credential.hasCredential ? '已配置 ' + (r.credential.hint || '') : '未配置';
     const wd = (r.schedule && r.schedule.weekdays) || [];
@@ -1864,9 +1866,15 @@ function renderReviewRepoTable() {
       ? (r.schedule.mode === 'interval' ? '每 ' + r.schedule.intervalHours + ' 小时'
         : '每天 ' + r.schedule.at + (wd.length ? ' 周' + wd.join('/') : '')) : '关闭';
     const src = r.source === 'remote' ? 'remote' : 'local';
+    const members = Array.isArray(r.members) ? r.members : [];
+    // 成员:显示姓名而不是 Key,超过 2 个收成 +N
+    const users = (SETTINGS && SETTINGS.globalUsers) || {};
+    const names = members.map((k) => (users[k] && users[k].username) || k.slice(0, 8) + '****');
+    const memText = names.length ? names.slice(0, 2).join('、') + (names.length > 2 ? ' +' + (names.length - 2) : '') : '—';
     return '<tr><td>' + h(r.name) + (r.enabled ? '' : ' <span class="note">(停用)</span>') + '</td><td>' + src + '</td>'
       + '<td style="font-size:11px;color:var(--dim);max-width:320px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + h(r.source === 'remote' ? r.url : r.localPath) + '</td>'
       + '<td>' + h(r.branch) + '</td><td>' + h(cred) + '</td><td>' + h(sched) + '</td><td>' + (r.apiTrigger ? '允许' : '—') + '</td>'
+      + '<td title="' + h(members.join(', ')) + '">' + h(memText) + '</td>'
       + '<td style="white-space:nowrap"><button type="button" class="btn btn-outline btn-sm" onclick="editReviewRepo(\'' + r.id + '\')">编辑</button> '
       + '<button type="button" class="btn btn-outline btn-sm" onclick="testReviewRepo(\'' + r.id + '\')">测试</button> '
       + '<button type="button" class="btn btn-outline btn-sm" onclick="deleteReviewRepo(\'' + r.id + '\')">删除</button></td></tr>';
@@ -1879,6 +1887,7 @@ function addReviewRepo() {
   crEl('crRepoSched').value = 'off'; crEl('crRepoInterval').value = '6'; crEl('crRepoAt').value = '03:00';
   crEl('crRepoWeekdays').value = '';
   crEl('crRepoApiTrigger').checked = false;
+  renderReviewRepoMembers([]);   // 新仓库:成员从空开始勾
   crOnRepoSourceChange();
   crEl('crRepoEditor').hidden = false;
   crSetRepoStatus('');
@@ -1898,6 +1907,7 @@ function editReviewRepo(id) {
   crEl('crRepoAt').value = (r.schedule && r.schedule.at) || '03:00';
   crEl('crRepoWeekdays').value = ((r.schedule && r.schedule.weekdays) || []).join(',');
   crEl('crRepoApiTrigger').checked = !!r.apiTrigger;
+  renderReviewRepoMembers(r.members || []);   // 预置该仓库的成员勾选
   crOnRepoSourceChange();
   crEl('crRepoEditor').hidden = false;
   crSetRepoStatus('凭据留空 = 不修改原凭据');
@@ -1908,7 +1918,6 @@ function cancelReviewRepoEdit() {
   crSetRepoStatus('');
 }
 function collectReviewSettings() {
-  const checked = Array.from(document.querySelectorAll('.cr-apikey')).filter((x) => x.checked).map((x) => x.value);
   return {
     enabled: crEl('crEnabled').checked,
     providerProfile: crEl('crProfile').value,
@@ -1925,7 +1934,6 @@ function collectReviewSettings() {
     notifyOn: crEl('crNotifyOn').value,
     exclude: crEl('crExclude').value.split(',').map((x) => x.trim()).filter(Boolean),
     storeComments: crEl('crStoreComments').checked,
-    apiKeys: checked,
     // 端点与协议由服务端按所选方案推导;这里带上现值只为保持载荷形状
     providerProtocol: (INITIAL_REVIEW && INITIAL_REVIEW.providerProtocol) || 'anthropic',
     providerUrl: (INITIAL_REVIEW && INITIAL_REVIEW.providerUrl) || '',
@@ -1945,6 +1953,24 @@ async function saveCodeReviewSettings() {
     await refreshReviewFromServer();
   } catch (e) { crSetStatus(e.message || '保存失败', 'error'); }
 }
+// 拉取分支填进 datalist:用的是编辑器里**当前填的**地址(还没保存也能拉),这样填错当场发现
+async function fetchReviewRepoBranches() {
+  const list = crEl('crRepoBranchList');
+  if (!list) return;
+  const repo = collectReviewRepoForm();
+  const addr = repo.source === 'remote' ? repo.url : repo.localPath;
+  if (!addr) { crSetRepoStatus(repo.source === 'remote' ? '请先填仓库地址' : '请先填本地路径', 'error'); return; }
+  crSetRepoStatus('拉取分支中…');
+  try {
+    const r = await crApi('/api/code-review/repos/branches', { method: 'POST', headers: csrfHeaders({ 'Content-Type': 'application/json' }), body: JSON.stringify({ repo }) });
+    if (!r.ok || !(r.branches || []).length) { crSetRepoStatus('拉取失败：' + (r.detail || '该仓库没有分支'), 'error'); return; }
+    list.innerHTML = r.branches.map((b) => '<option value="' + h(b) + '"></option>').join('');
+    const cur = crEl('crRepoBranch').value.trim();
+    if (!cur) crEl('crRepoBranch').value = r.branches[0];
+    crSetRepoStatus('拉到 ' + r.branches.length + ' 条分支,点分支输入框可选', 'ok');
+  } catch (e) { crSetRepoStatus(e.message || '拉取分支失败', 'error'); }
+}
+
 // 把编辑器里当前填的值拼成 repo 对象(保存与「测试连接」共用,保证测的就是要存的)
 function collectReviewRepoForm() {
   const source = crEl('crRepoSource').value;
@@ -1958,6 +1984,7 @@ function collectReviewRepoForm() {
     authType: crEl('crRepoAuth').value,
     credential: crEl('crRepoCred').value,
     apiTrigger: crEl('crRepoApiTrigger').checked,
+    members: Array.from(document.querySelectorAll('.cr-member')).filter((x) => x.checked).map((x) => x.value),
     enabled: true,
     schedule: {
       mode: crEl('crRepoSched').value,

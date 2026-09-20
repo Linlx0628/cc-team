@@ -24,7 +24,7 @@ import { wsAcceptUpgrade, wsRejectUpgrade, WsConn } from "./lib/ws-server.mjs";
 import { isCompactionRequest, transformCompactSseEvent } from "./lib/compact-bridge.mjs";
 import { tryThinkingPassbackSelfHeal } from "./lib/thinking-passback.mjs";
 import { createCodeReviewOcr } from "./lib/code-review-ocr.mjs";
-import { createCodeReview, initCodeReviewDb, sanitizeCodeReviewConfig, maskCredential, buildReviewReportHTML, TERMINAL, TERMINAL_OK } from "./lib/code-review.mjs";
+import { createCodeReview, initCodeReviewDb, sanitizeCodeReviewConfig, maskCredential, buildReviewReportHTML, migrateLegacyTriggerKeys, TERMINAL, TERMINAL_OK } from "./lib/code-review.mjs";
 import { PassThrough } from "node:stream";
 import { EventEmitter } from "node:events";
 import { escHtml, escJs } from "./lib/html.mjs";
@@ -276,7 +276,9 @@ function handleMcpPost(res, body, ctx) {
         };
       } else if (name === "code_review_list") {
         const c = config.codeReview || {};
-        const repos = (c.repos || []).filter(r => r.apiTrigger && r.enabled);
+        // 只看得到**自己负责的**仓库(仓库成员名单),不是「所有开了在线触发的仓库」——
+        // 否则一个仓库的成员能看到全部仓库的元数据与运行记录。
+        const repos = codeReviewApi.reposForMember(ctx.apiKey);
         const allowed = new Set(repos.map(r => r.id));
         const states = codeReviewApi.repoStates();
         const limit = Math.min(50, Math.max(1, Number(args.limit) || 10));
@@ -2171,14 +2173,66 @@ const codeReviewApi = createCodeReview({
 });
 // 评审端点由**所选方案**推导,不允许管理员手填:系统本身是网关,评审必须经自己
 // 才会计入用量与配额;协议不同入口不同(anthropic → /v1,responses → /v1/responses)。
+//
+// 注意:端点必须带**方案后缀**(/<suffix>/v1),否则评审跑的不是你选的方案:
+// 不带后缀的 /v1 会被 resolveProfile 判成 isDefaultEntry → 交给方案组 failover,
+// 于是「设置里选的是阶跃星辰,实际跑在火山引擎→DeepSeek」,真实 Key 也从胜出候选
+// 借用 —— 用量记在别人头上,而自检查的是评审方案的 Key,查了也发现不了(实测踩过)。
+// 带后缀的路径在 resolveProfile 里只会解析出**唯一一个**候选,不参与组调度。
+function reviewProfileSuffix(profileName) {
+  const prof = (config.profiles || {})[profileName];
+  if (!prof) return "";
+  const sfx = normalizeProfileSuffix(prof.suffix);
+  if (!PROFILE_SUFFIX_RE.test(sfx) || RESERVED_SUFFIXES.has(sfx) || !runtimes[sfx]) return "";
+  return sfx;
+}
 function applyReviewEndpoint(crCfg) {
   const prof = (config.profiles || {})[crCfg.providerProfile];
   const proto = normalizeProfileProtocol(prof?.protocol);
   crCfg.providerProtocol = proto === "responses" ? "openai-responses" : "anthropic";
-  crCfg.providerUrl = proto === "responses"
-    ? `http://127.0.0.1:${port}/v1/responses`
-    : `http://127.0.0.1:${port}/v1`;
+  const suffix = reviewProfileSuffix(crCfg.providerProfile);
+  const base = suffix ? `http://127.0.0.1:${port}/${suffix}` : `http://127.0.0.1:${port}`;
+  crCfg.providerUrl = proto === "responses" ? `${base}/v1/responses` : `${base}/v1`;
   return crCfg;
+}
+// 启动时就地纠正一次:老配置里存的是不带后缀的 /v1(评审会走方案组),重算后落盘,
+// 免得管理员必须回设置页点一次保存才生效。
+if (config.codeReview && config.codeReview.providerProfile) {
+  const before = config.codeReview.providerUrl;
+  applyReviewEndpoint(config.codeReview);
+  if (config.codeReview.providerUrl !== before) {
+    saveConfig(config);
+    console.log(`[代码评审] 评审端点已钉到所选方案: ${config.codeReview.providerUrl}`);
+  }
+}
+
+// 一次性迁移:旧的全局白名单 codeReview.apiKeys → 各仓库的成员名单。
+// 语义等价(那份名单当时能触发**所有**已开在线触发的仓库),迁完清空全局键并落盘,
+// 之后「谁能碰哪个仓库」只看仓库自己的 members。幂等:apiKeys 空了就什么都不做。
+const legacyTriggerKeys = Array.isArray(config.codeReview?.apiKeys) ? config.codeReview.apiKeys.length : 0;
+const migratedRepos = migrateLegacyTriggerKeys(config.codeReview);
+if (legacyTriggerKeys) {
+  saveConfig(config);
+  console.log(`[代码评审] 已把旧的全局触发白名单(${legacyTriggerKeys} 个 Key)迁移到 ${migratedRepos} 个仓库的成员名单`);
+}
+
+// 仓库入参解析(/repos/test 与 /repos/branches 共用):
+//   ① body.repo(对象)= 编辑器里**还没保存**的表单值 —— 走仓库白名单同一套校验,填错当场能发现;
+//   ② body.id = 已保存的仓库,表格行按钮用。
+// 返回 { repo } 或 { status, error }。
+function resolveReviewRepoInput(body) {
+  if (body.repo && typeof body.repo === "object") {
+    const repo = sanitizeCodeReviewConfig({ repos: [body.repo] }, port).repos[0];
+    if (!repo) return { status: 400, error: "仓库信息不合法：地址需为 https/ssh/git@（或 local 绝对路径），分支名不能含特殊字符" };
+    // 凭据留空 = 沿用已保存的(界面回显的是掩码);编辑已有仓库时才有原值可沿用
+    if (!repo.credential && body.repo.id) {
+      const old = codeReviewApi.findRepo(String(body.repo.id));
+      if (old && old.credential) repo.credential = old.credential;
+    }
+    return { repo };
+  }
+  const repo = codeReviewApi.findRepo(String(body.id || ""));
+  return repo ? { repo } : { status: 404, error: "仓库不存在" };
 }
 
 function pushCodeReviewNotice(ev) {
@@ -2210,28 +2264,37 @@ setInterval(() => {
 const bjStamp = (iso) => (iso ? new Date(Date.parse(iso) + 8 * 3600000).toISOString().slice(0, 16).replace("T", " ") : null);
 
 // 成员级触发(HTTP /api/code-review/trigger 与 MCP 的 code_review_trigger 共用)。
-// 三重闸门:①Key 是有效成员 ②在「在线触发授权」白名单里(超级用户豁免)③该仓库自己
-// 开了「允许在线触发」;再加每 Key 60s 一次的限频,防止 CI 抖动把套餐刷穿。
+// 闸门:①Key 是有效成员 ②目标仓库在**该成员的仓库名单**里(超级用户豁免)
+// ③该仓库自己开了「允许在线触发」;再加每 Key 60s 一次的限频,防止 CI 抖动把套餐刷穿。
+// 注意顺序:先解析出要触发哪些仓库,再逐个判成员资格 —— 权限是**按仓库**给的,
+// 不存在「一次授权、全仓库通行」的全局名单。
 // 返回 { status, body, results?, actor? } —— 调用方按各自协议翻译(HTTP 写状态码,MCP 包工具结果)。
 function triggerReviewForKey(apiKey, repoName) {
   if (!hasGlobalUser(apiKey)) {
     return { status: 401, body: { error: "认证失败：请提供有效的虚拟Key (Authorization: Bearer jx-...)" } };
   }
-  if (!codeReviewApi.canTrigger(apiKey)) {
-    return { status: 403, body: { error: "该 Key 未获得代码评审触发授权（在设置页「在线触发授权」里勾选）" } };
+  const wanted = String(repoName || "").trim();
+  const named = wanted ? codeReviewApi.findRepo(wanted) : null;
+  if (wanted && !named) return { status: 404, body: { error: `仓库「${wanted}」不在白名单里` } };
+  // 不带仓库名 = 触发「该成员名下的全部可触发仓库」
+  const candidates = named ? [named] : codeReviewApi.reposForMember(apiKey);
+  if (!candidates.length) {
+    return { status: 403, body: { error: "你没有负责任何仓库（在设置页·代码评审里把你的 Key 加到对应仓库的成员名单）" } };
+  }
+  // 逐个判:失败必点名是哪个仓库、以及**卡在哪一条** ——
+  // 「你不在名单里」与「仓库没开在线触发」是两件不同的事,含糊其辞成员不知道该找谁。
+  for (const repo of candidates) {
+    if (!codeReviewApi.isRepoMember(apiKey, repo)) {
+      return { status: 403, body: { error: `你不在仓库「${repo.name}」的成员名单里，无法触发它的评审` } };
+    }
+    if (!repo.enabled) return { status: 403, body: { error: `仓库「${repo.name}」已停用` } };
+    if (!repo.apiTrigger) return { status: 403, body: { error: `仓库「${repo.name}」未开启在线触发（在设置页里打开）` } };
   }
   const rate = codeReviewApi.checkTriggerRate(apiKey);
   if (!rate.allowed) {
     return { status: 429, body: { error: `触发过于频繁，请 ${rate.retryAfter}s 后重试`, retryAfter: rate.retryAfter } };
   }
-  const wanted = String(repoName || "").trim();
-  const targets = wanted
-    ? [codeReviewApi.findRepo(wanted)].filter(Boolean)
-    : (config.codeReview?.repos || []).filter((r) => r.apiTrigger && r.enabled);
-  if (wanted && !targets.length) return { status: 404, body: { error: `仓库「${wanted}」不在白名单里` } };
-  const denied = targets.filter((r) => !r.apiTrigger || !r.enabled);
-  if (denied.length) return { status: 403, body: { error: `仓库「${denied[0].name}」未开启在线触发` } };
-  if (!targets.length) return { status: 404, body: { error: "没有开启在线触发的仓库" } };
+  const targets = candidates;
   const actor = getUserName(apiKey) || "api";
   const results = [];
   for (const repo of targets) {
@@ -3251,9 +3314,8 @@ function getPublicSettings() {
         hasProviderKey: !!c.providerKey,
         background: c.background || "",
         exclude: Array.isArray(c.exclude) ? c.exclude : [],
-        // apiKeys 是「允许触发评审的成员 Key」白名单：与设置页其它成员 Key 同口径，
-        // 这里下发明文(该接口本来就要 checkAuth 管理员)，由界面自行掩码展示。
-        apiKeys: Array.isArray(c.apiKeys) ? c.apiKeys : [],
+        // members(每个仓库的成员名单)是「谁能触发/查看这个仓库」的唯一依据,随 repos 下发;
+        // 与设置页其它成员 Key 同口径下发明文(该接口本来就要 checkAuth 管理员),界面自行掩码。
         // 评审可选方案:供「评审方案 / 评审模型」两个下拉使用。hasRealKey 用来提示
         // 「该方案还没分配真实 Key,评审会拿不到凭证」。
         profiles: listProfiles().map((p) => {
@@ -3268,6 +3330,7 @@ function getPublicSettings() {
         repos: (c.repos || []).map((r) => ({
           id: r.id, name: r.name, source: r.source, url: r.url, localPath: r.localPath, branch: r.branch,
           authType: r.authType, username: r.username, enabled: r.enabled, apiTrigger: r.apiTrigger,
+          members: Array.isArray(r.members) ? r.members : [],
           schedule: r.schedule, overrides: r.overrides, createdAt: r.createdAt,
           credential: maskCredential(r.credential),
         })),
@@ -3328,6 +3391,14 @@ function personalClaudeExtras(vk) {
     noProfile: !hasAnthropic,
     hints: hasAnthropic ? buildAnthropicSetupHints(CLAUDE_DEPS, vk) : null,
   };
+}
+
+// 「我的用量」页的代码评审分区:只告诉页面「这个人有没有负责的仓库」,
+// 具体数据由 /api/my-review 现拉(与其它分区一致的做法:页面壳不做数据查询)。
+function personalReviewExtras(vk) {
+  let count = 0;
+  try { count = codeReviewApi.reposForMember(vk).length; } catch { count = 0; }
+  return { repoCount: count };
 }
 
 // /api/stats 读模型聚合（lib/stats.mjs）的依赖注入对象。db/stmts 在 initDb
@@ -5622,21 +5693,22 @@ const server = http.createServer((req, res) => {
       readJsonBody().then(async (body) => {
         // 两种入口:①带 id → 测已保存的仓库(表格里的「测试」按钮);②带 repo 对象 →
         // 测「编辑器里当前填的、还没保存」的值,这样填错能当场发现,不用先存再改。
-        let repo;
-        if (body.repo && typeof body.repo === "object") {
-          // 先按仓库白名单同一套规则校验(非法 URL/分支会被丢弃),避免把注入形态喂给 git
-          repo = sanitizeCodeReviewConfig({ repos: [body.repo] }, port).repos[0];
-          if (!repo) { json(400, { error: "仓库信息不合法：地址需为 https/ssh/git@（或 local 绝对路径），分支名不能含特殊字符" }); return; }
-          // 凭据留空 = 沿用已保存的(界面回显的是掩码);编辑已有仓库时才有原值可沿用
-          if (!repo.credential && body.repo.id) {
-            const old = codeReviewApi.findRepo(String(body.repo.id));
-            if (old && old.credential) repo.credential = old.credential;
-          }
-        } else {
-          repo = codeReviewApi.findRepo(String(body.id || ""));
-          if (!repo) { json(404, { error: "仓库不存在" }); return; }
-        }
-        const r = await codeReviewApi.testRepo(repo);
+        const in0 = resolveReviewRepoInput(body);
+        if (!in0.repo) { json(in0.status, { error: in0.error }); return; }
+        const r = await codeReviewApi.testRepo(in0.repo);
+        json(200, r);
+      }).catch((err) => json(400, { error: err.message }));
+      return;
+    }
+
+    // 列出仓库分支(供面板「按次选分支」与设置页分支 datalist)。入参同 /repos/test:
+    // 支持未保存的表单值,这样刚填完地址就能先看看有哪些分支。
+    if (req.method === "POST" && crPath === "/api/code-review/repos/branches") {
+      if (!adminWriteGate()) return;
+      readJsonBody().then(async (body) => {
+        const in0 = resolveReviewRepoInput(body);
+        if (!in0.repo) { json(in0.status, { error: in0.error }); return; }
+        const r = await codeReviewApi.listBranches(in0.repo);
         json(200, r);
       }).catch((err) => json(400, { error: err.message }));
       return;
@@ -5646,8 +5718,13 @@ const server = http.createServer((req, res) => {
       if (!adminWriteGate()) return;
       readJsonBody().then((body) => {
         try {
-          const r = codeReviewApi.enqueue(String(body.repo || ""), { trigger: "manual", actor: "admin" });
-          recordAdminAudit(req, "codereview.run", String(body.repo || ""), `手动触发代码评审（run #${r.runId}${r.deduped ? "，与进行中的任务合并" : ""}）`);
+          // branch 是**可选的按次覆盖**(面板上的分支下拉):只对本次生效,不写回仓库配置。
+          // 它只对单个仓库有意义 —— 「不带仓库 = 触发全部授权仓库」时给不出统一分支。
+          const branch = body.branch == null || body.branch === "" ? null : String(body.branch);
+          if (branch && !body.repo) { json(400, { error: "指定分支时必须同时指定仓库(不能一次给多个仓库设同一分支)" }); return; }
+          const r = codeReviewApi.enqueue(String(body.repo || ""), { trigger: "manual", actor: "admin", branch });
+          recordAdminAudit(req, "codereview.run", String(body.repo || ""),
+            `手动触发代码评审（run #${r.runId}${r.deduped ? "，与进行中的任务合并" : ""}${branch ? `，分支 ${branch}` : ""}）`);
           json(r.deduped ? 200 : 202, r);
         } catch (err) {
           json(err.statusCode || 400, { error: err.message });
@@ -6004,7 +6081,7 @@ const server = http.createServer((req, res) => {
       return;
     }
     res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
-    res.end(personalUsageHtml(PAGE_DEPS, vk, personalCodexExtras(vk), personalClaudeExtras(vk)));
+    res.end(personalUsageHtml(PAGE_DEPS, vk, personalCodexExtras(vk), personalClaudeExtras(vk), personalReviewExtras(vk)));
     return;
   }
   if (req.method === "GET" && req.url.startsWith("/my-usage")) {
@@ -6016,7 +6093,7 @@ const server = http.createServer((req, res) => {
       return;
     }
     res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
-    res.end(personalUsageHtml(PAGE_DEPS, vk, personalCodexExtras(vk), personalClaudeExtras(vk)));
+    res.end(personalUsageHtml(PAGE_DEPS, vk, personalCodexExtras(vk), personalClaudeExtras(vk), personalReviewExtras(vk)));
     return;
   }
 
@@ -6051,6 +6128,38 @@ const server = http.createServer((req, res) => {
         res.end(JSON.stringify({ error: err.message }));
       }
     }).catch(() => { res.writeHead(413); res.end("Request too large"); });
+    return;
+  }
+
+  // 成员评审视图(成员,虚拟Key 鉴权 — 同 /api/my-usage 口径)。
+  // 只返回**自己是成员的仓库**与它们的评审结果;越权过滤在 codeReviewApi.memberView 里。
+  if (req.method === "GET" && req.url.split("?")[0] === "/api/my-review") {
+    const apiKey = getApiKey(req);
+    if (!hasGlobalUser(apiKey)) {
+      res.writeHead(401, { "Content-Type": "application/json; charset=utf-8" });
+      res.end(JSON.stringify({ error: "认证失败：请提供有效的虚拟Key (Authorization: Bearer jx-...)" }));
+      return;
+    }
+    const limit = Number(new URL(req.url, "http://localhost").searchParams.get("limit")) || 20;
+    res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+    res.end(JSON.stringify(codeReviewApi.memberView(apiKey, { limit })));
+    return;
+  }
+
+  // 成员读单次运行的明细(含意见)。不归属自己的仓库一律 404 —— 不泄露「存在但无权限」。
+  if (req.method === "GET" && req.url.split("?")[0] === "/api/my-review/run") {
+    const apiKey = getApiKey(req);
+    if (!hasGlobalUser(apiKey)) {
+      res.writeHead(401, { "Content-Type": "application/json; charset=utf-8" });
+      res.end(JSON.stringify({ error: "认证失败：请提供有效的虚拟Key (Authorization: Bearer jx-...)" }));
+      return;
+    }
+    const id = new URL(req.url, "http://localhost").searchParams.get("id");
+    let d = null;
+    try { d = codeReviewApi.memberRun(apiKey, id); } catch { d = null; }
+    if (!d) { res.writeHead(404, { "Content-Type": "application/json; charset=utf-8" }); res.end(JSON.stringify({ error: "运行不存在" })); return; }
+    res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+    res.end(JSON.stringify({ run: d.run, comments: d.comments }));
     return;
   }
 

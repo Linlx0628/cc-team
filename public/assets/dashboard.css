@@ -214,3 +214,6 @@ td{padding:8px 12px;font-size:11px;border-bottom:1px solid #ecece8;white-space:n
 .cr-files-item+.cr-files-item{border-top:1px solid var(--border)}
 .cr-files-item:nth-child(even){background:var(--surface-subtle)}
 @media(max-width:560px){.cr-facts{grid-template-columns:1fr;gap:2px}.cr-fact{gap:0}.cr-fact-v{margin-bottom:6px}}
+/* 分支下拉:比仓库下拉窄一些,和它并排放在触发卡片里 */
+.cr-field-branch{max-width:200px}
+.cr-hint-inline{font-weight:400;color:var(--dim2);font-size:10px}

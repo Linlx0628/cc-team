@@ -86,7 +86,9 @@ function renderCodeReview(ocr) {
   let html = crEngineStrip(ocr, st)
     + '<div class="cr-toolbar"><div class="cr-toolbar-main">'
     + '<div class="cr-field"><label for="crRunRepo">评审仓库</label>'
-    + `<select id="crRunRepo">${repoOpts || '<option value="">(尚未配置仓库)</option>'}</select></div>`
+    + `<select id="crRunRepo" onchange="crOnRepoChange()">${repoOpts || '<option value="">(尚未配置仓库)</option>'}</select></div>`
+    + '<div class="cr-field cr-field-branch"><label for="crRunBranch">分支 <span class="cr-hint-inline">(按次,不改仓库配置)</span></label>'
+    + `<select id="crRunBranch" disabled><option value="">（选仓库后加载）</option></select></div>`
     + '<button type="button" class="btn btn-primary cr-go" id="crGoBtn" onclick="startReviewRun()"><span class="cr-go-ico">▸</span>开始评审</button>'
     + '</div>'
     + '<div class="cr-toolbar-hint">首次只评最新一个 <code>commit</code>;之后按「上次评到 → 现在 HEAD」的<b>增量</b>评审,不会整个仓库重跑。评审的是<b>已推送</b>的提交。</div>'
@@ -134,6 +136,8 @@ function renderCodeReview(ocr) {
   }).join("") + "</div>";
   html += '<div id="crRunDetail"></div></div>';
   body.innerHTML = html;
+  // 渲染完就把当前选中仓库的分支列表拉出来(默认分支会被自动选中)
+  crLoadBranches();
 }
 
 // files_json / tool_calls_json 是 TEXT 列,解析失败一律当无数据(别让一条脏 JSON 把整页打挂)
@@ -207,12 +211,47 @@ function crSetStatus(text, cls) {
   const el = document.getElementById("crRunStatus");
   if (el) { el.textContent = text || ""; el.className = "inline-status " + (cls || ""); }
 }
+
+// 拉某个仓库的分支列表填进下拉。默认分支(仓库配置里的)放首位并自动选中。
+async function crLoadBranches() {
+  const sel = document.getElementById("crRunBranch");
+  const repoId = document.getElementById("crRunRepo")?.value;
+  if (!sel) return;
+  if (!repoId) { sel.innerHTML = '<option value="">（选仓库后加载）</option>'; sel.disabled = true; return; }
+  const def = ((crData && crData.repoList) || []).find((r) => r.id === repoId)?.branch || "";
+  sel.disabled = true;
+  sel.innerHTML = '<option value="">加载中…</option>';
+  try {
+    const r = await crApi("/api/code-review/repos/branches", { method: "POST", headers: crCsrfHeaders({ "Content-Type": "application/json" }), body: JSON.stringify({ id: repoId }) });
+    if (!r.ok || !(r.branches || []).length) {
+      // 拿不到分支(私有仓库凭据不通/网络失败)时给「默认分支」一个兜底,别把触发卡死
+      sel.innerHTML = `<option value="${escH(def)}">${escH(def || "（默认）")}（未取到分支列表）</option>`;
+      sel.disabled = false;
+      crSetStatus("取分支失败:" + (r.detail || "未知原因"), "error");
+      return;
+    }
+    sel.innerHTML = r.branches.map((b) => `<option value="${escH(b)}">${escH(b)}</option>`).join("");
+    if (def && r.branches.includes(def)) sel.value = def;
+    sel.disabled = false;
+  } catch (err) {
+    sel.innerHTML = `<option value="${escH(def)}">${escH(def || "（默认）")}</option>`;
+    sel.disabled = false;
+    crSetStatus("取分支失败:" + (err.message || ""), "error");
+  }
+}
+function crOnRepoChange() {
+  crSetStatus("");
+  crLoadBranches();
+}
+
 async function startReviewRun() {
   const repo = document.getElementById("crRunRepo")?.value;
   if (!repo) { crSetStatus("请先在设置页添加仓库", "error"); return; }
+  // 面板上选的分支只对本次生效(服务端不会写回仓库配置)
+  const branch = document.getElementById("crRunBranch")?.value || "";
   crSetStatus("已提交,排队中…");
   try {
-    const r = await crApi("/api/code-review/runs/start", { method: "POST", headers: crCsrfHeaders({ "Content-Type": "application/json" }), body: JSON.stringify({ repo }) });
+    const r = await crApi("/api/code-review/runs/start", { method: "POST", headers: crCsrfHeaders({ "Content-Type": "application/json" }), body: JSON.stringify({ repo, branch }) });
     crSetStatus(r.deduped ? "该仓库已有进行中的评审,已合并" : `已入队 #${r.runId}`, "ok");
     setTimeout(loadCodeReview, 1500);
   } catch (err) { crSetStatus(err.message, "error"); }

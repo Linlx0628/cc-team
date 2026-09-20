@@ -172,7 +172,6 @@ td{padding:8px 12px;font-size:11px;border-bottom:1px solid #ecece8;white-space:n
 .cr-detail{margin-top:14px;border-top:1px solid var(--border);padding-top:14px}
 .cr-detail-head{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:12px}
 .cr-detail-head strong{font-size:13px;font-weight:650}
-.cr-detail-attr{font-size:11px;color:var(--dim);font-variant-numeric:tabular-nums}
 .cr-file{font-size:11px;color:var(--dim);font-family:var(--font-mono);margin:14px 0 8px;display:flex;align-items:center;gap:7px}
 .cr-file b{color:var(--text);font-weight:650}
 .cr-comment{border:1px solid var(--border);border-radius:6px;padding:11px 13px;margin-bottom:8px;background:var(--surface)}
@@ -198,3 +197,20 @@ td{padding:8px 12px;font-size:11px;border-bottom:1px solid #ecece8;white-space:n
 .cr-scroll .inline-status.error{color:var(--red)}
 .pill-dim{display:inline-block;font-size:10px;line-height:1.5;color:var(--dim);border:1px solid var(--border-strong);border-radius:9px;padding:1px 7px;font-variant-numeric:tabular-nums}
 .pill-run{display:inline-block;font-size:10px;line-height:1.5;color:var(--accent);border:1px solid var(--accent);border-radius:9px;padding:1px 7px;font-variant-numeric:tabular-nums;background:var(--accent-soft)}
+/* 运行行的一句话结论 + 被评文件 chips;详情的「事实表」与文件清单 */
+.cr-run-note{margin-top:4px;font-size:11.5px;color:var(--dim);line-height:1.5}
+.cr-run-note.is-err{color:var(--red)}
+.cr-run-files{margin-top:6px;display:flex;flex-wrap:wrap;gap:5px;align-items:center}
+.cr-file-chip{font-family:var(--font-mono);font-size:10.5px;color:var(--text);background:var(--surface-subtle);border:1px solid var(--border);border-radius:4px;padding:1px 6px;max-width:32ch;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.cr-file-more{font-size:10.5px;color:var(--dim2)}
+.cr-facts{display:grid;grid-template-columns:auto 1fr;gap:4px 12px;background:var(--surface-subtle);border:1px solid var(--border);border-radius:6px;padding:11px 14px;margin-bottom:14px;font-size:11.5px}
+.cr-fact{display:contents}
+.cr-fact-k{color:var(--dim);font-weight:650;white-space:nowrap}
+.cr-fact-v{color:var(--text);font-variant-numeric:tabular-nums;min-width:0;word-break:break-word}
+.cr-files-block{margin-bottom:16px}
+.cr-files-title{font-size:11.5px;font-weight:650;color:var(--dim);margin-bottom:7px}
+.cr-files-list{display:flex;flex-direction:column;gap:2px;border:1px solid var(--border);border-radius:6px;overflow:hidden}
+.cr-files-item{font-family:var(--font-mono);font-size:11px;color:var(--text);padding:5px 11px;background:var(--surface);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.cr-files-item+.cr-files-item{border-top:1px solid var(--border)}
+.cr-files-item:nth-child(even){background:var(--surface-subtle)}
+@media(max-width:560px){.cr-facts{grid-template-columns:1fr;gap:2px}.cr-fact{gap:0}.cr-fact-v{margin-bottom:6px}}

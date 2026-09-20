@@ -109,6 +109,11 @@ function renderCodeReview(ocr) {
     const cls = crStatusClass(r.status);
     const active = ["queued", "syncing", "running", "parsing"].includes(r.status);
     const trig = r.trigger && r.trigger !== "manual" ? `<span class="cr-run-trig">${escH(r.trigger)}</span>` : "";
+    const files = crParseFiles(r.files_json);
+    // 被评文件:列表里给前几个名字(比冷冰冰一个「文件 1」有用得多),更多用 +N 收口
+    const fileHint = files.length
+      ? `<div class="cr-run-files">${files.slice(0, 3).map((f) => `<span class="cr-file-chip" title="${escH(f)}">${escH(crBase(f))}</span>`).join("")}${files.length > 3 ? `<span class="cr-file-more">+${files.length - 3}</span>` : ""}</div>`
+      : "";
     return `<div class="cr-run is-${cls}"><span class="cr-run-num">#${r.id}</span>`
       + '<div class="cr-run-main"><div class="cr-run-title">'
       + `<span class="cr-run-repo">${escH(r.repo_name)}</span>`
@@ -116,8 +121,12 @@ function renderCodeReview(ocr) {
       + '<div class="cr-run-meta">' + escH(new Date(r.created_at).toLocaleString("zh-CN", { timeZone: "Asia/Shanghai", hour12: false }))
       + " · " + escH(r.range_mode === "single" ? "单提交 " + crShort(r.to_commit) : `${crShort(r.from_commit)}→${crShort(r.to_commit)}`)
       + ` · 文件 ${r.files_reviewed} · 意见 ${r.comments_count} · ${fmtT(r.input_tokens + r.output_tokens)} token · ${crDur(r.elapsed_ms)}`
-      + (r.error ? ` · <span class="cr-err">${escH(String(r.error).slice(0, 120))}</span>` : "")
-      + '</div></div>'
+      + '</div>'
+      // 一句话结论(note):「已跳过」到底是没新提交还是别的原因,靠它说清楚
+      + (r.note ? `<div class="cr-run-note">${escH(r.note)}</div>` : "")
+      + (r.error ? `<div class="cr-run-note is-err">${escH(String(r.error).slice(0, 200))}</div>` : "")
+      + fileHint
+      + '</div>'
       + '<div class="cr-run-actions">'
       + `<button type="button" class="btn btn-outline btn-sm" onclick="openReviewRun(${r.id})">详情</button>`
       + (active ? `<button type="button" class="btn btn-outline btn-sm" onclick="cancelReviewRun(${r.id})">取消</button>` : "")
@@ -127,20 +136,51 @@ function renderCodeReview(ocr) {
   body.innerHTML = html;
 }
 
+// files_json / tool_calls_json 是 TEXT 列,解析失败一律当无数据(别让一条脏 JSON 把整页打挂)
+function crParseFiles(json) { try { const a = JSON.parse(json || "[]"); return Array.isArray(a) ? a : []; } catch { return []; } }
+function crParseTools(json) { try { const o = JSON.parse(json || "null"); return o && typeof o === "object" ? o : null; } catch { return null; } }
+function crBase(p) { const s = String(p); const i = s.lastIndexOf("/"); return i >= 0 ? s.slice(i + 1) : s; }
+// 「事实表」:一行一个 标签/值,把「这次到底干了什么」摊开
+function crFact(label, valueHtml) { return `<div class="cr-fact"><span class="cr-fact-k">${escH(label)}</span><span class="cr-fact-v">${valueHtml}</span></div>`; }
+// 工具调用「说人话」:code_search→检索、file_read→读文件,其余原样
+const CR_TOOL_ZH = { code_search: "代码检索", file_read: "读文件", file_write: "写文件", shell: "执行命令", grep: "检索", glob: "匹配文件" };
+function crToolText(t) {
+  const parts = Object.entries(t.byTool || {}).map(([k, v]) => `${CR_TOOL_ZH[k] || k} ${v}`);
+  if (!parts.length) return t.total ? `共 ${t.total} 次` : "—";
+  return `共 ${t.total} 次（${parts.join(" · ")}）` + (t.failure ? ` · 失败 ${t.failure}` : "");
+}
+
 async function openReviewRun(id) {
   const box = document.getElementById("crRunDetail");
   box.innerHTML = '<div class="lb-msg">加载中…</div>';
   try {
     const d = await crApi("/api/code-review/run?id=" + encodeURIComponent(id));
     const run = d.run, comments = d.comments || [];
+    const files = crParseFiles(run.files_json);
+    const tools = crParseTools(run.tool_calls_json);
     let html = '<div class="cr-detail"><div class="cr-detail-head">'
       + `<strong>运行 #${run.id} · ${escH(run.repo_name)}</strong>`
       + `<span class="pill pill-${crStatusClass(run.status)}">${escH(CR_STATUS_LABEL[run.status] || run.status)}</span>`
-      + `<span class="cr-detail-attr">评审 Key 计 ${run.attributed_requests} 次请求 / ${fmtT(run.attributed_input + run.attributed_output)} token（OCR 上报 ${fmtT(run.input_tokens + run.output_tokens)}）</span>`
-      // 独立 HTML 报告:自包含单文件,下载后可直接发群(与「导出报告」同款)
       + `<a class="btn btn-outline btn-sm" style="margin-left:auto" href="/api/code-review/report?id=${run.id}">导出报告</a></div>`;
+    // 结论 + 引擎实际干了多少活:这条是回答「有没有真干活」的关键
+    html += '<div class="cr-facts">'
+      + crFact("结论", run.note || "—")
+      + crFact("评审范围", (run.range_mode === "single" ? "单提交 " : "增量 ") + escH(crShort(run.from_commit) || "—") + " → " + escH(crShort(run.to_commit) || "—"))
+      + crFact("模型", escH(run.ocr_model || "—") + (run.ocr_provider ? `（${escH(run.ocr_provider)}）` : ""))
+      + (tools ? crFact("引擎动作", escH(crToolText(tools))) : "")
+      + crFact("token", `网关计 ${fmtT(run.attributed_input + run.attributed_output)} · 引擎自报 ${fmtT(run.input_tokens + run.output_tokens)}（${fmtT(run.input_tokens)} 入 / ${fmtT(run.output_tokens)} 出）`)
+      + crFact("耗时", crDur(run.elapsed_ms))
+      + '</div>';
+    if (run.error) html += `<div class="cr-notice is-error" style="margin:0 0 12px">${escH(run.error)}</div>`;
+    // 被评文件清单:即使 0 意见也把评过的文件列出来 —— 证明它确实读了这些文件
+    html += '<div class="cr-files-block"><div class="cr-files-title">'
+      + (files.length ? `本次评审选取的 ${files.length} 个文件` : "本次没有选取任何文件")
+      + '</div>'
+      + (files.length ? '<div class="cr-files-list">' + files.map((f) => `<div class="cr-files-item" title="${escH(f)}">${escH(f)}</div>`).join("") + '</div>'
+        : '<div class="cr-empty-d" style="text-align:left;margin:0">范围里没有可评审的改动。若是「已跳过」,通常表示自上次评审以来没有新提交。</div>')
+      + '</div>';
     if (!comments.length) {
-      html += '<div class="cr-empty" style="padding:26px"><div class="cr-empty-ico">✓</div><div class="cr-empty-t">无意见</div><div class="cr-empty-d">本次增量没发现需要修改的问题。</div></div></div>';
+      html += '<div class="cr-empty" style="padding:22px"><div class="cr-empty-ico">✓</div><div class="cr-empty-t">无意见</div><div class="cr-empty-d">本次范围(上面列出的文件)未发现需要修改的问题。</div></div></div>';
       box.innerHTML = html;
       return;
     }

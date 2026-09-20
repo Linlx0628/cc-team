@@ -605,6 +605,17 @@ function initNotifierForm(){
   document.getElementById('notifBarkKey').value=n.barkDeviceKey||'';
   document.getElementById('notifBarkServer').value=n.barkServer||'';
   document.getElementById('notifInterval').value=(n.minIntervalSeconds!==undefined?n.minIntervalSeconds:300);
+  // SMTP:密码**不回显**(下面用 placeholder 表示「已保存」),其余字段照填
+  document.getElementById('notifSmtpHost').value=n.smtpHost||'';
+  document.getElementById('notifSmtpFrom').value=n.smtpFrom||'';
+  document.getElementById('notifSmtpPort').value=n.smtpPort||465;
+  document.getElementById('notifSmtpUser').value=n.smtpUser||'';
+  document.getElementById('notifSmtpTo').value=n.smtpTo||'';
+  document.getElementById('notifSmtpSecure').checked=n.smtpSecure!==false;
+  document.getElementById('notifSmtpInsecure').checked=n.smtpInsecure===true;
+  const pass=document.getElementById('notifSmtpPass');
+  pass.value='';
+  pass.placeholder=n.hasSmtpPass?'已保存（留空表示不修改）':'••••••••';
 }
 function collectNotifier(){
   return {
@@ -616,7 +627,15 @@ function collectNotifier(){
     serverchanSendKey:document.getElementById('notifServerchan').value.trim(),
     barkDeviceKey:document.getElementById('notifBarkKey').value.trim(),
     barkServer:document.getElementById('notifBarkServer').value.trim(),
-    minIntervalSeconds:parseInt(document.getElementById('notifInterval').value,10)||0
+    minIntervalSeconds:parseInt(document.getElementById('notifInterval').value,10)||0,
+    smtpHost:document.getElementById('notifSmtpHost').value.trim(),
+    smtpFrom:document.getElementById('notifSmtpFrom').value.trim(),
+    smtpPort:parseInt(document.getElementById('notifSmtpPort').value,10)||465,
+    smtpUser:document.getElementById('notifSmtpUser').value.trim(),
+    smtpPass:document.getElementById('notifSmtpPass').value,   // 空 = 服务端保留原值
+    smtpTo:document.getElementById('notifSmtpTo').value.trim(),
+    smtpSecure:document.getElementById('notifSmtpSecure').checked,
+    smtpInsecure:document.getElementById('notifSmtpInsecure').checked
   };
 }
 function setNotifierStatus(text,cls){const el=document.getElementById('notifStatus');el.textContent=text||'';el.className='inline-status '+(cls||'')}

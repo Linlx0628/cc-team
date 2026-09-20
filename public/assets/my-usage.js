@@ -624,7 +624,7 @@ load();setInterval(load,30000);
 // 配置 MCP(第三份 setup-guide 内嵌分区,见 setup-guide.js 的 mcp 分支)。
 // 顺序即导航顺序,id 由 setSection() 按 'mu-tab-'+s / 'mu-panel-'+s 硬拼 ——
 // 增删菜单必须与 lib/pages.mjs 的按钮和面板同时改,否则切换会静默失效。
-const SECTIONS=['overview','rates','analysis','sessions','leaderboard','review','claude','codex','mcp'];
+const SECTIONS=['overview','rates','analysis','sessions','leaderboard','review','notify','claude','codex','mcp'];
 function setSection(name,focus){
   if(SECTIONS.indexOf(name)<0)name='overview';
   SECTION=name;
@@ -657,6 +657,9 @@ function paintSection(){
     ensureLeaderboard();
   }else if(SECTION==='review'){
     ensureMyReview();
+    markReviewSeen();          // 打开这个分区就算「看过了」→ 角标归零
+  }else if(SECTION==='notify'){
+    ensureMyNotify();
   }
 }
 (function bindMyUsageNav(){
@@ -1067,6 +1070,86 @@ function ensureActivity(){if(!ACT.data&&!ACT.loading)fetchActivity()}
 // 只看得到自己**是成员**的仓库;越权过滤在服务端(/api/my-review),这里不做假设。
 const MR={data:null,loading:false};
 function ensureMyReview(){if(!MR.data&&!MR.loading)fetchMyReview()}
+// 「打开即已读」:只在真的进到这个分区时发一次,不用每次拉数据都发
+let MR_SEEN_SENT=false;
+function markReviewSeen(){
+  if(MR_SEEN_SENT)return;
+  MR_SEEN_SENT=true;
+  fetch('/api/my-review/seen',{method:'POST',headers:{'Authorization':'Bearer '+VK}})
+    .then(function(){const b=document.getElementById('mrPendingBadge');if(b)b.style.display='none'})
+    .catch(function(){MR_SEEN_SENT=false});   // 失败允许下次重试
+}
+function mrBadge(n){
+  const b=document.getElementById('mrPendingBadge');
+  if(!b)return;
+  if(n>0){b.style.display='';b.textContent=n>99?'99+':String(n)}else{b.style.display='none'}
+}
+// 角标数据:进页面时拉一次(与仓库列表同一个请求,不额外打接口)
+function loadReviewBadge(){
+  fetch('/api/my-review?limit=1',{headers:{'Authorization':'Bearer '+VK}})
+    .then(function(r){return r.ok?r.json():null})
+    .then(function(d){if(d)mrBadge(d.pending||0)})
+    .catch(function(){});
+}
+loadReviewBadge();
+
+// ── 我的通知设置 ──────────────────────────────────────────────────────────
+const MN={prefs:null,loading:false};
+function ensureMyNotify(){if(!MN.prefs&&!MN.loading)loadMyNotify()}
+function mnStatus(text,cls){const el=document.getElementById('mnStatus');if(el){el.textContent=text||'';el.className='inline-status '+(cls||'')}}
+function loadMyNotify(){
+  MN.loading=true;
+  fetch('/api/my-notify',{headers:{'Authorization':'Bearer '+VK}}).then(function(r){return r.json()}).then(function(d){
+    MN.prefs=d.prefs||{};MN.loading=false;renderMyNotify(d.hasSmtp);
+  }).catch(function(){MN.loading=false;mnStatus('加载失败','error')});
+}
+function renderMyNotify(hasSmtp){
+  const p=MN.prefs||{};
+  const f=function(id){return document.getElementById(id)};
+  if(!f('mnEnabled'))return;
+  f('mnEnabled').checked=p.enabled!==false;
+  // 已配置的渠道:输入框留空 + placeholder 提示「已保存」;未配置的用示例占位
+  const ph=function(id,field,example){
+    const el=f(id);if(!el)return;
+    el.value='';
+    el.placeholder=(p[field]&&p[field].has)?('已保存 '+(p[field].hint||'')+'（留空不修改）'):example;
+  };
+  ph('mnFeishu','feishuWebhook','https://open.feishu.cn/open-apis/bot/v2/hook/...');
+  ph('mnDingtalk','dingtalkWebhook','https://oapi.dingtalk.com/robot/send?access_token=...');
+  ph('mnWecom','wecomWebhook','https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=...');
+  ph('mnServerchan','serverchanSendKey','SCT...');
+  ph('mnBarkKey','barkDeviceKey','iOS 装 Bark 后复制的 Key');
+  ph('mnEmail','email','you@corp.com');
+  const note=document.getElementById('mnNote');
+  if(note&&!hasSmtp)note.textContent='提示:管理员还没配置 SMTP,「收件邮箱」这一项暂时发不出去;其它渠道不受影响。渠道凭据只存在服务器上,这里只显示是否已配置;输入框留空表示不修改。';
+}
+function collectMyNotify(){
+  const v=function(id){const el=document.getElementById(id);return el?el.value.trim():''};
+  return {
+    enabled:document.getElementById('mnEnabled').checked,
+    feishuWebhook:v('mnFeishu'),dingtalkWebhook:v('mnDingtalk'),wecomWebhook:v('mnWecom'),
+    serverchanSendKey:v('mnServerchan'),barkDeviceKey:v('mnBarkKey'),email:v('mnEmail')
+  };
+}
+async function saveMyNotify(){
+  mnStatus('保存中…');
+  try{
+    const r=await fetch('/api/my-notify',{method:'POST',headers:{'Authorization':'Bearer '+VK,'Content-Type':'application/json'},body:JSON.stringify(collectMyNotify())});
+    const d=await r.json();
+    if(!r.ok)throw new Error(d.error||('HTTP '+r.status));
+    MN.prefs=d.prefs||MN.prefs;renderMyNotify(true);mnStatus('已保存','ok');
+  }catch(e){mnStatus(e.message||'保存失败','error')}
+}
+async function testMyNotify(){
+  mnStatus('发送中…');
+  try{
+    const r=await fetch('/api/my-notify/test',{method:'POST',headers:{'Authorization':'Bearer '+VK,'Content-Type':'application/json'},body:JSON.stringify(collectMyNotify())});
+    const d=await r.json();
+    if(!r.ok)throw new Error(d.error||('HTTP '+r.status));
+    MN.prefs=d.prefs||MN.prefs;
+    mnStatus((d.results||[]).map(function(x){return x.channel+(x.ok?' 成功':' 失败:'+(x.error||''))}).join('；'),d.ok?'ok':'error');
+  }catch(e){mnStatus(e.message||'测试失败','error')}
+}
 const MR_LABEL={queued:'排队中',syncing:'同步代码',running:'评审中',parsing:'解析结果',success:'完成',
   completed_with_warnings:'完成(有警告)',completed_with_errors:'完成(有错误)',skipped:'已跳过',failed:'失败',timeout:'超时',canceled:'已取消'};
 function mrClass(s){

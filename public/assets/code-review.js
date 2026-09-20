@@ -170,6 +170,7 @@ async function openReviewRun(id) {
     html += '<div class="cr-facts">'
       + crFact("结论", run.note || "—")
       + crFact("评审范围", (run.range_mode === "single" ? "单提交 " : "增量 ") + escH(crShort(run.from_commit) || "—") + " → " + escH(crShort(run.to_commit) || "—"))
+      + (run.author_name || run.author_email ? crFact("提交人", escH(run.author_name || "—") + (run.author_email ? ` &lt;${escH(run.author_email)}&gt;` : "")) : "")
       + crFact("模型", escH(run.ocr_model || "—") + (run.ocr_provider ? `（${escH(run.ocr_provider)}）` : ""))
       + (tools ? crFact("引擎动作", escH(crToolText(tools))) : "")
       + crFact("token", `网关计 ${fmtT(run.attributed_input + run.attributed_output)} · 引擎自报 ${fmtT(run.input_tokens + run.output_tokens)}（${fmtT(run.input_tokens)} 入 / ${fmtT(run.output_tokens)} 出）`)

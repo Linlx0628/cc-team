@@ -25,6 +25,7 @@ import { isCompactionRequest, transformCompactSseEvent } from "./lib/compact-bri
 import { tryThinkingPassbackSelfHeal } from "./lib/thinking-passback.mjs";
 import { createCodeReviewOcr } from "./lib/code-review-ocr.mjs";
 import { createCodeReview, initCodeReviewDb, sanitizeCodeReviewConfig, maskCredential, buildReviewReportHTML, migrateLegacyTriggerKeys, TERMINAL, TERMINAL_OK } from "./lib/code-review.mjs";
+import { createMemberNotify, initMemberNotifyDb } from "./lib/member-notify.mjs";
 import { PassThrough } from "node:stream";
 import { EventEmitter } from "node:events";
 import { escHtml, escJs } from "./lib/html.mjs";
@@ -169,11 +170,17 @@ const MCP_TOOLS = [
   { name: "leaderboard", description: "团队排行榜：7 个维度（cache_rate 缓存率 / code_quality 代码质量 / code_lines 代码行数 / tokens 用量 / efficiency 效率比 / context_health 上下文健康度 / activity 活跃度）× 时间窗（today/week/month）。", inputSchema: { type: "object", properties: { dimension: { type: "string", enum: ["cache_rate", "code_quality", "code_lines", "tokens", "efficiency", "context_health", "activity"] }, window: { type: "string", enum: ["today", "week", "month"] } }, required: [] } },
   { name: "code_review_list", description: "查看代码评审：哪些仓库允许在线触发、各自上次评审状态、最近的评审运行（状态/意见数/token）。想知道「我的改动评过没有」时调用。仅对获授权的 Key 可见。", inputSchema: { type: "object", properties: { limit: { type: "number", description: "返回最近多少次运行（默认 10，最多 50）" } }, required: [] } },
   { name: "code_review_trigger", description: "触发一次代码评审（写操作，消耗 token）。评审的是仓库里**已提交**的最新代码，不是工作区未提交的改动。每 Key 60 秒只能触发一次；仓库需管理员开启「允许在线触发」。", inputSchema: { type: "object", properties: { repo: { type: "string", description: "仓库名称或 ID（可选，缺省=全部已开启在线触发的仓库）" } }, required: [] } },
+  { name: "code_review_findings", description: "查询代码评审**发现的具体问题**（文件、行号、问题描述、建议改法）。用户问「最近有没有代码评审的问题」「我负责的仓库有哪些要改的」时调用这个（而不是 code_review_list —— 那个只有计数）。只返回自己是成员的仓库。", inputSchema: { type: "object", properties: {
+    repo: { type: "string", description: "仓库名称或 ID（可选，缺省=自己负责的全部仓库）" },
+    since: { type: "string", description: "只看这个时间之后的评审，如 7d / 24h / 2026-09-18（北京时间，可选）" },
+    limit: { type: "number", description: "最多返回多少条意见（默认 20，最多 100）" },
+    unseenOnly: { type: "boolean", description: "只返回自己在「我的用量」页还没看过的（配合菜单小红点）" },
+  }, required: [] } },
 ];
 
 // 触发类工具只在获授权的 Key 上可见(未授权者 tools/list 里根本看不到),
 // 工具名清单放这里,避免在 schema 里塞标记位污染 tools/list 的输出。
-const MCP_CR_TOOLS = new Set(["code_review_list", "code_review_trigger"]);
+const MCP_CR_TOOLS = new Set(["code_review_list", "code_review_trigger", "code_review_findings"]);
 function mcpVisibleTools(apiKey) {
   try {
     if (codeReviewApi.canTrigger(apiKey)) return MCP_TOOLS;
@@ -303,6 +310,55 @@ function handleMcpPost(res, body, ctx) {
             createdAt: bjStamp(r.created_at), note: r.note || undefined, error: r.error || undefined,
           })),
         };
+      } else if (name === "code_review_findings") {
+        // 「最近有没有代码评审的问题」—— 这才是 MCP 的价值:把**具体意见**交回给模型,
+        // 用户看完再决定改不改、怎么改。code_review_list 只给计数,答不了这个问题。
+        const repos = codeReviewApi.reposVisibleTo(ctx.apiKey);
+        const wanted = String(args.repo || "").trim();
+        let targets = repos;
+        if (wanted) {
+          targets = repos.filter((r) => r.id === wanted || r.name === wanted);
+          if (!targets.length) { mcpRpcResult(res, id, { content: [{ type: "text", text: `仓库「${wanted}」不在你负责的范围内` }], isError: true }); return; }
+        }
+        const limit = Math.min(100, Math.max(1, Number(args.limit) || 20));
+        const since = mcpSinceIso(args.since);
+        // unseenOnly:只看「上次打开我的用量之后」的 —— 与菜单小红点同一口径
+        const seenAt = args.unseenOnly ? memberNotifyApi.lastSeen(ctx.apiKey) : null;
+        let rows = codeReviewApi.listFindings({ repoIds: targets.map((r) => r.id), since, limit: limit + 1 });
+        if (seenAt) rows = rows.filter((c) => String(c.created_at) > String(seenAt));
+        const truncated = rows.length > limit;
+        rows = rows.slice(0, limit);
+        const clip = (v, n) => {
+          const t = String(v == null ? "" : v);
+          return t.length > n ? t.slice(0, n) + "…" : t;
+        };
+        out = {
+          repos: targets.map((r) => r.name),
+          since: args.since || null,
+          summary: {
+            findings: rows.length,
+            repos: new Set(rows.map((c) => c.repo_id)).size,
+            runs: new Set(rows.map((c) => c.run_id)).size,
+            truncated: truncated || undefined,
+          },
+          findings: rows.map((c) => ({
+            repo: c.repo_name,
+            runId: c.run_id,
+            at: bjStamp(c.created_at),
+            branch: c.branch || undefined,
+            commit: String(c.to_commit || "").slice(0, 8) || undefined,
+            author: c.author_name || undefined,
+            path: c.path,
+            line: c.start_line ? (c.end_line && c.end_line !== c.start_line ? `${c.start_line}-${c.end_line}` : String(c.start_line)) : undefined,
+            // 单条字段可能到 8KB(落库上限),这里再截一次:交给模型的是摘要,全文让人去页面看
+            content: clip(c.content, 1200),
+            suggestion: c.suggestion_code ? clip(c.suggestion_code, 1500) : undefined,
+            clipped: c.truncated ? true : undefined,
+          })),
+        };
+        if (!out.findings.length) {
+          out.note = repos.length ? "这段时间没有评审出问题（或还没有评审记录）" : "你还不是任何仓库的成员";
+        }
       } else if (name === "code_review_trigger") {
         const r = triggerReviewForKey(ctx.apiKey, args.repo);
         if (r.status >= 400) { mcpRpcResult(res, id, { content: [{ type: "text", text: r.body.error }], isError: true }); return; }
@@ -1001,6 +1057,9 @@ function profilePeakHoursMap() {
     serverchanSendKey: "",
     barkServer: "",
     barkDeviceKey: "",
+    // 邮件(SMTP)。465 隐式 TLS 是默认;587 记得把 smtpSecure 关掉走 STARTTLS。
+    smtpHost: "", smtpPort: 465, smtpSecure: true,
+    smtpUser: "", smtpPass: "", smtpFrom: "", smtpTo: "", smtpInsecure: false,
   };
   if (!config.notifier || typeof config.notifier !== "object") {
     config.notifier = { ...defaults };
@@ -2153,6 +2212,8 @@ function loadProfileSnapshot(suffix) {
 ({ db, stmts } = persistenceApi.initDb());
 initProductionDb(db);   // 产出质量表(tool_events / production_alerts),先于 tracker 建语句
 initCodeReviewDb(db);   // 代码评审表(runs / comments / repo_state);功能默认关闭,建表无害
+initMemberNotifyDb(db); // 成员自助的通知渠道(成员用量页里配)
+const memberNotifyApi = createMemberNotify({ get db() { return db; } });
 function productionEnabled() { return (config.productionTracking || {}).enabled !== false; }
 const productionTracker = createProductionTracker({ db, getConfig: () => config.productionTracking || {}, log: console.log });
 
@@ -2236,17 +2297,104 @@ function resolveReviewRepoInput(body) {
   return repo ? { repo } : { status: 404, error: "仓库不存在" };
 }
 
+// 代码评审结果通知。两条**互相独立**的去向:
+//   ① 管理员渠道(飞书/钉钉/…):按 codeReview.notifyOn 规则走,行为与以前一致
+//   ② 写代码的人:评审**发现了意见**时,把问题发给这条提交的 git 作者邮箱
+//      (以及该仓库成员各自配置的渠道 —— 见 pushReviewToMembers)
+// 用户明确要求「有意见才通知」,所以②只在 comments>0 时发,「未发现问题」不打扰人。
 function pushCodeReviewNotice(ev) {
   const c = config.codeReview || {};
   const n = config.notifier || {};
-  if (!c.enabled || !n.enabled || c.notifyOn === "never") return;
-  const failed = ev.kind === "disk_full" || (ev.kind === "run" && TERMINAL.has(ev.report.status) && !TERMINAL_OK.has(ev.report.status));
-  if (failed === false && c.notifyOn === "failure") return;      // 只在失败时推
-  const msg = ev.kind === "disk_full"
-    ? `【代码评审】仓库「${ev.repo.name}」工作区磁盘超限,已拒绝入队\n—— ${notifierApi.beijingTimeString()}（token-monitor）`
-    : `【代码评审】${ev.repo.name} #${ev.runId} ${ev.report.status} · ${ev.report.comments.length} 条意见\n—— ${notifierApi.beijingTimeString()}（token-monitor）`;
-  for (const s of notifierApi.NOTIFY_SENDERS.filter(x => x.enabled(n))) {
-    s.send(n, msg).catch(err => console.error(`[通知] ${s.channel} 推送失败: ${err.message}`));
+  if (!c.enabled) return;
+  const isRun = ev.kind === "run";
+  const failed = ev.kind === "disk_full" || (isRun && TERMINAL.has(ev.report.status) && !TERMINAL_OK.has(ev.report.status));
+  const findings = isRun ? (ev.report.comments || []) : [];
+
+  // ① 管理员渠道
+  if (n.enabled && c.notifyOn !== "never" && (failed || c.notifyOn === "always")) {
+    const msg = ev.kind === "disk_full"
+      ? `【代码评审】仓库「${ev.repo.name}」工作区磁盘超限,已拒绝入队\n—— ${notifierApi.beijingTimeString()}（token-monitor）`
+      : `【代码评审】${ev.repo.name} #${ev.runId} ${ev.report.status} · ${findings.length} 条意见\n—— ${notifierApi.beijingTimeString()}（token-monitor）`;
+    for (const s of notifierApi.NOTIFY_SENDERS.filter(x => x.enabled(n))) {
+      s.send(n, msg).catch(err => console.error(`[通知] ${s.channel} 推送失败: ${err.message}`));
+    }
+  }
+
+  // ② 写代码的人 + 该仓库成员:只在**评出意见**时发
+  if (isRun && findings.length) {
+    notifyReviewFindings(ev).catch(err => console.error(`[代码评审] 通知负责人失败: ${err.message}`));
+  }
+}
+
+// 把「这次评审发现了什么」拼成一段人话。摘要只取前几条、每条截断 ——
+// 通知是提醒,不是全文;详情让成员去「我的用量」页或 MCP 里看。
+function reviewFindingsText(ev) {
+  const findings = ev.report.comments || [];
+  const head = `【代码评审】${ev.repo.name} 发现 ${findings.length} 处问题`;
+  const at = (finding) => {
+    const line = finding.start_line ? `:${finding.start_line}` : "";
+    const text = String(finding.content || "").replace(/\s+/g, " ").slice(0, 160);
+    return `· ${finding.path}${line}\n  ${text}`;
+  };
+  const shown = findings.slice(0, 5).map(at).join("\n");
+  const more = findings.length > 5 ? `\n…另有 ${findings.length - 5} 条` : "";
+  return [
+    head,
+    "",
+    `仓库：${ev.repo.name}${ev.branch ? `（分支 ${ev.branch}）` : ""}`,
+    `提交：${String(ev.to || "").slice(0, 8)}${ev.author && ev.author.name ? ` · ${ev.author.name}` : ""}`,
+    "",
+    shown + more,
+    "",
+    "完整结果（含建议改法）请在「我的用量 → 代码评审」查看，或直接问 MCP。",
+    `—— ${notifierApi.beijingTimeString()}（token-monitor）`,
+  ].filter((x) => x !== null).join("\n");
+}
+
+async function notifyReviewFindings(ev) {
+  const c = config.codeReview || {};
+  const n = config.notifier || {};
+  const text = reviewFindingsText(ev);
+  const subject = `【代码评审】${ev.repo.name} 发现 ${(ev.report.comments || []).length} 处问题`;
+  const jobs = [];
+
+  // a) 提交人邮箱:走管理员配的 SMTP。作者可能根本不是网关成员 —— 这正是这条路径的意义。
+  const authorEmail = ev.author && ev.author.email;
+  if (c.notifyCommitAuthor !== false && authorEmail && notifierApi.isValidEmail(authorEmail)) {
+    const mail = notifierApi.NOTIFY_SENDERS.find((s) => s.channel === "邮件");
+    if (mail && mail.enabled(n)) {
+      jobs.push(mail.send(n, text, { to: authorEmail, subject })
+        .catch((err) => console.error(`[通知] 邮件(提交人 ${authorEmail}) 推送失败: ${err.message}`)));
+    }
+  }
+
+  // b) 该仓库的成员:按他们各自配置的渠道(我的用量页里填的)
+  if (c.notifyMembers !== false) {
+    jobs.push(pushReviewToMembers(ev, text, subject));
+  }
+  await Promise.all(jobs);
+}
+// 成员的渠道存在 member_notify 表里(成员自助维护)。这里只做扇出,失败逐个吞掉 ——
+// 一个人配错了 webhook 不能让其他人都收不到。
+async function pushReviewToMembers(ev, text, subject) {
+  const memberKeys = Array.isArray(ev.repo.members) ? ev.repo.members : [];
+  if (!memberKeys.length) return;
+  const cfg = config.notifier || {};
+  const mailSender = notifierApi.NOTIFY_SENDERS.find((s) => s.channel === "邮件");
+  for (const key of memberKeys) {
+    let prefs = null;
+    try { prefs = memberNotifyApi.get(key); } catch { prefs = null; }
+    if (!prefs || prefs.enabled === false) continue;
+    // 全局 SMTP 凭据 + 该成员自己的收件邮箱
+    if (prefs.email && mailSender && mailSender.enabled(cfg) && notifierApi.isValidEmail(prefs.email)) {
+      mailSender.send(cfg, text, { to: prefs.email, subject })
+        .catch((err) => console.error(`[通知] 邮件(成员 ${key.slice(0, 10)}…) 推送失败: ${err.message}`));
+    }
+    for (const ch of notifierApi.MEMBER_SENDERS) {
+      if (!ch.enabled(prefs)) continue;
+      ch.send(prefs, text, { subject })
+        .catch((err) => console.error(`[通知] ${ch.channel}(成员 ${key.slice(0, 10)}…) 推送失败: ${err.message}`));
+    }
   }
 }
 codeReviewApi.reapStale();   // 上一次进程留下的 queued/running 永远不会再推进
@@ -2263,6 +2411,25 @@ setInterval(() => {
 
 // ISO(UTC) → 北京时间「YYYY-MM-DD HH:MM」,给接口/MCP 输出用(库内一律存 UTC)
 const bjStamp = (iso) => (iso ? new Date(Date.parse(iso) + 8 * 3600000).toISOString().slice(0, 16).replace("T", " ") : null);
+
+// MCP 的 since 参数解析成「UTC ISO 时刻」(库内 created_at 是 UTC)。
+// 支持 7d / 24h / 30m 与 2026-09-18(按**北京时间当天 00:00** 起算,与全站口径一致)。
+// 认不出的取值一律返回 null(不过滤),而不是报错 —— 查不到东西时「给全部」比「给空」有用。
+function mcpSinceIso(v) {
+  const s0 = String(v == null ? "" : v).trim();
+  if (!s0) return null;
+  const rel = s0.match(/^(\d+)\s*([dhm])$/i);
+  if (rel) {
+    const n = Number(rel[1]);
+    const unit = { d: 86400000, h: 3600000, m: 60000 }[rel[2].toLowerCase()];
+    if (Number.isFinite(n) && n > 0) return new Date(Date.now() - n * unit).toISOString();
+  }
+  if (/^\d{4}-\d{2}-\d{2}$/.test(s0)) {
+    const ms = Date.parse(`${s0}T00:00:00+08:00`);   // 北京时间当天零点
+    if (Number.isFinite(ms)) return new Date(ms).toISOString();
+  }
+  return null;
+}
 
 // 成员级触发(HTTP /api/code-review/trigger 与 MCP 的 code_review_trigger 共用)。
 // 闸门:①Key 是有效成员 ②目标仓库在**该成员的仓库名单**里(超级用户豁免)
@@ -5506,6 +5673,9 @@ const server = http.createServer((req, res) => {
     readBody(req, 20_000).then(buf => {
       try {
         const next = notifierApi.sanitizeNotifierConfig(JSON.parse(buf.toString()));
+        // SMTP 密码不回显给前端(表单里是空的),所以「空」= 保留原值,不是清空。
+        // 想真正清掉密码就改 config.json —— 与代码评审凭据同款约定。
+        if (!next.smtpPass && config.notifier && config.notifier.smtpPass) next.smtpPass = config.notifier.smtpPass;
         config.notifier = next;
         saveConfig(config);
         recordAdminAudit(req, "notifier.save", "全局", `保存通知设置（${next.enabled ? "已启用" : "已停用"}，冷却 ${next.minIntervalSeconds}s，恢复通知 ${next.notifyRecovery ? "开" : "关"}）`);
@@ -6143,8 +6313,10 @@ const server = http.createServer((req, res) => {
       return;
     }
     const limit = Number(new URL(req.url, "http://localhost").searchParams.get("limit")) || 20;
+    // lastSeen 一起给:待处理条数(菜单小红点)由它算出来
+    const lastSeenAt = memberNotifyApi.lastSeen(apiKey);
     res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
-    res.end(JSON.stringify(codeReviewApi.memberView(apiKey, { limit })));
+    res.end(JSON.stringify(codeReviewApi.memberView(apiKey, { limit, lastSeenAt })));
     return;
   }
 
@@ -6352,6 +6524,85 @@ const server = http.createServer((req, res) => {
         if (!res.writableEnded) res.end();
       }
     }
+    return;
+  }
+
+  // 成员自助通知渠道(虚拟 Key 鉴权,同 /api/checkin 口径)。
+  // 注意:必须注册在下面 startsWith("/api/my-usage") 那个前缀处理器**之前**,否则会被它吞掉。
+  if (req.url.split("?")[0] === "/api/my-notify" && req.method === "GET") {
+    const apiKey = getApiKey(req);
+    if (!hasGlobalUser(apiKey)) {
+      res.writeHead(401, { "Content-Type": "application/json; charset=utf-8" });
+      res.end(JSON.stringify({ error: "认证失败：请提供有效的虚拟Key (Authorization: Bearer jx-...)" }));
+      return;
+    }
+    res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+    res.end(JSON.stringify({ prefs: memberNotifyApi.masked(apiKey), hasSmtp: !!String((config.notifier || {}).smtpHost || "").trim() }));
+    return;
+  }
+  if (req.url.split("?")[0] === "/api/my-notify" && req.method === "POST") {
+    const apiKey = getApiKey(req);
+    readBody(req, 20_000).then((buf) => {
+      try {
+        if (!hasGlobalUser(apiKey)) throw new Error("认证失败：请提供有效的虚拟Key");
+        const prefs = memberNotifyApi.save(apiKey, JSON.parse(buf.toString() || "{}"));
+        recordAdminAudit(req, "member.notify.save", getUserName(apiKey) || apiKey, "成员更新自己的通知渠道");
+        res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+        res.end(JSON.stringify({ ok: true, prefs }));
+      } catch (err) {
+        res.writeHead(400, { "Content-Type": "application/json; charset=utf-8" });
+        res.end(JSON.stringify({ error: err.message }));
+      }
+    }).catch(() => { res.writeHead(413); res.end("Request too large"); });
+    return;
+  }
+  // 给自己发一条测试:让成员填完就能验证渠道通不通,不用等下一次评审
+  if (req.url.split("?")[0] === "/api/my-notify/test" && req.method === "POST") {
+    const apiKey = getApiKey(req);
+    readBody(req, 20_000).then(async (buf) => {
+      let results = [];
+      try {
+        if (!hasGlobalUser(apiKey)) throw new Error("认证失败：请提供有效的虚拟Key");
+        // 先保存再发,这样「填完直接点测试」也能用(否则还要先点保存)
+        const prefs = memberNotifyApi.save(apiKey, JSON.parse(buf.toString() || "{}"));
+        const full = memberNotifyApi.get(apiKey) || {};
+        const msg = `[token-monitor] 通知测试成功\n你的代码评审结果会推送到这里。\n—— ${notifierApi.beijingTimeString()}`;
+        const n = config.notifier || {};
+        if (full.email) {
+          const mail = notifierApi.NOTIFY_SENDERS.find((x) => x.channel === "邮件");
+          if (mail && mail.enabled(n)) {
+            try { await mail.send(n, msg, { to: full.email, subject: "[token-monitor] 通知测试" }); results.push({ channel: "邮件", ok: true }); }
+            catch (err) { results.push({ channel: "邮件", ok: false, error: err.message }); }
+          } else {
+            results.push({ channel: "邮件", ok: false, error: "管理员尚未配置 SMTP,邮件发不出去" });
+          }
+        }
+        for (const ch of notifierApi.MEMBER_SENDERS) {
+          if (!ch.enabled(full)) continue;
+          try { await ch.send(full, msg); results.push({ channel: ch.channel, ok: true }); }
+          catch (err) { results.push({ channel: ch.channel, ok: false, error: err.message }); }
+        }
+        if (!results.length) results = [{ channel: "—", ok: false, error: "还没有配置任何渠道" }];
+        res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+        res.end(JSON.stringify({ ok: results.every((r) => r.ok), results, prefs }));
+      } catch (err) {
+        res.writeHead(400, { "Content-Type": "application/json; charset=utf-8" });
+        res.end(JSON.stringify({ error: err.message }));
+      }
+    }).catch(() => { res.writeHead(413); res.end("Request too large"); });
+    return;
+  }
+  // 标记「评审结果已看过」—— 菜单小红点靠它归零
+  if (req.url.split("?")[0] === "/api/my-review/seen" && req.method === "POST") {
+    const apiKey = getApiKey(req);
+    if (!hasGlobalUser(apiKey)) {
+      res.writeHead(401, { "Content-Type": "application/json; charset=utf-8" });
+      res.end(JSON.stringify({ error: "认证失败" }));
+      return;
+    }
+    memberNotifyApi.markSeen(apiKey);
+    res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+    res.end(JSON.stringify({ ok: true }));
     return;
   }
 

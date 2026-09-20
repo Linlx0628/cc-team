@@ -1094,8 +1094,10 @@ function renderMyReview(){
   }
   note.textContent='你负责 '+d.repos.length+' 个仓库,以下是它们的评审情况(按时间倒序,最多 20 条)。';
   repos.innerHTML='<div class="lb-list">'+d.repos.map(function(r){
+    // 能看 ≠ 能触发:没开「允许在线触发」的仓库照样能看到结果,只是不能从外部发起
+    const trig=r.canTrigger?'':' <span style="font-size:10px;color:var(--dim2)">(仅可查看,未开外部触发)</span>';
     return '<div class="lb-row"><div class="lb-who"><div class="lb-name">'+esc(r.name)+
-      ' <span class="pill pill-'+mrClass(r.lastStatus)+'">'+(r.lastStatus?(MR_LABEL[r.lastStatus]||r.lastStatus):'未评审')+'</span></div>'+
+      ' <span class="pill pill-'+mrClass(r.lastStatus)+'">'+(r.lastStatus?(MR_LABEL[r.lastStatus]||r.lastStatus):'未评审')+'</span>'+trig+'</div>'+
       '<div class="lb-det">分支 '+esc(r.branch||'main')+' · 上次 '+(r.lastRunAt?esc(mrTime(r.lastRunAt)):'从未')+
       (r.consecutiveFailures?' · <span style="color:var(--red)">连续失败 '+r.consecutiveFailures+' 次</span>':'')+'</div></div></div>';
   }).join('')+'</div>';

@@ -278,7 +278,8 @@ function handleMcpPost(res, body, ctx) {
         const c = config.codeReview || {};
         // 只看得到**自己负责的**仓库(仓库成员名单),不是「所有开了在线触发的仓库」——
         // 否则一个仓库的成员能看到全部仓库的元数据与运行记录。
-        const repos = codeReviewApi.reposForMember(ctx.apiKey);
+        // 用 visible 口径(不是 triggerable):能不能看结果与「是否开放外部触发」无关。
+        const repos = codeReviewApi.reposVisibleTo(ctx.apiKey);
         const allowed = new Set(repos.map(r => r.id));
         const states = codeReviewApi.repoStates();
         const limit = Math.min(50, Math.max(1, Number(args.limit) || 10));
@@ -2277,7 +2278,8 @@ function triggerReviewForKey(apiKey, repoName) {
   const named = wanted ? codeReviewApi.findRepo(wanted) : null;
   if (wanted && !named) return { status: 404, body: { error: `仓库「${wanted}」不在白名单里` } };
   // 不带仓库名 = 触发「该成员名下的全部可触发仓库」
-  const candidates = named ? [named] : codeReviewApi.reposForMember(apiKey);
+  // 不带仓库名 = 触发「该成员**可触发**的全部仓库」(要看可见性用 reposVisibleTo —— 二者不同)
+  const candidates = named ? [named] : codeReviewApi.reposTriggerableBy(apiKey);
   if (!candidates.length) {
     return { status: 403, body: { error: "你没有负责任何仓库（在设置页·代码评审里把你的 Key 加到对应仓库的成员名单）" } };
   }
@@ -3397,7 +3399,7 @@ function personalClaudeExtras(vk) {
 // 具体数据由 /api/my-review 现拉(与其它分区一致的做法:页面壳不做数据查询)。
 function personalReviewExtras(vk) {
   let count = 0;
-  try { count = codeReviewApi.reposForMember(vk).length; } catch { count = 0; }
+  try { count = codeReviewApi.reposVisibleTo(vk).length; } catch { count = 0; }
   return { repoCount: count };
 }
 

@@ -101,7 +101,9 @@ async function openReviewRun(id) {
     let html = '<div class="workspace-panel-head" style="border-top:1px solid var(--border)">'
       + `<strong>运行 #${run.id} · ${escH(run.repo_name)}</strong>`
       + `<span class="workspace-panel-summary">归因: 评审 Key 计 ${run.attributed_requests} 次请求 / ${fmtT(run.attributed_input + run.attributed_output)} token`
-      + `（OCR 上报 ${fmtT(run.input_tokens + run.output_tokens)}）</span></div>`;
+      + `（OCR 上报 ${fmtT(run.input_tokens + run.output_tokens)}）</span>`
+      // 独立 HTML 报告:自包含单文件,下载后可直接发群(与「导出报告」同款)
+      + `<a class="btn btn-outline btn-sm" style="margin-left:8px" href="/api/code-review/report?id=${run.id}">导出报告</a></div>`;
     if (!comments.length) {
       html += '<div class="lb-msg" style="color:var(--green)">无意见</div>';
       box.innerHTML = html;

@@ -26,4 +26,13 @@ services:
       # entrypoint 的 `echo '{}' > /app/data.json` 随即报 "Is a directory",
       # 在 set -e 下脚本退出,restart: unless-stopped 让它无限重启。
       # 容器内路径仍是 /app/data.json,entrypoint 会自行创建普通文件,无需挂载。
+      #
+      # 代码评审工作区(拉下来的仓库副本 + OCR 隔离 HOME)。它是**派生数据**:不挂也能用,
+      # 只是每次重建容器都要重新 clone。这里用命名卷而不是 bind mount —— bind 到宿主上
+      # 不存在的路径时 Docker 会自建一个 root 属主目录,之后在宿主上直接跑裸服务就写不进去
+      # (与上面 data.json 的坑同源)。要清空:`docker volume rm token-monitor_code-review-workspaces`。
+      - code-review-workspaces:/app/code-review-workspaces
     restart: unless-stopped
+
+volumes:
+  code-review-workspaces:

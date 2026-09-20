@@ -24,7 +24,7 @@ import { wsAcceptUpgrade, wsRejectUpgrade, WsConn } from "./lib/ws-server.mjs";
 import { isCompactionRequest, transformCompactSseEvent } from "./lib/compact-bridge.mjs";
 import { tryThinkingPassbackSelfHeal } from "./lib/thinking-passback.mjs";
 import { createCodeReviewOcr } from "./lib/code-review-ocr.mjs";
-import { createCodeReview, initCodeReviewDb, sanitizeCodeReviewConfig, maskCredential, TERMINAL, TERMINAL_OK } from "./lib/code-review.mjs";
+import { createCodeReview, initCodeReviewDb, sanitizeCodeReviewConfig, maskCredential, buildReviewReportHTML, TERMINAL, TERMINAL_OK } from "./lib/code-review.mjs";
 import { PassThrough } from "node:stream";
 import { EventEmitter } from "node:events";
 import { escHtml, escJs } from "./lib/html.mjs";
@@ -167,7 +167,19 @@ const MCP_TOOLS = [
   { name: "request_quota", description: "向管理员提交加量申请（写操作）。每北京日限提交 1 次、每周被处理数有上限；不限量的池无需申请。", inputSchema: { type: "object", properties: { reason: { type: "string", description: "申请理由（必填，200 字以内）" }, pool: { type: "string", description: "额度池名（可选，缺省取第一个可申请的池）" } }, required: ["reason"] } },
   { name: "my_usage", description: "查询我的 token 用量明细：今日（或指定日期范围）合计、按模型统计（真实 token 与计入配额的计权值并排）、24 小时请求分布、按客户端统计。用户问「我今天用了多少/花在哪」时调用。", inputSchema: { type: "object", properties: { start: { type: "string", description: "起始日期 YYYY-MM-DD（北京时间，可选）" }, end: { type: "string", description: "结束日期 YYYY-MM-DD（可选，缺省=起始日）" }, protocol: { type: "string", enum: ["anthropic", "responses"], description: "可选协议过滤" } }, required: [] } },
   { name: "leaderboard", description: "团队排行榜：7 个维度（cache_rate 缓存率 / code_quality 代码质量 / code_lines 代码行数 / tokens 用量 / efficiency 效率比 / context_health 上下文健康度 / activity 活跃度）× 时间窗（today/week/month）。", inputSchema: { type: "object", properties: { dimension: { type: "string", enum: ["cache_rate", "code_quality", "code_lines", "tokens", "efficiency", "context_health", "activity"] }, window: { type: "string", enum: ["today", "week", "month"] } }, required: [] } },
+  { name: "code_review_list", description: "查看代码评审：哪些仓库允许在线触发、各自上次评审状态、最近的评审运行（状态/意见数/token）。想知道「我的改动评过没有」时调用。仅对获授权的 Key 可见。", inputSchema: { type: "object", properties: { limit: { type: "number", description: "返回最近多少次运行（默认 10，最多 50）" } }, required: [] } },
+  { name: "code_review_trigger", description: "触发一次代码评审（写操作，消耗 token）。评审的是仓库里**已提交**的最新代码，不是工作区未提交的改动。每 Key 60 秒只能触发一次；仓库需管理员开启「允许在线触发」。", inputSchema: { type: "object", properties: { repo: { type: "string", description: "仓库名称或 ID（可选，缺省=全部已开启在线触发的仓库）" } }, required: [] } },
 ];
+
+// 触发类工具只在获授权的 Key 上可见(未授权者 tools/list 里根本看不到),
+// 工具名清单放这里,避免在 schema 里塞标记位污染 tools/list 的输出。
+const MCP_CR_TOOLS = new Set(["code_review_list", "code_review_trigger"]);
+function mcpVisibleTools(apiKey) {
+  try {
+    if (codeReviewApi.canTrigger(apiKey)) return MCP_TOOLS;
+  } catch { /* 功能未启用/未初始化 → 全部隐藏 */ }
+  return MCP_TOOLS.filter((t) => !MCP_CR_TOOLS.has(t.name));
+}
 
 function mcpWikiResources() {
   let files = [];
@@ -209,7 +221,7 @@ function handleMcpPost(res, body, ctx) {
     return;
   }
   if (method === "ping") { mcpRpcResult(res, id, {}); return; }
-  if (method === "tools/list") { mcpRpcResult(res, id, { tools: MCP_TOOLS }); return; }
+  if (method === "tools/list") { mcpRpcResult(res, id, { tools: mcpVisibleTools(ctx.apiKey) }); return; }
   if (method === "tools/call") {
     const name = params?.name, args = params?.arguments || {};
     try {
@@ -262,6 +274,38 @@ function handleMcpPost(res, body, ctx) {
           hint: payload.hint, cohort: payload.cohort, note: payload.note || undefined,
           rows: (payload.rows || []).map(r => ({ rank: r.rank, name: r.user_name, value: r.value, isMe: !!r.isMe })),
         };
+      } else if (name === "code_review_list") {
+        const c = config.codeReview || {};
+        const repos = (c.repos || []).filter(r => r.apiTrigger && r.enabled);
+        const allowed = new Set(repos.map(r => r.id));
+        const states = codeReviewApi.repoStates();
+        const limit = Math.min(50, Math.max(1, Number(args.limit) || 10));
+        const { rows } = codeReviewApi.listRuns({ limit: 200 });
+        out = {
+          enabled: !!c.enabled,
+          repos: repos.map(r => {
+            const st = states[r.id] || {};
+            return {
+              name: r.name, id: r.id, branch: r.branch,
+              schedule: r.schedule?.mode === "off" ? "不定时" : r.schedule?.mode === "interval" ? `每 ${r.schedule.intervalHours} 小时` : `每天 ${r.schedule.at}`,
+              lastStatus: st.last_status || null, lastRunAt: bjStamp(st.last_run_at), lastCommit: st.last_commit ? String(st.last_commit).slice(0, 8) : null,
+              consecutiveFailures: st.consecutive_failures || 0,
+            };
+          }),
+          recentRuns: rows.filter(r => allowed.has(r.repo_id)).slice(0, limit).map(r => ({
+            id: r.id, repo: r.repo_name, status: r.status, trigger: r.trigger,
+            range: r.range_mode === "single" ? `单提交 ${String(r.to_commit || "").slice(0, 8)}` : `${String(r.from_commit || "").slice(0, 8)}→${String(r.to_commit || "").slice(0, 8)}`,
+            files: r.files_reviewed, comments: r.comments_count,
+            tokens: (r.input_tokens || 0) + (r.output_tokens || 0),
+            createdAt: bjStamp(r.created_at), note: r.note || undefined, error: r.error || undefined,
+          })),
+        };
+      } else if (name === "code_review_trigger") {
+        const r = triggerReviewForKey(ctx.apiKey, args.repo);
+        if (r.status >= 400) { mcpRpcResult(res, id, { content: [{ type: "text", text: r.body.error }], isError: true }); return; }
+        recordAdminAudit({ headers: { "x-forwarded-for": ctx.ip || "mcp" } }, "codereview.trigger.mcp", r.actor,
+          `MCP 触发代码评审（${(r.results || []).map((x) => `${x.repo}#${x.runId ?? "-"}`).join("、")}）`);
+        out = r.body;
       } else {
         mcpRpcResult(res, id, { content: [{ type: "text", text: `未知工具: ${name}` }], isError: true });
         return;
@@ -2137,7 +2181,8 @@ function applyReviewEndpoint(crCfg) {
   return crCfg;
 }
 
-function pushCodeReviewNotice(ev) {  const c = config.codeReview || {};
+function pushCodeReviewNotice(ev) {
+  const c = config.codeReview || {};
   const n = config.notifier || {};
   if (!c.enabled || !n.enabled || c.notifyOn === "never") return;
   const failed = ev.kind === "disk_full" || (ev.kind === "run" && TERMINAL.has(ev.report.status) && !TERMINAL_OK.has(ev.report.status));
@@ -2150,6 +2195,60 @@ function pushCodeReviewNotice(ev) {  const c = config.codeReview || {};
   }
 }
 codeReviewApi.reapStale();   // 上一次进程留下的 queued/running 永远不会再推进
+
+// 代码评审:60s 调度扫描 + 每日清理(unref 不阻止进程退出)。
+// 一个定时器干三件事:①按仓库 schedule 判定到期并入队;②北京日界跑一次历史清理;
+// ③当日 token 预算用尽时静默停触(见 tick 内部注释)。
+// 周期可用 CODE_REVIEW_TICK_MS 覆盖(测试用),下限 50ms —— 不设「至少 1 秒」那种下限,
+// 否则测试传的小周期会被静默抬回 1s,表现成「定时功能没生效」。
+const CODE_REVIEW_TICK_MS = Math.max(50, Number(process.env.CODE_REVIEW_TICK_MS) || 60_000);
+setInterval(() => {
+  try { codeReviewApi.tick(); } catch (err) { console.log(`[代码评审] 调度扫描异常: ${err?.message}`); }
+}, CODE_REVIEW_TICK_MS).unref();
+
+// ISO(UTC) → 北京时间「YYYY-MM-DD HH:MM」,给接口/MCP 输出用(库内一律存 UTC)
+const bjStamp = (iso) => (iso ? new Date(Date.parse(iso) + 8 * 3600000).toISOString().slice(0, 16).replace("T", " ") : null);
+
+// 成员级触发(HTTP /api/code-review/trigger 与 MCP 的 code_review_trigger 共用)。
+// 三重闸门:①Key 是有效成员 ②在「在线触发授权」白名单里(超级用户豁免)③该仓库自己
+// 开了「允许在线触发」;再加每 Key 60s 一次的限频,防止 CI 抖动把套餐刷穿。
+// 返回 { status, body, results?, actor? } —— 调用方按各自协议翻译(HTTP 写状态码,MCP 包工具结果)。
+function triggerReviewForKey(apiKey, repoName) {
+  if (!hasGlobalUser(apiKey)) {
+    return { status: 401, body: { error: "认证失败：请提供有效的虚拟Key (Authorization: Bearer jx-...)" } };
+  }
+  if (!codeReviewApi.canTrigger(apiKey)) {
+    return { status: 403, body: { error: "该 Key 未获得代码评审触发授权（在设置页「在线触发授权」里勾选）" } };
+  }
+  const rate = codeReviewApi.checkTriggerRate(apiKey);
+  if (!rate.allowed) {
+    return { status: 429, body: { error: `触发过于频繁，请 ${rate.retryAfter}s 后重试`, retryAfter: rate.retryAfter } };
+  }
+  const wanted = String(repoName || "").trim();
+  const targets = wanted
+    ? [codeReviewApi.findRepo(wanted)].filter(Boolean)
+    : (config.codeReview?.repos || []).filter((r) => r.apiTrigger && r.enabled);
+  if (wanted && !targets.length) return { status: 404, body: { error: `仓库「${wanted}」不在白名单里` } };
+  const denied = targets.filter((r) => !r.apiTrigger || !r.enabled);
+  if (denied.length) return { status: 403, body: { error: `仓库「${denied[0].name}」未开启在线触发` } };
+  if (!targets.length) return { status: 404, body: { error: "没有开启在线触发的仓库" } };
+  const actor = getUserName(apiKey) || "api";
+  const results = [];
+  for (const repo of targets) {
+    try {
+      const r = codeReviewApi.enqueue(repo.id, { trigger: "api", actor });
+      results.push({ repo: repo.name, repoId: repo.id, runId: r.runId, deduped: !!r.deduped, skipped: !!r.skipped });
+    } catch (err) {
+      results.push({ repo: repo.name, repoId: repo.id, error: err.message });
+    }
+  }
+  // 单仓库:202 = 已受理,200 = 与进行中任务合并/被预算跳过/入队失败;多仓库:200 + 数组
+  if (results.length === 1) {
+    const one = results[0];
+    return { status: one.deduped || one.skipped || one.error ? 200 : 202, body: { ...one, ok: !one.error }, results, actor };
+  }
+  return { status: 200, body: { ok: true, results }, results, actor };
+}
 
 // 产出质量:60s 告警扫描 + 过期清理(unref 不阻止进程退出);告警经既有通知渠道 webhook 推送。
 const prodNotifyCooldown = new Map();
@@ -5398,6 +5497,25 @@ const server = http.createServer((req, res) => {
     };
     const readJsonBody = (limit = 100_000) => readBody(req, limit).then((buf) => JSON.parse(buf.toString() || "{}"));
 
+    // 成员级触发(CI / MCP 用):**虚拟 Key 鉴权**,不是后台 cookie —— 所以排在本块最前,
+    // 不能被下面的 adminGate 拦掉。闸门与文案都在 triggerReviewForKey 里,与 MCP 工具共用。
+    if (req.method === "POST" && crPath === "/api/code-review/trigger") {
+      readJsonBody(10_000).then((body) => {
+        const r = triggerReviewForKey(getApiKey(req), body.repo);
+        if (r.results) {
+          recordAdminAudit(req, "codereview.trigger.api", r.actor,
+            `在线触发代码评审（${r.results.map((x) => `${x.repo}#${x.runId ?? "-"}${x.error ? " 失败:" + x.error : ""}`).join("、")}）`);
+        }
+        if (r.status === 429) {
+          res.writeHead(429, { "Content-Type": "application/json", "Retry-After": String(r.body.retryAfter) });
+          res.end(JSON.stringify(r.body));
+          return;
+        }
+        json(r.status, r.body);
+      }).catch((err) => json(400, { error: err.message }));
+      return;
+    }
+
     if (req.method === "GET" && crPath === "/api/code-review/status") {
       if (!adminGate()) return;
       (async () => {
@@ -5441,6 +5559,12 @@ const server = http.createServer((req, res) => {
           return r;
         });
         if (!next.providerKey && prev.providerKey) next.providerKey = prev.providerKey;
+        // 这几个字段界面没有对应控件(只在 config.json 里手改):载荷里**缺省**时保留原值,
+        // 否则管理员每在界面点一次保存,工作区目录就被换回默认、OCR 隔离模式被改回 isolated、
+        // 评审背景说明被清空 —— 全是静默的。显式传值(含空串)仍然生效,所以想清回默认做得到。
+        for (const k of ["ocrConfigMode", "workspaceDir", "providerName", "background"]) {
+          if (body[k] === undefined && prev[k] !== undefined) next[k] = prev[k];
+        }
         // 引擎参数与仓库是两块独立的表单:payload 没带 repos 时保留现有仓库,
         // 「只保存引擎设置」不能顺手清空仓库白名单
         if (!Array.isArray(body.repos) && Array.isArray(prev.repos)) next.repos = prev.repos;
@@ -5559,6 +5683,57 @@ const server = http.createServer((req, res) => {
         reloadAllRuntimes();
         recordAdminAudit(req, "codereview.account.create", profileName, "创建代码评审专用账号（超级用户,借用方案 " + profileName + " 的真实 Key）");
         json(200, { ok: true, key, masked: key.slice(0, 8) + "****" });
+      }).catch((err) => json(400, { error: err.message }));
+      return;
+    }
+
+    // 独立 HTML 报告:自包含单文件,下载后可直接发群/存档(照 /api/production/report 先例)
+    if (req.method === "GET" && crPath === "/api/code-review/report") {
+      if (!adminGate()) return;
+      const run = codeReviewApi.getRun(crUrl.searchParams.get("id"));
+      if (!run) { json(404, { error: "运行不存在" }); return; }
+      const repo = codeReviewApi.findRepo(run.repo_id) || { name: run.repo_name };
+      const html = buildReviewReportHTML({ run, comments: codeReviewApi.listComments(run.id, { limit: 500 }), repo });
+      res.writeHead(200, { "Content-Type": "text/html; charset=utf-8", "Content-Disposition": `attachment; filename="code-review-run-${run.id}.html"` });
+      res.end(html);
+      return;
+    }
+
+    // 自检:一次把「为什么跑不起来」列清(引擎/方案/账号/工作区/每个仓库)。
+    // 只探测不修改配置;会起两个 --version 子进程并往工作区写一个探针文件。
+    if (req.method === "POST" && crPath === "/api/code-review/selfcheck") {
+      if (!adminWriteGate()) return;
+      codeReviewApi.selfCheck()
+        .then((r) => json(200, r))
+        .catch((err) => json(500, { error: err.message }));
+      return;
+    }
+
+    // 立即清理历史(保留期 + 每仓库条数上限)。默认每天自动跑一次,这里是手动版。
+    if (req.method === "POST" && crPath === "/api/code-review/maintenance") {
+      if (!adminWriteGate()) return;
+      try {
+        const r = codeReviewApi.prune();
+        recordAdminAudit(req, "codereview.prune", "全局", `清理代码评审历史(删除 ${r.runs} 条运行、${r.files} 个报告文件)`);
+        json(200, { ok: true, ...r });
+      } catch (err) { json(500, { error: err.message }); }
+      return;
+    }
+
+    // 清空评审数据(统计+意见+游标,可选连工作区代码一起删)。破坏性操作:照
+    // /api/data-clear 的先例 —— 二次密码 + 先备份 + 出口前落审计。
+    if (req.method === "POST" && crPath === "/api/code-review/data-clear") {
+      if (!adminWriteGate()) return;
+      readJsonBody().then((body) => {
+        if (!dashboardPassword || !timingSafeEqual(String(body.password || ""), dashboardPassword)) {
+          json(401, { error: "密码错误" }); return;
+        }
+        backupFileSync(configPath, "config.json", "review-clear");
+        backupDatabaseSync("review-clear");
+        const r = codeReviewApi.clearData({ includeWorkspace: !!body.includeWorkspace });
+        recordAdminAudit(req, "codereview.clear", "全局",
+          `清空代码评审数据（${r.runs} 条运行、${r.files} 个报告文件${r.workspace ? "、工作区仓库" : ""}），已自动备份`);
+        json(200, { ok: true, ...r });
       }).catch((err) => json(400, { error: err.message }));
       return;
     }

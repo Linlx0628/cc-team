@@ -19,10 +19,11 @@ CC Team 是一套**团队 AI 编码网关**：一个服务同时代理 Claude Co
 - [快速上手](quick-start.md) — 管理员与成员各自的第一步
 - [核心概念与术语](concepts.md) — 方案、虚拟 Key、额度池、倍率……所有名词的解释
 - [管理面板：顶栏与图表](dashboard.md) — `/dashboard` 的指标卡与六张图表
-- [管理面板：九个工作区](dashboard-workspaces.md) — 用户用量、明细记录、产出质量等九个标签页
+- [管理面板：十个工作区](dashboard-workspaces.md) — 用户用量、明细记录、产出质量等十个标签页
 - [设置页：方案与全局配置](settings.md) — 方案卡片、模型别名、峰谷倍率、通知等
 - [方案组调度](schedule.md) — 按星期 × 时段自动切换方案组
 - [用户与配额管理](users.md) — 虚拟 Key、临时额度、加量申请审批
+- [代码评审](code-review.md) — 把仓库拉下来做行级评审：定时 / CI / MCP 触发、预算与守卫、报告导出
 - [我的用量页](my-usage.md) — 成员侧的签到、日历、用量分析、排行榜
 - [接入配置（Claude Code / Codex）](setup-guide.md) — 一键脚本、手动配置、cc-switch 导入
 - [MCP 接入](mcp.md) — 把配额查询/签到/价目表/手册接入 Claude 的 MCP 端点

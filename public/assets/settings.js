@@ -1815,6 +1815,9 @@ function initReviewForm() {
   crEl('crBudget').value = c.defaultMaxTokensBudget || 0;
   crEl('crParallel').value = c.maxParallelJobs || 2;
   crEl('crRetention').value = c.runRetentionDays || 90;
+  crEl('crKeepRuns').value = c.keepRunsPerRepo || 50;
+  crEl('crDiskLimit').value = c.perRepoDiskLimitMB || 2048;
+  crEl('crDailyBudget').value = c.dailyTokenBudget || 0;
   crEl('crNotifyOn').value = c.notifyOn || 'always';
   crEl('crExclude').value = (c.exclude || []).join(',');
   crEl('crStoreComments').checked = c.storeComments !== false;
@@ -1856,8 +1859,10 @@ function renderReviewRepoTable() {
   if (!CR.repos.length) { body.innerHTML = '<tr><td colspan="8" class="empty">还没有仓库 —— 点右上「＋ 添加仓库」</td></tr>'; return; }
   body.innerHTML = CR.repos.map((r) => {
     const cred = r.credential && r.credential.hasCredential ? '已配置 ' + (r.credential.hint || '') : '未配置';
+    const wd = (r.schedule && r.schedule.weekdays) || [];
     const sched = r.schedule && r.schedule.mode !== 'off'
-      ? (r.schedule.mode === 'interval' ? '每 ' + r.schedule.intervalHours + ' 小时' : '每天 ' + r.schedule.at) : '关闭';
+      ? (r.schedule.mode === 'interval' ? '每 ' + r.schedule.intervalHours + ' 小时'
+        : '每天 ' + r.schedule.at + (wd.length ? ' 周' + wd.join('/') : '')) : '关闭';
     const src = r.source === 'remote' ? 'remote' : 'local';
     return '<tr><td>' + h(r.name) + (r.enabled ? '' : ' <span class="note">(停用)</span>') + '</td><td>' + src + '</td>'
       + '<td style="font-size:11px;color:var(--dim);max-width:320px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + h(r.source === 'remote' ? r.url : r.localPath) + '</td>'
@@ -1872,6 +1877,7 @@ function addReviewRepo() {
   crEl('crRepoName').value = ''; crEl('crRepoSource').value = 'remote'; crEl('crRepoUrl').value = '';
   crEl('crRepoBranch').value = 'main'; crEl('crRepoAuth').value = 'none'; crEl('crRepoCred').value = '';
   crEl('crRepoSched').value = 'off'; crEl('crRepoInterval').value = '6'; crEl('crRepoAt').value = '03:00';
+  crEl('crRepoWeekdays').value = '';
   crEl('crRepoApiTrigger').checked = false;
   crOnRepoSourceChange();
   crEl('crRepoEditor').hidden = false;
@@ -1890,6 +1896,7 @@ function editReviewRepo(id) {
   crEl('crRepoSched').value = (r.schedule && r.schedule.mode) || 'off';
   crEl('crRepoInterval').value = (r.schedule && r.schedule.intervalHours) || 6;
   crEl('crRepoAt').value = (r.schedule && r.schedule.at) || '03:00';
+  crEl('crRepoWeekdays').value = ((r.schedule && r.schedule.weekdays) || []).join(',');
   crEl('crRepoApiTrigger').checked = !!r.apiTrigger;
   crOnRepoSourceChange();
   crEl('crRepoEditor').hidden = false;
@@ -1912,6 +1919,9 @@ function collectReviewSettings() {
     defaultMaxTokensBudget: parseInt(crEl('crBudget').value, 10) || 0,
     maxParallelJobs: parseInt(crEl('crParallel').value, 10) || 2,
     runRetentionDays: parseInt(crEl('crRetention').value, 10) || 90,
+    keepRunsPerRepo: parseInt(crEl('crKeepRuns').value, 10) || 50,
+    perRepoDiskLimitMB: parseInt(crEl('crDiskLimit').value, 10) || 2048,
+    dailyTokenBudget: parseInt(crEl('crDailyBudget').value, 10) || 0,
     notifyOn: crEl('crNotifyOn').value,
     exclude: crEl('crExclude').value.split(',').map((x) => x.trim()).filter(Boolean),
     storeComments: crEl('crStoreComments').checked,
@@ -1948,7 +1958,13 @@ async function saveReviewRepo() {
     credential: crEl('crRepoCred').value,
     apiTrigger: crEl('crRepoApiTrigger').checked,
     enabled: true,
-    schedule: { mode: crEl('crRepoSched').value, intervalHours: parseInt(crEl('crRepoInterval').value, 10) || 6, at: crEl('crRepoAt').value.trim() || '03:00', weekdays: [] },
+    schedule: {
+      mode: crEl('crRepoSched').value,
+      intervalHours: parseInt(crEl('crRepoInterval').value, 10) || 6,
+      at: crEl('crRepoAt').value.trim() || '03:00',
+      // 星期用「1,3,5」这种最省事的写法:能填错的只有数字,服务端还会二次过滤
+      weekdays: crEl('crRepoWeekdays').value.split(',').map((x) => parseInt(x.trim(), 10)).filter((d) => d >= 1 && d <= 7),
+    },
   };
   crSetRepoStatus('保存中…');
   try {
@@ -1998,9 +2014,68 @@ async function probeReviewEngine() {
     parts.push(o.gitOk ? o.git : (o.git ? o.git + '（需要 ≥ 2.41）' : '未检测到 git'));
     parts.push('工作区 ' + (st.workspaceBytes / 1048576).toFixed(1) + 'MB');
     parts.push('队列 ' + st.queue + ' · 运行中 ' + st.running);
+    if (st.dailyTokenBudget > 0) parts.push('今日 ' + (st.todayTokens || 0).toLocaleString('zh-CN') + '/' + st.dailyTokenBudget.toLocaleString('zh-CN') + ' token' + (st.budgetExhausted ? '（已用尽，当日不再自动触发）' : ''));
     note.textContent = '引擎：' + parts.join(' · ');
+    const wsInfo = crEl('crWorkspaceInfo');
+    if (wsInfo) wsInfo.value = '工作区 ' + (st.workspaceBytes / 1048576).toFixed(1) + 'MB · ' + (st.workspaceDir || '');
     const pill = crEl('crStatusPill');
     if (pill) pill.textContent = st.enabled ? (o.installed && o.gitOk ? '已启用' : '缺依赖') : '未启用';
     if (pill) pill.className = 'status ' + (st.enabled ? (o.installed && o.gitOk ? 'status-ok' : 'status-warn') : '');
   } catch (e) { note.textContent = '引擎检测失败：' + e.message; }
+}
+
+// ─── 自检:一次列出所有「跑不起来」的原因(引擎/方案/账号/工作区/每个仓库) ───
+async function runReviewSelfCheck() {
+  const box = crEl('crSelfCheck');
+  if (!box) return;
+  box.hidden = false;
+  box.innerHTML = '<div class="note">自检中…</div>';
+  try {
+    const r = await crApi('/api/code-review/selfcheck', { method: 'POST', headers: csrfHeaders({ 'Content-Type': 'application/json' }), body: '{}' });
+    const rows = (r.items || []).map(function (it) {
+      const mark = it.ok ? '✓' : '✗';
+      const color = it.ok ? 'var(--ok,#2f6e50)' : 'var(--danger,#b91c1c)';
+      return '<div style="display:flex;gap:8px;padding:3px 0;align-items:baseline">'
+        + '<span style="color:' + color + ';width:14px;flex:none">' + mark + '</span>'
+        + '<span style="flex:none;min-width:120px">' + h(it.name) + '</span>'
+        + '<span class="note" style="margin:0">' + h(it.detail) + (it.hint ? ' —— ' + h(it.hint) : '') + '</span></div>';
+    }).join('');
+    box.innerHTML = '<div style="display:flex;align-items:center;gap:8px;margin-bottom:4px"><strong style="font-size:12.5px">自检结果</strong>'
+      + '<span class="status ' + (r.ok ? 'status-ok' : 'status-warn') + '">' + (r.ok ? '全部通过' : '有问题项') + '</span></div>' + rows;
+  } catch (e) {
+    box.innerHTML = '<div class="note" style="color:var(--danger,#b91c1c)">自检失败：' + h(e.message) + '</div>';
+  }
+}
+function crSetMaintStatus(text, cls) {
+  const el = crEl('crMaintStatus');
+  if (el) { el.textContent = text || ''; el.className = 'inline-status ' + (cls || ''); }
+}
+async function pruneReviewHistory() {
+  crSetMaintStatus('清理中…');
+  try {
+    const r = await crApi('/api/code-review/maintenance', { method: 'POST', headers: csrfHeaders({ 'Content-Type': 'application/json' }), body: '{}' });
+    crSetMaintStatus('已删除 ' + r.runs + ' 条运行、' + r.files + ' 个报告文件', 'ok');
+    await refreshReviewFromServer();
+    await probeReviewEngine();
+  } catch (e) { crSetMaintStatus('清理失败：' + e.message, 'error'); }
+}
+// 清空评审数据:破坏性操作,二次密码(与「清空全部数据」同口径);includeWorkspace 连
+// 拉下来的代码副本一起删 —— 那才是磁盘大头,代价只是下次评审重新 clone。
+async function clearReviewData(includeWorkspace) {
+  const pwd = crEl('crClearPassword') ? crEl('crClearPassword').value : '';
+  if (!pwd) { crSetMaintStatus('请先填写管理员密码', 'error'); return; }
+  const what = includeWorkspace ? '评审数据 + 工作区里拉下来的代码副本' : '评审数据(统计、意见、游标)';
+  if (!confirm('确认清空' + what + '？\n\n会自动备份数据库;仓库定义与引擎配置保留。此操作不可撤销。')) return;
+  crSetMaintStatus('清空中…');
+  try {
+    const r = await crApi('/api/code-review/data-clear', {
+      method: 'POST', headers: csrfHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify({ password: pwd, includeWorkspace: !!includeWorkspace }),
+    });
+    crEl('crClearPassword').value = '';
+    crSetMaintStatus('已清空 ' + r.runs + ' 条运行、' + r.files + ' 个报告文件' + (r.workspace ? '、工作区代码' : '') + '（已自动备份）', 'ok');
+    toast('代码评审数据已清空');
+    await refreshReviewFromServer();
+    await probeReviewEngine();
+  } catch (e) { crSetMaintStatus('清空失败：' + e.message, 'error'); }
 }

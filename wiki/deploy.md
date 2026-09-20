@@ -41,6 +41,14 @@ node server.mjs
 | `@alibaba-group/open-code-review`（`ocr`） | 见 `ocr version` | `npm i -g @alibaba-group/open-code-review` | 评审引擎；**网关不会自动安装**，未装时功能显示「未安装」与安装指引 |
 | `openssh-client` | — | `apk add openssh-client` | 仅当用 SSH 方式拉私有仓库时需要 |
 
+容器化部署（`docker/docker-compose.yml`）已经把工作区挂成**命名卷** `code-review-workspaces`（对应容器内 `/app/code-review-workspaces`）——不挂也能跑，只是每次重建容器都要重新 clone 仓库：
+
+```bash
+docker volume rm token-monitor_code-review-workspaces   # 想彻底清空工作区时
+```
+
+⚠️ 用 `local` 来源的仓库时，**填的是容器内的路径**，需要你另外把该目录挂进容器；跨容器用 `remote` 来源更省事。
+
 **实测结论（2026-09-19，macOS + open-code-review v1.12.3）**——这些直接决定网关怎么调用它：
 
 - **HOME 隔离成立**：以 `HOME=<工作区>/ocr-home` 运行时，`ocr config set` 与运行都只读写 `<HOME>/.opencodereview/`，宿主机 `~/.opencodereview/config.json` 的 hash 与 mtime 分毫未变 → 网关可以把自己的 provider 配置写进隔离目录，不碰管理员在宿主机上的全局配置
@@ -64,10 +72,19 @@ node server.mjs
 | `quotaRequest` | 加量申请开关与参数 |
 | `autoQuotaAdjust` | 自动配额调整（周期 / 命中率阈值 / 冷却） |
 | `productionTracking` | 产出质量追踪（含文件路径记录开关） |
+| `codeReview` | 代码评审（仓库白名单 / 方案 / 账号 / 定时 / 预算；建议在设置页里维护，凭据在这个字段里明文存放） |
 | `notifier` | 通知渠道（飞书 / 钉钉 / 企微 / Server酱 / Bark） |
 | `proxy` | 超时 / 重试 / 并发 / 限速 / 熔断 / 粘性会话 TTL 等 |
 
 > 大部分配置在 `/settings` 页面里改即可，服务会写回 `config.json`；手改文件后重启生效。
+
+### 环境变量
+
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `CODE_REVIEW_TICK_MS` | `60000` | 代码评审调度扫描周期（毫秒，下限 50）；调小只影响到期判定的灵敏度，不改变「同一仓库串行」与「一天只跑一次」的语义 |
+
+监听端口来自 `config.json` 的 `port`（默认 6789），没有环境变量覆盖。
 
 ## 数据文件
 
@@ -76,6 +93,7 @@ node server.mjs
 | `config.json` | 全部配置（设置页写回） |
 | `data.db`（+shm/wal） | SQLite：统计、错误记录、审计日志、配额历史 |
 | `backups/` | 破坏性操作与数据迁移前的自动备份 |
+| `code-review-workspaces/` | 代码评审的工作区：拉下来的仓库副本 + OCR 隔离 HOME（派生数据，可随时删，已在 `.gitignore`） |
 | `logs/` | 请求日志 `requests-YYYY-MM-DD.jsonl`（保留 30 天，不记对话内容） |
 
 ## 健康检查

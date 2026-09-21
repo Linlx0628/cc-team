@@ -5045,6 +5045,25 @@ const server = http.createServer((req, res) => {
     if (!checkAuth(req)) { res.writeHead(401); res.end("Unauthorized"); return; }
     const url = new URL(req.url, `http://localhost`);
     const profileSuffix = url.searchParams.get("profile") || "all";
+    // section:按菜单只取需要的部分(dashboard 懒加载)。**不带 section 时行为与历史一致**
+    // —— 多个测试断言完整形状,这条兼容性必须守住。
+    //   overview            数据总览(卡片+六图;不含最贵的 profileDailyModels)
+    //   profile-daily-models 图表切「按方案」维度时才单独拉
+    //   users/clients/detail/profiles/rates/errors  各自菜单
+    const SECTION_KEYS = {
+      overview: ["users", "daily", "models", "hourly", "dailyModels", "dailyClients", "hourlyModels", "profileDaily", "profiles", "profileView", "protocolView", "upstream"],
+      "profile-daily-models": ["profiles", "profileDailyModels"],
+      users: ["users", "daily", "profiles", "userQuotaMatrix", "userQuotas", "userQuotaEff", "profileQuota", "profileView", "protocolView"],
+      clients: ["users", "dailyClients", "profileView", "protocolView"],
+      detail: ["users", "daily", "profileView", "protocolView"],
+      profiles: ["profiles", "profileSummaries", "profileView", "protocolView"],
+      rates: ["profiles", "modelRateBoard", "profileView", "protocolView"],
+      errors: ["errors", "profileView", "protocolView"],
+    };
+    const sectionParam = url.searchParams.get("section");
+    const section = sectionParam && SECTION_KEYS[sectionParam] ? sectionParam : null;
+    const keys = section ? new Set(SECTION_KEYS[section]) : null;   // null = 全量
+    const want = (k) => !keys || keys.has(k);
     // Optional protocol split for the "all" view: anthropic|responses. Ignored
     // when a specific profile is selected (a profile already belongs to one
     // protocol). Missing/invalid value = current unfiltered behavior.
@@ -5077,12 +5096,14 @@ const server = http.createServer((req, res) => {
         const poolOf = getPoolForSuffix(targetSuffix);
         data.profileQuota = getPoolQuota(poolOf.name);
         data.quotaPool = poolOf.name;
+        // 逐用户的配额(每人两条 SQL):只有「用户用量」菜单用得上 —— 其它 section 跳过整轮
+        const needQuota = want("userQuotas") || want("userQuotaEff");
         data.userQuotas = {};
         // Effective quota per user (base + today's manual bonus, usage minus
         // reset baseline) so the dashboard quota bar matches what the proxy
         // actually enforces, while usage columns keep the real statistics.
         data.userQuotaEff = {};
-        for (const k of Object.keys(targetRt.users)) {
+        for (const k of needQuota ? Object.keys(targetRt.users) : []) {
           const q = getUserPoolQuota(poolOf.name, k);
           if (q > 0) data.userQuotas[k.slice(0, 8) + "****"] = q;
           const eff = checkTokenQuota(k, targetSuffix, targetRt);
@@ -5095,19 +5116,26 @@ const server = http.createServer((req, res) => {
       }
     }
     // Add profile list for dropdown
-    data.profiles = listProfiles();
-    data.profileSummaries = statsApi.getProfileSummaries();
+    if (want("profiles")) data.profiles = listProfiles();
+    if (want("profileSummaries")) data.profileSummaries = statsApi.getProfileSummaries();
     // Chart feeds: hourly×model trend (scoped to current profile view) and
     // cross-profile daily aggregates (always all profiles — the profile chart
     // is a cross-profile dimension and must not shrink with the profile filter).
     const scopedSuffix = profileSuffix === "all" ? null : normalizeProfileSuffix(profileSuffix);
-    data.hourlyModels = statsApi.loadHourlyModels(scopedSuffix, protoFilter);
-    data.profileDaily = statsApi.loadProfileDaily(protoFilter);
-    data.profileDailyModels = statsApi.loadProfileDailyModels(protoFilter);
+    if (want("hourlyModels")) data.hourlyModels = statsApi.loadHourlyModels(scopedSuffix, protoFilter);
+    if (want("profileDaily")) data.profileDaily = statsApi.loadProfileDaily(protoFilter);
+    // 最贵的一张(最大表的第二次全表扫):只有图表切到「按方案」维度时才拉
+    if (want("profileDailyModels")) data.profileDailyModels = statsApi.loadProfileDailyModels(protoFilter);
     // Model rate board: config rates + today's realised cost per profile×model.
-    data.modelRateBoard = statsApi.getModelRateBoard(
-      profileSuffix === "all" ? protoFilter : [normalizeProfileSuffix(profileSuffix)]
-    );
+    if (want("modelRateBoard")) {
+      data.modelRateBoard = statsApi.getModelRateBoard(
+        profileSuffix === "all" ? protoFilter : [normalizeProfileSuffix(profileSuffix)]
+      );
+    }
+    // 带 section 时**只留白名单里的键**:构建器(聚合视图/单方案快照)会初始化一堆键,
+    // 跳过查询的会留成空对象 —— 与其让前端拿到「存在但为空」的误导性字段,不如裁干净。
+    // 不带 section 时 keys 为 null,一个键都不动(兼容护栏)。
+    if (keys) for (const k of Object.keys(data)) if (!keys.has(k)) delete data[k];
     sendJson(res, data, req);
     return;
   }

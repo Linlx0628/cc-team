@@ -5,10 +5,75 @@ Chart.defaults.color='#686863';Chart.defaults.font.family='-apple-system,BlinkMa
 let D=null,P="day",C={t:null,p:null,m:null,h:null,hm:null,pr:null},errPage=1,autoRefresh=true,refreshTimer=null,currentProfile="all",PROTO="";
 let MDL="all",USR="all",MT="tokens",PIEDIM="user",MDLDIM="model";
 let DS="",DE="";
+// 北京时间的「今天」(YYYY-MM-DD)。原先 render / renderCharts / renderTables 各抄一份
+// 这个表达式,上一轮把用户表搬进 renderTables 时漏了一份 —— 运行期直接 ReferenceError
+// (侧栏显示 Error: td is not defined,后续所有渲染被跳过,六张表全空)。
+// 抽成一处共用,以后无论怎么拆函数都不会再漏。
+const todayBJ=()=>new Date(Date.now()+8*36e5).toISOString().slice(0,10);
 let activeWorkspaceTab="overview";
 // 菜单顺序,与侧栏按钮一一对应;id 由 setWorkspaceTab 按 'workspace-tab-'+s 硬拼 ——
 // 增删菜单必须与 lib/pages.mjs 的按钮和面板同时改,否则切换会静默失效。
 const SECTIONS=['overview','users','clients','detail','profiles','rates','errors','production','sessions','costs','review'];
+
+// ── 按菜单懒加载 ─────────────────────────────────────────────────────────────
+// 点哪个菜单才查哪个菜单的数据:别为了一张错误表去跑 dailyModels/dailyClients 那几张
+// 400 天宽表的全表扫描(实测这是 dashboard 最重的一块)。
+//   值 = /api/stats 的 section 名;null = 该菜单有自己的独立端点(产出/会话/成本/评审)。
+const SECTION_SOURCE={
+  overview:"overview", users:"users", clients:"clients", detail:"detail",
+  profiles:"profiles", rates:"rates", errors:"errors",
+  production:null, sessions:null, costs:null, review:null,
+};
+const sectionLoaded={};        // 菜单 → 是否已把它的数据拉进来过
+
+// 该菜单的数据源拉取完成后,由它自己渲染(每个渲染函数都自带「数据不在就跳过」的守卫)
+function renderSection(name){
+  if(name==="overview")render();
+  else if(name==="users")renderUsersPanel();
+  else if(name==="clients")renderClientBoard();
+  else if(name==="detail")renderDetailPanel();
+  else if(name==="profiles")renderProfilesPanel();
+  else if(name==="rates")renderRateBoard();
+  else if(name==="errors")renderErrorsPanel();
+  renderMeta();
+}
+
+// 首次进入某菜单时拉它自己的那份数据;force=true 用于自动刷新/手动刷新
+async function ensureSection(name,{force=false}={}){
+  const src=SECTION_SOURCE[name];
+  if(src===undefined)return;
+  if(src===null){                       // 产出/会话/成本/评审:各自的加载器/标志
+    if(name==="review"){window.crEnsureLoaded&&window.crEnsureLoaded();return}
+    if(force||!sectionLoaded[name]){
+      sectionLoaded[name]=true;
+      if(name==="production")loadProduction();
+      else if(name==="sessions")loadSessions();
+      else if(name==="costs")loadCosts();
+    }
+    return;
+  }
+  if(!force&&sectionLoaded[name]){renderSection(name);return}
+  try{
+    const qs=new URLSearchParams({section:src});
+    if(currentProfile!=="all")qs.set("profile",currentProfile);
+    else if(PROTO)qs.set("protocol",PROTO);
+    const r=await fetch("/api/stats?"+qs);
+    const payload=await r.json();
+    D=Object.assign(D||{},payload);     // 合并进既有全局:渲染函数继续读 D.*
+    sectionLoaded[name]=true;
+    renderSection(name);
+  }catch(e){document.getElementById("meta").textContent="Error: "+e.message}
+}
+
+// 自动刷新/手动刷新:只重拉当前菜单的那份数据
+function refreshCurrent(){
+  // 代码评审有自己的加载器(在 code-review.js 里),它单独暴露了两个钩子
+  if(activeWorkspaceTab==="review"){window.crReload&&window.crReload();return}
+  ensureSection(activeWorkspaceTab,{force:true});
+}
+
+// 方案/协议变了 → 每个 section 的载荷都是按它过滤的,已加载的统统作废
+function clearSectionCache(){for(const k of Object.keys(sectionLoaded))delete sectionLoaded[k]}
 // 图表脏标记:面板隐藏时建不出图(宽度 0)。render() 在「数据总览不可见」时跳过建图
 // 并置脏;切回数据总览时若脏且有数据就重建 —— 否则自动刷新会把图画废(踩过)。
 let chartsDirty=false;
@@ -40,7 +105,7 @@ function wk(s){const d=new Date(s),day=d.getDay()||7,mon=new Date(d);mon.setDate
 function grp(daily,p){const g={};for(const[day,ud]of Object.entries(daily)){const k=p==="week"?wk(day):p==="month"?day.slice(0,7):p==="year"?day.slice(0,4):day;if(!g[k])g[k]={};for(const[u,s]of Object.entries(ud)){if(!g[k][u])g[k][u]={inputTokens:0,outputTokens:0,requests:0,cacheCreationTokens:0,cacheReadTokens:0};g[k][u].inputTokens+=s.inputTokens;g[k][u].outputTokens+=s.outputTokens;g[k][u].requests+=s.requests;g[k][u].cacheCreationTokens+=(s.cacheCreationTokens||0);g[k][u].cacheReadTokens+=(s.cacheReadTokens||0)}}return g}
 function lbl(p,k){if(p==="day")return k.slice(5);if(p==="week")return k.slice(5)+" 周";if(p==="month")return k;return k+"年"}
 // 当前周期窗口（北京时间）：日=今天、周=本周一、月=本月 1 日、年=本年 1 月 1 日。
-function winBounds(){const t=new Date(Date.now()+8*36e5).toISOString().slice(0,10);return{wStart:P==="day"?t:P==="week"?wk(t):P==="month"?t.slice(0,7)+"-01":t.slice(0,4)+"-01-01",td:t}}
+function winBounds(){const t=todayBJ();return{wStart:P==="day"?t:P==="week"?wk(t):P==="month"?t.slice(0,7)+"-01":t.slice(0,4)+"-01-01",td:t}}
 // 四张非 24h 图的有效窗口:日期范围(开始/结束)生效时用它,否则退回周期窗口。
 // 日期范围只做窗口过滤,分桶粒度仍由周期 tabs 控制(两者正交)。
 function effBounds(){
@@ -88,6 +153,8 @@ function setWorkspaceTab(tab,focus){
   if(focus){const b=document.getElementById("workspace-tab-"+tab);if(b)b.focus()}
   // 切回数据总览时,若期间 render() 因面板隐藏跳过了建图,现在补建
   if(tab==="overview"&&chartsDirty&&D){chartsDirty=false;renderCharts()}
+  // 菜单的数据按需拉取 —— 在这里触发(而不是绑 click 监听),键盘上下键切菜单同样生效
+  ensureSection(tab);
   scheduleChartResize();
 }
 function handleWorkspaceTabKeydown(event){
@@ -147,20 +214,9 @@ function renderClientBoard(){
     }
     body.innerHTML=rows.join("");
   }
-  document.getElementById("workspaceCountClients").textContent=order.length;
   document.getElementById("clientContext").textContent=order.length
     ?(order.length+' 个客户端 · 合计 '+fmtT(total)+' Token')
     :"暂无数据";
-}
-function renderWorkspaceSummaries(){
-  if(!D)return;
-  document.getElementById("workspaceCountUsers").textContent=Object.keys(D.users||{}).length;
-  document.getElementById("workspaceCountProfiles").textContent=Array.isArray(D.profileSummaries)?D.profileSummaries.length:0;
-  document.getElementById("workspaceCountErrors").textContent=Array.isArray(D.errors)?D.errors.length:0;
-  // Tab count = models priced individually, not total rows: that is the number an
-  // admin is checking ("did my overrides take effect?").
-  const board=Array.isArray(D.modelRateBoard)?D.modelRateBoard:[];
-  document.getElementById("workspaceCountRates").textContent=board.filter(r=>r.custom).length;
 }
 // Fold a model's aliases + peak-aliases (across all its profiles) into compact
 // chips; the tail collapses to "+N". Peak-only aliases carry a 峰 marker.
@@ -437,15 +493,14 @@ function renderDetail(){
     hoursCharts.set(id,chart);
   }
   document.getElementById("detailHint").textContent=periods.length+' 个周期 · '+memberCount+' 条用户记录';
-  document.getElementById("workspaceCountDetail").textContent=periods.length;
   document.getElementById("detailPages").innerHTML=periods.length?'<span>第 '+detailPage+' / '+totalPages+' 页</span><button type="button" onclick="setDetailPage('+(detailPage-1)+')" '+(detailPage<=1?'disabled':'')+'>上一页</button><button type="button" onclick="setDetailPage('+(detailPage+1)+')" '+(detailPage>=totalPages?'disabled':'')+'>下一页</button>':'';
 }
-function switchProfileView(v){currentProfile=v||"all";resetDetailGrouping();load()}
+function switchProfileView(v){currentProfile=v||"all";resetDetailGrouping();clearSectionCache();load()}
 // Protocol segmented control: switches the "all profiles" aggregation between
 // Anthropic (Claude Code) and Responses (Codex) views. Selecting a specific
 // profile overrides it — the segment then mirrors that profile's protocol.
 function setProtoSeg(proto){document.querySelectorAll("#protoSeg button").forEach(b=>b.classList.toggle("on",b.dataset.proto===(proto||"")))}
-function switchProtocolView(proto){PROTO=proto||"";if(currentProfile!=="all"){currentProfile="all";const sel=document.getElementById("profileSel");if(sel)sel.value="all"}setProtoSeg(PROTO);resetDetailGrouping();load()}
+function switchProtocolView(proto){PROTO=proto||"";if(currentProfile!=="all"){currentProfile="all";const sel=document.getElementById("profileSel");if(sel)sel.value="all"}setProtoSeg(PROTO);resetDetailGrouping();clearSectionCache();load()}
 document.querySelectorAll("#protoSeg button").forEach(b=>b.addEventListener("click",()=>switchProtocolView(b.dataset.proto)));
 // 用户分布图的维度切换(按用户 / 按客户端)。只重画这一张图,不需要重新拉数 ——
 // dailyClients 与 daily/dailyModels 一起来自 /api/stats,已经在 D 里了。
@@ -453,9 +508,55 @@ function setPieDim(dim){PIEDIM=dim==="client"?"client":"user";document.querySele
 document.querySelectorAll("#pieDim button").forEach(b=>b.addEventListener("click",()=>setPieDim(b.dataset.dim)));
 // 模型请求分布图的维度切换(按模型 / 按方案),与用户分布图的 seg 同款。只重画不重新拉数
 // —— profileDailyModels(方案×日期×模型聚合)与 dailyModels 一样已在 /api/stats 返回里。
-function setModelDim(dim){MDLDIM=dim==="profile"?"profile":"model";document.querySelectorAll("#modelDim button").forEach(b=>b.classList.toggle("on",b.dataset.dim===MDLDIM));if(D)render()}
+function setModelDim(dim){
+  MDLDIM=dim==="profile"?"profile":"model";
+  document.querySelectorAll("#modelDim button").forEach(b=>b.classList.toggle("on",b.dataset.dim===MDLDIM));
+  // 「按方案」维度要的是 profileDailyModels —— 最大表的第二次全表扫描,是全页面最贵的一项。
+  // 所以它**不进数据总览的载荷**,切到这个维度时才单独拉一次(用户确认的取舍)。
+  if(MDLDIM==="profile"&&D&&!D.profileDailyModels){
+    const qs=new URLSearchParams({section:"profile-daily-models"});
+    if(PROTO)qs.set("protocol",PROTO);
+    fetch("/api/stats?"+qs).then(r=>r.json())
+      .then(payload=>{if(D)Object.assign(D,payload);if(MDLDIM==="profile"&&D)render()})
+      .catch(e=>{document.getElementById("meta").textContent="Error: "+e.message});
+    return;
+  }
+  if(D)render();
+}
 document.querySelectorAll("#modelDim button").forEach(b=>b.addEventListener("click",()=>setModelDim(b.dataset.dim)));
 const protoLabel=proto=>proto==="anthropic"?"Anthropic":proto==="responses"?"OpenAI":"";
+// 侧栏那行「方案: … | 更新时间 …」。每个 section 拉完都刷新一次 —— 它不依赖具体某个面板。
+function renderMeta(){
+  if(!D)return;
+  const curProtoProf=(D.profiles||[]).find(p=>p.suffix===currentProfile);
+  const profileLabel=D.profileView||(currentProfile==="all"?"全部方案":"默认方案");
+  const protoSuffix=protoLabel(currentProfile!=="all"?((curProtoProf&&curProtoProf.protocol)||""):PROTO);
+  const upstreamInfo=D.upstream?(" | 上游: "+D.upstream.replace("https://","").replace("http://","")):"";
+  document.getElementById("meta").innerHTML='<span style="color:var(--accent);font-weight:600">方案: '+profileLabel+(protoSuffix?' · '+protoSuffix:'')+'</span>'+upstreamInfo+' &nbsp;|&nbsp; 更新于 '+(function(){const d=new Date();const utc=d.getTime()+d.getTimezoneOffset()*60000;return new Date(utc+8*3600000).toLocaleTimeString("zh-CN")})()+" (北京时间) | 每30秒刷新";
+}
+
+// ── 方案中心(独立菜单:数据来自 /api/stats?section=profiles)──
+// 只在这个菜单的数据到位后渲染;别的 section 的载荷里没有 profileSummaries,直接跳过。
+function renderProfilesPanel(){
+  if(!D||!Array.isArray(D.profileSummaries))return;
+  const psb=document.getElementById("profileSummaryBody"),profiles=Array.isArray(D.profileSummaries)?D.profileSummaries:[];
+  const fmtResume=function(iso){const d=new Date(new Date(iso).getTime()+8*3600000);const p=n=>String(n).padStart(2,'0');const now=new Date(Date.now()+8*3600000);const hm=p(d.getUTCHours())+':'+p(d.getUTCMinutes());if(d.getUTCFullYear()===now.getUTCFullYear()&&d.getUTCMonth()===now.getUTCMonth()&&d.getUTCDate()===now.getUTCDate())return hm;if(Date.UTC(d.getUTCFullYear(),d.getUTCMonth(),d.getUTCDate())-Date.UTC(now.getUTCFullYear(),now.getUTCMonth(),now.getUTCDate())===86400000)return '明天 '+hm;return (d.getUTCFullYear()===now.getUTCFullYear()?'':d.getUTCFullYear()+'-')+p(d.getUTCMonth()+1)+'-'+p(d.getUTCDate())+' '+hm};
+  const rowOf=p=>{const st=p.breakerState||"UNKNOWN";const rl=p.rateLimit;let col,led,stateLabel;if(rl){col='var(--red)';led='err';stateLabel='限额中 '+fmtResume(rl.resumeAt)+'恢复';}else{col=st==="CLOSED"?"var(--green)":st==="HALF_OPEN"?"var(--orange)":"var(--red)";led=st==="CLOSED"?"on":st==="HALF_OPEN"?"warn":"err";stateLabel=st==="CLOSED"?"正常":st==="HALF_OPEN"?"探测中":"熔断"+(p.breakerCooldownRemaining>0?' '+Math.ceil(p.breakerCooldownRemaining/1000)+'s后探测':'');}const current=currentProfile!=="all"&&p.suffix===currentProfile;const gBadge=p.inDefaultGroup?' <span style="color:var(--blue);font-size:10px;font-weight:600">默认组·'+(p.groupOrder+1)+'</span>':'';const rBadge=p.inResponsesGroup?' <span style="color:var(--blue);font-size:10px;font-weight:600">Resp组·'+(p.responsesGroupOrder+1)+'</span>':'';const protoBadge=p.protocol==='responses'?' <span style="color:var(--blue);font-size:10px">OpenAI</span>':'';const bLabel=p.billingType==='coding_plan'?' <span style="color:var(--dim);font-size:10px">CP</span>':p.billingType==='token_plan'?' <span style="color:var(--dim);font-size:10px">TP</span>':'';const pk=(p.peakHours&&p.peakHours.length)?(function(rs){const now=new Date(),cur=((now.getTime()+8*3600000)%86400000)/60000;const tm=function(t){if(!t)return null;const a=t.split(':');return (+a[0])*60+(+a[1])};const inPk=rs.some(function(r){const s=tm(r.start),e=tm(r.end);return s!==null&&e!==null&&s!==e&&(s<e?(cur>=s&&cur<e):(cur>=s||cur<e))});return ' <span style="color:'+(inPk?'var(--orange)':'var(--dim)')+';font-size:10px" title="高峰时段(北京时间) '+rs.map(function(r){return r.start+'-'+r.end}).join(', ')+'">'+(inPk?'高峰中':rs.map(function(r){return r.start+'-'+r.end}).join(','))+'</span>'})(p.peakHours):'';const rt2=(function(){if(p.peakQuotaRate==null&&p.offPeakQuotaRate==null)return'';const pr=p.peakQuotaRate==null?1:p.peakQuotaRate,orr=p.offPeakQuotaRate==null?1:p.offPeakQuotaRate;const nCustom=Object.keys(p.modelQuotaRates||{}).length;if(pr===1&&orr===1&&nCustom===0)return'';var now=new Date(),cur=((now.getTime()+8*3600000)%86400000)/60000;var tm=function(t){if(!t)return null;var a=t.split(':');return (+a[0])*60+(+a[1])};var ip=(p.peakHours||[]).some(function(r){var s=tm(r.start),e=tm(r.end);return s!==null&&e!==null&&s!==e&&(s<e?(cur>=s&&cur<e):(cur>=s||cur<e))});return ' <span style="color:var(--accent);font-size:10px" title="默认配额倍率：高峰 ×'+pr+' / 低谷 ×'+orr+'（当前'+(ip?'高峰':'低谷')+'）'+(nCustom?'；另有 '+nCustom+' 个模型单独定价':'')+'">×'+(ip?pr:orr)+(nCustom?'+'+nCustom:'')+'</span>'})();const restricted=(p.inDefaultGroup&&profiles.filter(x=>x.inDefaultGroup).length>=2)||(p.inResponsesGroup&&profiles.filter(x=>x.inResponsesGroup).length>=2);const entryCode=p.protocol==='responses'?'/v1/responses':'/v1';const defBadge=(p.isDefault||p.isResponsesDefault)?' <span style="color:var(--green);font-size:11px;font-weight:600;vertical-align:middle">默认</span>':'';/* 「使用状态」列:active 由后端算好(进行中请求 或 最近5分钟内完成记账)。使用中且
+     有并发时带数字(failover 排查能直接看到哪个方案被压着 N 个);休眠时悬停看最后活跃。 */
+const actCell='<td><span class="led '+(p.active?'on':'')+'"></span><span style="color:'+(p.active?'var(--green)':'var(--dim)')+';font-size:12px;white-space:nowrap"'+(p.active?'':' title="最后活跃：'+(p.lastActive?ago(p.lastActive):'从未')+'"')+'>'+(p.active?'使用中'+(p.inflight>0?' · '+p.inflight:''):'休眠中')+'</span></td>';return'<tr'+(current?' class="profile-current" aria-current="true"':'')+'><td>'+escH(p.name)+defBadge+gBadge+rBadge+protoBadge+bLabel+pk+rt2+(current?' <span class="current-mark">当前</span>':'')+'</td><td>'+(restricted?'<code>'+entryCode+'</code> <span style="color:var(--dim);font-size:10px">仅 '+entryCode+'</span>':'<code>/'+escH(p.suffix)+'</code>'+((p.isDefault||p.isResponsesDefault)?' <span style="color:var(--dim)">/ <code>'+entryCode+'</code></span>':''))+'</td><td style="font-size:12px;color:var(--dim);max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+escH((p.upstream||'').replace('https://','').replace('http://',''))+'</td><td class="n">'+fmtT(p.todayRequests||0)+'</td><td class="n hl">'+fmtT(p.todayTokens||0)+'</td>'+actCell+'<td><span class="led '+led+'"></span><span style="color:'+col+';font-size:12px">'+stateLabel+'</span></td></tr>'};
+  const anthProfiles=profiles.filter(p=>p.protocol!=="responses"),respProfiles=profiles.filter(p=>p.protocol==="responses");
+  const protoRow=(label,entry,count)=>'<tr class="proto-row"><td colspan="7">'+label+' · 入口 '+entry+' · '+count+' 个方案</td></tr>';
+  let psbHtml="";
+  if(anthProfiles.length)psbHtml+=protoRow("Anthropic","/v1",anthProfiles.length)+anthProfiles.map(rowOf).join("");
+  if(respProfiles.length)psbHtml+=protoRow("OpenAI","/v1/responses",respProfiles.length)+respProfiles.map(rowOf).join("");
+  psb.innerHTML=profiles.length?psbHtml:'<tr><td colspan="7" class="empty">暂无方案</td></tr>';
+  const profileLabel=D.profileView||(currentProfile==="all"?"全部方案":"默认方案");
+  const curProtoProf=(D.profiles||[]).find(p=>p.suffix===currentProfile);
+  setProtoSeg(currentProfile!=="all"?((curProtoProf&&curProtoProf.protocol)||""):PROTO);
+  const protoSuffix=protoLabel(currentProfile!=="all"?((curProtoProf&&curProtoProf.protocol)||""):PROTO);
+  document.getElementById("profileContext").textContent="当前查看："+profileLabel+(protoSuffix?" · "+protoSuffix:"");
+}
+
 function render(){
   if(!D)return;
   // Populate profile dropdown
@@ -484,40 +585,15 @@ function render(){
   MDL=rebuildFilterSel("modelSel",modelEntries,"全部模型");
   USR=rebuildFilterSel("userSel",Object.keys(D.users||{}).map(k=>[k,D.users[k].name]),"全部用户");
   const us=Object.values(D.users),allTokens=us.reduce((s,u)=>s+totalTokens(u),0),tr=us.reduce((s,u)=>s+u.totalRequests,0);
-  const td=new Date(Date.now()+8*36e5).toISOString().slice(0,10),tdd=(D.daily||{})[td]||{};
+  const tday=todayBJ(),tdd=(D.daily||{})[tday]||{};
   const todayTokens=Object.values(tdd).reduce((s,d)=>s+totalTokens(d),0),tR=Object.values(tdd).reduce((s,d)=>s+d.requests,0);
-  document.getElementById("cards").innerHTML=c("今日用量",todayTokens,"var(--accent)",1)+c("今日请求",tR,"var(--blue)",1)+c("总用量",allTokens,"var(--green)",1)+c("总请求",tr,"var(--orange)",1)+c("今日错误",(Array.isArray(D.errors)?D.errors:[]).filter(e=>e.time&&bjDateStr(e.time)===td).length,"var(--red)",1);
+  document.getElementById("cards").innerHTML=c("今日用量",todayTokens,"var(--accent)",1)+c("今日请求",tR,"var(--blue)",1)+c("总用量",allTokens,"var(--green)",1)+c("总请求",tr,"var(--orange)",1)+c("今日错误",(Array.isArray(D.errors)?D.errors:[]).filter(e=>e.time&&bjDateStr(e.time)===tday).length,"var(--red)",1);
   runCountUps(document.getElementById("cards"));
-  const psb=document.getElementById("profileSummaryBody"),profiles=Array.isArray(D.profileSummaries)?D.profileSummaries:[];
-  const fmtResume=function(iso){const d=new Date(new Date(iso).getTime()+8*3600000);const p=n=>String(n).padStart(2,'0');const now=new Date(Date.now()+8*3600000);const hm=p(d.getUTCHours())+':'+p(d.getUTCMinutes());if(d.getUTCFullYear()===now.getUTCFullYear()&&d.getUTCMonth()===now.getUTCMonth()&&d.getUTCDate()===now.getUTCDate())return hm;if(Date.UTC(d.getUTCFullYear(),d.getUTCMonth(),d.getUTCDate())-Date.UTC(now.getUTCFullYear(),now.getUTCMonth(),now.getUTCDate())===86400000)return '明天 '+hm;return (d.getUTCFullYear()===now.getUTCFullYear()?'':d.getUTCFullYear()+'-')+p(d.getUTCMonth()+1)+'-'+p(d.getUTCDate())+' '+hm};
-  const rowOf=p=>{const st=p.breakerState||"UNKNOWN";const rl=p.rateLimit;let col,led,stateLabel;if(rl){col='var(--red)';led='err';stateLabel='限额中 '+fmtResume(rl.resumeAt)+'恢复';}else{col=st==="CLOSED"?"var(--green)":st==="HALF_OPEN"?"var(--orange)":"var(--red)";led=st==="CLOSED"?"on":st==="HALF_OPEN"?"warn":"err";stateLabel=st==="CLOSED"?"正常":st==="HALF_OPEN"?"探测中":"熔断"+(p.breakerCooldownRemaining>0?' '+Math.ceil(p.breakerCooldownRemaining/1000)+'s后探测':'');}const current=currentProfile!=="all"&&p.suffix===currentProfile;const gBadge=p.inDefaultGroup?' <span style="color:var(--blue);font-size:10px;font-weight:600">默认组·'+(p.groupOrder+1)+'</span>':'';const rBadge=p.inResponsesGroup?' <span style="color:var(--blue);font-size:10px;font-weight:600">Resp组·'+(p.responsesGroupOrder+1)+'</span>':'';const protoBadge=p.protocol==='responses'?' <span style="color:var(--blue);font-size:10px">OpenAI</span>':'';const bLabel=p.billingType==='coding_plan'?' <span style="color:var(--dim);font-size:10px">CP</span>':p.billingType==='token_plan'?' <span style="color:var(--dim);font-size:10px">TP</span>':'';const pk=(p.peakHours&&p.peakHours.length)?(function(rs){const now=new Date(),cur=((now.getTime()+8*3600000)%86400000)/60000;const tm=function(t){if(!t)return null;const a=t.split(':');return (+a[0])*60+(+a[1])};const inPk=rs.some(function(r){const s=tm(r.start),e=tm(r.end);return s!==null&&e!==null&&s!==e&&(s<e?(cur>=s&&cur<e):(cur>=s||cur<e))});return ' <span style="color:'+(inPk?'var(--orange)':'var(--dim)')+';font-size:10px" title="高峰时段(北京时间) '+rs.map(function(r){return r.start+'-'+r.end}).join(', ')+'">'+(inPk?'高峰中':rs.map(function(r){return r.start+'-'+r.end}).join(','))+'</span>'})(p.peakHours):'';const rt2=(function(){if(p.peakQuotaRate==null&&p.offPeakQuotaRate==null)return'';const pr=p.peakQuotaRate==null?1:p.peakQuotaRate,orr=p.offPeakQuotaRate==null?1:p.offPeakQuotaRate;const nCustom=Object.keys(p.modelQuotaRates||{}).length;if(pr===1&&orr===1&&nCustom===0)return'';var now=new Date(),cur=((now.getTime()+8*3600000)%86400000)/60000;var tm=function(t){if(!t)return null;var a=t.split(':');return (+a[0])*60+(+a[1])};var ip=(p.peakHours||[]).some(function(r){var s=tm(r.start),e=tm(r.end);return s!==null&&e!==null&&s!==e&&(s<e?(cur>=s&&cur<e):(cur>=s||cur<e))});return ' <span style="color:var(--accent);font-size:10px" title="默认配额倍率：高峰 ×'+pr+' / 低谷 ×'+orr+'（当前'+(ip?'高峰':'低谷')+'）'+(nCustom?'；另有 '+nCustom+' 个模型单独定价':'')+'">×'+(ip?pr:orr)+(nCustom?'+'+nCustom:'')+'</span>'})();const restricted=(p.inDefaultGroup&&profiles.filter(x=>x.inDefaultGroup).length>=2)||(p.inResponsesGroup&&profiles.filter(x=>x.inResponsesGroup).length>=2);const entryCode=p.protocol==='responses'?'/v1/responses':'/v1';const defBadge=(p.isDefault||p.isResponsesDefault)?' <span style="color:var(--green);font-size:11px;font-weight:600;vertical-align:middle">默认</span>':'';/* 「使用状态」列:active 由后端算好(进行中请求 或 最近5分钟内完成记账)。使用中且
-     有并发时带数字(failover 排查能直接看到哪个方案被压着 N 个);休眠时悬停看最后活跃。 */
-const actCell='<td><span class="led '+(p.active?'on':'')+'"></span><span style="color:'+(p.active?'var(--green)':'var(--dim)')+';font-size:12px;white-space:nowrap"'+(p.active?'':' title="最后活跃：'+(p.lastActive?ago(p.lastActive):'从未')+'"')+'>'+(p.active?'使用中'+(p.inflight>0?' · '+p.inflight:''):'休眠中')+'</span></td>';return'<tr'+(current?' class="profile-current" aria-current="true"':'')+'><td>'+escH(p.name)+defBadge+gBadge+rBadge+protoBadge+bLabel+pk+rt2+(current?' <span class="current-mark">当前</span>':'')+'</td><td>'+(restricted?'<code>'+entryCode+'</code> <span style="color:var(--dim);font-size:10px">仅 '+entryCode+'</span>':'<code>/'+escH(p.suffix)+'</code>'+((p.isDefault||p.isResponsesDefault)?' <span style="color:var(--dim)">/ <code>'+entryCode+'</code></span>':''))+'</td><td style="font-size:12px;color:var(--dim);max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+escH((p.upstream||'').replace('https://','').replace('http://',''))+'</td><td class="n">'+fmtT(p.todayRequests||0)+'</td><td class="n hl">'+fmtT(p.todayTokens||0)+'</td>'+actCell+'<td><span class="led '+led+'"></span><span style="color:'+col+';font-size:12px">'+stateLabel+'</span></td></tr>'};
-  const anthProfiles=profiles.filter(p=>p.protocol!=="responses"),respProfiles=profiles.filter(p=>p.protocol==="responses");
-  const protoRow=(label,entry,count)=>'<tr class="proto-row"><td colspan="7">'+label+' · 入口 '+entry+' · '+count+' 个方案</td></tr>';
-  let psbHtml="";
-  if(anthProfiles.length)psbHtml+=protoRow("Anthropic","/v1",anthProfiles.length)+anthProfiles.map(rowOf).join("");
-  if(respProfiles.length)psbHtml+=protoRow("OpenAI","/v1/responses",respProfiles.length)+respProfiles.map(rowOf).join("");
-  psb.innerHTML=profiles.length?psbHtml:'<tr><td colspan="7" class="empty">暂无方案</td></tr>';
-  const profileLabel=D.profileView||(currentProfile==="all"?"全部方案":"默认方案");
-  const curProtoProf=(D.profiles||[]).find(p=>p.suffix===currentProfile);
-  setProtoSeg(currentProfile!=="all"?((curProtoProf&&curProtoProf.protocol)||""):PROTO);
-  const protoSuffix=protoLabel(currentProfile!=="all"?((curProtoProf&&curProtoProf.protocol)||""):PROTO);
-  document.getElementById("profileContext").textContent="当前查看："+profileLabel+(protoSuffix?" · "+protoSuffix:"");
-  const upstreamInfo=D.upstream?(" | 上游: "+D.upstream.replace("https://","").replace("http://","")):"";
-  document.getElementById("meta").innerHTML='<span style="color:var(--accent);font-weight:600">方案: '+profileLabel+(protoSuffix?' · '+protoSuffix:'')+'</span>'+upstreamInfo+' &nbsp;|&nbsp; 更新于 '+(function(){const d=new Date();const utc=d.getTime()+d.getTimezoneOffset()*60000;return new Date(utc+8*3600000).toLocaleTimeString("zh-CN")})()+" (北京时间) | 每30秒刷新";
-
-  // 图表:面板隐藏时建不出图(宽度 0)—— 置脏,切回数据总览时由 setWorkspaceTab 补建;
-  // 表格不受此限,无条件渲染(否则自动刷新不会再更新用户表/明细/错误)
+  // overview 只画自己那一份(卡片 + 图表);其余菜单的数据由各自的 section 懒加载后渲染
   if(overviewVisible()){renderCharts()}else{chartsDirty=true}
-  renderTables();
-  renderWorkspaceSummaries();
-  renderClientBoard();
-  renderRateBoard();
+  renderMeta();
 }
 function renderCharts(){
-  // 与 render() 的「今日」同一口径(北京时间零点);用户表的今日列也要用
-  const td=new Date(Date.now()+8*36e5).toISOString().slice(0,10);
   // Charts —— 六图共用全局筛选：P 周期 / MT 指标 / MDL 模型 / USR 用户 / DS+DE 日期范围。
   // 窗口规则:分布类图(用户/客户端分布、模型、两张 24 小时)用 effBounds() —— 日期范围
   // 生效时优先,否则周期窗口;趋势与方案两张全史分桶图只在日期范围生效时收窄。
@@ -670,7 +746,9 @@ function renderCharts(){
   C.pr=new Chart(document.getElementById("profileChart"),{type:"bar",data:{labels:pSorted.map(k=>lbl(P,k)),datasets:pSfx.map((sfx,i)=>({label:suffixName[sfx]||sfx,data:pSorted.map(k=>{const s=(pBuckets[k]||{})[sfx];return s?(MT==="requests"?s.requests:s.tokens):0}),backgroundColor:COL[i%COL.length]+"cc",borderRadius:3,borderSkipped:false}))},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:trendLegend(),tooltip:{callbacks:{label:ctx=>ctx.dataset.label+": "+fmtT(ctx.raw)+(MT==="requests"?" 次请求":" tokens")}}},scales:{x:{stacked:true,ticks:{color:"#686863",font:{size:10}},grid:{color:"rgba(24,24,22,.08)"}},y:{stacked:true,ticks:{color:"#686863",callback:v=>fmtTk(v)},grid:{color:"rgba(24,24,22,.08)"}}}}});
 }
 
-function renderTables(){
+// ── 用户用量(独立菜单 /api/stats?section=users)──
+function renderUsersPanel(){
+  if(!D||!D.users)return;
   // User table. In the all-profiles view the single 配额 column cannot say
   // anything useful (a user has one quota PER profile), so it is replaced by one
   // column per quota-bearing profile — the profile name is written once in the
@@ -684,9 +762,20 @@ function renderTables(){
   renderUserQuotaContext(multiQuota?qm:null,ul);
   applyQuotaFocus();
   const colSpan=multiQuota?10+qPools.length:11;
-  if(!ul.length){ut.innerHTML='<tr><td colspan="'+colSpan+'" class="empty">暂无数据</td></tr>'}else{ut.innerHTML=ul.map(([uk,u],idx)=>{const on=u.lastActive&&Date.now()-new Date(u.lastActive).getTime()<36e5;const effQ=(D.userQuotaEff||{})[uk];const uq=effQ?effQ.limit:((D.userQuotas||{})[uk]||D.profileQuota||0);const td2=(D.daily||{})[td]||{};const tdu=td2[uk]||{};const used=effQ?effQ.used:ioTokens(tdu);const qPct=uq>0?Math.min(100,Math.round(used/uq*100)):0;const rank='<span class="rank">'+(idx+1)+'.</span>';const qTag=effQ&&effQ.bonus>0?' <span style="font-size:10px;color:var(--green);border:1px solid var(--green);border-radius:3px;padding:0 3px;white-space:nowrap" title="今日临时加量，明日自动失效">+'+fmtTk(effQ.bonus)+'</span>':(effQ&&effQ.resetApplied?' <span style="font-size:10px;color:var(--accent);border:1px solid var(--accent);border-radius:3px;padding:0 3px;white-space:nowrap" title="今日用量已重置（统计保留）">已重置</span>':'');const rTag=(effQ&&effQ.rate!=null&&effQ.rate!==1)?' <span style="font-size:10px;color:var(--dim);border:1px solid var(--border);border-radius:3px;padding:0 3px;white-space:nowrap" title="配额倍率 ×'+effQ.rate+'（当前时段）· 实际 '+fmtT(effQ.rawUsed||0)+'，计入配额 '+fmtT(effQ.used||0)+'">×'+effQ.rate+'</span>':'';const qCell=uq>0?'<span style="color:var(--accent);font-size:12px">'+qPct+'%</span> '+quotaBar(qPct)+qTag+rTag:'<span style="color:var(--dim)">-</span>';const quotaCells=multiQuota?qPools.map(p=>quotaMatrixCell(((qm.matrix||{})[uk]||{})[p.key],u.name,p)).join(""):'<td class="n" style="white-space:nowrap">'+qCell+'</td>';return'<tr><td>'+rank+escH(u.name)+'</td><td><span class="led '+(on?'on':'')+'"></span><span style="color:'+(on?'var(--green)':'var(--dim)')+';font-size:12px">'+(on?'在线':'离线')+'</span></td><td class="n stat-col">'+fmtT(u.totalRequests)+'</td><td class="n stat-col">'+fmtT(u.totalInputTokens)+'</td><td class="n stat-col">'+fmtT(u.totalOutputTokens)+'</td><td class="n stat-col">'+fmtT(u.cacheCreationTokens || 0)+'</td><td class="n stat-col">'+fmtT(u.cacheReadTokens || 0)+'</td><td class="n hl stat-col">'+fmtT(ioTokens(u))+'</td><td class="n">'+fmtT(ioTokens(tdu))+'</td>'+quotaCells+'<td style="font-size:12px;color:var(--dim)">'+ago(u.lastActive)+'</td></tr>'}).join("")}
+  const tday=todayBJ();   // 用户表「今日」列用(曾因这行缺失而整页渲染中断)
+  if(!ul.length){ut.innerHTML='<tr><td colspan="'+colSpan+'" class="empty">暂无数据</td></tr>'}else{ut.innerHTML=ul.map(([uk,u],idx)=>{const on=u.lastActive&&Date.now()-new Date(u.lastActive).getTime()<36e5;const effQ=(D.userQuotaEff||{})[uk];const uq=effQ?effQ.limit:((D.userQuotas||{})[uk]||D.profileQuota||0);const td2=(D.daily||{})[tday]||{};const tdu=td2[uk]||{};const used=effQ?effQ.used:ioTokens(tdu);const qPct=uq>0?Math.min(100,Math.round(used/uq*100)):0;const rank='<span class="rank">'+(idx+1)+'.</span>';const qTag=effQ&&effQ.bonus>0?' <span style="font-size:10px;color:var(--green);border:1px solid var(--green);border-radius:3px;padding:0 3px;white-space:nowrap" title="今日临时加量，明日自动失效">+'+fmtTk(effQ.bonus)+'</span>':(effQ&&effQ.resetApplied?' <span style="font-size:10px;color:var(--accent);border:1px solid var(--accent);border-radius:3px;padding:0 3px;white-space:nowrap" title="今日用量已重置（统计保留）">已重置</span>':'');const rTag=(effQ&&effQ.rate!=null&&effQ.rate!==1)?' <span style="font-size:10px;color:var(--dim);border:1px solid var(--border);border-radius:3px;padding:0 3px;white-space:nowrap" title="配额倍率 ×'+effQ.rate+'（当前时段）· 实际 '+fmtT(effQ.rawUsed||0)+'，计入配额 '+fmtT(effQ.used||0)+'">×'+effQ.rate+'</span>':'';const qCell=uq>0?'<span style="color:var(--accent);font-size:12px">'+qPct+'%</span> '+quotaBar(qPct)+qTag+rTag:'<span style="color:var(--dim)">-</span>';const quotaCells=multiQuota?qPools.map(p=>quotaMatrixCell(((qm.matrix||{})[uk]||{})[p.key],u.name,p)).join(""):'<td class="n" style="white-space:nowrap">'+qCell+'</td>';return'<tr><td>'+rank+escH(u.name)+'</td><td><span class="led '+(on?'on':'')+'"></span><span style="color:'+(on?'var(--green)':'var(--dim)')+';font-size:12px">'+(on?'在线':'离线')+'</span></td><td class="n stat-col">'+fmtT(u.totalRequests)+'</td><td class="n stat-col">'+fmtT(u.totalInputTokens)+'</td><td class="n stat-col">'+fmtT(u.totalOutputTokens)+'</td><td class="n stat-col">'+fmtT(u.cacheCreationTokens || 0)+'</td><td class="n stat-col">'+fmtT(u.cacheReadTokens || 0)+'</td><td class="n hl stat-col">'+fmtT(ioTokens(u))+'</td><td class="n">'+fmtT(ioTokens(tdu))+'</td>'+quotaCells+'<td style="font-size:12px;color:var(--dim)">'+ago(u.lastActive)+'</td></tr>'}).join("")}
 
+}
+
+// ── 明细记录(独立菜单 /api/stats?section=detail)──
+function renderDetailPanel(){
+  if(!D||!D.daily)return;
   renderDetail();
+}
+
+// ── 错误记录(独立菜单 /api/stats?section=errors)──
+function renderErrorsPanel(){
+  if(!D||!Array.isArray(D.errors))return;
 
   // Error table with pagination
   const allErrs=Array.isArray(D.errors)?D.errors:[];
@@ -701,7 +790,10 @@ function renderTables(){
   document.getElementById("errorHint").textContent=allErrs.length>0?(allErrs.length+'条错误'):'暂无错误';
 }
 
-async function load(){try{const profile=currentProfile==="all"?"all":currentProfile;const qs=[];if(profile!=="all")qs.push("profile="+encodeURIComponent(profile));else if(PROTO)qs.push("protocol="+PROTO);const r=await fetch("/api/stats"+(qs.length?"?"+qs.join("&"):""));D=await r.json();render()}catch(e){document.getElementById("meta").textContent="Error: "+e.message}}
+
+// 保留这个名字作为「刷新当前菜单」的入口:它以前是「拉全量 /api/stats」,现在
+// 一次只拉当前菜单的 section —— 所有既有调用点(清除错误、重置筛选)语义不变。
+function load(){refreshCurrent()}
 function toggleSec(id){const body=document.getElementById(id+"Body");const icon=document.getElementById(id+"Icon");const open=body.classList.toggle("open");icon.classList.toggle("open",open)}
 document.querySelectorAll(".tab").forEach(b=>b.addEventListener("click",()=>{document.querySelectorAll(".tab").forEach(x=>x.classList.remove("on"));b.classList.add("on");P=b.dataset.p;resetDetailGrouping();render()}));
 document.getElementById("metricSel").addEventListener("change",e=>{MT=e.target.value;render()});
@@ -781,7 +873,6 @@ async function markProdAlerts(){
   await fetch('/api/production/alerts/seen',{method:'POST',headers:{'Content-Type':'application/json','x-csrf-token':csrf},body:JSON.stringify({id:0})});
   loadProduction();
 }
-document.getElementById('workspace-tab-production').addEventListener('click',()=>{if(!prodLoaded){prodLoaded=true;loadProduction()}});
 // 指标口径速览:点击「指标口径」展开/收起一行小字
 document.getElementById('prodMetricHelp').addEventListener('click',()=>{const b=document.getElementById('prodMetricHelpBody');b.style.display=(b.style.display==='none'?'':'none')});
 // ── 等值成本 tab(懒加载:首次切到该 tab 才拉数据)──
@@ -806,7 +897,6 @@ async function loadCosts(){
     document.getElementById('unpricedNote').innerHTML=c.unpriced.length?'未配置价格:'+c.unpriced.map(u=>'<span class="chip chip-warn">'+ph(u)+'</span>').join('')+'(在设置页补充)':'';
   }catch(e){document.getElementById('costSummary').textContent='加载失败: '+e.message}
 }
-document.getElementById('workspace-tab-costs').addEventListener('click',()=>{if(!costsLoaded){costsLoaded=true;loadCosts()}});
 // ── 会话使用情况 tab(懒加载:首次切到该 tab 才拉数据)──
 // 与成本/产出一致:会话视图比总览更细(时间戳、文件路径、会话标识),按需拉、不挂 30 秒轮询。
 let sessionsLoaded=false,sessDrillUser='';
@@ -874,8 +964,7 @@ async function loadSessions(){
     document.getElementById('sessSummary').textContent='加载失败: '+e.message;
   }
 }
-document.getElementById('workspace-tab-sessions').addEventListener('click',()=>{if(!sessionsLoaded){sessionsLoaded=true;loadSessions()}});
-function startAutoRefresh(){if(refreshTimer)clearInterval(refreshTimer);refreshTimer=setInterval(()=>{if(autoRefresh)load()},30000)}
+function startAutoRefresh(){if(refreshTimer)clearInterval(refreshTimer);refreshTimer=setInterval(()=>{if(autoRefresh)refreshCurrent()},30000)}
 document.getElementById("autoRefreshBtn").addEventListener("click",()=>{autoRefresh=!autoRefresh;const btn=document.getElementById("autoRefreshBtn");btn.textContent="自动刷新: "+(autoRefresh?"开":"关");btn.className=autoRefresh?"ar-on":"ar-off"});
 window.addEventListener("resize",scheduleChartResize);
-setWorkspaceTab('overview',false);load();startAutoRefresh();
+setWorkspaceTab('overview',false);ensureSection('overview');startAutoRefresh();

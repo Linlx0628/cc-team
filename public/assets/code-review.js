@@ -323,3 +323,7 @@ async function cancelReviewRun(id) {
 document.getElementById("workspace-tab-review")?.addEventListener("click", () => {
   if (!crLoaded) { crLoaded = true; loadCodeReview(); }
 });
+// 暴露给 dashboard.js 的按菜单懒加载/自动刷新:切到代码评审(含键盘)时确保已加载;
+// 自动刷新当前菜单时重拉一次。放在这里是因为加载逻辑与状态都在本文件。
+window.crEnsureLoaded = () => { if (!crLoaded) { crLoaded = true; loadCodeReview(); } };
+window.crReload = () => loadCodeReview();

@@ -507,13 +507,17 @@ const actCell='<td><span class="led '+(p.active?'on':'')+'"></span><span style="
   const upstreamInfo=D.upstream?(" | 上游: "+D.upstream.replace("https://","").replace("http://","")):"";
   document.getElementById("meta").innerHTML='<span style="color:var(--accent);font-weight:600">方案: '+profileLabel+(protoSuffix?' · '+protoSuffix:'')+'</span>'+upstreamInfo+' &nbsp;|&nbsp; 更新于 '+(function(){const d=new Date();const utc=d.getTime()+d.getTimezoneOffset()*60000;return new Date(utc+8*3600000).toLocaleTimeString("zh-CN")})()+" (北京时间) | 每30秒刷新";
 
-  // 图表:面板隐藏时建不出图(宽度 0)—— 置脏,切回数据总览时由 setWorkspaceTab 补建
+  // 图表:面板隐藏时建不出图(宽度 0)—— 置脏,切回数据总览时由 setWorkspaceTab 补建;
+  // 表格不受此限,无条件渲染(否则自动刷新不会再更新用户表/明细/错误)
   if(overviewVisible()){renderCharts()}else{chartsDirty=true}
+  renderTables();
   renderWorkspaceSummaries();
   renderClientBoard();
   renderRateBoard();
 }
 function renderCharts(){
+  // 与 render() 的「今日」同一口径(北京时间零点);用户表的今日列也要用
+  const td=new Date(Date.now()+8*36e5).toISOString().slice(0,10);
   // Charts —— 六图共用全局筛选：P 周期 / MT 指标 / MDL 模型 / USR 用户 / DS+DE 日期范围。
   // 窗口规则:分布类图(用户/客户端分布、模型、两张 24 小时)用 effBounds() —— 日期范围
   // 生效时优先,否则周期窗口;趋势与方案两张全史分桶图只在日期范围生效时收窄。
@@ -664,7 +668,9 @@ function renderCharts(){
   const pSorted=Object.keys(pBuckets).sort();
   const pSfx=Object.keys(pdBase).sort();
   C.pr=new Chart(document.getElementById("profileChart"),{type:"bar",data:{labels:pSorted.map(k=>lbl(P,k)),datasets:pSfx.map((sfx,i)=>({label:suffixName[sfx]||sfx,data:pSorted.map(k=>{const s=(pBuckets[k]||{})[sfx];return s?(MT==="requests"?s.requests:s.tokens):0}),backgroundColor:COL[i%COL.length]+"cc",borderRadius:3,borderSkipped:false}))},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:trendLegend(),tooltip:{callbacks:{label:ctx=>ctx.dataset.label+": "+fmtT(ctx.raw)+(MT==="requests"?" 次请求":" tokens")}}},scales:{x:{stacked:true,ticks:{color:"#686863",font:{size:10}},grid:{color:"rgba(24,24,22,.08)"}},y:{stacked:true,ticks:{color:"#686863",callback:v=>fmtTk(v)},grid:{color:"rgba(24,24,22,.08)"}}}}});
+}
 
+function renderTables(){
   // User table. In the all-profiles view the single 配额 column cannot say
   // anything useful (a user has one quota PER profile), so it is replaced by one
   // column per quota-bearing profile — the profile name is written once in the
@@ -694,6 +700,7 @@ function renderCharts(){
   document.getElementById("errorCount").textContent=allErrs.length>0?'('+allErrs.length+')':'';
   document.getElementById("errorHint").textContent=allErrs.length>0?(allErrs.length+'条错误'):'暂无错误';
 }
+
 async function load(){try{const profile=currentProfile==="all"?"all":currentProfile;const qs=[];if(profile!=="all")qs.push("profile="+encodeURIComponent(profile));else if(PROTO)qs.push("protocol="+PROTO);const r=await fetch("/api/stats"+(qs.length?"?"+qs.join("&"):""));D=await r.json();render()}catch(e){document.getElementById("meta").textContent="Error: "+e.message}}
 function toggleSec(id){const body=document.getElementById(id+"Body");const icon=document.getElementById(id+"Icon");const open=body.classList.toggle("open");icon.classList.toggle("open",open)}
 document.querySelectorAll(".tab").forEach(b=>b.addEventListener("click",()=>{document.querySelectorAll(".tab").forEach(x=>x.classList.remove("on"));b.classList.add("on");P=b.dataset.p;resetDetailGrouping();render()}));

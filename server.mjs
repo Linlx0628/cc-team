@@ -24,7 +24,7 @@ import { wsAcceptUpgrade, wsRejectUpgrade, WsConn } from "./lib/ws-server.mjs";
 import { isCompactionRequest, transformCompactSseEvent } from "./lib/compact-bridge.mjs";
 import { tryThinkingPassbackSelfHeal } from "./lib/thinking-passback.mjs";
 import { createCodeReviewOcr } from "./lib/code-review-ocr.mjs";
-import { createCodeReview, initCodeReviewDb, sanitizeCodeReviewConfig, maskCredential, buildReviewReportHTML, migrateLegacyTriggerKeys, TERMINAL, TERMINAL_OK } from "./lib/code-review.mjs";
+import { createCodeReview, initCodeReviewDb, sanitizeCodeReviewConfig, maskCredential, buildReviewReportHTML, migrateLegacyTriggerKeys, isValidBranch, TERMINAL, TERMINAL_OK } from "./lib/code-review.mjs";
 import { createMemberNotify, initMemberNotifyDb } from "./lib/member-notify.mjs";
 import { PassThrough } from "node:stream";
 import { EventEmitter } from "node:events";
@@ -2358,13 +2358,19 @@ async function notifyReviewFindings(ev) {
   const subject = `【代码评审】${ev.repo.name} 发现 ${(ev.report.comments || []).length} 处问题`;
   const jobs = [];
 
-  // a) 提交人邮箱:走管理员配的 SMTP。作者可能根本不是网关成员 —— 这正是这条路径的意义。
+  // a) 直接收邮件的人:提交人(git 作者)+ 推送人(webhook 带来的,比作者更贴近「该负责的人」,
+  //    哪怕他不是网关成员)。同一邮箱只发一封 —— 作者=推送人是最常见的情形,别双发。
+  const mail = notifierApi.NOTIFY_SENDERS.find((s) => s.channel === "邮件");
+  const recipients = new Set();
   const authorEmail = ev.author && ev.author.email;
-  if (c.notifyCommitAuthor !== false && authorEmail && notifierApi.isValidEmail(authorEmail)) {
-    const mail = notifierApi.NOTIFY_SENDERS.find((s) => s.channel === "邮件");
-    if (mail && mail.enabled(n)) {
-      jobs.push(mail.send(n, text, { to: authorEmail, subject })
-        .catch((err) => console.error(`[通知] 邮件(提交人 ${authorEmail}) 推送失败: ${err.message}`)));
+  if (c.notifyCommitAuthor !== false && authorEmail && notifierApi.isValidEmail(authorEmail)) recipients.add(authorEmail.toLowerCase());
+  let pusherEmail = null;
+  try { pusherEmail = codeReviewApi.getRun(ev.runId)?.pusher_email || null; } catch { pusherEmail = null; }
+  if (c.notifyCommitAuthor !== false && pusherEmail && notifierApi.isValidEmail(pusherEmail)) recipients.add(String(pusherEmail).toLowerCase());
+  if (mail && mail.enabled(n)) {
+    for (const to of recipients) {
+      mail.send(n, text, { to, subject })
+        .catch((err) => console.error(`[通知] 邮件(评审结果 ${to}) 推送失败: ${err.message}`));
     }
   }
 
@@ -2429,6 +2435,70 @@ function mcpSinceIso(v) {
     if (Number.isFinite(ms)) return new Date(ms).toISOString();
   }
   return null;
+}
+
+// ── Webhook 辅助:密钥校验 / URL 归一化匹配 / 推送人提取 ────────────────────────
+const webhookLastPushAt = new Map();   // repoId → ms(push 防抖,重启清空,与其它冷却一致)
+
+// 三家密钥校验。GitHub 不发静态 token,发 HMAC-SHA256(密钥, 原始字节)的十六进制;
+// GitLab/Gitee 是静态 token 头。比对走 timingSafeEqual(先比长度再比内容)。
+function verifyWebhookSecret(provider, headers, secret, rawBody) {
+  if (provider === "github") {
+    const sig256 = String(headers["x-hub-signature-256"] || "");
+    if (sig256) {
+      const expect = "sha256=" + crypto.createHmac("sha256", secret).update(rawBody).digest("hex");
+      return timingSafeEqual(sig256, expect);
+    }
+    const sig1 = String(headers["x-hub-signature"] || "");   // 旧版 sha1(平台没配 sha256 时的回退)
+    if (sig1) {
+      const expect = "sha1=" + crypto.createHmac("sha1", secret).update(rawBody).digest("hex");
+      return timingSafeEqual(sig1, expect);
+    }
+    return false;
+  }
+  const token = String(headers[provider === "gitlab" ? "x-gitlab-token" : "x-gitee-token"] || "");
+  return !!token && timingSafeEqual(token, secret);
+}
+
+// 把仓库地址归一成「host + path」的比对键:https://host[:port]/a/b.git 与 git@host:a/b.git
+// 要能互相关联(白名单常填 SSH 写法,而平台回调是 https)。host 小写、去端口 —— SSH 的
+// scp 写法根本表达不了 https 的自定义端口(隐式 22),同 host 同 path 就是同一个逻辑仓库;
+// 真正的安全门是密钥 + 白名单本身,端口放严只会让合法配置匹配不上。path 保留大小写
+// (GitLab 路径区分大小写)并去掉 .git 与尾斜杠。
+function normalizeRepoUrlKey(u) {
+  const s0 = String(u || "").trim();
+  if (!s0) return "";
+  const scp = s0.match(/^git@([A-Za-z0-9.-]+?)(?::\d+)?:([^:]+)$/);   // git@host[:port]:path
+  if (scp) return `${scp[1].toLowerCase()}/${scp[2].replace(/\/+$/, "").replace(/\.git$/, "")}`;
+  try {
+    const x = new URL(s0);
+    const path = x.pathname.replace(/\.git$/, "").replace(/\/+$/, "");
+    return `${x.hostname.toLowerCase()}${path}`;
+  } catch { return ""; }
+}
+
+// 从三家载荷里收集仓库地址候选,归一化后与白名单(remote 来源)比对。
+// 多候选是因为各家字段名不同,而且同一平台 http/ssh/web 地址都可能出现在不同字段里。
+function matchWebhookRepo(body) {
+  const candidates = [
+    body.project?.git_http_url, body.project?.web_url, body.project?.url,
+    body.repository?.clone_url, body.repository?.url, body.repository?.git_url, body.repository?.html_url,
+    body.url,
+  ].filter(Boolean);
+  const keys = new Set(candidates.map(normalizeRepoUrlKey).filter(Boolean));
+  if (!keys.size) return null;
+  for (const repo of config.codeReview?.repos || []) {
+    if (repo.source !== "remote" || !repo.url) continue;
+    if (keys.has(normalizeRepoUrlKey(repo.url))) return repo;
+  }
+  return null;
+}
+
+// 推送人:GitHub 是 pusher 对象;GitLab 是顶层 user_name/user_email;Gitee 是 pusher 或 user 对象
+function webhookPusher(body) {
+  const name = body.pusher?.name || body.user?.name || body.user_name || "";
+  const email = body.pusher?.email || body.user?.email || body.user_email || "";
+  return { name: String(name).slice(0, 120), email: String(email).slice(0, 200) };
 }
 
 // 成员级触发(HTTP /api/code-review/trigger 与 MCP 的 code_review_trigger 共用)。
@@ -3481,6 +3551,10 @@ function getPublicSettings() {
         providerModel: c.providerModel || "",
         providerKeyMasked: c.providerKey ? `${String(c.providerKey).slice(0, 8)}****` : "",
         hasProviderKey: !!c.providerKey,
+        // Webhook 密钥同样只出掩码:明文只存在 config.json(与凭据同信任级别)
+        webhookSecretMasked: c.webhookSecret ? `${String(c.webhookSecret).slice(0, 4)}****` : "",
+        hasWebhookSecret: !!c.webhookSecret,
+        webhookDebounceSeconds: c.webhookDebounceSeconds ?? 300,
         background: c.background || "",
         exclude: Array.isArray(c.exclude) ? c.exclude : [],
         // members(每个仓库的成员名单)是「谁能触发/查看这个仓库」的唯一依据,随 repos 下发;
@@ -3499,6 +3573,7 @@ function getPublicSettings() {
         repos: (c.repos || []).map((r) => ({
           id: r.id, name: r.name, source: r.source, url: r.url, localPath: r.localPath, branch: r.branch,
           authType: r.authType, username: r.username, enabled: r.enabled, apiTrigger: r.apiTrigger,
+          pushTrigger: !!r.pushTrigger,
           members: Array.isArray(r.members) ? r.members : [],
           schedule: r.schedule, overrides: r.overrides, createdAt: r.createdAt,
           credential: maskCredential(r.credential),
@@ -5759,6 +5834,73 @@ const server = http.createServer((req, res) => {
       return;
     }
 
+    // Webhook 自动评审(GitLab / GitHub / Gitee 的 push 回调)。**密钥鉴权**,不是管理员
+    // cookie —— 回调方是代码托管平台,不可能登录,所以和上面一样排在 adminGate 之前、
+    // 不做 CSRF。安全模型:全局密钥(验证「回调确实来自我配过的平台」)× URL 白名单
+    // (决定「哪个仓库可以被触发」)。秒回:入队是同步的,评审在后台跑 —— 平台等 2xx,
+    // 等久了会重试,重试就是重复触发。
+    if (req.method === "POST" && crPath === "/api/code-review/webhook") {
+      (async () => {
+        const cfg = config.codeReview || {};
+        // 1) 认平台:三家的事件头互不冲突。一个都没有 → 400(顺带挡住乱扫的 POST)。
+        const h = req.headers;
+        const provider = h["x-github-event"] ? "github" : h["x-gitlab-event"] ? "gitlab" : h["x-gitee-event"] ? "gitee" : null;
+        if (!provider) { json(400, { error: "缺少平台事件头(x-github-event / x-gitlab-event / x-gitee-event)" }); return; }
+        // 2) 原始字节:GitHub 的 HMAC 必须对收到的原始 body 算,JSON 转一道就会错签
+        const buf = await readBody(req, 1_000_000);
+        // 3) 验密钥(在解析 JSON 之前)。secret 未配置 = 功能整体关闭。
+        const secret = String(cfg.webhookSecret || "");
+        if (!secret) { console.log(`[代码评审] 收到 ${provider} 回调但 Webhook 密钥未配置,已拒绝`); json(403, { error: "Webhook 未配置" }); return; }
+        const sigOk = verifyWebhookSecret(provider, h, secret, buf);
+        if (!sigOk) {
+          // 只打一行日志、不写审计:这个端点无鉴权可达,被乱打时不能刷爆审计表
+          console.log(`[代码评审] ${provider} 回调密钥校验失败(${getClientIp(req)})`);
+          json(403, { error: "密钥不匹配" });
+          return;
+        }
+        let body = null;
+        try { body = JSON.parse(buf.toString() || "{}"); } catch { json(400, { error: "payload 不是合法 JSON" }); return; }
+        // 4) 只认 push;ping(GitHub 建 webhook 时的握手)、Merge Request、tag 等一律 200 忽略
+        //    —— 返回非 2xx 会被平台当失败重试、连错多次甚至禁用 webhook。
+        const eventName = String(h["x-github-event"] || h["x-gitlab-event"] || h["x-gitee-event"] || "").toLowerCase();
+        if (!eventName.startsWith("push")) { json(200, { ignored: "event", event: eventName }); return; }
+        const ref = String(body.ref || "");
+        if (ref.startsWith("refs/tags/")) { json(200, { ignored: "tag" }); return; }
+        const after = String(body.after || "");
+        if (/^0+$/.test(after) || body.deleted === true) { json(200, { ignored: "branch-delete" }); return; }
+        const branch = ref.replace(/^refs\/heads\//, "");
+        if (!isValidBranch(branch)) { json(200, { ignored: "branch", branch: branch.slice(0, 60) }); return; }
+        // 5) 仓库匹配:载荷里的 URL 候选归一化后与白名单比对(含 git@ 形态对 https 形态)
+        const repo = matchWebhookRepo(body);
+        if (!repo || repo.source !== "remote") { json(200, { ignored: "repo" }); return; }
+        // 6) 门禁:功能、仓库、开关、分支
+        if (!cfg.enabled || repo.enabled === false) { json(200, { ignored: "disabled" }); return; }
+        if (!repo.pushTrigger) { json(200, { ignored: "push-off" }); return; }
+        if (branch !== repo.branch) { json(200, { ignored: "branch", branch, expect: repo.branch }); return; }
+        // 7) 防抖:同一仓库窗口内只评一次(固定窗口,忽略不续期)。「评审进行中来的 push」
+        //    由入队的既有去重合并,这里管的是「刚评完又连推」。
+        const windowMs = (Number(cfg.webhookDebounceSeconds) || 0) * 1000;
+        if (windowMs > 0) {
+          const last = webhookLastPushAt.get(repo.id) || 0;
+          if (Date.now() - last < windowMs) { json(200, { ignored: "debounced", seconds: Math.ceil((windowMs - (Date.now() - last)) / 1000) }); return; }
+          webhookLastPushAt.set(repo.id, Date.now());
+        }
+        // 8) 入队:去重/串行/磁盘/当日预算全部沿用。推送人记进 actor 与 pusher_email。
+        const pusher = webhookPusher(body);
+        const r = codeReviewApi.enqueue(repo.id, {
+          trigger: "webhook",
+          actor: `推送:${pusher.name || "未知"}`,
+          branch,
+          pusherEmail: pusher.email || null,
+        });
+        recordAdminAudit(req, "codereview.webhook", repo.name,
+          `Webhook 触发评审（run #${r.runId}，分支 ${branch}${pusher.name ? `，推送人 ${pusher.name}` : ""}${r.deduped ? "，与进行中任务合并" : ""}）`);
+        // 一律 202:对平台而言「这次 push 已被接受」,与进行中任务合并/被预算拦下都属于受理
+        json(202, { triggered: true, runId: r.runId, repo: repo.name, deduped: !!r.deduped, skipped: !!r.skipped });
+      })().catch((err) => { json(400, { error: err.message }); });
+      return;
+    }
+
     if (req.method === "GET" && crPath === "/api/code-review/status") {
       if (!adminGate()) return;
       (async () => {
@@ -5796,12 +5938,19 @@ const server = http.createServer((req, res) => {
         const next = sanitizeCodeReviewConfig(body, port);
         // 凭据字段为空字符串时保留原值:界面回显的是掩码,不回传就不该被清空
         const prev = config.codeReview || {};
-        next.repos = next.repos.map((r) => {
+        next.repos = next.repos.map((r, i) => {
           const old = (prev.repos || []).find((x) => x.id === r.id);
           if (old && !r.credential) r.credential = old.credential || "";
+          // 成员名单:整表保存的载荷可能不带 members(引擎表单的仓库映射就不带),
+          // 缺省时回填原值 —— 否则每点一次「保存代码评审设置」就把所有仓库的成员清空了
+          // (实测踩过:成员配好了,保存一次引擎参数,成员全没了)。
+          const bodyRepo = Array.isArray(body.repos) ? body.repos[i] : null;
+          if (old && bodyRepo && bodyRepo.members === undefined) r.members = old.members || [];
           return r;
         });
         if (!next.providerKey && prev.providerKey) next.providerKey = prev.providerKey;
+        // Webhook 密钥同理:界面回显的是掩码,空串 = 不修改
+        if (!next.webhookSecret && prev.webhookSecret) next.webhookSecret = prev.webhookSecret;
         // 这几个字段界面没有对应控件(只在 config.json 里手改):载荷里**缺省**时保留原值,
         // 否则管理员每在界面点一次保存,工作区目录就被换回默认、OCR 隔离模式被改回 isolated、
         // 评审背景说明被清空 —— 全是静默的。显式传值(含空串)仍然生效,所以想清回默认做得到。

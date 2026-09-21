@@ -58,6 +58,15 @@ docker volume rm token-monitor_code-review-workspaces   # 想彻底清空工作�
 - **`--max-tokens-budget`**：`0` = 不限；超预算时已完成的局部结果仍会发布且**退出码 0**，只有全部子任务失败才非零
 - **失败也会产出 JSON**：`status: "failed"` 且照常带 `summary` token 统计，退出码 1 → 以 JSON 里的 `status` 为准，退出码只作参考
 
+## Webhook 自动评审的网络要求
+
+代码评审支持 GitLab / GitHub / Gitee 的 push 回调自动触发(见[代码评审](code-review.md#webhook-自动评审push-即评审))。前提是**托管平台那台机器能访问到网关的回调地址**:
+
+- 裸机部署:填网关的局域网地址,如 `http://192.168.x.x:6789/api/code-review/webhook`
+- 容器部署:端口映射过就填宿主机地址;**别填 127.0.0.1**(那是容器自己)
+- 走 nginx 反代的 https:回调地址用反代域名;自签证书时在平台侧关闭该 webhook 的 SSL 校验
+- 平台的「测试/Test」按钮返回 2xx 即通(非 push 事件也会返回 2xx 忽略,不会标红)
+
 ## config.json 字段参考
 
 | 字段 | 说明 |

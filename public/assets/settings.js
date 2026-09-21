@@ -1852,6 +1852,11 @@ function initReviewForm() {
   crOnProfileChange();
   if (c.providerModel) crEl('crModel').value = c.providerModel;
   crEl('crKeyText').value = c.hasProviderKey ? (c.providerKeyMasked || '已创建') : '';
+  // Webhook:地址用当前站点拼出来(容器/反代下 origin 才是平台可达的地址);密钥只回显掩码
+  crEl('crWebhookUrl').value = location.origin + '/api/code-review/webhook';
+  const wh = crEl('crWebhookSecret');
+  if (wh) { wh.value = ''; wh.placeholder = c.hasWebhookSecret ? ('已保存 ' + (c.webhookSecretMasked || '') + '(留空不修改)') : '••••••••'; }
+  crEl('crWebhookDebounce').value = c.webhookDebounceSeconds != null ? c.webhookDebounceSeconds : 300;
   renderReviewRepoTable();
   renderReviewRepoMembers([]);
   crEl('crRepoEditor').hidden = true;
@@ -1881,9 +1886,10 @@ function renderReviewRepoTable() {
   body.innerHTML = CR.repos.map((r) => {
     const cred = r.credential && r.credential.hasCredential ? '已配置 ' + (r.credential.hint || '') : '未配置';
     const wd = (r.schedule && r.schedule.weekdays) || [];
-    const sched = r.schedule && r.schedule.mode !== 'off'
+    const sched = (r.schedule && r.schedule.mode !== 'off'
       ? (r.schedule.mode === 'interval' ? '每 ' + r.schedule.intervalHours + ' 小时'
-        : '每天 ' + r.schedule.at + (wd.length ? ' 周' + wd.join('/') : '')) : '关闭';
+        : '每天 ' + r.schedule.at + (wd.length ? ' 周' + wd.join('/') : '')) : '关闭')
+      + (r.pushTrigger ? ' · push' : '');
     const src = r.source === 'remote' ? 'remote' : 'local';
     const members = Array.isArray(r.members) ? r.members : [];
     // 成员:显示姓名而不是 Key,超过 2 个收成 +N
@@ -1906,6 +1912,7 @@ function addReviewRepo() {
   crEl('crRepoSched').value = 'off'; crEl('crRepoInterval').value = '6'; crEl('crRepoAt').value = '03:00';
   crEl('crRepoWeekdays').value = '';
   crEl('crRepoApiTrigger').checked = false;
+  crEl('crRepoPushTrigger').checked = false;
   renderReviewRepoMembers([]);   // 新仓库:成员从空开始勾
   crOnRepoSourceChange();
   crEl('crRepoEditor').hidden = false;
@@ -1926,6 +1933,7 @@ function editReviewRepo(id) {
   crEl('crRepoAt').value = (r.schedule && r.schedule.at) || '03:00';
   crEl('crRepoWeekdays').value = ((r.schedule && r.schedule.weekdays) || []).join(',');
   crEl('crRepoApiTrigger').checked = !!r.apiTrigger;
+  crEl('crRepoPushTrigger').checked = !!r.pushTrigger;
   renderReviewRepoMembers(r.members || []);   // 预置该仓库的成员勾选
   crOnRepoSourceChange();
   crEl('crRepoEditor').hidden = false;
@@ -1935,6 +1943,14 @@ function cancelReviewRepoEdit() {
   crEl('crRepoEditor').hidden = true;
   CR.editingRepoId = null;
   crSetRepoStatus('');
+}
+// 生成 32 位 hex 的随机密钥(前端生成,不经网络;保存后服务端只存这串)
+function genWebhookSecret() {
+  const bytes = new Uint8Array(16);
+  (window.crypto || {}).getRandomValues ? crypto.getRandomValues(bytes) : bytes.fill(0);
+  const hex = Array.from(bytes).map((b) => b.toString(16).padStart(2, '0')).join('');
+  const el = crEl('crWebhookSecret');
+  if (el) { el.value = hex; crSetStatus('已生成新密钥 —— 保存后需要同步更新托管平台里填的值', 'ok'); }
 }
 function collectReviewSettings() {
   return {
@@ -1953,13 +1969,16 @@ function collectReviewSettings() {
     notifyOn: crEl('crNotifyOn').value,
     exclude: crEl('crExclude').value.split(',').map((x) => x.trim()).filter(Boolean),
     storeComments: crEl('crStoreComments').checked,
+    webhookSecret: crEl('crWebhookSecret') ? crEl('crWebhookSecret').value : '',
+    webhookDebounceSeconds: parseInt(crEl('crWebhookDebounce').value, 10) || 0,
     // 端点与协议由服务端按所选方案推导;这里带上现值只为保持载荷形状
     providerProtocol: (INITIAL_REVIEW && INITIAL_REVIEW.providerProtocol) || 'anthropic',
     providerUrl: (INITIAL_REVIEW && INITIAL_REVIEW.providerUrl) || '',
     repos: CR.repos.map((r) => ({
       id: r.id, name: r.name, source: r.source, url: r.url, localPath: r.localPath, branch: r.branch,
       authType: r.authType, username: r.username, credential: '', enabled: r.enabled,
-      apiTrigger: r.apiTrigger, schedule: r.schedule, overrides: r.overrides, createdAt: r.createdAt,
+      apiTrigger: r.apiTrigger, pushTrigger: r.pushTrigger === true,
+      members: Array.isArray(r.members) ? r.members : [], schedule: r.schedule, overrides: r.overrides, createdAt: r.createdAt,
     })),
   };
 }
@@ -2003,6 +2022,7 @@ function collectReviewRepoForm() {
     authType: crEl('crRepoAuth').value,
     credential: crEl('crRepoCred').value,
     apiTrigger: crEl('crRepoApiTrigger').checked,
+    pushTrigger: crEl('crRepoPushTrigger').checked,
     members: Array.from(document.querySelectorAll('.cr-member')).filter((x) => x.checked).map((x) => x.value),
     enabled: true,
     schedule: {

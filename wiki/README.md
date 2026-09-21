@@ -18,8 +18,8 @@ CC Team 是一套**团队 AI 编码网关**：一个服务同时代理 Claude Co
 
 - [快速上手](quick-start.md) — 管理员与成员各自的第一步
 - [核心概念与术语](concepts.md) — 方案、虚拟 Key、额度池、倍率……所有名词的解释
-- [管理面板：顶栏与图表](dashboard.md) — `/dashboard` 的指标卡与六张图表
-- [管理面板：十个工作区](dashboard-workspaces.md) — 用户用量、明细记录、产出质量等十个标签页
+- [管理面板：左栏菜单与数据总览](dashboard.md) — `/dashboard` 的左栏菜单、指标卡与六张图表
+- [管理面板：十个工作区](dashboard-workspaces.md) — 用户用量、明细记录、产出质量等十个菜单项
 - [设置页：方案与全局配置](settings.md) — 方案卡片、模型别名、峰谷倍率、通知等
 - [方案组调度](schedule.md) — 按星期 × 时段自动切换方案组
 - [用户与配额管理](users.md) — 虚拟 Key、临时额度、加量申请审批

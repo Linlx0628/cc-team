@@ -5,7 +5,14 @@ Chart.defaults.color='#686863';Chart.defaults.font.family='-apple-system,BlinkMa
 let D=null,P="day",C={t:null,p:null,m:null,h:null,hm:null,pr:null},errPage=1,autoRefresh=true,refreshTimer=null,currentProfile="all",PROTO="";
 let MDL="all",USR="all",MT="tokens",PIEDIM="user",MDLDIM="model";
 let DS="",DE="";
-let activeWorkspaceTab="users";
+let activeWorkspaceTab="overview";
+// 菜单顺序,与侧栏按钮一一对应;id 由 setWorkspaceTab 按 'workspace-tab-'+s 硬拼 ——
+// 增删菜单必须与 lib/pages.mjs 的按钮和面板同时改,否则切换会静默失效。
+const SECTIONS=['overview','users','clients','detail','profiles','rates','errors','production','sessions','costs','review'];
+// 图表脏标记:面板隐藏时建不出图(宽度 0)。render() 在「数据总览不可见」时跳过建图
+// 并置脏;切回数据总览时若脏且有数据就重建 —— 否则自动刷新会把图画废(踩过)。
+let chartsDirty=false;
+function overviewVisible(){const p=document.getElementById("workspace-panel-overview");return !!p&&!p.hidden}
 let quotaFocus=(function(){try{return localStorage.getItem('tm_quota_focus')==='1'}catch(e){return false}})();
 const ERR_PAGE_SIZE=20;
 const DETAIL_PAGE_SIZE=10;
@@ -70,17 +77,22 @@ function doughnutLegend(){const compact=innerWidth<1280;return{position:"bottom"
 function trendLegend(){const compact=innerWidth<=820;return{labels:{color:"#686863",font:{size:compact?9:11},padding:compact?6:10,boxWidth:compact?16:40}}}
 function scheduleChartResize(){cancelAnimationFrame(chartResizeFrame);chartResizeFrame=requestAnimationFrame(()=>{for(const chart of[C.p,C.m]){if(chart){chart.options.plugins.legend={display:false};chart.update("none")}}for(const chart of[C.t,C.hm,C.pr]){if(chart){chart.options.plugins.legend=trendLegend();chart.update("none")}}Object.values(C).forEach(chart=>chart&&chart.resize())})}
 function setWorkspaceTab(tab,focus){
-  const next=document.getElementById("workspace-tab-"+tab),panel=document.getElementById("workspace-panel-"+tab);
-  if(!next||!panel)return;
+  if(SECTIONS.indexOf(tab)<0)tab="overview";
   activeWorkspaceTab=tab;
-  document.querySelectorAll(".workspace-tab").forEach(button=>{const selected=button===next;button.setAttribute("aria-selected",String(selected));button.tabIndex=selected?0:-1});
-  document.querySelectorAll(".workspace-content>[role=tabpanel]").forEach(item=>{const selected=item===panel;item.hidden=!selected;item.classList.toggle("active",selected)});
-  if(focus)next.focus();
+  SECTIONS.forEach(function(sec){
+    const btn=document.getElementById("workspace-tab-"+sec),panel=document.getElementById("workspace-panel-"+sec);
+    const on=sec===tab;
+    if(btn){btn.classList.toggle("active",on);btn.setAttribute("aria-selected",String(on));btn.tabIndex=on?0:-1}
+    if(panel){panel.hidden=!on;panel.classList.toggle("active",on)}
+  });
+  if(focus){const b=document.getElementById("workspace-tab-"+tab);if(b)b.focus()}
+  // 切回数据总览时,若期间 render() 因面板隐藏跳过了建图,现在补建
+  if(tab==="overview"&&chartsDirty&&D){chartsDirty=false;renderCharts()}
   scheduleChartResize();
 }
 function handleWorkspaceTabKeydown(event){
-  const tabs=[...document.querySelectorAll(".workspace-tab")],index=tabs.indexOf(event.currentTarget);let next=index;
-  if(event.key==="ArrowRight")next=(index+1)%tabs.length;else if(event.key==="ArrowLeft")next=(index-1+tabs.length)%tabs.length;else if(event.key==="Home")next=0;else if(event.key==="End")next=tabs.length-1;else return;
+  const tabs=[...document.querySelectorAll("#dashNav .nav-btn")],index=tabs.indexOf(event.currentTarget);let next=index;
+  if(event.key==="ArrowDown"||event.key==="ArrowRight")next=(index+1)%tabs.length;else if(event.key==="ArrowUp"||event.key==="ArrowLeft")next=(index-1+tabs.length)%tabs.length;else if(event.key==="Home")next=0;else if(event.key==="End")next=tabs.length-1;else return;
   event.preventDefault();setWorkspaceTab(tabs[next].id.replace("workspace-tab-",""),true);
 }
 // ── 客户端用量 board ────────────────────────────────────────────────────────
@@ -495,6 +507,13 @@ const actCell='<td><span class="led '+(p.active?'on':'')+'"></span><span style="
   const upstreamInfo=D.upstream?(" | 上游: "+D.upstream.replace("https://","").replace("http://","")):"";
   document.getElementById("meta").innerHTML='<span style="color:var(--accent);font-weight:600">方案: '+profileLabel+(protoSuffix?' · '+protoSuffix:'')+'</span>'+upstreamInfo+' &nbsp;|&nbsp; 更新于 '+(function(){const d=new Date();const utc=d.getTime()+d.getTimezoneOffset()*60000;return new Date(utc+8*3600000).toLocaleTimeString("zh-CN")})()+" (北京时间) | 每30秒刷新";
 
+  // 图表:面板隐藏时建不出图(宽度 0)—— 置脏,切回数据总览时由 setWorkspaceTab 补建
+  if(overviewVisible()){renderCharts()}else{chartsDirty=true}
+  renderWorkspaceSummaries();
+  renderClientBoard();
+  renderRateBoard();
+}
+function renderCharts(){
   // Charts —— 六图共用全局筛选：P 周期 / MT 指标 / MDL 模型 / USR 用户 / DS+DE 日期范围。
   // 窗口规则:分布类图(用户/客户端分布、模型、两张 24 小时)用 effBounds() —— 日期范围
   // 生效时优先,否则周期窗口;趋势与方案两张全史分桶图只在日期范围生效时收窄。
@@ -674,9 +693,6 @@ const actCell='<td><span class="led '+(p.active?'on':'')+'"></span><span style="
   pg.innerHTML='<span style="font-size:12px;color:var(--dim)">第 '+errPage+"/"+totalErrPages+' 页 (共 '+allErrs.length+' 条)</span> '+(errPage>1?'<button onclick="setErrorPage('+(errPage-1)+')" style="font-size:11px;background:var(--card);color:var(--text);border:1px solid var(--border);padding:2px 10px;border-radius:4px;cursor:pointer">上一页</button> ':'')+(errPage<totalErrPages?'<button onclick="setErrorPage('+(errPage+1)+')" style="font-size:11px;background:var(--card);color:var(--text);border:1px solid var(--border);padding:2px 10px;border-radius:4px;cursor:pointer">下一页</button>':'');
   document.getElementById("errorCount").textContent=allErrs.length>0?'('+allErrs.length+')':'';
   document.getElementById("errorHint").textContent=allErrs.length>0?(allErrs.length+'条错误'):'暂无错误';
-  renderWorkspaceSummaries();
-  renderClientBoard();
-  renderRateBoard();
 }
 async function load(){try{const profile=currentProfile==="all"?"all":currentProfile;const qs=[];if(profile!=="all")qs.push("profile="+encodeURIComponent(profile));else if(PROTO)qs.push("protocol="+PROTO);const r=await fetch("/api/stats"+(qs.length?"?"+qs.join("&"):""));D=await r.json();render()}catch(e){document.getElementById("meta").textContent="Error: "+e.message}}
 function toggleSec(id){const body=document.getElementById(id+"Body");const icon=document.getElementById(id+"Icon");const open=body.classList.toggle("open");icon.classList.toggle("open",open)}
@@ -685,7 +701,12 @@ document.getElementById("metricSel").addEventListener("change",e=>{MT=e.target.v
 document.getElementById("modelSel").addEventListener("change",e=>{MDL=e.target.value;resetDetailGrouping();render()});
 document.getElementById("userSel").addEventListener("change",e=>{USR=e.target.value;render()});
 function resetChartFilters(){P="day";MT="tokens";MDL="all";USR="all";DS="";DE="";PROTO="";setPieDim("user");setModelDim("model");setProtoSeg("");document.querySelectorAll("#globalTabs .tab").forEach(x=>x.classList.toggle("on",x.dataset.p==="day"));document.getElementById("metricSel").value="tokens";document.getElementById("modelSel").value="all";document.getElementById("userSel").value="all";document.getElementById("dateStart").value="";document.getElementById("dateEnd").value="";if(currentProfile!=="all"){currentProfile="all";document.getElementById("profileSel").value="all"}resetDetailGrouping();load()}
-document.querySelectorAll(".workspace-tab").forEach(button=>{button.addEventListener("click",()=>setWorkspaceTab(button.id.replace("workspace-tab-","")));button.addEventListener("keydown",handleWorkspaceTabKeydown)});
+(function bindDashNav(){
+  const nav=document.getElementById("dashNav");
+  if(!nav)return;
+  nav.addEventListener("click",e=>{const b=e.target.closest(".nav-btn");if(b&&b.id&&b.id.startsWith("workspace-tab-"))setWorkspaceTab(b.id.replace("workspace-tab-",""),false)});
+  nav.addEventListener("keydown",handleWorkspaceTabKeydown);
+})();
 document.getElementById("clearErrors").addEventListener("click",async()=>{if(confirm("确定清除所有错误记录？")){const csrf=(document.cookie.match(/tm_csrf=([^;]+)/)||[])[1]||'';await fetch("/api/clear-errors",{method:"POST",headers:{"x-csrf-token":csrf}});toast('错误记录已清除');errPage=1;load()}});
 // ── 产出质量 tab(懒加载:首次切到该 tab 才拉数据)──
 const ph=escH;
@@ -850,4 +871,4 @@ document.getElementById('workspace-tab-sessions').addEventListener('click',()=>{
 function startAutoRefresh(){if(refreshTimer)clearInterval(refreshTimer);refreshTimer=setInterval(()=>{if(autoRefresh)load()},30000)}
 document.getElementById("autoRefreshBtn").addEventListener("click",()=>{autoRefresh=!autoRefresh;const btn=document.getElementById("autoRefreshBtn");btn.textContent="自动刷新: "+(autoRefresh?"开":"关");btn.className=autoRefresh?"ar-on":"ar-off"});
 window.addEventListener("resize",scheduleChartResize);
-load();startAutoRefresh();
+setWorkspaceTab('overview',false);load();startAutoRefresh();

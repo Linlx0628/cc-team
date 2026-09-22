@@ -141,7 +141,10 @@ function crRunRow(r) {
   return `<div class="cr-run is-${cls}"><span class="cr-run-num">#${r.id}</span>`
     + '<div class="cr-run-main"><div class="cr-run-title">'
     + `<span class="cr-run-repo">${escH(r.repo_name)}</span>`
-    + `<span class="pill pill-${cls}">${escH(CR_STATUS_LABEL[r.status] || r.status)}</span>` + trig + '</div>'
+    + `<span class="pill pill-${cls}">${escH(CR_STATUS_LABEL[r.status] || r.status)}</span>`
+    // 评出过意见的记录带「已解决/未解决」:和成员页同一状态,管理员也能代为标记
+    + (r.comments_count > 0 ? (r.resolved ? '<span class="pill pill-dim">已解决</span>' : '<span class="pill pill-warn">未解决</span>') : "")
+    + trig + '</div>'
     + '<div class="cr-run-meta">' + escH(new Date(r.created_at).toLocaleString("zh-CN", { timeZone: "Asia/Shanghai", hour12: false }))
     + " · " + escH(r.range_mode === "single" ? "单提交 " + crShort(r.to_commit) : `${crShort(r.from_commit)}→${crShort(r.to_commit)}`)
     + ` · 文件 ${r.files_reviewed} · 意见 ${r.comments_count} · ${fmtT(r.input_tokens + r.output_tokens)} token · ${crDur(r.elapsed_ms)}`
@@ -230,6 +233,17 @@ async function openReviewRun(id) {
       `${run.comments_count} 条意见 · ${run.files_reviewed} 个文件 · ${fmtT(run.input_tokens + run.output_tokens)} token · ${crDur(run.elapsed_ms)}`,
     ].filter(Boolean).join(" · ");
     if (exp) { exp.href = "/api/code-review/report?id=" + run.id; exp.style.display = ""; }
+    // 「已解决」按钮:有意见的终结态运行才显示,点了与成员页共享同一个状态
+    const rb = document.getElementById("crDetailResolve");
+    if (rb) {
+      const hasComments = Number(run.comments_count) > 0;
+      rb.style.display = hasComments ? "" : "none";
+      if (hasComments) {
+        rb.dataset.runId = String(run.id);
+        rb.dataset.resolved = run.resolved ? "1" : "0";
+        rb.textContent = run.resolved ? "撤销已解决" : "标记已解决";
+      }
+    }
     // 结论 + 引擎实际干了多少活:这条是回答「有没有真干活」的关键
     let html = '<div class="cr-detail"><div class="cr-facts">'
       + crFact("结论", run.note || "—")
@@ -320,6 +334,22 @@ async function cancelReviewRun(id) {
     setTimeout(loadCodeReview, 800);
   } catch (err) { crSetStatus(err.message, "error"); }
 }
+// 详情弹层里的「已解决」切换(管理端):与成员端同一个后端状态,谁点都生效
+document.getElementById("crDetailResolve")?.addEventListener("click", async function () {
+  const rb = this;
+  const id = rb.dataset.runId;
+  if (!id) return;
+  const want = rb.dataset.resolved !== "1";
+  rb.disabled = true;
+  try {
+    await crApi("/api/code-review/runs/resolve", { method: "POST", headers: crCsrfHeaders({ "Content-Type": "application/json" }), body: JSON.stringify({ id: Number(id), resolved: want }) });
+    rb.dataset.resolved = want ? "1" : "0";
+    rb.textContent = want ? "撤销已解决" : "标记已解决";
+    crSetStatus(want ? "已标记为已解决" : "已恢复为未解决", "ok");
+    loadCodeReview();   // 列表行的 pill 同步
+  } catch (err) { crSetStatus(err.message, "error"); }
+  rb.disabled = false;
+});
 document.getElementById("workspace-tab-review")?.addEventListener("click", () => {
   if (!crLoaded) { crLoaded = true; loadCodeReview(); }
 });

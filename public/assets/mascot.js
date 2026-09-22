@@ -251,8 +251,11 @@
 
     // —— 对话气泡:window.Mascot.say(text, opts) 的载体 ——
     // 与角色弹层互斥(两者都悬在吉祥物正上方,同时显示会叠在一起)。
+    // opts.onClick:气泡被点击时的回调(先收气泡再调) —— 用于「点我去看」这类
+    // 带入口的提醒;超时自动收起时回调作废,不会误触发。
     var sayTimer = 0;
     var moodTimer = 0;
+    var bubbleClick = null;
     var bubble = document.createElement('div');
     bubble.style.cssText = 'position:absolute;right:0;bottom:150px;max-width:220px;padding:8px 12px;'
       + 'background:var(--bg,#fff);color:var(--text,#333);border:1px solid var(--border-strong,#ccc);'
@@ -265,7 +268,18 @@
       + 'background:var(--bg,#fff);border-right:1px solid var(--border-strong,#ccc);'
       + 'border-bottom:1px solid var(--border-strong,#ccc);transform:rotate(45deg);"></span>';
     var bubbleText = bubble.querySelector('[data-bubble-text]');
-    bubble.addEventListener('click', hideBubble);
+    // 可聚焦 + 键盘触发(visibility:hidden 时天然不进 Tab 序列,只在显示时可及)
+    bubble.setAttribute('role', 'button');
+    bubble.tabIndex = 0;
+    function bubbleActivate() {
+      var fn = bubbleClick;
+      hideBubble();
+      if (fn) fn();
+    }
+    bubble.addEventListener('click', bubbleActivate);
+    bubble.addEventListener('keydown', function (e) {
+      if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); bubbleActivate(); }
+    });
     dock.appendChild(bubble);
 
     // 开合用 opacity/visibility 而不是 display:hidden 属性会被内联样式压过,
@@ -274,6 +288,7 @@
       bubble.style.opacity = 0;
       bubble.style.visibility = 'hidden';
       bubble.style.pointerEvents = 'none';
+      bubbleClick = null;   // 自动收起后回调作废
       window.clearTimeout(moodTimer);
       reactionIdx = null;
       paintReaction();
@@ -285,6 +300,7 @@
       bubble.style.opacity = 1;
       bubble.style.visibility = 'visible';
       bubble.style.pointerEvents = 'auto';
+      bubbleClick = typeof opts.onClick === 'function' ? opts.onClick : null;
       // mood:REACT[key] 给下标,缺省 delighted;表情与气泡同寿,收起时一并回正。
       var idx = REACT.hasOwnProperty(opts.mood) ? REACT[opts.mood] : 8;
       window.clearTimeout(moodTimer);

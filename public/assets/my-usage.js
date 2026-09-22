@@ -184,17 +184,28 @@ function renderCalendar(){
 // 未签到时让吉祥物口头提醒；已签到(或签到功能不可用)则改为时段问候 + 一句话今日
 // 用量简报。每次进页/刷新都说一次:用内存标记做「单次」守卫挡住 30s 轮询反复进
 // load() 的重弹;切换侧栏菜单不刷新页面,天然不会重新触发。
+// 有未解决的代码评审时,提醒优先于问候(更有行动价值),点气泡直达评审分区 ——
+// 角标请求(轻)与 /api/my-usage(重)先后不定,两条路都会汇到 mrReviewReminder,
+// MR_REMIND_SHOWN 保证只弹一次、且问候不会反过来盖掉提醒。
 var mascotSaid = false;
+var MR_PENDING=0, MR_REMIND_SHOWN=false;
+function mrReviewReminder(n){
+  MR_PENDING=n;
+  if(!(n>0)||MR_REMIND_SHOWN||SECTION==='review')return;
+  MR_REMIND_SHOWN=true;
+  window.Mascot&&Mascot.say('你有 '+n+' 条代码评审待处理，点我去看',{mood:'surprised',duration:12000,onClick:function(){setSection('review',true)}});
+}
 function mascotHello(){
-  if(mascotSaid)return;
+  if(mascotSaid||MR_REMIND_SHOWN)return;
   const c=D&&D.checkin;
   if(c&&c.available&&c.enabled===false)return;
+  if(MR_PENDING>0&&SECTION!=='review'){mascotSaid=true;setTimeout(function(){mrReviewReminder(MR_PENDING)},1500);return}
   mascotSaid=true;
   if(c&&c.available&&!c.checkedInToday){
-    setTimeout(()=>{window.Mascot&&Mascot.say('记得签到哦～，点上面的「签到领 token」领今日加量')},1500);
+    setTimeout(()=>{if(!MR_REMIND_SHOWN)window.Mascot&&Mascot.say('记得签到哦～，点上面的「签到领 token」领今日加量')},1500);
     return;
   }
-  setTimeout(()=>{window.Mascot&&Mascot.say(mascotHelloLine())},1500);
+  setTimeout(()=>{if(!MR_REMIND_SHOWN)window.Mascot&&Mascot.say(mascotHelloLine())},1500);
 }
 function mascotHelloLine(){
   const h=Number(new Date(Date.now()+8*3600000).getUTCHours());
@@ -1070,13 +1081,14 @@ function ensureActivity(){if(!ACT.data&&!ACT.loading)fetchActivity()}
 // 只看得到自己**是成员**的仓库;越权过滤在服务端(/api/my-review),这里不做假设。
 const MR={data:null,loading:false};
 function ensureMyReview(){if(!MR.data&&!MR.loading)fetchMyReview()}
-// 「打开即已读」:只在真的进到这个分区时发一次,不用每次拉数据都发
+// 「打开即已读」:只在真的进到这个分区时发一次,不用每次拉数据都发。
+// 只喂 MCP 的 unseenOnly 口径(last_seen_review_at);菜单角标已改按「未解决数」计,
+// 不再因为打开分区而清零 —— 点了「已解决」才减少。
 let MR_SEEN_SENT=false;
 function markReviewSeen(){
   if(MR_SEEN_SENT)return;
   MR_SEEN_SENT=true;
   fetch('/api/my-review/seen',{method:'POST',headers:{'Authorization':'Bearer '+VK}})
-    .then(function(){const b=document.getElementById('mrPendingBadge');if(b)b.style.display='none'})
     .catch(function(){MR_SEEN_SENT=false});   // 失败允许下次重试
 }
 function mrBadge(n){
@@ -1084,11 +1096,12 @@ function mrBadge(n){
   if(!b)return;
   if(n>0){b.style.display='';b.textContent=n>99?'99+':String(n)}else{b.style.display='none'}
 }
-// 角标数据:进页面时拉一次(与仓库列表同一个请求,不额外打接口)
+// 角标数据:进页面时拉一次(与仓库列表同一个请求,不额外打接口)。
+// pending = 未解决数;顺手喂吉祥物提醒。
 function loadReviewBadge(){
   fetch('/api/my-review?limit=1',{headers:{'Authorization':'Bearer '+VK}})
     .then(function(r){return r.ok?r.json():null})
-    .then(function(d){if(d)mrBadge(d.pending||0)})
+    .then(function(d){if(d){mrBadge(d.pending||0);mrReviewReminder(d.pending||0)}})
     .catch(function(){});
 }
 loadReviewBadge();
@@ -1195,8 +1208,10 @@ function renderMyReview(){
   if(cnt)cnt.textContent=rows.length+' 条'+(kw&&rows.length!==d.runs.length?'(共 '+d.runs.length+')':'');
   if(!rows.length){runs.innerHTML='<div class="lb-msg" style="margin-top:12px">没有匹配的记录</div>';return}
   runs.innerHTML='<h3 style="font-size:13px;font-weight:650;margin:16px 0 8px">评审记录</h3><div class="lb-list">'+rows.map(function(r){
+    // 评出过意见的记录带「已解决/未解决」:不点已解决就一直挂着未解决(角标因此常驻)
+    const resolvePill=r.comments>0?(r.resolved?' <span class="mr-pill mr-pill-dim">已解决</span>':' <span class="mr-pill mr-pill-warn">未解决</span>'):'';
     return '<div class="lb-row"><div class="lb-who"><div class="lb-name">'+esc(r.repo)+
-      ' <span class="mr-pill mr-pill-'+mrClass(r.status)+'">'+esc(MR_LABEL[r.status]||r.status)+'</span></div>'+
+      ' <span class="mr-pill mr-pill-'+mrClass(r.status)+'">'+esc(MR_LABEL[r.status]||r.status)+'</span>'+resolvePill+'</div>'+
       '<div class="lb-det">'+esc(mrTime(r.createdAt))+' · '+esc(r.rangeMode==='single'?'单提交':'增量')+' '+
       esc(String(r.toCommit||'').slice(0,8))+' · 文件 '+r.filesReviewed+' · 意见 '+r.comments+' · '+fmtTk(r.tokens)+' token</div>'+
       (r.note?'<div class="lb-det" style="white-space:normal">'+esc(r.note)+'</div>':'')+
@@ -1234,12 +1249,15 @@ function openMyReviewRun(id){
   fetch('/api/my-review/run?id='+id,{headers:{'Authorization':'Bearer '+VK}}).then(function(r){
     if(!r.ok)throw new Error('HTTP '+r.status);return r.json();
   }).then(function(d){
+    // /api/my-review/run 回的是原始 DB 行(蛇形列) —— 列表行才是 memberView 的驼峰映射,
+    // 这里别再混用两套字段名(早先读驼峰,副标题全是 undefined)。
     const run=d.run,cs=d.comments||[];
     if(title)title.textContent='运行 #'+run.id+' · '+run.repo_name;
     if(sub)sub.textContent=[
-      (run.rangeMode==='single'?'单提交':'增量')+String(run.toCommit||'').slice(0,8),
-      run.comments+' 条意见 · '+run.filesReviewed+' 个文件'
+      (run.range_mode==='single'?'单提交':'增量')+String(run.to_commit||'').slice(0,8),
+      run.comments_count+' 条意见 · '+run.files_reviewed+' 个文件'
     ].filter(Boolean).join(' · ');
+    mrDetailResolvePaint(run);
     let html='<div class="note" style="margin-bottom:10px">'+esc(run.note||'')+'</div>';
     if(!cs.length){
       html+='<div class="lb-msg" style="color:var(--green)">本次没有提出意见</div>';
@@ -1255,6 +1273,71 @@ function openMyReviewRun(id){
     MR_DETAIL_PAGER.set([]);
   });
 }
+// 详情头部的「已解决」按钮:按整次运行一条,可撤销;点完刷新列表与角标。
+function mrDetailResolvePaint(run){
+  const rb=document.getElementById('mrDetailResolve');
+  if(!rb)return;
+  const hasComments=Number(run.comments_count)>0;
+  rb.style.display=hasComments?'':'none';
+  if(!hasComments)return;
+  rb.dataset.runId=String(run.id);
+  rb.dataset.resolved=run.resolved?'1':'0';
+  rb.textContent=run.resolved?'撤销已解决':'标记已解决';
+}
+(function(){
+  const rb=document.getElementById('mrDetailResolve');
+  if(!rb||rb.dataset.bound)return;
+  rb.dataset.bound='1';
+  rb.addEventListener('click',function(){
+    const id=rb.dataset.runId;
+    if(!id)return;
+    const want=rb.dataset.resolved!=='1';
+    rb.disabled=true;
+    fetch('/api/my-review/resolve',{method:'POST',headers:{'Authorization':'Bearer '+VK,'Content-Type':'application/json'},body:JSON.stringify({id:Number(id),resolved:want})})
+      .then(function(r){return r.json().then(function(d){return{ok:r.ok,status:r.status,d:d}})})
+      .then(function(res){
+        if(!res.ok)throw new Error(res.d&&res.d.error||('HTTP '+res.status));
+        rb.dataset.resolved=want?'1':'0';
+        rb.textContent=want?'撤销已解决':'标记已解决';
+        toast(want?'已标记为已解决':'已恢复为未解决');
+        fetchMyReview();   // 列表行的 chip 同步
+        loadReviewBadge(); // 角标(未解决数)同步
+      })
+      .catch(function(e){toast('操作失败:'+(e.message||e))})
+      .then(function(){rb.disabled=false});
+  });
+})();
+
+// ── 评审邮箱门(评审启用且 member_notify 未填邮箱时,服务端已把弹窗渲染成打开)──
+// 不可关闭:没有 ✕、没有遮罩点击、没挂 dlgInit(Esc 天然无效),填完保存才消失。
+// 正则与 smtp.mjs 的 isValidEmail 同款,服务端 save() 还会再校验一遍。
+(function bindEmailGate(){
+  if(!REVIEW_EMAIL_GATE)return;
+  const input=document.getElementById('gateEmail'),err=document.getElementById('gateErr'),btn=document.getElementById('gateSubmit');
+  if(!input||!btn)return;
+  const EMAIL_RE=/^[^\s@<>,"]+@[^\s@<>,"]+\.[^\s@<>,"]+$/;
+  async function submit(){
+    const v=input.value.trim();
+    if(err)err.textContent='';
+    if(!EMAIL_RE.test(v)){if(err)err.textContent='邮箱格式不对，请检查后重试';input.focus();return}
+    btn.disabled=true;btn.textContent='保存中…';
+    try{
+      const r=await fetch('/api/my-notify',{method:'POST',headers:{'Authorization':'Bearer '+VK,'Content-Type':'application/json'},body:JSON.stringify({email:v})});
+      const d=await r.json();
+      if(!r.ok)throw new Error(d.error||('HTTP '+r.status));
+      const gate=document.getElementById('emailGate');
+      if(gate)gate.classList.remove('open');
+      MN.prefs=d.prefs||MN.prefs;   // 「通知设置」分区同步已保存状态
+      if(window.Mascot&&Mascot.say)window.Mascot.say('邮箱已保存，评审结果会通知到这里',{duration:5000});
+    }catch(e){
+      if(err)err.textContent=(e.message||'保存失败，请重试');
+      btn.disabled=false;btn.textContent='保存';
+    }
+  }
+  btn.addEventListener('click',submit);
+  input.addEventListener('keydown',function(e){if(e.key==='Enter')submit()});
+  setTimeout(function(){input.focus()},200);
+})();
 
 setSection('overview',false);
 // 日期筛选控件放在最后初始化:两个面板此刻都还隐藏,只写 innerHTML 不读宽度,安全。

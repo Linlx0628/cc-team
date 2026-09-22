@@ -25,7 +25,7 @@ import { isCompactionRequest, transformCompactSseEvent } from "./lib/compact-bri
 import { tryThinkingPassbackSelfHeal } from "./lib/thinking-passback.mjs";
 import { createCodeReviewOcr } from "./lib/code-review-ocr.mjs";
 import { createCodeReview, initCodeReviewDb, sanitizeCodeReviewConfig, maskCredential, buildReviewReportHTML, migrateLegacyTriggerKeys, isValidBranch, TERMINAL, TERMINAL_OK } from "./lib/code-review.mjs";
-import { createMemberNotify, initMemberNotifyDb } from "./lib/member-notify.mjs";
+import { createMemberNotify, initMemberNotifyDb, pickNotifyTarget } from "./lib/member-notify.mjs";
 import { PassThrough } from "node:stream";
 import { EventEmitter } from "node:events";
 import { escHtml, escJs } from "./lib/html.mjs";
@@ -2299,8 +2299,9 @@ function resolveReviewRepoInput(body) {
 
 // 代码评审结果通知。两条**互相独立**的去向:
 //   ① 管理员渠道(飞书/钉钉/…):按 codeReview.notifyOn 规则走,行为与以前一致
-//   ② 写代码的人:评审**发现了意见**时,把问题发给这条提交的 git 作者邮箱
-//      (以及该仓库成员各自配置的渠道 —— 见 pushReviewToMembers)
+//   ② 写代码的人:评审**发现了意见**时,按推送人/提交作者的邮箱匹配系统成员 ——
+//      匹配到就**只**通知这个人(走他自己的渠道);没匹配到才直发作者邮箱 + 仓库全员
+//      (见 notifyReviewFindings / pushReviewToMembers)
 // 用户明确要求「有意见才通知」,所以②只在 comments>0 时发,「未发现问题」不打扰人。
 function pushCodeReviewNotice(ev) {
   const c = config.codeReview || {};
@@ -2357,43 +2358,71 @@ async function notifyReviewFindings(ev) {
   const text = reviewFindingsText(ev);
   const subject = `【代码评审】${ev.repo.name} 发现 ${(ev.report.comments || []).length} 处问题`;
   const jobs = [];
-
-  // a) 直接收邮件的人:提交人(git 作者)+ 推送人(webhook 带来的,比作者更贴近「该负责的人」,
-  //    哪怕他不是网关成员)。同一邮箱只发一封 —— 作者=推送人是最常见的情形,别双发。
   const mail = notifierApi.NOTIFY_SENDERS.find((s) => s.channel === "邮件");
-  const recipients = new Set();
   const authorEmail = ev.author && ev.author.email;
-  if (c.notifyCommitAuthor !== false && authorEmail && notifierApi.isValidEmail(authorEmail)) recipients.add(authorEmail.toLowerCase());
   let pusherEmail = null;
   try { pusherEmail = codeReviewApi.getRun(ev.runId)?.pusher_email || null; } catch { pusherEmail = null; }
+
+  // 邮件正文 = 导出报告同款完整 HTML(buildReviewReportHTML 已做全字段转义)。
+  // 体积护栏:最坏几百条 × 8KB 的意见能拼出十几 MB,任何 SMTP 都会拒 —— 超限降级纯文本。
+  let html = "";
+  try {
+    const run = codeReviewApi.getRun(ev.runId);
+    if (run) {
+      html = buildReviewReportHTML({ run, comments: codeReviewApi.listComments(ev.runId, { limit: 100 }), repo: ev.repo });
+      if (html.length > 1_500_000) {
+        console.warn(`[代码评审] run#${ev.runId} 报告 ${(html.length / 1048576).toFixed(1)}MB 过大,邮件降级纯文本`);
+        html = "";
+      }
+    }
+  } catch (err) { console.error(`[代码评审] 组装报告 HTML 失败,邮件降级纯文本: ${err.message}`); }
+
+  // a) 这条提交是谁写的:推送人(webhook 带来,比 git 作者更贴近「该负责的人」)优先、
+  //    作者兜底,按邮箱匹配系统成员。匹配到 → **只**通知这个人,不打扰仓库全员。
+  const target = pickNotifyTarget({
+    authorEmail, pusherEmail,
+    findByEmail: (e) => memberNotifyApi.findByEmail(e),
+    isAccountActive: (key, prefs) => hasGlobalUser(key) && !(config.users || {})[key]?.disabled && prefs?.enabled !== false,
+  });
+  if (target.matched && (c.notifyCommitAuthor !== false || c.notifyMembers !== false)) {
+    jobs.push(pushReviewToMembers(ev, text, subject, [target.userKey], html));
+    await Promise.all(jobs);
+    return;
+  }
+
+  // b) 没匹配到系统成员:维持原行为 —— 直发提交人/推送人邮箱(哪怕他不是网关成员)。
+  //    同一邮箱只发一封 —— 作者=推送人是最常见的情形,别双发。
+  const recipients = new Set();
+  if (c.notifyCommitAuthor !== false && authorEmail && notifierApi.isValidEmail(authorEmail)) recipients.add(authorEmail.toLowerCase());
   if (c.notifyCommitAuthor !== false && pusherEmail && notifierApi.isValidEmail(pusherEmail)) recipients.add(String(pusherEmail).toLowerCase());
   if (mail && mail.enabled(n)) {
     for (const to of recipients) {
-      mail.send(n, text, { to, subject })
+      mail.send(n, text, { to, subject, html })
         .catch((err) => console.error(`[通知] 邮件(评审结果 ${to}) 推送失败: ${err.message}`));
     }
   }
 
-  // b) 该仓库的成员:按他们各自配置的渠道(我的用量页里填的)
+  // c) 该仓库的成员:按他们各自配置的渠道(我的用量页里填的)
   if (c.notifyMembers !== false) {
-    jobs.push(pushReviewToMembers(ev, text, subject));
+    jobs.push(pushReviewToMembers(ev, text, subject, undefined, html));
   }
   await Promise.all(jobs);
 }
 // 成员的渠道存在 member_notify 表里(成员自助维护)。这里只做扇出,失败逐个吞掉 ——
-// 一个人配错了 webhook 不能让其他人都收不到。
-async function pushReviewToMembers(ev, text, subject) {
-  const memberKeys = Array.isArray(ev.repo.members) ? ev.repo.members : [];
+// 一个人配错了 webhook 不能让其他人都收不到。memberKeys 缺省 = 仓库全员;定向投递时
+// 传单元素数组(只发给匹配到的那个人)。
+async function pushReviewToMembers(ev, text, subject, memberKeys, html = "") {
+  const keys = Array.isArray(memberKeys) ? memberKeys : (Array.isArray(ev.repo.members) ? ev.repo.members : []);
   if (!memberKeys.length) return;
   const cfg = config.notifier || {};
   const mailSender = notifierApi.NOTIFY_SENDERS.find((s) => s.channel === "邮件");
-  for (const key of memberKeys) {
+  for (const key of keys) {
     let prefs = null;
     try { prefs = memberNotifyApi.get(key); } catch { prefs = null; }
     if (!prefs || prefs.enabled === false) continue;
     // 全局 SMTP 凭据 + 该成员自己的收件邮箱
     if (prefs.email && mailSender && mailSender.enabled(cfg) && notifierApi.isValidEmail(prefs.email)) {
-      mailSender.send(cfg, text, { to: prefs.email, subject })
+      mailSender.send(cfg, text, { to: prefs.email, subject, html })
         .catch((err) => console.error(`[通知] 邮件(成员 ${key.slice(0, 10)}…) 推送失败: ${err.message}`));
     }
     for (const ch of notifierApi.MEMBER_SENDERS) {
@@ -2479,19 +2508,18 @@ function normalizeRepoUrlKey(u) {
 
 // 从三家载荷里收集仓库地址候选,归一化后与白名单(remote 来源)比对。
 // 多候选是因为各家字段名不同,而且同一平台 http/ssh/web 地址都可能出现在不同字段里。
-function matchWebhookRepo(body) {
+// 返回**所有**命中的条目:同一个仓库 URL 允许在白名单里配多条(每条一个分支,各自勾
+// push 自动评审)—— 推 dev 只该触发配 dev 的那条,配 main 的条目由调用方的分支门禁忽略。
+function matchWebhookRepos(body) {
   const candidates = [
     body.project?.git_http_url, body.project?.web_url, body.project?.url,
     body.repository?.clone_url, body.repository?.url, body.repository?.git_url, body.repository?.html_url,
     body.url,
   ].filter(Boolean);
   const keys = new Set(candidates.map(normalizeRepoUrlKey).filter(Boolean));
-  if (!keys.size) return null;
-  for (const repo of config.codeReview?.repos || []) {
-    if (repo.source !== "remote" || !repo.url) continue;
-    if (keys.has(normalizeRepoUrlKey(repo.url))) return repo;
-  }
-  return null;
+  if (!keys.size) return [];
+  return (config.codeReview?.repos || []).filter((repo) =>
+    repo.source === "remote" && repo.url && keys.has(normalizeRepoUrlKey(repo.url)));
 }
 
 // 推送人:GitHub 是 pusher 对象;GitLab 是顶层 user_name/user_email;Gitee 是 pusher 或 user 对象
@@ -3551,8 +3579,11 @@ function getPublicSettings() {
         providerModel: c.providerModel || "",
         providerKeyMasked: c.providerKey ? `${String(c.providerKey).slice(0, 8)}****` : "",
         hasProviderKey: !!c.providerKey,
-        // Webhook 密钥同样只出掩码:明文只存在 config.json(与凭据同信任级别)
-        webhookSecretMasked: c.webhookSecret ? `${String(c.webhookSecret).slice(0, 4)}****` : "",
+        // Webhook 密钥**明文**下发(破例于其它凭据):它是管理员必须复制去 GitLab/GitHub/Gitee
+        // 平台的运维凭据 —— 只给掩码的话,生成保存后就再也无法从界面拿到,只能上服务器翻
+        // config.json。端点本身 checkAuth 管理员专属,与 config.json 同一信任级别;
+        // providerKey 仍只出掩码:那是网关内部用的,从不需要人来抄。
+        webhookSecret: c.webhookSecret || "",
         hasWebhookSecret: !!c.webhookSecret,
         webhookDebounceSeconds: c.webhookDebounceSeconds ?? 300,
         background: c.background || "",
@@ -3642,7 +3673,11 @@ function personalClaudeExtras(vk) {
 function personalReviewExtras(vk) {
   let count = 0;
   try { count = codeReviewApi.reposVisibleTo(vk).length; } catch { count = 0; }
-  return { repoCount: count };
+  // 评审通知的定向投递靠邮箱匹配成员 —— 功能启用后,还没填邮箱的成员进页要被
+  // 不可关闭的弹窗拦下来补填(填过 member_notify.email 就不再拦)。
+  let needEmail = false;
+  try { needEmail = !!(config.codeReview || {}).enabled && !(memberNotifyApi.get(vk) || {}).email; } catch { needEmail = false; }
+  return { repoCount: count, needEmail };
 }
 
 // /api/stats 读模型聚合（lib/stats.mjs）的依赖注入对象。db/stmts 在 initDb
@@ -5804,6 +5839,10 @@ const server = http.createServer((req, res) => {
       (async () => {
         try {
           const cfg = notifierApi.sanitizeNotifierConfig(JSON.parse(buf.toString()));
+          // 密码不回显的旧页面/旧脚本可能带空密码来测试 —— 认证模式下回填已保存的值,
+          // 否则「发送测试」永远拿空密码打服务器(实测阿里企业邮回 524 username or passwd is NULL)。
+          // 只在填了账号时回填:留空账号 = 刻意测试匿名发信,不掺已保存的凭据。
+          if (!cfg.smtpPass && cfg.smtpUser && config.notifier && config.notifier.smtpPass) cfg.smtpPass = config.notifier.smtpPass;
           const anyChannel = notifierApi.NOTIFY_SENDERS.some((s) => s.enabled(cfg));
           if (!anyChannel) {
             res.writeHead(400, { "Content-Type": "application/json" });
@@ -5898,33 +5937,46 @@ const server = http.createServer((req, res) => {
         if (/^0+$/.test(after) || body.deleted === true) { json(200, { ignored: "branch-delete" }); return; }
         const branch = ref.replace(/^refs\/heads\//, "");
         if (!isValidBranch(branch)) { json(200, { ignored: "branch", branch: branch.slice(0, 60) }); return; }
-        // 5) 仓库匹配:载荷里的 URL 候选归一化后与白名单比对(含 git@ 形态对 https 形态)
-        const repo = matchWebhookRepo(body);
-        if (!repo || repo.source !== "remote") { json(200, { ignored: "repo" }); return; }
-        // 6) 门禁:功能、仓库、开关、分支
-        if (!cfg.enabled || repo.enabled === false) { json(200, { ignored: "disabled" }); return; }
-        if (!repo.pushTrigger) { json(200, { ignored: "push-off" }); return; }
-        if (branch !== repo.branch) { json(200, { ignored: "branch", branch, expect: repo.branch }); return; }
-        // 7) 防抖:同一仓库窗口内只评一次(固定窗口,忽略不续期)。「评审进行中来的 push」
-        //    由入队的既有去重合并,这里管的是「刚评完又连推」。
-        const windowMs = (Number(cfg.webhookDebounceSeconds) || 0) * 1000;
-        if (windowMs > 0) {
-          const last = webhookLastPushAt.get(repo.id) || 0;
-          if (Date.now() - last < windowMs) { json(200, { ignored: "debounced", seconds: Math.ceil((windowMs - (Date.now() - last)) / 1000) }); return; }
-          webhookLastPushAt.set(repo.id, Date.now());
-        }
-        // 8) 入队:去重/串行/磁盘/当日预算全部沿用。推送人记进 actor 与 pusher_email。
+        // 5) 仓库匹配:载荷里的 URL 候选归一化后与白名单比对(含 git@ 形态对 https 形态)。
+        //    同一个 URL 可以配**多条**白名单(每条一个分支,实现多分支同时监控)——
+        //    返回所有命中条目,门禁逐条独立判定:推 dev 只触发配 dev 的那条,
+        //    配 main 的条目在分支门禁处被忽略。
+        const matched = matchWebhookRepos(body);
+        if (!matched.length) { json(200, { ignored: "repo" }); return; }
+        // 6) 门禁:功能、仓库、开关、分支 —— 每条命中条目独立过,命中几条触发几条
+        if (!cfg.enabled) { json(200, { ignored: "disabled" }); return; }
         const pusher = webhookPusher(body);
-        const r = codeReviewApi.enqueue(repo.id, {
-          trigger: "webhook",
-          actor: `推送:${pusher.name || "未知"}`,
-          branch,
-          pusherEmail: pusher.email || null,
-        });
-        recordAdminAudit(req, "codereview.webhook", repo.name,
-          `Webhook 触发评审（run #${r.runId}，分支 ${branch}${pusher.name ? `，推送人 ${pusher.name}` : ""}${r.deduped ? "，与进行中任务合并" : ""}）`);
-        // 一律 202:对平台而言「这次 push 已被接受」,与进行中任务合并/被预算拦下都属于受理
-        json(202, { triggered: true, runId: r.runId, repo: repo.name, deduped: !!r.deduped, skipped: !!r.skipped });
+        const triggeredRuns = [];
+        let lastIgnore = null;
+        for (const repo of matched) {
+          if (repo.enabled === false) { lastIgnore = { ignored: "disabled" }; continue; }
+          if (!repo.pushTrigger) { lastIgnore = { ignored: "push-off" }; continue; }
+          if (branch !== repo.branch) { lastIgnore = { ignored: "branch", branch, expect: repo.branch }; continue; }
+          // 7) 防抖:同一仓库窗口内只评一次(固定窗口,忽略不续期)。「评审进行中来的 push」
+          //    由入队的既有去重合并,这里管的是「刚评完又连推」。按 repo_id 计,多条分支条目互不干扰。
+          const windowMs = (Number(cfg.webhookDebounceSeconds) || 0) * 1000;
+          if (windowMs > 0) {
+            const last = webhookLastPushAt.get(repo.id) || 0;
+            if (Date.now() - last < windowMs) { lastIgnore = { ignored: "debounced", seconds: Math.ceil((windowMs - (Date.now() - last)) / 1000) }; continue; }
+            webhookLastPushAt.set(repo.id, Date.now());
+          }
+          // 8) 入队:去重/串行/磁盘/当日预算全部沿用。推送人记进 actor 与 pusher_email。
+          const r = codeReviewApi.enqueue(repo.id, {
+            trigger: "webhook",
+            actor: `推送:${pusher.name || "未知"}`,
+            branch,
+            pusherEmail: pusher.email || null,
+          });
+          recordAdminAudit(req, "codereview.webhook", repo.name,
+            `Webhook 触发评审（run #${r.runId}，分支 ${branch}${pusher.name ? `，推送人 ${pusher.name}` : ""}${r.deduped ? "，与进行中任务合并" : ""}）`);
+          triggeredRuns.push({ runId: r.runId, repo: repo.name, deduped: !!r.deduped, skipped: !!r.skipped });
+        }
+        if (!triggeredRuns.length) { json(200, lastIgnore || { ignored: "branch" }); return; }
+        // 一律 202:对平台而言「这次 push 已被接受」,与进行中任务合并/被预算拦下都属于受理。
+        // 单条命中保持原有响应形状(面板/脚本按 runId 取详情);多条命中(多分支白名单)给 runs 数组。
+        json(202, triggeredRuns.length === 1
+          ? { triggered: true, ...triggeredRuns[0] }
+          : { triggered: true, runs: triggeredRuns });
       })().catch((err) => { json(400, { error: err.message }); });
       return;
     }
@@ -6089,6 +6141,21 @@ const server = http.createServer((req, res) => {
           const r = codeReviewApi.cancel(Number(body.id));
           recordAdminAudit(req, "codereview.cancel", `run #${body.id}`, `取消代码评审（${r.canceled ? "已取消" : "未取消:" + r.note}）`);
           json(200, r);
+        } catch (err) {
+          json(err.statusCode || 400, { error: err.message });
+        }
+      }).catch((err) => json(400, { error: err.message }));
+      return;
+    }
+
+    // 管理端标记/撤销「已解决」:与成员端同一个状态,谁点都生效。
+    if (req.method === "POST" && crPath === "/api/code-review/runs/resolve") {
+      if (!adminWriteGate()) return;
+      readJsonBody().then((body) => {
+        try {
+          const run = codeReviewApi.setRunResolved(Number(body.id), body.resolved !== false, "管理员");
+          recordAdminAudit(req, "codereview.resolve", `run #${body.id}`, `${run.resolved ? "标记已解决" : "撤销已解决"}`);
+          json(200, { ok: true, run: { id: run.id, resolved: !!run.resolved, resolvedAt: run.resolved_at || null } });
         } catch (err) {
           json(err.statusCode || 400, { error: err.message });
         }
@@ -6490,10 +6557,11 @@ const server = http.createServer((req, res) => {
       return;
     }
     const limit = Number(new URL(req.url, "http://localhost").searchParams.get("limit")) || 20;
-    // lastSeen 一起给:待处理条数(菜单小红点)由它算出来
-    const lastSeenAt = memberNotifyApi.lastSeen(apiKey);
+    // 邮箱一起给:运行可见性与未解决数都含「pusher/作者邮箱=本人邮箱」的定向命中
+    // (被定向通知到的非成员也要能在自己的页面看到/处理这条 run)。
+    const email = (memberNotifyApi.get(apiKey) || {}).email || "";
     res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
-    res.end(JSON.stringify(codeReviewApi.memberView(apiKey, { limit, lastSeenAt })));
+    res.end(JSON.stringify(codeReviewApi.memberView(apiKey, { limit, email })));
     return;
   }
 
@@ -6506,11 +6574,38 @@ const server = http.createServer((req, res) => {
       return;
     }
     const id = new URL(req.url, "http://localhost").searchParams.get("id");
+    const email = (memberNotifyApi.get(apiKey) || {}).email || "";
     let d = null;
-    try { d = codeReviewApi.memberRun(apiKey, id); } catch { d = null; }
+    try { d = codeReviewApi.memberRun(apiKey, id, email); } catch { d = null; }
     if (!d) { res.writeHead(404, { "Content-Type": "application/json; charset=utf-8" }); res.end(JSON.stringify({ error: "运行不存在" })); return; }
     res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
     res.end(JSON.stringify({ run: d.run, comments: d.comments }));
+    return;
+  }
+
+  // 成员标记/撤销「已解决」:可见性与 memberRun 同口径(成员仓库 OR 邮箱命中),
+  // 点完角标减一;同仓库下一次 push 是新 run,会重新计入未解决。
+  if (req.method === "POST" && req.url.split("?")[0] === "/api/my-review/resolve") {
+    const apiKey = getApiKey(req);
+    readBody(req, 20_000).then((buf) => {
+      try {
+        if (!hasGlobalUser(apiKey)) {
+          res.writeHead(401, { "Content-Type": "application/json; charset=utf-8" });
+          res.end(JSON.stringify({ error: "认证失败：请提供有效的虚拟Key (Authorization: Bearer jx-...)" }));
+          return;
+        }
+        const body = JSON.parse(buf.toString() || "{}");
+        const email = (memberNotifyApi.get(apiKey) || {}).email || "";
+        const seen = codeReviewApi.canMemberSeeRun(apiKey, String(body.id || ""), email);
+        if (!seen) { res.writeHead(404, { "Content-Type": "application/json; charset=utf-8" }); res.end(JSON.stringify({ error: "运行不存在" })); return; }
+        const run = codeReviewApi.setRunResolved(seen.id, body.resolved !== false, getUserName(apiKey) || apiKey);
+        res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+        res.end(JSON.stringify({ ok: true, run: { id: run.id, resolved: !!run.resolved, resolvedAt: run.resolved_at || null } }));
+      } catch (err) {
+        res.writeHead(err.statusCode || 400, { "Content-Type": "application/json; charset=utf-8" });
+        res.end(JSON.stringify({ error: err.message }));
+      }
+    }).catch(() => { res.writeHead(413); res.end("Request too large"); });
     return;
   }
 

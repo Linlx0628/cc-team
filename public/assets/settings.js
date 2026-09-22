@@ -605,17 +605,18 @@ function initNotifierForm(){
   document.getElementById('notifBarkKey').value=n.barkDeviceKey||'';
   document.getElementById('notifBarkServer').value=n.barkServer||'';
   document.getElementById('notifInterval').value=(n.minIntervalSeconds!==undefined?n.minIntervalSeconds:300);
-  // SMTP:密码**不回显**(下面用 placeholder 表示「已保存」),其余字段照填
+  // SMTP:密码明文回填(管理员要核对;服务端「空=保留原值」的语义仍在,清空保存不会误删)
   document.getElementById('notifSmtpHost').value=n.smtpHost||'';
   document.getElementById('notifSmtpFrom').value=n.smtpFrom||'';
   document.getElementById('notifSmtpPort').value=n.smtpPort||465;
   document.getElementById('notifSmtpUser').value=n.smtpUser||'';
+  document.getElementById('notifSmtpFromName').value=n.smtpFromName||'';
   document.getElementById('notifSmtpTo').value=n.smtpTo||'';
   document.getElementById('notifSmtpSecure').checked=n.smtpSecure!==false;
   document.getElementById('notifSmtpInsecure').checked=n.smtpInsecure===true;
   const pass=document.getElementById('notifSmtpPass');
-  pass.value='';
-  pass.placeholder=n.hasSmtpPass?'已保存（留空表示不修改）':'••••••••';
+  pass.value=n.smtpPass||'';
+  pass.placeholder=n.hasSmtpPass?'':'未设置 —— 填入邮箱的授权码(不是网页登录密码)';
 }
 function collectNotifier(){
   return {
@@ -632,6 +633,7 @@ function collectNotifier(){
     smtpFrom:document.getElementById('notifSmtpFrom').value.trim(),
     smtpPort:parseInt(document.getElementById('notifSmtpPort').value,10)||465,
     smtpUser:document.getElementById('notifSmtpUser').value.trim(),
+    smtpFromName:document.getElementById('notifSmtpFromName').value.trim(),
     smtpPass:document.getElementById('notifSmtpPass').value,   // 空 = 服务端保留原值
     smtpTo:document.getElementById('notifSmtpTo').value.trim(),
     smtpSecure:document.getElementById('notifSmtpSecure').checked,
@@ -1073,9 +1075,6 @@ function addGlobalUser(){
   SETTINGS.globalUsers[vk]={username:'',expiresAt:'',disabled:false,superUser:false};
   for(const p of SETTINGS.profiles){if(!SETTINGS.profileAssignments[p.suffix])SETTINGS.profileAssignments[p.suffix]={}}
   renderProfileUsers(document.getElementById('userProfileSel').value);
-}
-function fillUpstream(url){
-  document.querySelector('[name=upstream]').value=url;
 }
 // ── 模型别名的结构化行编辑器 ─────────────────────────────────────────────
 // 通用别名行 ma_alias_N/ma_model_N/ma_ctx_N；高峰覆盖行 pa_alias_N/pa_model_N。
@@ -1852,10 +1851,11 @@ function initReviewForm() {
   crOnProfileChange();
   if (c.providerModel) crEl('crModel').value = c.providerModel;
   crEl('crKeyText').value = c.hasProviderKey ? (c.providerKeyMasked || '已创建') : '';
-  // Webhook:地址用当前站点拼出来(容器/反代下 origin 才是平台可达的地址);密钥只回显掩码
+  // Webhook:地址用当前站点拼出来(容器/反代下 origin 才是平台可达的地址);
+  // 密钥明文回填 —— 管理员要复制去托管平台填,掩码等于没法配置。
   crEl('crWebhookUrl').value = location.origin + '/api/code-review/webhook';
   const wh = crEl('crWebhookSecret');
-  if (wh) { wh.value = ''; wh.placeholder = c.hasWebhookSecret ? ('已保存 ' + (c.webhookSecretMasked || '') + '(留空不修改)') : '••••••••'; }
+  if (wh) { wh.value = c.webhookSecret || ''; }
   crEl('crWebhookDebounce').value = c.webhookDebounceSeconds != null ? c.webhookDebounceSeconds : 300;
   renderReviewRepoTable();
   renderReviewRepoMembers([]);
@@ -1951,6 +1951,12 @@ function genWebhookSecret() {
   const hex = Array.from(bytes).map((b) => b.toString(16).padStart(2, '0')).join('');
   const el = crEl('crWebhookSecret');
   if (el) { el.value = hex; crSetStatus('已生成新密钥 —— 保存后需要同步更新托管平台里填的值', 'ok'); }
+}
+// Webhook 密钥复制(http 明文下 navigator.clipboard 可能不存在,copyText 内部有兜底)
+async function copyWebhookSecret(btn) {
+  const v = (crEl('crWebhookSecret') || {}).value || '';
+  if (!v) { crSetStatus('还没有密钥 —— 先点「生成」并保存', 'error'); return; }
+  await copyText(v, btn);
 }
 function collectReviewSettings() {
   return {

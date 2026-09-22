@@ -629,13 +629,13 @@ load();setInterval(load,30000);
 
 
 // ── 面板切换 ──
-// 菜单按功能划分,八块:概览(含使用日历、各方案配额、产出画像)/ 配额价目表 /
+// 菜单按功能划分:概览(含使用日历、各方案配额、产出画像)/ 配额价目表 /
 // 用量分析(图表、模型表、客户端用量、项目分布)/ 会话使用情况 / 团队排行榜 /
-// 配置 Claude Code / 配置 Codex(两份 /setup 式接入指南搬进来的内嵌分区) /
-// 配置 MCP(第三份 setup-guide 内嵌分区,见 setup-guide.js 的 mcp 分支)。
+// 代码评审 / 通知设置 / 配置 Agent(Claude Code / Codex / MCP 三份 setup-guide
+// 内嵌分区合一,分区内用 agentTabs 子 Tab 切换)。
 // 顺序即导航顺序,id 由 setSection() 按 'mu-tab-'+s / 'mu-panel-'+s 硬拼 ——
 // 增删菜单必须与 lib/pages.mjs 的按钮和面板同时改,否则切换会静默失效。
-const SECTIONS=['overview','rates','analysis','sessions','leaderboard','review','notify','claude','codex','mcp'];
+const SECTIONS=['overview','rates','analysis','sessions','leaderboard','review','notify','agent'];
 function setSection(name,focus){
   if(SECTIONS.indexOf(name)<0)name='overview';
   SECTION=name;
@@ -1121,23 +1121,26 @@ function renderMyNotify(hasSmtp){
   const f=function(id){return document.getElementById(id)};
   if(!f('mnEnabled'))return;
   f('mnEnabled').checked=p.enabled!==false;
-  // 已配置的渠道:输入框留空 + placeholder 提示「已保存」;未配置的用示例占位
-  const ph=function(id,field,example){
+  // 渠道信息明文回填:所见即所得,成员能核对填没填对;清空输入框保存 = 清除该渠道
+  // (collect 对空值传 null,服务端 save 的 null=清除语义)。
+  const fill=function(id,field,example){
     const el=f(id);if(!el)return;
-    el.value='';
-    el.placeholder=(p[field]&&p[field].has)?('已保存 '+(p[field].hint||'')+'（留空不修改）'):example;
+    el.value=p[field]||'';
+    el.placeholder=example;
   };
-  ph('mnFeishu','feishuWebhook','https://open.feishu.cn/open-apis/bot/v2/hook/...');
-  ph('mnDingtalk','dingtalkWebhook','https://oapi.dingtalk.com/robot/send?access_token=...');
-  ph('mnWecom','wecomWebhook','https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=...');
-  ph('mnServerchan','serverchanSendKey','SCT...');
-  ph('mnBarkKey','barkDeviceKey','iOS 装 Bark 后复制的 Key');
-  ph('mnEmail','email','you@corp.com');
+  fill('mnFeishu','feishuWebhook','https://open.feishu.cn/open-apis/bot/v2/hook/...');
+  fill('mnDingtalk','dingtalkWebhook','https://oapi.dingtalk.com/robot/send?access_token=...');
+  fill('mnWecom','wecomWebhook','https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=...');
+  fill('mnServerchan','serverchanSendKey','SCT...');
+  fill('mnBarkKey','barkDeviceKey','iOS 装 Bark 后复制的 Key');
+  fill('mnEmail','email','you@corp.com');
   const note=document.getElementById('mnNote');
-  if(note&&!hasSmtp)note.textContent='提示:管理员还没配置 SMTP,「收件邮箱」这一项暂时发不出去;其它渠道不受影响。渠道凭据只存在服务器上,这里只显示是否已配置;输入框留空表示不修改。';
+  if(note&&!hasSmtp)note.textContent='提示:管理员还没配置 SMTP,「收件邮箱」这一项暂时发不出去;其它渠道不受影响。渠道信息明文回显,清空某一项保存即清除该渠道。';
 }
 function collectMyNotify(){
-  const v=function(id){const el=document.getElementById(id);return el?el.value.trim():''};
+  // 空串转 null:服务端 save() 的 null = 清除该字段 —— 明文回显下所见即所得,
+  // 「输入框里有什么,保存后就是什么」;不传(undefined)才会保留原值。
+  const v=function(id){const el=document.getElementById(id);const s=el?el.value.trim():'';return s===''?null:s};
   return {
     enabled:document.getElementById('mnEnabled').checked,
     feishuWebhook:v('mnFeishu'),dingtalkWebhook:v('mnDingtalk'),wecomWebhook:v('mnWecom'),
@@ -1305,6 +1308,23 @@ function mrDetailResolvePaint(run){
       })
       .catch(function(e){toast('操作失败:'+(e.message||e))})
       .then(function(){rb.disabled=false});
+  });
+})();
+
+// ── 配置Agent 分区的子 Tab(Claude Code / Codex / MCP)──
+// 三份 setup-guide 的容器在同一个分区内,这里只负责显隐切换;
+// 内容本身由 setup-guide.js 在页面加载时就地渲染(与容器可见性无关)。
+(function bindAgentTabs(){
+  const tabs=document.getElementById('agentTabs');
+  if(!tabs)return;
+  tabs.addEventListener('click',function(e){
+    const b=e.target.closest('button[data-agent-tab]');
+    if(!b)return;
+    [].forEach.call(tabs.querySelectorAll('button'),function(x){x.classList.toggle('on',x===b)});
+    const want=b.getAttribute('data-agent-tab');
+    document.querySelectorAll('#mu-panel-agent [data-agent-body]').forEach(function(p){
+      p.hidden=p.getAttribute('data-agent-body')!==want;
+    });
   });
 })();
 

@@ -118,3 +118,9 @@ td{padding:8px;border-bottom:1px solid #ecece8;font-size:12px}
 .cbx{width:auto;accent-color:var(--accent)}
 .checkline{display:flex;align-items:center;gap:6px;cursor:pointer;margin-top:12px}
 .checkline>span{font-size:12.5px}
+
+/* 分支下拉(自定义 combobox,datalist 在动态填充后很多浏览器点不开) */
+.cr-branch-drop{position:absolute;top:calc(100% + 4px);left:0;right:0;background:var(--surface);border:1px solid var(--border-strong);border-radius:6px;box-shadow:0 8px 22px rgba(24,24,22,.16);z-index:30;max-height:220px;overflow:auto}
+.cr-branch-drop button{display:block;width:100%;text-align:left;font-family:var(--font-mono);font-size:12px;padding:7px 11px;border:0;background:transparent;color:var(--text);cursor:pointer}
+.cr-branch-drop button:hover{background:var(--accent-soft);color:var(--accent)}
+.cr-branch-drop .empty{padding:8px 11px;font-size:11px;color:var(--dim)}

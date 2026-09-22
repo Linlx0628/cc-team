@@ -1884,7 +1884,7 @@ function renderReviewRepoTable() {
   if (!body) return;
   if (!CR.repos.length) { body.innerHTML = '<tr><td colspan="9" class="empty">还没有仓库 —— 点右上「＋ 添加仓库」</td></tr>'; return; }
   body.innerHTML = CR.repos.map((r) => {
-    const cred = r.credential && r.credential.hasCredential ? '已配置 ' + (r.credential.hint || '') : '未配置';
+    const cred = r.credential ? '已配置 ****' + String(r.credential).slice(-4) : '未配置';
     const wd = (r.schedule && r.schedule.weekdays) || [];
     const sched = (r.schedule && r.schedule.mode !== 'off'
       ? (r.schedule.mode === 'interval' ? '每 ' + r.schedule.intervalHours + ' 小时'
@@ -1901,9 +1901,28 @@ function renderReviewRepoTable() {
       + '<td>' + h(r.branch) + '</td><td>' + h(cred) + '</td><td>' + h(sched) + '</td><td>' + (r.apiTrigger ? '允许' : '—') + '</td>'
       + '<td title="' + h(members.join(', ')) + '">' + h(memText) + '</td>'
       + '<td style="white-space:nowrap"><button type="button" class="btn btn-outline btn-sm" onclick="editReviewRepo(\'' + r.id + '\')">编辑</button> '
+      + '<button type="button" class="btn btn-outline btn-sm" onclick="copyReviewRepo(\'' + r.id + '\')">复制</button> '
       + '<button type="button" class="btn btn-outline btn-sm" onclick="testReviewRepo(\'' + r.id + '\')">测试</button> '
       + '<button type="button" class="btn btn-outline btn-sm" onclick="deleteReviewRepo(\'' + r.id + '\')">删除</button></td></tr>';
   }).join('');
+}
+// 复制仓库:同一条配置克隆成新条目(name 加「副本」),用于同仓库多分支监控 ——
+// 复制完改个分支即可。凭据客户端拿不到明文,一律不复制;push 自动评审默认关,
+// 避免同 URL 同分支双条目同时勾着触发重复评审。只改本地状态,点「保存代码评审设置」才落盘。
+function copyReviewRepo(id) {
+  const r = CR.repos.find((x) => x.id === id);
+  if (!r) return;
+  const bytes = new Uint8Array(4);
+  (window.crypto || {}).getRandomValues ? crypto.getRandomValues(bytes) : bytes.fill(0);
+  // 8 位 hex 的合法 id 服务端会原样保留(sanitizeRepo 只重生成非法形状)
+  const nid = Array.from(bytes).map((b) => b.toString(16).padStart(2, '0')).join('');
+  const copy = JSON.parse(JSON.stringify(r));
+  copy.id = nid;
+  copy.name = (r.name || '仓库') + ' (副本)';
+  copy.pushTrigger = false;
+  CR.repos.push(copy);
+  renderReviewRepoTable();
+  crSetRepoStatus('已复制为「' + copy.name + '」—— push 自动评审已关(避免与原条目同分支双触发);改完分支记得「保存代码评审设置」', 'ok');
 }
 function addReviewRepo() {
   CR.editingRepoId = null;
@@ -1916,6 +1935,7 @@ function addReviewRepo() {
   renderReviewRepoMembers([]);   // 新仓库:成员从空开始勾
   crOnRepoSourceChange();
   crEl('crRepoEditor').hidden = false;
+  crBranchReset();
   crSetRepoStatus('');
 }
 function editReviewRepo(id) {
@@ -1927,7 +1947,7 @@ function editReviewRepo(id) {
   crEl('crRepoUrl').value = r.source === 'remote' ? (r.url || '') : (r.localPath || '');
   crEl('crRepoBranch').value = r.branch || 'main';
   crEl('crRepoAuth').value = r.authType || 'none';
-  crEl('crRepoCred').value = '';
+  crEl('crRepoCred').value = r.credential || '';   // 凭据明文回显,可直接核对/修改
   crEl('crRepoSched').value = (r.schedule && r.schedule.mode) || 'off';
   crEl('crRepoInterval').value = (r.schedule && r.schedule.intervalHours) || 6;
   crEl('crRepoAt').value = (r.schedule && r.schedule.at) || '03:00';
@@ -1936,6 +1956,7 @@ function editReviewRepo(id) {
   crEl('crRepoPushTrigger').checked = !!r.pushTrigger;
   renderReviewRepoMembers(r.members || []);   // 预置该仓库的成员勾选
   crOnRepoSourceChange();
+  crBranchReset();   // 换了仓库地址,旧分支列表作废(点「拉取分支」重新拉)
   crEl('crRepoEditor').hidden = false;
   crSetRepoStatus('凭据留空 = 不修改原凭据');
 }
@@ -1997,10 +2018,48 @@ async function saveCodeReviewSettings() {
     await refreshReviewFromServer();
   } catch (e) { crSetStatus(e.message || '保存失败', 'error'); }
 }
-// 拉取分支填进 datalist:用的是编辑器里**当前填的**地址(还没保存也能拉),这样填错当场发现
+// ── 分支下拉(自定义 combobox)──
+// 旧的 <datalist> 在选项动态填充后很多浏览器点不开/不弹列表 —— 换成自绘下拉:
+// 输入框照常手输(输入即过滤),点 ▾ 或「拉取分支」展开列表点选。列表按地址缓存,
+// 编辑器里改了仓库地址就重置,防止串到别的仓库的旧分支。
+const CR_BRANCH = { addr: '', branches: [] };
+let crBranchHideTimer = 0;   // blur 的延迟隐藏:展开时取消它,避免「刚展开又被旧定时器关掉」
+function crBranchAddr() {
+  const repo = collectReviewRepoForm();
+  return repo.source === 'remote' ? (repo.url || '') : (repo.localPath || '');
+}
+function crBranchDropRender() {
+  const drop = crEl('crRepoBranchDrop');
+  if (!drop) return;
+  const kw = crEl('crRepoBranch').value.trim().toLowerCase();
+  const list = CR_BRANCH.branches.filter((b) => !kw || b.toLowerCase().includes(kw));
+  drop.innerHTML = list.length
+    ? list.map((b) => '<button type="button" data-branch="' + h(b) + '">' + h(b) + '</button>').join('')
+    : '<div class="empty">' + (CR_BRANCH.branches.length ? '没有匹配的分支' : '还没有分支列表 —— 点「拉取分支」获取') + '</div>';
+}
+function crBranchDropShow() {
+  const drop = crEl('crRepoBranchDrop');
+  if (!drop) return;
+  window.clearTimeout(crBranchHideTimer);
+  crBranchDropRender();
+  drop.hidden = false;
+  crEl('crRepoBranch').setAttribute('aria-expanded', 'true');
+}
+function crBranchDropHide() {
+  window.clearTimeout(crBranchHideTimer);
+  const drop = crEl('crRepoBranchDrop');
+  if (drop) { drop.hidden = true; crEl('crRepoBranch').setAttribute('aria-expanded', 'false'); }
+}
+// 失焦后延迟隐藏:给 option 的 mousedown(先于 blur 触发)留出执行窗口
+function crBranchDropHideSoon() {
+  window.clearTimeout(crBranchHideTimer);
+  crBranchHideTimer = window.setTimeout(crBranchDropHide, 120);
+}
+function crBranchReset() {
+  CR_BRANCH.addr = ''; CR_BRANCH.branches = [];
+  crBranchDropHide();
+}
 async function fetchReviewRepoBranches() {
-  const list = crEl('crRepoBranchList');
-  if (!list) return;
   const repo = collectReviewRepoForm();
   const addr = repo.source === 'remote' ? repo.url : repo.localPath;
   if (!addr) { crSetRepoStatus(repo.source === 'remote' ? '请先填仓库地址' : '请先填本地路径', 'error'); return; }
@@ -2008,12 +2067,35 @@ async function fetchReviewRepoBranches() {
   try {
     const r = await crApi('/api/code-review/repos/branches', { method: 'POST', headers: csrfHeaders({ 'Content-Type': 'application/json' }), body: JSON.stringify({ repo }) });
     if (!r.ok || !(r.branches || []).length) { crSetRepoStatus('拉取失败：' + (r.detail || '该仓库没有分支'), 'error'); return; }
-    list.innerHTML = r.branches.map((b) => '<option value="' + h(b) + '"></option>').join('');
+    CR_BRANCH.addr = addr; CR_BRANCH.branches = r.branches;
+    crBranchDropShow();   // 先渲染全量列表(此刻输入框还是空,不会触发过滤)……
     const cur = crEl('crRepoBranch').value.trim();
-    if (!cur) crEl('crRepoBranch').value = r.branches[0];
-    crSetRepoStatus('拉到 ' + r.branches.length + ' 条分支,点分支输入框可选', 'ok');
+    if (!cur) crEl('crRepoBranch').value = r.branches[0];   // ……再填默认分支,否则过滤器会把其它分支全滤没
+    crSetRepoStatus('拉到 ' + r.branches.length + ' 条分支 —— 点选项或直接手输', 'ok');
   } catch (e) { crSetRepoStatus(e.message || '拉取分支失败', 'error'); }
 }
+(function bindBranchDrop(){
+  const input = crEl('crRepoBranch');
+  const arrow = crEl('crRepoBranchArrow');
+  const drop = crEl('crRepoBranchDrop');
+  if (!input || !arrow || !drop) return;
+  input.addEventListener('focus', function () { if (CR_BRANCH.branches.length) crBranchDropShow(); });
+  input.addEventListener('input', crBranchDropShow);   // 输入即过滤并展开
+  input.addEventListener('keydown', function (e) { if (e.key === 'Escape') crBranchDropHide(); });
+  input.addEventListener('blur', crBranchDropHideSoon);
+  arrow.addEventListener('mousedown', function (e) { e.preventDefault(); });   // 防止抢焦点让 input 先 blur
+  arrow.addEventListener('click', function () {
+    if (!CR_BRANCH.branches.length || crBranchAddr() !== CR_BRANCH.addr) { fetchReviewRepoBranches(); return; }
+    if (drop.hidden) crBranchDropShow(); else crBranchDropHide();
+  });
+  drop.addEventListener('mousedown', function (e) {
+    const b = e.target.closest('button[data-branch]');
+    if (!b) return;
+    e.preventDefault();   // mousedown 选值,避免 input blur 抢先把列表关掉
+    input.value = b.getAttribute('data-branch');
+    crBranchDropHide();
+  });
+})();
 
 // 把编辑器里当前填的值拼成 repo 对象(保存与「测试连接」共用,保证测的就是要存的)
 function collectReviewRepoForm() {

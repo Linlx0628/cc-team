@@ -30,6 +30,12 @@ body{padding:0;overflow:hidden;height:100vh}
 /* 补齐 .nav-btn 里 <a> 的按压反馈:theme.css:18 只写到 button:active,.btn:active,
    而「配置 Codex」是 <a>,同一个视觉组件此前有两种手感。值与那边相同。 */
 .sidebar-nav .nav-btn:active{transform:translateY(1px)}
+/* 侧栏底部的「文档」链接:不在菜单 tablist 里(不该被键盘导航/分区切换当成菜单项),
+   样式照菜单同款;flex:none 保证它钉在拉长的 sidebar-nav 下方 */
+.side-ft{flex:none;padding:10px 10px 12px;border-top:1px solid var(--border)}
+.side-ft .nav-btn{width:100%;display:flex;align-items:center;gap:10px;font-family:inherit;font-size:12.5px;font-weight:600;padding:9px 12px;border:1px solid transparent;border-radius:8px;background:transparent;color:var(--dim);cursor:pointer;white-space:nowrap;text-decoration:none}
+.side-ft .nav-btn:hover{background:var(--surface-hover);color:var(--text)}
+.side-ft .nav-btn svg{flex:none;display:block;opacity:.8}
 /* 页脚次级入口:单独一条分隔线,弱化 */
 .sidebar-nav.sidebar-ft-nav{flex:none;padding-top:10px;border-top:1px solid var(--border)}
 .main{flex:1;min-width:0;overflow-y:auto;padding:24px clamp(20px,3vw,40px) 48px;scrollbar-gutter:stable}
@@ -346,6 +352,9 @@ table{width:100%;border-collapse:collapse;min-width:560px}th{text-align:left;pad
   .sidebar-nav .nav-btn{width:auto;flex:none}
   /* 页脚那条也必须清掉 border-top:上面那条菜单已经有 border-top,两条 1px 相邻会叠成深线 */
   .sidebar-nav.sidebar-ft-nav{flex:none;border-top:0;padding-top:8px}
+  /* 窄屏侧栏折成横条后,「文档」链接并入同一行,不再占一整行 */
+  .side-ft{display:flex;flex-direction:row;gap:6px;padding:0 12px 10px;border-top:0}
+  .side-ft .nav-btn{width:auto;flex:none}
   .main{overflow:visible;padding:18px 14px 36px}
 }
 @media(max-width:560px){.cards{grid-template-columns:1fr 1fr}.card .v{font-size:20px}.box{padding:14px}.pq-grid{grid-template-columns:1fr}.lb-row{gap:9px;padding:9px 11px}.lb-val b{font-size:15px}.lb-podium{gap:6px}.lb-pod{padding:8px 6px;border-radius:6px}.lb-pod-rank{font-size:18px}.lb-pod-name{font-size:11.5px}.lb-pod-det{font-size:9.5px}

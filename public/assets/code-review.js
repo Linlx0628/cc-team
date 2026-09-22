@@ -244,6 +244,12 @@ async function openReviewRun(id) {
         rb.textContent = run.resolved ? "撤销已解决" : "标记已解决";
       }
     }
+    // 「发送给负责人」:评出过意见的运行才可手动补发报告邮件(自动通知只发一次)
+    const nb = document.getElementById("crDetailNotify");
+    if (nb) {
+      nb.style.display = Number(run.comments_count) > 0 ? "" : "none";
+      nb.dataset.runId = String(run.id);
+    }
     // 结论 + 引擎实际干了多少活:这条是回答「有没有真干活」的关键
     let html = '<div class="cr-detail"><div class="cr-facts">'
       + crFact("结论", run.note || "—")
@@ -349,6 +355,22 @@ document.getElementById("crDetailResolve")?.addEventListener("click", async func
     loadCodeReview();   // 列表行的 pill 同步
   } catch (err) { crSetStatus(err.message, "error"); }
   rb.disabled = false;
+});
+// 详情弹层里的「发送给负责人」:手动把这条评审的报告邮件再发一次(负责人判定与
+// 自动通知同一套邮箱定向规则);响应里的 message 说明实际发给了谁。
+document.getElementById("crDetailNotify")?.addEventListener("click", async function () {
+  const nb = this;
+  const id = nb.dataset.runId;
+  if (!id) return;
+  nb.disabled = true;
+  const old = nb.textContent;
+  nb.textContent = "发送中…";
+  try {
+    const r = await crApi("/api/code-review/runs/notify", { method: "POST", headers: crCsrfHeaders({ "Content-Type": "application/json" }), body: JSON.stringify({ id: Number(id) }) });
+    crSetStatus(r.message || "已发送", "ok");
+  } catch (err) { crSetStatus(err.message, "error"); }
+  nb.disabled = false;
+  nb.textContent = old;
 });
 document.getElementById("workspace-tab-review")?.addEventListener("click", () => {
   if (!crLoaded) { crLoaded = true; loadCodeReview(); }

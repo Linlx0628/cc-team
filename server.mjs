@@ -2353,27 +2353,40 @@ function reviewFindingsText(ev) {
 }
 
 async function notifyReviewFindings(ev) {
+  const run = codeReviewApi.getRun(ev.runId);
+  if (!run) return;
+  await sendReviewFindingsNotice({ repo: ev.repo, run, reportComments: ev.report.comments || [], author: ev.author });
+}
+
+// 把一次「评出意见」的评审结果通知出去。自动链路(persistReport 之后)与管理端详情页的
+// 「发送给负责人」按钮共用;负责人判定同一套:按邮箱匹配成员 → 只发他,未匹配 → 直发
+// 作者/推送人 + 仓库全员。返回去向摘要,供手动发送的界面反馈与审计。
+async function sendReviewFindingsNotice({ repo, run, reportComments, author = null }) {
   const c = config.codeReview || {};
   const n = config.notifier || {};
+  // 通知文案用的 ev 形状与自动链路一致(reviewFindingsText 从这里取仓库/分支/作者/意见)
+  const ev = {
+    repo,
+    branch: run.branch,
+    to: run.to_commit,
+    author: author || (run.author_email || run.author_name ? { name: run.author_name || "", email: run.author_email || "" } : null),
+    report: { comments: reportComments },
+  };
   const text = reviewFindingsText(ev);
-  const subject = `【代码评审】${ev.repo.name} 发现 ${(ev.report.comments || []).length} 处问题`;
+  const subject = `【代码评审】${repo.name} 发现 ${reportComments.length} 处问题`;
   const jobs = [];
   const mail = notifierApi.NOTIFY_SENDERS.find((s) => s.channel === "邮件");
   const authorEmail = ev.author && ev.author.email;
-  let pusherEmail = null;
-  try { pusherEmail = codeReviewApi.getRun(ev.runId)?.pusher_email || null; } catch { pusherEmail = null; }
+  const pusherEmail = run.pusher_email || null;
 
   // 邮件正文 = 导出报告同款完整 HTML(buildReviewReportHTML 已做全字段转义)。
   // 体积护栏:最坏几百条 × 8KB 的意见能拼出十几 MB,任何 SMTP 都会拒 —— 超限降级纯文本。
   let html = "";
   try {
-    const run = codeReviewApi.getRun(ev.runId);
-    if (run) {
-      html = buildReviewReportHTML({ run, comments: codeReviewApi.listComments(ev.runId, { limit: 100 }), repo: ev.repo });
-      if (html.length > 1_500_000) {
-        console.warn(`[代码评审] run#${ev.runId} 报告 ${(html.length / 1048576).toFixed(1)}MB 过大,邮件降级纯文本`);
-        html = "";
-      }
+    html = buildReviewReportHTML({ run, comments: codeReviewApi.listComments(run.id, { limit: 100 }), repo });
+    if (html.length > 1_500_000) {
+      console.warn(`[代码评审] run#${run.id} 报告 ${(html.length / 1048576).toFixed(1)}MB 过大,邮件降级纯文本`);
+      html = "";
     }
   } catch (err) { console.error(`[代码评审] 组装报告 HTML 失败,邮件降级纯文本: ${err.message}`); }
 
@@ -2384,10 +2397,12 @@ async function notifyReviewFindings(ev) {
     findByEmail: (e) => memberNotifyApi.findByEmail(e),
     isAccountActive: (key, prefs) => hasGlobalUser(key) && !(config.users || {})[key]?.disabled && prefs?.enabled !== false,
   });
+  const summary = { matched: null, direct: [], members: 0 };
   if (target.matched && (c.notifyCommitAuthor !== false || c.notifyMembers !== false)) {
-    jobs.push(pushReviewToMembers(ev, text, subject, [target.userKey], html));
-    await Promise.all(jobs);
-    return;
+    summary.matched = target.userKey;
+    summary.members = 1;
+    await pushReviewToMembers(ev, text, subject, [target.userKey], html);
+    return summary;
   }
 
   // b) 没匹配到系统成员:维持原行为 —— 直发提交人/推送人邮箱(哪怕他不是网关成员)。
@@ -2395,6 +2410,7 @@ async function notifyReviewFindings(ev) {
   const recipients = new Set();
   if (c.notifyCommitAuthor !== false && authorEmail && notifierApi.isValidEmail(authorEmail)) recipients.add(authorEmail.toLowerCase());
   if (c.notifyCommitAuthor !== false && pusherEmail && notifierApi.isValidEmail(pusherEmail)) recipients.add(String(pusherEmail).toLowerCase());
+  summary.direct = [...recipients];
   if (mail && mail.enabled(n)) {
     for (const to of recipients) {
       mail.send(n, text, { to, subject, html })
@@ -2404,16 +2420,19 @@ async function notifyReviewFindings(ev) {
 
   // c) 该仓库的成员:按他们各自配置的渠道(我的用量页里填的)
   if (c.notifyMembers !== false) {
-    jobs.push(pushReviewToMembers(ev, text, subject, undefined, html));
+    const memberKeys = Array.isArray(repo.members) ? repo.members : [];
+    summary.members = memberKeys.length;
+    if (memberKeys.length) jobs.push(pushReviewToMembers(ev, text, subject, memberKeys, html));
   }
   await Promise.all(jobs);
+  return summary;
 }
 // 成员的渠道存在 member_notify 表里(成员自助维护)。这里只做扇出,失败逐个吞掉 ——
 // 一个人配错了 webhook 不能让其他人都收不到。memberKeys 缺省 = 仓库全员;定向投递时
 // 传单元素数组(只发给匹配到的那个人)。
 async function pushReviewToMembers(ev, text, subject, memberKeys, html = "") {
   const keys = Array.isArray(memberKeys) ? memberKeys : (Array.isArray(ev.repo.members) ? ev.repo.members : []);
-  if (!memberKeys.length) return;
+  if (!keys.length) return;
   const cfg = config.notifier || {};
   const mailSender = notifierApi.NOTIFY_SENDERS.find((s) => s.channel === "邮件");
   for (const key of keys) {
@@ -3607,7 +3626,9 @@ function getPublicSettings() {
           pushTrigger: !!r.pushTrigger,
           members: Array.isArray(r.members) ? r.members : [],
           schedule: r.schedule, overrides: r.overrides, createdAt: r.createdAt,
-          credential: maskCredential(r.credential),
+          // 凭据**明文**下发(应管理员要求,编辑器里明文回显可核对/可复制;与 webhook 密钥
+          // 同一逻辑 —— 设置页本身密码门,与 config.json 同信任级别)
+          credential: r.credential || "",
         })),
       };
     })(),
@@ -6163,6 +6184,40 @@ const server = http.createServer((req, res) => {
       return;
     }
 
+    // 详情页「发送给负责人」:把这条评审的报告邮件手动发一次(负责人判定与自动通知同一套
+    // 邮箱定向规则)。自动通知只在评审完成时发一次 —— 事后补发/换邮箱后重发靠这个按钮。
+    if (req.method === "POST" && crPath === "/api/code-review/runs/notify") {
+      if (!adminWriteGate()) return;
+      readJsonBody().then(async (body) => {
+        try {
+          const run = codeReviewApi.getRun(Number(body.id));
+          if (!run) { json(404, { error: "运行不存在" }); return; }
+          const comments = codeReviewApi.listComments(run.id, { limit: 100 });
+          if (!comments.length) { json(400, { error: "本次评审没有意见,无需发送" }); return; }
+          const repo = codeReviewApi.findRepo(run.repo_id) || { id: run.repo_id, name: run.repo_name, members: [] };
+          const summary = await sendReviewFindingsNotice({ repo, run, reportComments: comments });
+          const toWhom = summary.matched
+            ? `成员 ${summary.matched.slice(0, 12)}…的通知渠道(邮箱定向)`
+            : summary.direct.length
+              ? `直发 ${summary.direct.join("、")}`
+              : "未找到负责人邮箱";
+          recordAdminAudit(req, "codereview.notify", `run #${body.id}`,
+            `手动发送评审报告（${toWhom}${!summary.matched && summary.members && !summary.direct.length ? `，仓库 ${summary.members} 名成员各自渠道` : ""}）`);
+          const message = summary.matched
+            ? `已按邮箱定向发送给成员 ${summary.matched.slice(0, 12)}… 的通知渠道`
+            : summary.direct.length
+              ? `已直发 ${summary.direct.join("、")}` + (summary.members ? `，并通知仓库 ${summary.members} 名成员` : "")
+              : summary.members
+                ? `负责人邮箱未匹配到系统成员，已通知仓库 ${summary.members} 名成员各自的渠道`
+                : "没有可通知的人：负责人邮箱缺失，仓库也没有成员";
+          json(200, { ok: true, message, summary });
+        } catch (err) {
+          json(err.statusCode || 400, { error: err.message });
+        }
+      }).catch((err) => json(400, { error: err.message }));
+      return;
+    }
+
     // 一键创建评审专用虚拟 Key:明文只在本次响应返回一次;真实上游 Key 由管理员提供
     // (从某方案现有分配里选),因为 canUseProfile 要求该 Key 在某方案下有真实 Key。
     if (req.method === "POST" && crPath === "/api/code-review/key/create") {
@@ -6809,7 +6864,12 @@ const server = http.createServer((req, res) => {
       return;
     }
     res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
-    res.end(JSON.stringify({ prefs: memberNotifyApi.masked(apiKey), hasSmtp: !!String((config.notifier || {}).smtpHost || "").trim() }));
+    // 渠道信息**明文**回显:成员核对/修改自己的渠道(他们填的就是自己的 webhook 与邮箱,
+    // 没有别人会看到),掩码反而让「填没填对」无从核对。前端所见即所得:清空保存 = 清除渠道。
+    const rawPrefs = memberNotifyApi.get(apiKey) || {};
+    const prefs = { enabled: rawPrefs.enabled !== false };
+    for (const f of ["feishuWebhook", "dingtalkWebhook", "wecomWebhook", "serverchanSendKey", "barkDeviceKey", "barkServer", "email"]) prefs[f] = rawPrefs[f] || "";
+    res.end(JSON.stringify({ prefs, hasSmtp: !!String((config.notifier || {}).smtpHost || "").trim() }));
     return;
   }
   if (req.url.split("?")[0] === "/api/my-notify" && req.method === "POST") {

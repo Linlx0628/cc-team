@@ -86,9 +86,20 @@ async function clearAllData(){
     toastThen('数据已清空，已自动备份',()=>location.reload());
   }catch(error){status.textContent=error.message||'清空失败';status.className='inline-status error'}
 }
-function openUserModal(){const sfx=document.getElementById('profileSuffixInput').value||SETTINGS.selectedProfileSuffix;document.getElementById('userProfileSel').value=sfx;renderProfileUsers(sfx);document.getElementById('userModal').classList.add('open')}
-function closeUserModal(){document.getElementById('userModal').classList.remove('open')}
-document.getElementById('userModal').addEventListener('click',function(e){if(e.target===this)closeUserModal()});
+// 用户管理是右侧二级视图(原先是弹窗,复用同一套表格 id:globalUsersTable/profileUsersTable)。
+// 打开时按当前编辑的方案渲染真实 Key 分配表;保存成功后整页刷新,靠 sessionStorage
+// 落回本视图(与额度池视图同款套路)。
+function openUserManageView(){
+  const sfx=document.getElementById('profileSuffixInput').value||SETTINGS.selectedProfileSuffix;
+  document.getElementById('userProfileSel').value=sfx;
+  renderProfileUsers(sfx);
+  const form=document.getElementById('settingsForm');
+  hideAllSecondaryViews();
+  form.hidden=true;
+  const view=document.getElementById('userManageView');
+  view.hidden=false;view.setAttribute('aria-hidden','false');
+  document.getElementById('userManageNav').classList.add('active');
+}
 // 当前该用哪个协议：以可见的面板为准（无参调用的侧栏"新增方案"按钮就该跟着眼前的
 // 标签页走），没有可见面板时退回记住的标签页。
 function activeProtoTab(){
@@ -301,23 +312,27 @@ function showProfileSettings(){
   const sched=document.getElementById('planScheduleView');
   const qr=document.getElementById('quotaRequestView');
   const cr=document.getElementById('codeReviewView');
+  const um=document.getElementById('userManageView');
+  const nm=document.getElementById('notifyManageView');
   form.hidden=false;
-  [view,audit,pool,qr,sched,cr].forEach(function(el){if(el){el.hidden=true;el.setAttribute('aria-hidden','true')}});
-  ['dataManagementNav','auditLogNav','quotaPoolNav','quotaRequestNav','planScheduleNav','codeReviewNav'].forEach(function(id){
+  [view,audit,pool,qr,sched,cr,um,nm].forEach(function(el){if(el){el.hidden=true;el.setAttribute('aria-hidden','true')}});
+  ['dataManagementNav','auditLogNav','quotaPoolNav','quotaRequestNav','planScheduleNav','codeReviewNav','userManageNav','notifyManageNav'].forEach(function(id){
     const el=document.getElementById(id);if(el)el.classList.remove('active');
   });
 }
 function hideAllSecondaryViews(){
-  const cr=document.getElementById('codeReviewView'),dm=document.getElementById('dataManagementView'),audit=document.getElementById('auditLogView'),pool=document.getElementById('quotaPoolView'),qr=document.getElementById('quotaRequestView'),sched=document.getElementById('planScheduleView');
+  const cr=document.getElementById('codeReviewView'),dm=document.getElementById('dataManagementView'),audit=document.getElementById('auditLogView'),pool=document.getElementById('quotaPoolView'),qr=document.getElementById('quotaRequestView'),sched=document.getElementById('planScheduleView'),um=document.getElementById('userManageView'),nm=document.getElementById('notifyManageView');
   dm.hidden=true;dm.setAttribute('aria-hidden','true');
   audit.hidden=true;audit.setAttribute('aria-hidden','true');
   if(pool){pool.hidden=true;pool.setAttribute('aria-hidden','true')}
   if(qr){qr.hidden=true;qr.setAttribute('aria-hidden','true')}
   if(sched){sched.hidden=true;sched.setAttribute('aria-hidden','true')}
   if(cr){cr.hidden=true;cr.setAttribute('aria-hidden','true')}
+  if(um){um.hidden=true;um.setAttribute('aria-hidden','true')}
+  if(nm){nm.hidden=true;nm.setAttribute('aria-hidden','true')}
   document.querySelectorAll('.pl-item').forEach(function(el){el.classList.remove('active')});
   // Nav buttons live outside .pl-item now, so clear their highlight explicitly.
-  ['quotaPoolNav','dataManagementNav','auditLogNav','quotaRequestNav','planScheduleNav','codeReviewNav'].forEach(function(id){
+  ['quotaPoolNav','dataManagementNav','auditLogNav','quotaRequestNav','planScheduleNav','codeReviewNav','userManageNav','notifyManageNav'].forEach(function(id){
     const el=document.getElementById(id);
     if(el)el.classList.remove('active');
   });
@@ -938,7 +953,7 @@ document.addEventListener('click',function(e){
 async function deleteGlobalUser(k){
   if(!confirm('确定删除用户？该用户将从所有方案中移除。'))return;
   const r=await fetch('/api/global-user/delete',{method:'POST',headers:csrfHeaders({'Content-Type':'application/json'}),body:JSON.stringify({key:k})});
-  if(r.ok)toastThen('用户已删除',()=>location.reload());else{const e=await r.json();alert('删除失败: '+e.error)}
+  if(r.ok){try{sessionStorage.setItem('tm_return_user_view','1')}catch(e){}toastThen('用户已删除',()=>location.reload())}else{const e=await r.json();alert('删除失败: '+e.error)}
 }
 function renderProfileUsers(suffix){
   const assignments=SETTINGS.profileAssignments[suffix]||{};
@@ -983,6 +998,7 @@ async function saveUsers(){
     profileUsers.push({key:vk,realKey:rkInput?rkInput.value.trim():'',disabled:disInput?disInput.checked:false});
   });
   const profileSuffix=document.getElementById('userProfileSel').value;
+  try{sessionStorage.setItem('tm_return_user_view','1')}catch(e){}
   const r=await fetch('/api/global-user/save',{method:'POST',headers:csrfHeaders({'Content-Type':'application/json'}),body:JSON.stringify({users,profileUsers,profileSuffix})});
   if(r.ok){toastThen('用户配置已保存',()=>location.reload())}else{const e=await r.json();alert('保存失败: '+e.error)}
 }
@@ -1725,6 +1741,8 @@ try{if(sessionStorage.getItem('tm_return_pool_view')==='1'){sessionStorage.remov
 // Same one-shot for the 方案组调度 view: an admin adjusting several groups/rules in a
 // row shouldn't be kicked back to the profile form after each save.
 try{if(sessionStorage.getItem('tm_return_schedule_view')==='1'){sessionStorage.removeItem('tm_return_schedule_view');openPlanScheduleView()}}catch(e){}
+// 用户管理视图同款(保存/删除用户会整页刷新)。
+try{if(sessionStorage.getItem('tm_return_user_view')==='1'){sessionStorage.removeItem('tm_return_user_view');openUserManageView()}}catch(e){}
 // 侧栏 dock 的调度提示切换。与服务端渲染的 hidden 属性幂等（同一判定函数），
 // 放在 init 末尾是因为它只读 schedState，不依赖别的前置状态。
 applyScheduleDockState();
@@ -2250,3 +2268,137 @@ async function clearReviewData(includeWorkspace) {
     await probeReviewEngine();
   } catch (e) { crSetMaintStatus('清空失败：' + e.message, 'error'); }
 }
+
+// ─── 通知管理(站内信):草稿→发布→撤回/删除;目标全员或指定成员 ───
+const NOTIFY={rows:[],users:[]};
+function notifyTime(iso){return iso?new Date(iso).toLocaleString('zh-CN',{timeZone:'Asia/Shanghai',hour12:false}):'—'}
+function openNotifyManageView(){
+  const form=document.getElementById('settingsForm');
+  hideAllSecondaryViews();
+  form.hidden=true;
+  const view=document.getElementById('notifyManageView');
+  view.hidden=false;view.setAttribute('aria-hidden','false');
+  document.getElementById('notifyManageNav').classList.add('active');
+  loadNotifications();
+}
+function setNotifyStatus(msg,type){const el=document.getElementById('notifyStatus');if(el){el.textContent=msg||'';el.className='inline-status '+(type||'')}}
+async function loadNotifications(){
+  setNotifyStatus('加载中…');
+  try{
+    const r=await fetch('/api/notifications',{headers:csrfHeaders({})});
+    const j=await r.json();
+    if(!r.ok)throw new Error(j.error||('HTTP '+r.status));
+    NOTIFY.rows=j.rows||[];NOTIFY.users=j.users||[];
+    renderNotifyTable();
+    setNotifyStatus('');
+  }catch(e){setNotifyStatus('加载失败: '+e.message,'error')}
+}
+function notifyNameOf(key){const u=NOTIFY.users.find(x=>x.key===key);return u?u.username:(key.length>12?key.slice(0,12)+'…':key)}
+function notifyTargetSummary(n){
+  if(n.targetType!=='user')return '全员';
+  const names=(n.targetKeys||[]).map(notifyNameOf);
+  if(names.length<=2)return names.join('、')||'—';
+  return names.slice(0,2).join('、')+' 等 '+names.length+' 人';
+}
+function renderNotifyTable(){
+  const tbody=document.getElementById('notifyBody');
+  if(!NOTIFY.rows.length){tbody.innerHTML='<tr><td colspan="5" style="color:var(--dim);text-align:center;padding:18px">还没有通知 — 点上方「＋ 新建通知」创建第一条</td></tr>';return}
+  tbody.innerHTML=NOTIFY.rows.map(n=>{
+    const published=n.status==='published';
+    const ops=[];
+    if(!published)ops.push('<button type="button" class="btn btn-outline btn-sm" onclick="notifyOpenEditor('+n.id+')">编辑</button>');
+    ops.push('<button type="button" class="btn btn-outline btn-sm" onclick="openNotifyView('+n.id+')">查看</button>');
+    if(!published)ops.push('<button type="button" class="btn btn-primary btn-sm" onclick="notifyPublish('+n.id+')">发布</button>');
+    else ops.push('<button type="button" class="btn btn-outline btn-sm" onclick="notifyUnpublish('+n.id+')">撤回</button>');
+    ops.push('<button type="button" class="btn btn-outline btn-sm" style="color:var(--red)" onclick="notifyDelete('+n.id+')">删除</button>');
+    const statusBadge=published
+      ?'<span style="color:var(--green);font-weight:600">已发布</span>'
+      :'<span style="color:var(--dim)">草稿</span>';
+    return '<tr>'
+      +'<td><b style="font-size:12.5px">'+h(n.title)+'</b></td>'
+      +'<td style="font-size:12px">'+h(notifyTargetSummary(n))+'</td>'
+      +'<td>'+statusBadge+'</td>'
+      +'<td style="font-size:11px;color:var(--dim)">'+(published?notifyTime(n.publishedAt):'—')+'</td>'
+      +'<td><div style="display:flex;gap:6px;flex-wrap:wrap">'+ops.join('')+'</div></td>'
+      +'</tr>';
+  }).join('');
+}
+function notifyOpenEditor(id){
+  const ed=document.getElementById('notifyEditor');
+  const n=id?NOTIFY.rows.find(x=>x.id===id):null;
+  document.getElementById('notifyEditId').value=n?String(n.id):'';
+  document.getElementById('notifyTitle').value=n?n.title:'';
+  document.getElementById('notifyTargetType').value=n?n.targetType:'all';
+  renderNotifyUserChecks(n?(n.targetKeys||[]):[]);
+  document.getElementById('notifyContent').value=n?n.content:'';
+  notifyPreview();
+  ed.hidden=false;
+  document.getElementById('notifyTitle').focus();
+}
+function notifyCloseEditor(){
+  document.getElementById('notifyEditor').hidden=true;
+  document.getElementById('notifyEditId').value='';
+}
+function renderNotifyUserChecks(checkedKeys){
+  const wrap=document.getElementById('notifyUserChecks');
+  const set=new Set(checkedKeys||[]);
+  wrap.innerHTML=NOTIFY.users.map(u=>'<label class="notify-user-check"><input type="checkbox" value="'+h(u.key)+'" '+(set.has(u.key)?'checked':'')+'><span>'+h(u.username)+'</span><code>'+h(u.key)+'</code></label>').join('')
+    ||'<span style="font-size:12px;color:var(--dim)">暂无用户 — 先在「用户管理」里添加</span>';
+}
+function notifyTargetTypeChanged(){
+  document.getElementById('notifyTargetUsers').style.display=document.getElementById('notifyTargetType').value==='user'?'':'none';
+}
+function notifyPreview(){
+  const box=document.getElementById('notifyPreviewBox');
+  const md=document.getElementById('notifyContent').value.trim();
+  box.innerHTML=(window.renderMarkdown&&md)?window.renderMarkdown(md):'<span style="color:var(--dim);font-size:12px">（无内容）</span>';
+}
+function notifyCollectForm(){
+  const ids=[].map.call(document.querySelectorAll('#notifyUserChecks input:checked'),function(cb){return cb.value});
+  return {
+    id:Number(document.getElementById('notifyEditId').value)||undefined,
+    title:document.getElementById('notifyTitle').value.trim(),
+    content:document.getElementById('notifyContent').value,
+    targetType:document.getElementById('notifyTargetType').value,
+    targetKeys:ids,
+  };
+}
+async function notifySaveDraft(){
+  const body=notifyCollectForm();
+  if(!body.title){setNotifyStatus('请填写标题','error');return}
+  if(!body.content.trim()){setNotifyStatus('请填写正文','error');return}
+  if(body.targetType==='user'&&!body.targetKeys.length){setNotifyStatus('定向通知请至少选择一位成员','error');return}
+  const editing=!!body.id;
+  setNotifyStatus('保存中…');
+  try{
+    const r=await fetch(editing?'/api/notifications/update':'/api/notifications/create',{method:'POST',headers:csrfHeaders({'Content-Type':'application/json'}),body:JSON.stringify(body)});
+    const j=await r.json();
+    if(!r.ok)throw new Error(j.error||('HTTP '+r.status));
+    toast(editing?'草稿已更新':'草稿已保存 — 记得点「发布」才会推送给成员');
+    notifyCloseEditor();
+    await loadNotifications();
+  }catch(e){setNotifyStatus('保存失败: '+e.message,'error')}
+}
+async function notifyPost(action,id,confirmMsg){
+  if(confirmMsg&&!confirm(confirmMsg))return;
+  setNotifyStatus('处理中…');
+  try{
+    const r=await fetch('/api/notifications/'+action,{method:'POST',headers:csrfHeaders({'Content-Type':'application/json'}),body:JSON.stringify({id})});
+    const j=await r.json();
+    if(!r.ok)throw new Error(j.error||('HTTP '+r.status));
+    await loadNotifications();
+    setNotifyStatus('','ok');
+  }catch(e){setNotifyStatus('操作失败: '+e.message,'error')}
+}
+function notifyPublish(id){notifyPost('publish',id)}
+function notifyUnpublish(id){notifyPost('unpublish',id,'撤回后成员铃铛里会立即消失（已读记录保留，重新发布不重置）。确定撤回？')}
+function notifyDelete(id){notifyPost('delete',id,'删除后不可恢复。确定删除这条通知？')}
+function openNotifyView(id){
+  const n=NOTIFY.rows.find(x=>x.id===id);
+  if(!n)return;
+  document.getElementById('notifyViewTitle').textContent=n.title;
+  document.getElementById('notifyViewMeta').textContent=(n.status==='published'?'发布于 '+notifyTime(n.publishedAt):'草稿 · 创建于 '+notifyTime(n.createdAt))+' · '+notifyTargetSummary(n);
+  document.getElementById('notifyViewContent').innerHTML=(window.renderMarkdown&&n.content)?window.renderMarkdown(n.content):h(n.content);
+  document.getElementById('notifyViewModal').classList.add('open');
+}
+function closeNotifyView(){document.getElementById('notifyViewModal').classList.remove('open')}

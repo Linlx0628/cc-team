@@ -433,3 +433,39 @@ table{width:100%;border-collapse:collapse;min-width:560px}th{text-align:left;pad
 .mn-status.ok{color:var(--green)}
 .mn-status.error{color:var(--red)}
 @media(max-width:560px){.mn-grid{grid-template-columns:1fr}}
+
+/* ── 消息通知铃铛(工具栏右侧,所有标签页共用;hover 弹未读,点击开完整列表)── */
+.notice-wrap{position:relative;flex:none}
+.notice-bell{position:relative;display:inline-flex;align-items:center;justify-content:center;width:36px;height:36px;border-radius:8px;border:1px solid var(--border-strong);background:var(--surface);color:var(--text);cursor:pointer;padding:0}
+.notice-bell:hover{background:var(--accent-soft);border-color:var(--accent);color:var(--accent)}
+.notice-bell.has-unread{color:var(--accent)}
+.notice-badge{position:absolute;top:-6px;right:-6px;min-width:17px;height:17px;padding:0 4px;border-radius:9px;background:var(--red);color:#fff;font-size:10px;font-weight:650;line-height:17px;text-align:center;font-variant-numeric:tabular-nums;box-sizing:border-box}
+/* 弹层用 fixed 定位:工具栏是 flex 容器但 .main 可滚动,absolute 子元素会被 overflow 裁掉 */
+.notice-pop{position:fixed;z-index:55;width:320px;max-width:calc(100vw - 32px);background:var(--surface);border:1px solid var(--border-strong);border-radius:8px;box-shadow:0 12px 32px rgba(24,24,22,.16);padding:10px 0 6px}
+/* 铃铛与浮窗之间隔着 8px 视觉空隙,鼠标移过去时若穿过纯空白会触发 wrap 的 mouseleave。
+   这条透明桥把空隙并入浮窗命中区:悬停路径 bell → 空隙 → 浮窗全程都在 wrap 内,不会闪没。 */
+.notice-pop::before{content:"";position:absolute;top:-9px;left:0;right:0;height:9px}
+.notice-pop-hd{font-size:11px;font-weight:650;color:var(--dim);padding:2px 14px 8px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between}
+.notice-pop-list{max-height:280px;overflow-y:auto}
+.notice-pop-item{padding:8px 14px;cursor:pointer;border-bottom:1px solid var(--border)}
+.notice-pop-item:last-child{border-bottom:none}
+.notice-pop-item:hover{background:var(--surface-subtle)}
+.notice-pop-item .np-title{font-size:12.5px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.notice-pop-item .np-time{font-size:10.5px;color:var(--dim);margin-top:2px}
+.notice-pop-empty{padding:16px 14px;font-size:12px;color:var(--dim);text-align:center}
+.notice-pop-ft{padding:6px 14px 2px;border-top:1px solid var(--border);text-align:right}
+.notice-link{border:none;background:none;color:var(--accent);font-size:11.5px;cursor:pointer;padding:2px 4px}
+.notice-link:hover{text-decoration:underline}
+/* 完整列表弹窗内的条目 */
+.notice-tools{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:10px}
+.notice-sub{font-size:11.5px;color:var(--dim)}
+.notice-item{border:1px solid var(--border);border-radius:7px;margin-bottom:8px;overflow:hidden}
+.notice-item.unread{border-color:var(--accent)}
+.notice-item-hd{display:flex;align-items:center;gap:8px;padding:9px 12px;cursor:pointer;background:var(--surface)}
+.notice-item-hd:hover{background:var(--surface-subtle)}
+.notice-item-hd .ni-dot{flex:none;width:7px;height:7px;border-radius:50%;background:var(--accent);opacity:0}
+.notice-item.unread .ni-dot{opacity:1}
+.notice-item-hd .ni-title{flex:1;min-width:0;font-size:13px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.notice-item.unread .ni-title{color:var(--accent)}
+.notice-item-hd .ni-time{flex:none;font-size:10.5px;color:var(--dim)}
+.notice-item-body{padding:2px 14px 12px;border-top:1px solid var(--border)}

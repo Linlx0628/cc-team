@@ -26,6 +26,7 @@ import { tryThinkingPassbackSelfHeal } from "./lib/thinking-passback.mjs";
 import { createCodeReviewOcr } from "./lib/code-review-ocr.mjs";
 import { createCodeReview, initCodeReviewDb, sanitizeCodeReviewConfig, maskCredential, buildReviewReportHTML, migrateLegacyTriggerKeys, isValidBranch, TERMINAL, TERMINAL_OK } from "./lib/code-review.mjs";
 import { createMemberNotify, initMemberNotifyDb, pickNotifyTarget } from "./lib/member-notify.mjs";
+import { createNotifications, initNotificationsDb } from "./lib/notifications.mjs";
 import { PassThrough } from "node:stream";
 import { EventEmitter } from "node:events";
 import { escHtml, escJs } from "./lib/html.mjs";
@@ -2214,6 +2215,8 @@ initProductionDb(db);   // 产出质量表(tool_events / production_alerts),先�
 initCodeReviewDb(db);   // 代码评审表(runs / comments / repo_state);功能默认关闭,建表无害
 initMemberNotifyDb(db); // 成员自助的通知渠道(成员用量页里配)
 const memberNotifyApi = createMemberNotify({ get db() { return db; } });
+initNotificationsDb(db); // 管理员系统通知(站内信,成员铃铛)
+const notificationsApi = createNotifications({ get db() { return db; } });
 function productionEnabled() { return (config.productionTracking || {}).enabled !== false; }
 const productionTracker = createProductionTracker({ db, getConfig: () => config.productionTracking || {}, log: console.log });
 
@@ -5758,6 +5761,80 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+  // ── 系统通知（站内信，管理端）──
+  // 列表附带每个成员的 user_key 清单（供新建时选目标）；名字顺带返回，前端不必再查。
+  if (req.method === "GET" && req.url === "/api/notifications") {
+    if (!checkAuth(req)) { res.writeHead(401); res.end("Unauthorized"); return; }
+    const users = Object.entries(config.users || {}).map(([key, v]) => ({
+      key, username: (v && typeof v === "object" ? v.username : "") || key.slice(0, 12),
+    }));
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ rows: notificationsApi.listAll(), users }));
+    return;
+  }
+  const notificationWrite = async (handler) => {
+    readBody(req, 100_000).then((buf) => {
+      try {
+        const result = handler(JSON.parse(buf.toString() || "{}"));
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: true, notification: result }));
+      } catch (err) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: err.message }));
+      }
+    }).catch(() => { res.writeHead(413); res.end("Request too large"); });
+  };
+  if (req.method === "POST" && req.url === "/api/notifications/create") {
+    if (!checkAuth(req)) { res.writeHead(401); res.end("Unauthorized"); return; }
+    if (!checkCsrf(req)) { res.writeHead(403); res.end("CSRF validation failed"); return; }
+    notificationWrite((body) => {
+      const n = notificationsApi.create(body, "admin");
+      recordAdminAudit(req, "notification.create", `#${n}`, `新建通知「${body.title || ""}」（草稿，目标：${body.targetType === "user" ? "定向" : "全员"}）`);
+      return notificationsApi.get(n);
+    });
+    return;
+  }
+  if (req.method === "POST" && req.url === "/api/notifications/update") {
+    if (!checkAuth(req)) { res.writeHead(401); res.end("Unauthorized"); return; }
+    if (!checkCsrf(req)) { res.writeHead(403); res.end("CSRF validation failed"); return; }
+    notificationWrite((body) => {
+      const n = notificationsApi.update(body.id, body);
+      recordAdminAudit(req, "notification.update", `#${body.id}`, `编辑通知「${n.title}」`);
+      return n;
+    });
+    return;
+  }
+  if (req.method === "POST" && req.url === "/api/notifications/publish") {
+    if (!checkAuth(req)) { res.writeHead(401); res.end("Unauthorized"); return; }
+    if (!checkCsrf(req)) { res.writeHead(403); res.end("CSRF validation failed"); return; }
+    notificationWrite((body) => {
+      const n = notificationsApi.publish(body.id);
+      recordAdminAudit(req, "notification.publish", `#${body.id}`, `发布通知「${n.title}」（${n.targetType === "user" ? `定向 ${n.targetKeys.length} 人` : "全员"}）`);
+      return n;
+    });
+    return;
+  }
+  if (req.method === "POST" && req.url === "/api/notifications/unpublish") {
+    if (!checkAuth(req)) { res.writeHead(401); res.end("Unauthorized"); return; }
+    if (!checkCsrf(req)) { res.writeHead(403); res.end("CSRF validation failed"); return; }
+    notificationWrite((body) => {
+      const n = notificationsApi.unpublish(body.id);
+      recordAdminAudit(req, "notification.unpublish", `#${body.id}`, `撤回通知「${n.title}」为草稿`);
+      return n;
+    });
+    return;
+  }
+  if (req.method === "POST" && req.url === "/api/notifications/delete") {
+    if (!checkAuth(req)) { res.writeHead(401); res.end("Unauthorized"); return; }
+    if (!checkCsrf(req)) { res.writeHead(403); res.end("CSRF validation failed"); return; }
+    notificationWrite((body) => {
+      const n = notificationsApi.remove(body.id);
+      recordAdminAudit(req, "notification.delete", `#${body.id}`, `删除通知「${n.title}」`);
+      return { id: Number(body.id) };
+    });
+    return;
+  }
+
   // Quota-request grant (admin): adds a today bonus to the member's pool and
   // marks the request handled in one call, so the admin never has to hop between
   // the request queue and the pool tools for the common path.
@@ -6935,6 +7012,38 @@ const server = http.createServer((req, res) => {
     memberNotifyApi.markSeen(apiKey);
     res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
     res.end(JSON.stringify({ ok: true }));
+    return;
+  }
+
+  // ── 系统通知（站内信，成员端，虚拟Key 鉴权 — 同 /api/my-review 口径）──
+  if (req.method === "GET" && req.url.split("?")[0] === "/api/my-notifications") {
+    const apiKey = getApiKey(req);
+    if (!hasGlobalUser(apiKey)) {
+      res.writeHead(401, { "Content-Type": "application/json; charset=utf-8" });
+      res.end(JSON.stringify({ error: "认证失败：请提供有效的虚拟Key (Authorization: Bearer jx-...)" }));
+      return;
+    }
+    const items = notificationsApi.forUser(apiKey);
+    res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+    res.end(JSON.stringify({ items, unread: items.filter(n => !n.readAt).length }));
+    return;
+  }
+  // 标记已读。ids=[] 或缺省 = 全部已读；只能标自己收到的，别人的 id 静默忽略。
+  if (req.method === "POST" && req.url.split("?")[0] === "/api/my-notifications/read") {
+    const apiKey = getApiKey(req);
+    readBody(req, 20_000).then((buf) => {
+      try {
+        if (!hasGlobalUser(apiKey)) throw new Error("认证失败：请提供有效的虚拟Key");
+        const body = JSON.parse(buf.toString() || "{}");
+        const all = !!body.all || !Array.isArray(body.ids) || body.ids.length === 0;
+        const count = all ? notificationsApi.markAllRead(apiKey) : notificationsApi.markRead(apiKey, body.ids);
+        res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+        res.end(JSON.stringify({ ok: true, marked: count }));
+      } catch (err) {
+        res.writeHead(400, { "Content-Type": "application/json; charset=utf-8" });
+        res.end(JSON.stringify({ error: err.message }));
+      }
+    }).catch(() => { res.writeHead(413); res.end("Request too large"); });
     return;
   }
 

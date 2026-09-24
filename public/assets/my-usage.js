@@ -1363,3 +1363,102 @@ setSection('overview',false);
 // 日期筛选控件放在最后初始化:两个面板此刻都还隐藏,只写 innerHTML 不读宽度,安全。
 renderRangeCtl('anaRangeCtl',ANA,analysisRangeChanged);
 renderRangeCtl('sessRangeCtl',SESS,sessRangeChanged);
+
+// ── 消息通知(站内信):铃铛 hover 弹未读,点击开完整列表;60s 轮询未读数 ──
+const NT={items:[],unread:0,timer:null};
+function noticeTime(iso){const d=new Date(new Date(iso).getTime()+8*3600000);const p=n=>String(n).padStart(2,'0');return d.getUTCFullYear()+'-'+p(d.getUTCMonth()+1)+'-'+p(d.getUTCDate())+' '+p(d.getUTCHours())+':'+p(d.getUTCMinutes())}
+async function fetchNotices(){
+  try{
+    const r=await fetch('/api/my-notifications',{headers:{'Authorization':'Bearer '+VK}});
+    if(!r.ok)return;
+    const j=await r.json();
+    NT.items=j.items||[];NT.unread=j.unread||0;
+    renderNoticeBadge();
+    if(!document.getElementById('noticePop').hidden)renderNoticePop();
+    if(!document.getElementById('noticeModal').classList.contains('open'))renderNoticeList();
+  }catch(e){/* 网络抖动静默:下一轮轮询会再试 */}
+}
+function renderNoticeBadge(){
+  const badge=document.getElementById('noticeBadge'),bell=document.getElementById('noticeBell');
+  if(!badge||!bell)return;
+  if(NT.unread>0){badge.hidden=false;badge.textContent=NT.unread>99?'99+':String(NT.unread);bell.classList.add('has-unread')}
+  else{badge.hidden=true;bell.classList.remove('has-unread')}
+}
+function renderNoticePop(){
+  const list=document.getElementById('noticePopList');
+  const unread=NT.items.filter(n=>!n.readAt);
+  document.getElementById('noticePopCount').textContent=unread.length?unread.length+' 条':'';
+  list.innerHTML=unread.length?unread.slice(0,8).map(n=>'<div class="notice-pop-item" onclick="openNoticeModal()"><div class="np-title">'+esc(n.title)+'</div><div class="np-time">'+noticeTime(n.publishedAt)+'</div></div>').join('')
+    :'<div class="notice-pop-empty">暂无未读消息</div>';
+}
+// hover 弹层:移入铃铛弹出,移出整个 wrap(含弹层)180ms 后收起 —— 弹层与按钮之间的
+// 空隙靠这个宽限兜住。弹层 fixed 定位,每次展开按铃铛当前位置摆放(窗口缩放不漂移)。
+let noticePopTimer=null;
+function showNoticePop(){
+  clearTimeout(noticePopTimer);
+  const pop=document.getElementById('noticePop');
+  renderNoticePop();
+  pop.hidden=false;
+  const bell=document.getElementById('noticeBell').getBoundingClientRect();
+  pop.style.top=(bell.bottom+8)+'px';
+  pop.style.right=Math.max(8,window.innerWidth-bell.right)+'px';
+  pop.style.left='auto';
+}
+// 铃铛与浮窗之间有 8px 空隙:鼠标从铃铛挪进浮窗要穿过它,wrap 的 mouseleave 会先触发。
+// 所以除了把宽限拉到 300ms,还要在「移入浮窗」时主动撤掉关闭定时器 —— 悬停在浮窗上
+// (或浮窗内点击)期间浮窗绝不消失;真正移出浮窗才走宽限收起。
+function hideNoticePopSoon(){clearTimeout(noticePopTimer);noticePopTimer=setTimeout(function(){document.getElementById('noticePop').hidden=true},300)}
+function renderNoticeList(){
+  const list=document.getElementById('noticeList');
+  document.getElementById('noticeSub').textContent=NT.unread>0?('有 '+NT.unread+' 条未读'):'共 '+NT.items.length+' 条消息';
+  document.getElementById('noticeReadAll').style.display=NT.unread>0?'':'none';
+  if(!NT.items.length){list.innerHTML='<div class="notice-pop-empty">还没有收到通知</div>';return}
+  list.innerHTML=NT.items.map(n=>'<div class="notice-item'+(n.readAt?'':' unread')+'" data-id="'+n.id+'">'
+    +'<div class="notice-item-hd" onclick="toggleNotice('+n.id+')"><span class="ni-dot"></span><span class="ni-title">'+esc(n.title)+'</span><span class="ni-time">'+noticeTime(n.publishedAt)+(n.readAt?'':' · 未读')+'</span></div>'
+    +'<div class="notice-item-body" hidden><div class="md-preview">'+window.renderMarkdown(n.content)+'</div></div>'
+    +'</div>').join('');
+}
+async function toggleNotice(id){
+  const item=document.querySelector('.notice-item[data-id="'+id+'"]');
+  if(!item)return;
+  const body=item.querySelector('.notice-item-body');
+  body.hidden=!body.hidden;
+  const n=NT.items.find(x=>x.id===id);
+  if(n&&!n.readAt&&!body.hidden){
+    n.readAt=new Date().toISOString();
+    item.classList.remove('unread');
+    const timeEl=item.querySelector('.ni-time');
+    if(timeEl)timeEl.textContent=noticeTime(n.publishedAt);
+    NT.unread=Math.max(0,NT.unread-1);
+    renderNoticeBadge();
+    fetch('/api/my-notifications/read',{method:'POST',headers:{'Authorization':'Bearer '+VK,'Content-Type':'application/json'},body:JSON.stringify({ids:[id]})}).catch(()=>{});
+  }
+}
+async function markAllNoticesRead(){
+  const unreadIds=NT.items.filter(n=>!n.readAt).map(n=>n.id);
+  if(!unreadIds.length)return;
+  try{
+    const r=await fetch('/api/my-notifications/read',{method:'POST',headers:{'Authorization':'Bearer '+VK,'Content-Type':'application/json'},body:JSON.stringify({all:true})});
+    if(!r.ok)return;
+    NT.items.forEach(n=>{n.readAt=n.readAt||new Date().toISOString()});
+    NT.unread=0;renderNoticeBadge();renderNoticeList();renderNoticePop();
+  }catch(e){}
+}
+function openNoticeModal(){
+  document.getElementById('noticePop').hidden=true;
+  renderNoticeList();
+  document.getElementById('noticeModal').classList.add('open');
+  // 打开列表只展示,不自动全部已读 —— 逐条展开时才标读,与评审小红点的「看过才算」同思路。
+}
+function closeNoticeModal(){document.getElementById('noticeModal').classList.remove('open')}
+(function initNotices(){
+  const bell=document.getElementById('noticeBell'),wrap=document.getElementById('noticeWrap');
+  if(!bell)return;
+  bell.addEventListener('mouseenter',showNoticePop);
+  wrap.addEventListener('mouseleave',hideNoticePopSoon);
+  document.getElementById('noticePop').addEventListener('mouseenter',function(){clearTimeout(noticePopTimer)});
+  bell.addEventListener('click',openNoticeModal);
+  document.addEventListener('keydown',function(e){if(e.key==='Escape')closeNoticeModal()});
+  fetchNotices();
+  NT.timer=setInterval(fetchNotices,60000);
+})();

@@ -1374,6 +1374,7 @@ async function fetchNotices(){
     const j=await r.json();
     NT.items=j.items||[];NT.unread=j.unread||0;
     renderNoticeBadge();
+    if(!NT.popupDone){NT.popupDone=true;queueAnnouncements()}   // 只在进页后首次成功拉取时弹公告,60s 轮询不打断
     if(!document.getElementById('noticePop').hidden)renderNoticePop();
     if(!document.getElementById('noticeModal').classList.contains('open'))renderNoticeList();
   }catch(e){/* 网络抖动静默:下一轮轮询会再试 */}
@@ -1388,9 +1389,10 @@ function renderNoticePop(){
   const list=document.getElementById('noticePopList');
   const unread=NT.items.filter(n=>!n.readAt);
   document.getElementById('noticePopCount').textContent=unread.length?unread.length+' 条':'';
-  list.innerHTML=unread.length?unread.slice(0,8).map(n=>'<div class="notice-pop-item" onclick="openNoticeModal()"><div class="np-title">'+esc(n.title)+'</div><div class="np-time">'+noticeTime(n.publishedAt)+'</div></div>').join('')
+  list.innerHTML=unread.length?unread.slice(0,8).map(n=>'<div class="notice-pop-item" onclick="openNoticeModal()"><div class="np-title">'+noticeTag(n)+esc(n.title)+'</div><div class="np-time">'+noticeTime(n.publishedAt)+'</div></div>').join('')
     :'<div class="notice-pop-empty">暂无未读消息</div>';
 }
+function noticeTag(n){return n.noticeType==='announcement'?'<span class="ni-tag">公告</span>':''}
 // hover 弹层:移入铃铛弹出,移出整个 wrap(含弹层)180ms 后收起 —— 弹层与按钮之间的
 // 空隙靠这个宽限兜住。弹层 fixed 定位,每次展开按铃铛当前位置摆放(窗口缩放不漂移)。
 let noticePopTimer=null;
@@ -1414,7 +1416,7 @@ function renderNoticeList(){
   document.getElementById('noticeReadAll').style.display=NT.unread>0?'':'none';
   if(!NT.items.length){list.innerHTML='<div class="notice-pop-empty">还没有收到通知</div>';return}
   list.innerHTML=NT.items.map(n=>'<div class="notice-item'+(n.readAt?'':' unread')+'" data-id="'+n.id+'">'
-    +'<div class="notice-item-hd" onclick="toggleNotice('+n.id+')"><span class="ni-dot"></span><span class="ni-title">'+esc(n.title)+'</span><span class="ni-time">'+noticeTime(n.publishedAt)+(n.readAt?'':' · 未读')+'</span></div>'
+    +'<div class="notice-item-hd" onclick="toggleNotice('+n.id+')"><span class="ni-dot"></span>'+noticeTag(n)+'<span class="ni-title">'+esc(n.title)+'</span><span class="ni-time">'+noticeTime(n.publishedAt)+(n.readAt?'':' · 未读')+'</span></div>'
     +'<div class="notice-item-body" hidden><div class="md-preview">'+window.renderMarkdown(n.content)+'</div></div>'
     +'</div>').join('');
 }
@@ -1451,6 +1453,47 @@ function openNoticeModal(){
   // 打开列表只展示,不自动全部已读 —— 逐条展开时才标读,与评审小红点的「看过才算」同思路。
 }
 function closeNoticeModal(){document.getElementById('noticeModal').classList.remove('open')}
+
+// ── 公告弹屏:管理员把类型设为「公告」时,成员每次打开本页,未读公告按发布时间从旧到新
+// 逐条全屏弹出。「暂时关闭」不标读(下次进页再弹);「我已阅读」或在铃铛里展开都算已读
+// —— 三者写的是同一份已读记录,任一处标读后这条公告就不再弹。
+const AN={queue:[],total:0,pos:0,cur:null};
+function queueAnnouncements(){
+  if(!document.getElementById('announceMask'))return;   // 页面结构不匹配(如旧缓存 HTML)时静默跳过
+  AN.queue=NT.items.filter(n=>n.noticeType==='announcement'&&!n.readAt)
+    .sort((a,b)=>String(a.publishedAt||'').localeCompare(String(b.publishedAt||'')))
+    .map(n=>n.id);
+  AN.total=AN.queue.length;AN.pos=0;
+  showNextAnnounce();
+}
+function showNextAnnounce(){
+  const mask=document.getElementById('announceMask');
+  AN.cur=null;
+  const id=AN.queue.shift();
+  if(id==null){mask.classList.remove('open');return}
+  const n=NT.items.find(x=>x.id===id);
+  if(!n||n.readAt)return showNextAnnounce();   // 排队期间已被标读(比如铃铛里展开过)就跳过
+  AN.cur=id;AN.pos++;
+  document.getElementById('announceTitle').textContent=n.title;
+  document.getElementById('announceMeta').textContent='发布于 '+noticeTime(n.publishedAt);
+  document.getElementById('announceIdx').textContent=AN.total>1?('第 '+AN.pos+' / '+AN.total+' 条'):'';
+  document.getElementById('announceBody').innerHTML=window.renderMarkdown(n.content);
+  mask.classList.add('open');
+}
+async function closeAnnounce(read){
+  const id=AN.cur;
+  if(read&&id!=null){
+    const n=NT.items.find(x=>x.id===id);
+    if(n&&!n.readAt){
+      n.readAt=new Date().toISOString();
+      NT.unread=Math.max(0,NT.unread-1);
+      renderNoticeBadge();renderNoticePop();
+      if(!document.getElementById('noticeModal').classList.contains('open'))renderNoticeList();
+      fetch('/api/my-notifications/read',{method:'POST',headers:{'Authorization':'Bearer '+VK,'Content-Type':'application/json'},body:JSON.stringify({ids:[id]})}).catch(()=>{});
+    }
+  }
+  showNextAnnounce();
+}
 (function initNotices(){
   const bell=document.getElementById('noticeBell'),wrap=document.getElementById('noticeWrap');
   if(!bell)return;
@@ -1458,7 +1501,12 @@ function closeNoticeModal(){document.getElementById('noticeModal').classList.rem
   wrap.addEventListener('mouseleave',hideNoticePopSoon);
   document.getElementById('noticePop').addEventListener('mouseenter',function(){clearTimeout(noticePopTimer)});
   bell.addEventListener('click',openNoticeModal);
-  document.addEventListener('keydown',function(e){if(e.key==='Escape')closeNoticeModal()});
+  document.addEventListener('keydown',function(e){
+    if(e.key!=='Escape')return;
+    // Esc 关公告按「暂时关闭」处理(不标读);铃铛弹窗其次。
+    if(document.getElementById('announceMask').classList.contains('open')){closeAnnounce(false);return}
+    closeNoticeModal();
+  });
   fetchNotices();
   NT.timer=setInterval(fetchNotices,60000);
 })();

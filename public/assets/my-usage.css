@@ -469,3 +469,19 @@ table{width:100%;border-collapse:collapse;min-width:560px}th{text-align:left;pad
 .notice-item.unread .ni-title{color:var(--accent)}
 .notice-item-hd .ni-time{flex:none;font-size:10.5px;color:var(--dim)}
 .notice-item-body{padding:2px 14px 12px;border-top:1px solid var(--border)}
+/* 「公告」小标记:铃铛弹层与完整列表里,公告标题前的小角标 */
+.ni-tag{flex:none;font-size:10px;font-weight:650;line-height:15px;padding:0 5px;border-radius:4px;color:var(--accent);background:var(--accent-soft);border:1px solid var(--accent)}
+.np-title .ni-tag{margin-right:5px;vertical-align:1px}
+/* 公告全屏弹屏:进页时未读公告逐条盖满视口展示。z-index 65 —— 盖住页面与铃铛弹窗,
+   只让位于强制的邮箱补填门(z70),「先填邮箱、再看公告」的顺序更合理。 */
+.announce-mask{display:none;position:fixed;inset:0;z-index:65;background:rgba(20,20,18,.66);backdrop-filter:blur(3px);align-items:center;justify-content:center;padding:28px}
+.announce-mask.open{display:flex}
+.announce-card{background:var(--surface);border:1px solid var(--border-strong);border-radius:12px;width:100%;max-width:680px;max-height:88vh;display:flex;flex-direction:column;box-shadow:0 24px 64px rgba(0,0,0,.28);overflow:hidden}
+.announce-hd{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:16px 22px 0}
+.announce-kind{display:inline-flex;align-items:center;gap:6px;font-size:12px;font-weight:700;color:var(--accent);letter-spacing:.5px}
+.announce-idx{font-size:11px;color:var(--dim)}
+.announce-title{margin:8px 22px 0;font-size:19px;font-weight:700;line-height:1.35;color:var(--text)}
+.announce-meta{margin:4px 22px 0;font-size:11px;color:var(--dim)}
+.announce-body{flex:1;min-height:0;overflow-y:auto;margin:14px 0;padding:0 22px;border-top:1px solid var(--border);padding-top:14px}
+.announce-ft{border-top:1px solid var(--border);padding:12px 22px 16px;background:var(--surface-subtle)}
+.announce-actions{display:flex;justify-content:flex-end;gap:8px;flex-wrap:wrap}

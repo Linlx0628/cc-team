@@ -192,7 +192,8 @@ function mcpVisibleTools(apiKey) {
 function mcpWikiResources() {
   let files = [];
   try {
-    files = fs.readdirSync(WIKI_DIR).filter(f => f.endsWith(".md") && f !== "_sidebar.md").sort();
+    // _ 前缀是 docsify 的站点结构文件(_sidebar / _sidebar-member / _navbar…),不是手册正文
+    files = fs.readdirSync(WIKI_DIR).filter(f => f.endsWith(".md") && !f.startsWith("_")).sort();
   } catch { /* wiki 目录缺失时资源为空,不影响工具 */ }
   return files.map(f => ({ uri: "wiki://" + f, name: f.replace(/\.md$/, ""), title: f, mimeType: "text/markdown", description: MCP_WIKI_DESC[f] || "使用手册页面" }));
 }
@@ -5789,7 +5790,7 @@ const server = http.createServer((req, res) => {
     if (!checkCsrf(req)) { res.writeHead(403); res.end("CSRF validation failed"); return; }
     notificationWrite((body) => {
       const n = notificationsApi.create(body, "admin");
-      recordAdminAudit(req, "notification.create", `#${n}`, `新建通知「${body.title || ""}」（草稿，目标：${body.targetType === "user" ? "定向" : "全员"}）`);
+      recordAdminAudit(req, "notification.create", `#${n}`, `新建${body.noticeType === "announcement" ? "公告" : "通知"}「${body.title || ""}」（草稿，目标：${body.targetType === "user" ? "定向" : "全员"}）`);
       return notificationsApi.get(n);
     });
     return;
@@ -5809,7 +5810,7 @@ const server = http.createServer((req, res) => {
     if (!checkCsrf(req)) { res.writeHead(403); res.end("CSRF validation failed"); return; }
     notificationWrite((body) => {
       const n = notificationsApi.publish(body.id);
-      recordAdminAudit(req, "notification.publish", `#${body.id}`, `发布通知「${n.title}」（${n.targetType === "user" ? `定向 ${n.targetKeys.length} 人` : "全员"}）`);
+      recordAdminAudit(req, "notification.publish", `#${body.id}`, `发布${n.noticeType === "announcement" ? "公告" : "通知"}「${n.title}」（${n.targetType === "user" ? `定向 ${n.targetKeys.length} 人` : "全员"}）`);
       return n;
     });
     return;

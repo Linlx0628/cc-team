@@ -18,24 +18,48 @@
 <body>
   <div id="app">手册加载中…</div>
   <script>
-    window.$docsify = {
-      name: 'CC Team 使用手册',
+    // ?scope=member = 成员版手册:侧栏换成 _sidebar-member.md(只列成员章节),站名带
+    // 「成员版」,首页别名指到 my-usage。query string 在 docsify 的 hash 路由下全程保留,
+    // 站内点击不会丢 scope;顶部站名链接成员版也指回 my-usage。搜索插件只在完整版加载
+    // —— 全文搜索会索引整本手册,成员版下搜出管理员页面就「穿帮」了。管理员直接访问
+    // /wiki/(不带 scope)看到的仍是完整手册。
+    // 侧栏用 loadSidebar 的字符串形态(全页面固定加载这一个文件)而不是 alias:
+    // 顶级路由(#/my-usage)请求的侧栏路径是 /_sidebar.md,嵌套路由才是 /xxx/_sidebar.md,
+    // alias 正则 '/.*/_sidebar.md' 盖不住顶级路由 —— 实测会退回完整侧栏。
+    var MEMBER = new URLSearchParams(location.search).get('scope') === 'member';
+    var base = {
       basePath: '/wiki/',
-      loadSidebar: true,
       subMaxLevel: 3,
-      auto2top: true,
-      // 站点内所有页面共用根目录的 _sidebar.md
-      alias: { '/.*/_sidebar.md': '/_sidebar.md' },
-      search: {
-        paths: 'auto',
-        placeholder: '搜索手册…',
-        noData: '没有找到相关结果',
-        depth: 3
-      }
+      auto2top: true
+    };
+    if (MEMBER) {
+      window.$docsify = Object.assign(base, {
+        name: 'CC Team 使用手册（成员版）',
+        nameLink: '?scope=member#/',
+        loadSidebar: '_sidebar-member.md',
+        alias: { '/': '/my-usage.md' }
+      });
+    } else {
+      window.$docsify = Object.assign(base, {
+        name: 'CC Team 使用手册',
+        loadSidebar: true,
+        // 站点内所有页面共用根目录的 _sidebar.md
+        alias: { '/.*/_sidebar.md': '/_sidebar.md' },
+        search: {
+          paths: 'auto',
+          placeholder: '搜索手册…',
+          noData: '没有找到相关结果',
+          depth: 3
+        }
+      });
     }
   </script>
   <script src="https://cdn.jsdelivr.net/npm/docsify@4.13.1/lib/docsify.min.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/docsify@4.13.1/lib/plugins/search.min.js"></script>
+  <script>
+    // 必须同步插入(document.write)而不是动态 append:插件要在 DOMContentLoaded(docsify
+    // 初始化)之前注册完;上面 var MEMBER 是全局 var,这里直接可用。
+    if (!MEMBER) document.write('<script src="https://cdn.jsdelivr.net/npm/docsify@4.13.1/lib/plugins/search.min.js"><\/script>');
+  </script>
   <script src="https://cdn.jsdelivr.net/npm/docsify-copy-code@3.0.2/dist/docsify-copy-code.min.js"></script>
 </body>
 </html>

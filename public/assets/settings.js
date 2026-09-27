@@ -2302,7 +2302,7 @@ function notifyTargetSummary(n){
 }
 function renderNotifyTable(){
   const tbody=document.getElementById('notifyBody');
-  if(!NOTIFY.rows.length){tbody.innerHTML='<tr><td colspan="5" style="color:var(--dim);text-align:center;padding:18px">还没有通知 — 点上方「＋ 新建通知」创建第一条</td></tr>';return}
+  if(!NOTIFY.rows.length){tbody.innerHTML='<tr><td colspan="6" style="color:var(--dim);text-align:center;padding:18px">还没有通知 — 点上方「＋ 新建通知」创建第一条</td></tr>';return}
   tbody.innerHTML=NOTIFY.rows.map(n=>{
     const published=n.status==='published';
     const ops=[];
@@ -2314,8 +2314,12 @@ function renderNotifyTable(){
     const statusBadge=published
       ?'<span style="color:var(--green);font-weight:600">已发布</span>'
       :'<span style="color:var(--dim)">草稿</span>';
+    const kindBadge=n.noticeType==='announcement'
+      ?'<span style="color:var(--accent);font-weight:600">公告</span>'
+      :'<span style="color:var(--dim)">通知</span>';
     return '<tr>'
       +'<td><b style="font-size:12.5px">'+h(n.title)+'</b></td>'
+      +'<td style="font-size:12px">'+kindBadge+'</td>'
       +'<td style="font-size:12px">'+h(notifyTargetSummary(n))+'</td>'
       +'<td>'+statusBadge+'</td>'
       +'<td style="font-size:11px;color:var(--dim)">'+(published?notifyTime(n.publishedAt):'—')+'</td>'
@@ -2328,6 +2332,8 @@ function notifyOpenEditor(id){
   const n=id?NOTIFY.rows.find(x=>x.id===id):null;
   document.getElementById('notifyEditId').value=n?String(n.id):'';
   document.getElementById('notifyTitle').value=n?n.title:'';
+  document.getElementById('notifyNoticeType').value=n?(n.noticeType||'notice'):'notice';
+  notifyTypeChanged();
   document.getElementById('notifyTargetType').value=n?n.targetType:'all';
   renderNotifyUserChecks(n?(n.targetKeys||[]):[]);
   document.getElementById('notifyContent').value=n?n.content:'';
@@ -2348,6 +2354,14 @@ function renderNotifyUserChecks(checkedKeys){
 function notifyTargetTypeChanged(){
   document.getElementById('notifyTargetUsers').style.display=document.getElementById('notifyTargetType').value==='user'?'':'none';
 }
+// 类型说明随所选类型切换:让管理员在下单前就知道「公告」会全屏弹、未读会反复弹。
+function notifyTypeChanged(){
+  const hint=document.getElementById('notifyTypeHint');
+  const isAnn=document.getElementById('notifyNoticeType').value==='announcement';
+  hint.textContent=isAnn
+    ?'成员每次打开「我的用量」页都会全屏弹出，直到点了「我已阅读」；点「暂时关闭」只关当次，下次进页仍会弹。'
+    :'只在成员「我的用量」页右上角铃铛里出现，不打断使用。';
+}
 function notifyPreview(){
   const box=document.getElementById('notifyPreviewBox');
   const md=document.getElementById('notifyContent').value.trim();
@@ -2359,6 +2373,7 @@ function notifyCollectForm(){
     id:Number(document.getElementById('notifyEditId').value)||undefined,
     title:document.getElementById('notifyTitle').value.trim(),
     content:document.getElementById('notifyContent').value,
+    noticeType:document.getElementById('notifyNoticeType').value,
     targetType:document.getElementById('notifyTargetType').value,
     targetKeys:ids,
   };
@@ -2397,7 +2412,7 @@ function openNotifyView(id){
   const n=NOTIFY.rows.find(x=>x.id===id);
   if(!n)return;
   document.getElementById('notifyViewTitle').textContent=n.title;
-  document.getElementById('notifyViewMeta').textContent=(n.status==='published'?'发布于 '+notifyTime(n.publishedAt):'草稿 · 创建于 '+notifyTime(n.createdAt))+' · '+notifyTargetSummary(n);
+  document.getElementById('notifyViewMeta').textContent=(n.noticeType==='announcement'?'公告':'通知')+' · '+(n.status==='published'?'发布于 '+notifyTime(n.publishedAt):'草稿 · 创建于 '+notifyTime(n.createdAt))+' · '+notifyTargetSummary(n);
   document.getElementById('notifyViewContent').innerHTML=(window.renderMarkdown&&n.content)?window.renderMarkdown(n.content):h(n.content);
   document.getElementById('notifyViewModal').classList.add('open');
 }

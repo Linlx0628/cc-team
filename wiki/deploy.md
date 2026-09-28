@@ -37,9 +37,22 @@ node server.mjs
 
 | 依赖 | 版本要求 | 安装 | 说明 |
 |---|---|---|---|
-| `git` | ≥ 2.41 | `apk add git` / `apt install git` | 系统用它 clone/fetch 仓库 |
+| `git` | ≥ 2.41 | `apk add git` / `apt install git` | 系统用它 clone/fetch 仓库；OCR 全员使用 `--end-of-options`，低于 2.41 的部分子命令不认该选项 |
 | `@alibaba-group/open-code-review`（`ocr`） | 见 `ocr version` | `npm i -g @alibaba-group/open-code-review` | 评审引擎；**网关不会自动安装**，未装时功能显示「未安装」与安装指引 |
 | `openssh-client` | — | `apk add openssh-client` | 仅当用 SSH 方式拉私有仓库时需要 |
+
+### Debian 12 上升级 git（apt 装不到 ≥2.41）
+
+Debian 12（bookworm）的 apt 只有 **git 2.39.5**，且 **backports 里没有 git 包** —— 想满足 OCR 要求只能源码编译。仓库自带脚本：
+
+```bash
+docker cp docker/upgrade-git-in-container.sh <容器名>:/tmp/upgrade-git.sh
+docker exec -it <容器名> sh /tmp/upgrade-git.sh     # 装依赖→编译→验证，幂等可重跑
+```
+
+脚本编译安装到 `/usr/local`（不覆盖系统 git），末尾会自动验证 OCR 实际依赖的五个 git 调用。⚠️ 产物在容器可写层，**1Panel/Compose 重建容器后需重跑**；要一劳永逸请改用派生镜像（`FROM <现有镜像>` + `COPY` 编译好的 git）。
+
+> OCR 本身的版本检查是**软警告**（版本不足只在 stderr 打一行字、不拦截），所以升级前也可先跑一次评审验证：若 diff 生成正常，可暂不升级。
 
 容器化部署（`docker/docker-compose.yml`）已经把工作区挂成**命名卷** `code-review-workspaces`（对应容器内 `/app/code-review-workspaces`）——不挂也能跑，只是每次重建容器都要重新 clone 仓库：
 

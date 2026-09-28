@@ -45,6 +45,7 @@ import { getApiKey, makeClientAbortError, isClientAbortError, createClientAbortS
 import { createVisionBridge } from "./lib/vision-bridge.mjs";
 import { createToolPatternCompat } from "./lib/tool-pattern-compat.mjs";
 import { createProxyCore } from "./lib/proxy-core.mjs";
+import { createEgressMeter } from "./lib/egress-meter.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -3356,6 +3357,30 @@ function appendRequestLine(obj) {
   try { requestLogStream.write(JSON.stringify(obj) + "\n"); } catch {}
 }
 
+// ─── 出网字节观测 ─────────────────────────────────────────────────────────────
+// 逐请求的 up/dn/att 累计在 clientState.egress(proxy-core 创建并埋点),请求收尾时
+// 在 attachRequestLogger 里汇总进这个日计数器;/api/stats 的 overview 段对外暴露快照。
+const egressMeter = createEgressMeter();
+
+// 重启回填:回放今日 requests JSONL,把 upB/dnB/att 与行数累回计数器。旧行缺字段按 0;
+// 任何读失败都静默 —— 观测数据不值得让启动报警。
+function reseedEgressFromTodayLog() {
+  try {
+    const file = path.join(REQUEST_LOG_DIR, `requests-${cnDate()}.log`);
+    if (!fs.existsSync(file)) return;
+    let up = 0, dn = 0, att = 0, n = 0;
+    for (const line of fs.readFileSync(file, "utf8").split("\n")) {
+      const t = line.trim();
+      if (!t) continue;
+      try {
+        const o = JSON.parse(t);
+        up += o.upB || 0; dn += o.dnB || 0; att += o.att || 0; n += 1;
+      } catch {}
+    }
+    if (n > 0) egressMeter.reseed(up, dn, att, n);
+  } catch {}
+}
+
 // Attach the finish/close bookkeeping to a proxied response. The reqLog holder
 // starts with the fields known at clientState creation and is enriched later by
 // the readBody callback (model / source / serving profile / usage).
@@ -3365,6 +3390,8 @@ function attachRequestLogger(res, clientState, reqLog) {
     if (logged) return;
     logged = true;
     const usage = clientState.lastUsage;
+    const eg = clientState.egress;
+    if (eg) egressMeter.noteRequest(eg.up, eg.dn, eg.att);
     appendRequestLine({
       t: new Date().toISOString(),
       user: reqLog.user,
@@ -3390,6 +3417,11 @@ function attachRequestLogger(res, clientState, reqLog) {
       status: res.statusCode || 0,
       ms: Date.now() - reqLog.start,
       aborted: aborted === true,
+      // 出网观测(纯追加字段,旧解析器无影响):upB=发上游请求体字节(含重试累计),
+      // dnB=回传客户端应用层字节(不含响应头),att=上游上传次数(>1 即存在重试/failover 放大)。
+      upB: eg ? eg.up : 0,
+      dnB: eg ? eg.dn : 0,
+      att: eg ? eg.att : 0,
     });
   };
   res.on("finish", () => write(false));
@@ -3450,6 +3482,10 @@ function sendUpstream(body, reqUrl, reqMethod, reqHeaders, timeout, _rt, clientS
       err.isTimeout = err.message.includes("timeout");
       reject(err);
     });
+    if (clientState && clientState.egress) {
+      clientState.egress.up += body.length;
+      clientState.egress.att += 1;
+    }
     upReq.write(body);
     upReq.end();
   });
@@ -5111,7 +5147,7 @@ const server = http.createServer((req, res) => {
     //   profile-daily-models 图表切「按方案」维度时才单独拉
     //   users/clients/detail/profiles/rates/errors  各自菜单
     const SECTION_KEYS = {
-      overview: ["users", "daily", "models", "hourly", "dailyModels", "dailyClients", "hourlyModels", "profileDaily", "profiles", "profileView", "protocolView", "upstream"],
+      overview: ["users", "daily", "models", "hourly", "dailyModels", "dailyClients", "hourlyModels", "profileDaily", "profiles", "profileView", "protocolView", "upstream", "egress"],
       "profile-daily-models": ["profiles", "profileDailyModels"],
       users: ["users", "daily", "profiles", "userQuotaMatrix", "userQuotas", "userQuotaEff", "profileQuota", "profileView", "protocolView"],
       clients: ["users", "dailyClients", "profileView", "protocolView"],
@@ -5192,6 +5228,8 @@ const server = http.createServer((req, res) => {
         profileSuffix === "all" ? protoFilter : [normalizeProfileSuffix(profileSuffix)]
       );
     }
+    // 出网字节观测:与方案/协议无关的进程级快照,overview 段随卡片展示(约 100 字节)。
+    if (want("egress")) data.egress = egressMeter.snapshot();
     // 带 section 时**只留白名单里的键**:构建器(聚合视图/单方案快照)会初始化一堆键,
     // 跳过查询的会留成空对象 —— 与其让前端拿到「存在但为空」的误导性字段,不如裁干净。
     // 不带 section 时 keys 为 null,一个键都不动(兼容护栏)。
@@ -7108,6 +7146,7 @@ server.listen(port, "0.0.0.0", () => {
   console.log(`[团队AI Coding监控] Settings: http://localhost:${port}/settings`);
   console.log(`[团队AI Coding监控] Users: ${Object.values(rt?.globalUsers || {}).map(u => u.username || "").join(", ")}`);
   toolPatternApi.scheduleToolPatternProbes();
+  reseedEgressFromTodayLog();
 });
 
 // Codex remote compact 的 WebSocket 通道:只接 /v1/responses(含方案后缀)的 upgrade,

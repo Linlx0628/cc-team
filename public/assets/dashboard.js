@@ -137,6 +137,10 @@ function filteredDaily(){
   const f={};for(const[date,ud]of Object.entries(D.daily||{})){if(ud[USR])f[date]={[USR]:ud[USR]}}return f;
 }
 function c(l,v,cl,k){return'<div class="card"><div class="l">'+l+'</div><div class="v" data-cu="'+v+'"'+(k?' data-cu-k':'')+'>0</div></div>'}
+const fmtBytes=n=>{if(n>=1073741824)return(n/1073741824).toFixed(2)+" GB";if(n>=1048576)return(n/1048576).toFixed(1)+" MB";if(n>=1024)return(n/1024).toFixed(1)+" KB";return n+" B"};
+// 今日出网卡片:↑ 发往上游的请求体字节(含重试累计)/ ↓ 回传客户端字节。数字过大不适合
+// count-up 动画,直接格式化文本(不带 data-cu,runCountUps 会跳过)。
+function egressCard(){const e=D.egress;if(!e)return"";return'<div class="card" title="上行 '+e.upstreamPosts+' 次上传 / '+e.requests+' 个请求,北京日界重置,重启后按今日日志回填"><div class="l">今日出网</div><div class="v"><span style="color:var(--orange)">↑ '+fmtBytes(e.upBytes)+'</span><span style="color:var(--blue);margin-left:10px">↓ '+fmtBytes(e.downBytes)+'</span></div></div>'}
 let chartResizeFrame=0;
 function doughnutLegend(){const compact=innerWidth<1280;return{position:"bottom",labels:{color:"#686863",font:{size:compact?10:11},padding:compact?6:10,boxWidth:compact?16:24}}}
 function trendLegend(){const compact=innerWidth<=820;return{labels:{color:"#686863",font:{size:compact?9:11},padding:compact?6:10,boxWidth:compact?16:40}}}
@@ -587,7 +591,7 @@ function render(){
   const us=Object.values(D.users),allTokens=us.reduce((s,u)=>s+totalTokens(u),0),tr=us.reduce((s,u)=>s+u.totalRequests,0);
   const tday=todayBJ(),tdd=(D.daily||{})[tday]||{};
   const todayTokens=Object.values(tdd).reduce((s,d)=>s+totalTokens(d),0),tR=Object.values(tdd).reduce((s,d)=>s+d.requests,0);
-  document.getElementById("cards").innerHTML=c("今日用量",todayTokens,"var(--accent)",1)+c("今日请求",tR,"var(--blue)",1)+c("总用量",allTokens,"var(--green)",1)+c("总请求",tr,"var(--orange)",1)+c("今日错误",(Array.isArray(D.errors)?D.errors:[]).filter(e=>e.time&&bjDateStr(e.time)===tday).length,"var(--red)",1);
+  document.getElementById("cards").innerHTML=c("今日用量",todayTokens,"var(--accent)",1)+c("今日请求",tR,"var(--blue)",1)+c("总用量",allTokens,"var(--green)",1)+c("总请求",tr,"var(--orange)",1)+c("今日错误",(Array.isArray(D.errors)?D.errors:[]).filter(e=>e.time&&bjDateStr(e.time)===tday).length,"var(--red)",1)+egressCard();
   runCountUps(document.getElementById("cards"));
   // overview 只画自己那一份(卡片 + 图表);其余菜单的数据由各自的 section 懒加载后渲染
   if(overviewVisible()){renderCharts()}else{chartsDirty=true}

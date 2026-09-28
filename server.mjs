@@ -41,7 +41,7 @@ import { createSessionsReader } from "./lib/sessions.mjs";
 import { createNotifier } from "./lib/notifier.mjs";
 import { createPersistence } from "./lib/persistence.mjs";
 import { createMemberRewards } from "./lib/member-rewards.mjs";
-import { getApiKey, makeClientAbortError, isClientAbortError, createClientAbortState, markClientAborted, addClientAbortListener, setActiveUpstreamRequest, throwIfClientAborted, sleepWithClientAbort, jitter, buildUpstreamPath, extractClientSignal } from "./lib/proxy-helpers.mjs";
+import { getApiKey, makeClientAbortError, isClientAbortError, createClientAbortState, markClientAborted, addClientAbortListener, setActiveUpstreamRequest, throwIfClientAborted, sleepWithClientAbort, jitter, buildUpstreamPath, extractClientSignal, uploadBudgetExceeded } from "./lib/proxy-helpers.mjs";
 import { createVisionBridge } from "./lib/vision-bridge.mjs";
 import { createToolPatternCompat } from "./lib/tool-pattern-compat.mjs";
 import { createProxyCore } from "./lib/proxy-core.mjs";
@@ -3470,6 +3470,8 @@ function attachRequestLogger(res, clientState, reqLog) {
       upB: eg ? eg.up : 0,
       dnB: eg ? eg.dn : 0,
       att: eg ? eg.att : 0,
+      // 单请求上传预算是否在本请求上触发过 503(次数/字节超限)。
+      budget: reqLog.budgetExhausted === true,
     });
   };
   res.on("finish", () => write(false));
@@ -3497,6 +3499,16 @@ async function sendUpstream(body, reqUrl, reqMethod, reqHeaders, timeout, _rt, c
   const sendBody = gzPrep ? gzPrep.body : body;
   const sendHeaders = gzPrep ? gzPrep.headers : reqHeaders;
   const gzUsed = !!gzPrep;
+  // 上传预算(次数/字节)在写出前检查:非流式重试/自愈每次都经这里,超限即整单 503。
+  const budgetHit = uploadBudgetExceeded(clientState && clientState.uploadBudget, clientState && clientState.egress, sendBody.length);
+  if (budgetHit) {
+    const err = new Error(budgetHit.reason === "attempts"
+      ? `Upstream upload budget exceeded (${budgetHit.attempts} posts, cap ${budgetHit.cap}). Try again later.`
+      : `Upstream upload budget exceeded (${(budgetHit.upBytes / 1048576).toFixed(1)}MB, cap ${(budgetHit.cap / 1048576).toFixed(1)}MB). Try again later.`);
+    err.isUploadBudget = true;
+    err.budget = budgetHit;
+    throw err;
+  }
   return await new Promise((resolve, reject) => {
     try {
       throwIfClientAborted(clientState);
@@ -3973,6 +3985,7 @@ const PROXY_CORE_DEPS = {
   noteGroupSwitch,
   resolveRequestGroup,
   notifierApi,
+  parseRetryAfterMs,
   port,
   productionEnabled,
   productionTracker,

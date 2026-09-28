@@ -2256,7 +2256,7 @@ function loadProfileSnapshot(suffix, wideFloor) {
     if (!dailyClients[r.date][r.user_key]) dailyClients[r.date][r.user_key] = {};
     dailyClients[r.date][r.user_key][r.client] = { inputTokens: r.input_tokens, outputTokens: r.output_tokens, requests: r.requests };
   }
-  const errors = db.prepare("SELECT time,user_name AS user,user_key AS userKey,status_code AS statusCode,error,path,model FROM errors WHERE profile=? ORDER BY id DESC LIMIT 200").all(suffix);
+  const errors = db.prepare("SELECT id,time,user_name AS user,user_key AS userKey,status_code AS statusCode,error,path,model FROM errors WHERE profile=? ORDER BY id DESC LIMIT 200").all(suffix);
   return { users, daily, dailyModels, dailyClients, dailyHourly, models, hourly, errors };
 }
 
@@ -3296,9 +3296,12 @@ function recordError(apiKey, statusCode, errorMessage, path, model, suffix, _rt)
   const runtime = _rt || runtimes[normalizeProfileSuffix(suffix)] || rt;
   const key = resolveUserKey(apiKey, runtime);
   const sfx = normalizeProfileSuffix(suffix) || runtime?.suffix || "";
+  // 单条正文上限 2000 字符(调用点已按此截;这里再防线一次,防其他调用点传超长文本)。
+  // 2026-09-28 前 200 字符 —— 错误详情经常在 200 字之后才是关键(上游错误体多为长 JSON)。
+  const errorText = String(errorMessage || "").slice(0, 2000);
   stmts.insertError.run({
     profile: sfx, time: new Date().toISOString(), userName: getUserName(key, runtime),
-    key, statusCode, error: errorMessage, path, model: model || "unknown",
+    key, statusCode, error: errorText, path, model: model || "unknown",
   });
   const cutoff7d = new Date(Date.now() - 7 * 24 * 3600 * 1000).toISOString();
   const tx = db.transaction(() => {

@@ -795,6 +795,15 @@ function renderDetailPanel(){
 }
 
 // ── 错误记录(独立菜单 /api/stats?section=errors)──
+// 点击行展开该条错误的完整信息(存储层单条上限 2000 字符);列表单元格保持单行省略,
+// 悬浮 title 仍可快速预览。展开状态按错误 id 记忆,翻页/刷新不丢。
+const expandedErrors=new Set();
+function toggleErrorRow(id){expandedErrors.has(id)?expandedErrors.delete(id):expandedErrors.add(id);renderErrorsPanel()}
+function copyErrorText(id){
+  const e=(D&&Array.isArray(D.errors)?D.errors:[]).find(x=>x.id===id);if(!e)return;
+  const text=(e.error||"")+"\n—— "+(e.user||"-")+" · "+(e.statusCode||"-")+" · "+(e.model||"-")+" · "+(e.path||"-")+" · "+(e.time?fmtBJ(e.time):"-");
+  (navigator.clipboard?navigator.clipboard.writeText(text):Promise.reject()).then(()=>toast("已复制完整错误信息")).catch(()=>toast("复制失败"));
+}
 function renderErrorsPanel(){
   if(!D||!Array.isArray(D.errors))return;
 
@@ -804,9 +813,12 @@ function renderErrorsPanel(){
   if(errPage>totalErrPages)errPage=totalErrPages;
   const errs=allErrs.slice((errPage-1)*ERR_PAGE_SIZE,errPage*ERR_PAGE_SIZE);
   const et=document.querySelector("#eTable tbody");
-  if(!errs.length){et.innerHTML='<tr><td colspan="6" class="empty">暂无错误记录</td></tr>'}else{et.innerHTML=errs.map(e=>{const sc=e.statusCode||"-";const col=sc>=500?"var(--red)":sc>=400?"var(--orange)":"var(--dim)";return'<tr><td style="font-size:12px;white-space:nowrap">'+(e.time?fmtBJ(e.time):"-")+'</td><td>'+(e.user||"-")+'</td><td class="n" style="color:'+col+';font-weight:600">'+sc+'</td><td style="font-size:12px;color:var(--blue)">'+(e.model||"-")+'</td><td style="font-size:12px;color:var(--dim);max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+(e.path||"-")+'</td><td style="font-size:12px;color:var(--red);max-width:400px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="'+(e.error||"").replace(/"/g,'&quot;')+'">'+(e.error||"-")+'</td></tr>'}).join("")}
+  if(!errs.length){et.innerHTML='<tr><td colspan="6" class="empty">暂无错误记录</td></tr>'}else{et.innerHTML=errs.map(e=>{const sc=e.statusCode||"-";const col=sc>=500?"var(--red)":sc>=400?"var(--orange)":"var(--dim)";const eid=e.id!=null?e.id:null;const open=eid!=null&&expandedErrors.has(eid);const rowAttrs=eid!=null?(' data-eid="'+eid+'" onclick="toggleErrorRow('+eid+')" style="cursor:pointer"'):'';
+    let html='<tr'+rowAttrs+'><td style="font-size:12px;white-space:nowrap">'+(open?"▾ ":"")+(e.time?fmtBJ(e.time):"-")+'</td><td>'+(e.user||"-")+'</td><td class="n" style="color:'+col+';font-weight:600">'+sc+'</td><td style="font-size:12px;color:var(--blue)">'+(e.model||"-")+'</td><td style="font-size:12px;color:var(--dim);max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+escH(e.path||"-")+'</td><td style="font-size:12px;color:var(--red);max-width:400px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="'+escH(e.error||"")+'">'+escH(e.error||"-")+'</td></tr>';
+    if(open){html+='<tr class="err-detail-row"><td colspan="6" style="background:var(--surface-subtle);padding:10px 14px"><div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px"><span style="font-size:11px;color:var(--dim)">完整错误信息（'+(e.error||"").length+' 字符 · 上限 2000，超出部分在入库前截断）</span><button onclick="event.stopPropagation();copyErrorText('+eid+')" style="font-size:11px;background:var(--card);color:var(--text);border:1px solid var(--border);padding:2px 10px;border-radius:4px;cursor:pointer">复制</button></div><pre style="margin:0;white-space:pre-wrap;word-break:break-all;font-size:12px;line-height:1.6;color:var(--red);max-height:260px;overflow:auto">'+escH(e.error||"-")+'</pre></td></tr>'}
+    return html}).join("")}
   const pg=document.getElementById("errPages");
-  pg.innerHTML='<span style="font-size:12px;color:var(--dim)">第 '+errPage+"/"+totalErrPages+' 页 (共 '+allErrs.length+' 条)</span> '+(errPage>1?'<button onclick="setErrorPage('+(errPage-1)+')" style="font-size:11px;background:var(--card);color:var(--text);border:1px solid var(--border);padding:2px 10px;border-radius:4px;cursor:pointer">上一页</button> ':'')+(errPage<totalErrPages?'<button onclick="setErrorPage('+(errPage+1)+')" style="font-size:11px;background:var(--card);color:var(--text);border:1px solid var(--border);padding:2px 10px;border-radius:4px;cursor:pointer">下一页</button>':'');
+  pg.innerHTML='<span style="font-size:12px;color:var(--dim)">第 '+errPage+"/"+totalErrPages+' 页 (共 '+allErrs.length+' 条) · 点行展开完整错误 </span> '+(errPage>1?'<button onclick="setErrorPage('+(errPage-1)+')" style="font-size:11px;background:var(--card);color:var(--text);border:1px solid var(--border);padding:2px 10px;border-radius:4px;cursor:pointer">上一页</button> ':'')+(errPage<totalErrPages?'<button onclick="setErrorPage('+(errPage+1)+')" style="font-size:11px;background:var(--card);color:var(--text);border:1px solid var(--border);padding:2px 10px;border-radius:4px;cursor:pointer">下一页</button>':'');
   document.getElementById("errorCount").textContent=allErrs.length>0?'('+allErrs.length+')':'';
   document.getElementById("errorHint").textContent=allErrs.length>0?(allErrs.length+'条错误'):'暂无错误';
 }

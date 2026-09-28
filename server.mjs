@@ -46,6 +46,7 @@ import { createVisionBridge } from "./lib/vision-bridge.mjs";
 import { createToolPatternCompat } from "./lib/tool-pattern-compat.mjs";
 import { createProxyCore } from "./lib/proxy-core.mjs";
 import { createEgressMeter } from "./lib/egress-meter.mjs";
+import { installApiGzip } from "./lib/api-gzip.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -121,7 +122,7 @@ const WIKI_MIME = {
   ".ico": "image/x-icon",
 };
 
-function serveWiki(wikiPath, res) {
+function serveWiki(wikiPath, req, res) {
   let rel = wikiPath.replace(/^\/wiki\//, "");
   if (!rel) rel = "index.html";
   const filePath = path.resolve(WIKI_DIR, rel);
@@ -132,6 +133,24 @@ function serveWiki(wikiPath, res) {
     res.end("Not found");
     return;
   }
+  let stat;
+  try {
+    stat = fs.statSync(filePath);
+  } catch {
+    res.writeHead(404, { "Content-Type": "text/plain; charset=utf-8" });
+    res.end("Not found");
+    return;
+  }
+  // ETag 用 size+mtime:wiki 是每次读盘的活文件,内容变了 mtime 变,ETag 跟着变。
+  // Cache-Control 维持 no-cache(每次重验证,编辑即时生效),但命中后回 304 —— docsify
+  // 全文搜索把整本 .md 拉一遍、以及爬虫/监控的反复全量抓取,从「每次全量 200」变成
+  // 「每次一个空体 304」,出网字节归零而语义不变。
+  const etag = `"w-${stat.size}-${Math.floor(stat.mtimeMs)}"`;
+  if (req.headers["if-none-match"] === etag) {
+    res.writeHead(304, { ETag: etag, "Cache-Control": "no-cache" });
+    res.end();
+    return;
+  }
   let body;
   try {
     body = fs.readFileSync(filePath);
@@ -140,7 +159,23 @@ function serveWiki(wikiPath, res) {
     res.end("Not found");
     return;
   }
-  res.writeHead(200, { "Content-Type": mime, "Cache-Control": "no-cache" });
+  res.writeHead(200, { "Content-Type": mime, "Cache-Control": "no-cache", ETag: etag });
+  res.end(body);
+}
+
+// ─── 页面 HTML 的条件请求(ETag/304)─────────────────────────────────────────────
+// 页面是登录态渲染,不能给 max-age 浏览器缓存;但同一版本的 HTML(如 settings 页 ~96KB)
+// 在常规刷新/重开标签时完全可以走 304 空体。ETag 取渲染结果 sha1 前 16 位 —— 模板或
+// 数据变了哈希就变,不会命中错版本。Cache-Control 维持 no-cache(每次重验证)。
+function serveHtml(res, req, html) {
+  const body = Buffer.from(html);
+  const etag = `"h-${crypto.createHash("sha1").update(body).digest("hex").slice(0, 16)}"`;
+  if (req.headers["if-none-match"] === etag) {
+    res.writeHead(304, { ETag: etag, "Cache-Control": "no-cache" });
+    res.end();
+    return;
+  }
+  res.writeHead(200, { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-cache", ETag: etag });
   res.end(body);
 }
 
@@ -3955,14 +3990,26 @@ const server = http.createServer((req, res) => {
     res.setHeader("Strict-Transport-Security", "max-age=31536000; includeSubDomains");
   }
 
+  // /api/* 的 JSON 响应统一走 gzip 出口(150+ 处 res.end(JSON.stringify) 不逐点改,
+  // 在这里包装一次)。代理路径 /v1/* 与页面路由不经过包装。gProxy.apiGzip === false
+  // 可整体关闭(热读,设置页保存后 gProxy 快照刷新即生效)。
+  if (gProxy.apiGzip !== false && req.url.split("?")[0].startsWith("/api/")) {
+    installApiGzip(req, res);
+  }
+
   // 静态页面资源（settings.js 等纯浏览器代码，不含密钥或按请求数据，无需鉴权）。
   // CSP 的 script-src/style-src 'self' 已覆盖；?v= 是内容哈希，改文件后引用 URL 随
   // 重启变化，故可放心强缓存一周。
   if (req.method === "GET" && req.url.split("?")[0].startsWith("/assets/")) {
     const asset = assets.get(req.url.split("?")[0].slice(8));
     if (!asset) { res.writeHead(404, { "Content-Type": "text/plain; charset=utf-8" }); res.end("Not found"); return; }
-    res.writeHead(200, { "Content-Type": asset.contentType, "Cache-Control": "public, max-age=604800" });
-    res.end(asset.body);
+    const useGz = asset.gz && (req.headers["accept-encoding"] || "").includes("gzip");
+    res.writeHead(200, {
+      "Content-Type": asset.contentType,
+      "Cache-Control": "public, max-age=604800",
+      ...(useGz ? { "Content-Encoding": "gzip", "Vary": "Accept-Encoding" } : {}),
+    });
+    res.end(useGz ? asset.gz : asset.body);
     return;
   }
 
@@ -3970,7 +4017,7 @@ const server = http.createServer((req, res) => {
   if (req.method === "GET") {
     const wikiPath = req.url.split("?")[0];
     if (wikiPath === "/wiki") { res.writeHead(301, { Location: "/wiki/" }); res.end(); return; }
-    if (wikiPath.startsWith("/wiki/")) { serveWiki(wikiPath, res); return; }
+    if (wikiPath.startsWith("/wiki/")) { serveWiki(wikiPath, req, res); return; }
   }
 
   // MCP 端点（/mcp，streamable HTTP，成员虚拟 Key 鉴权，见 handleMcpPost 上方注释）。
@@ -4057,12 +4104,10 @@ const server = http.createServer((req, res) => {
   // Settings page (auth required)
   if (req.method === "GET" && req.url.split("?")[0] === "/settings") {
     if (!checkAuth(req)) {
-      res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
-      res.end(loginHtml(PAGE_DEPS));
+      serveHtml(res, req, loginHtml(PAGE_DEPS));
       return;
     }
-    res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
-    res.end(settingsHtml(PAGE_DEPS));
+    serveHtml(res, req, settingsHtml(PAGE_DEPS));
     return;
   }
 
@@ -5127,12 +5172,10 @@ const server = http.createServer((req, res) => {
   // Dashboard page (auth required)
   if (req.method === "GET" && (req.url === "/" || req.url === "/dashboard")) {
     if (!checkAuth(req)) {
-      res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
-      res.end(loginHtml(PAGE_DEPS));
+      serveHtml(res, req, loginHtml(PAGE_DEPS));
       return;
     }
-    res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
-    res.end(dashboardHtml(PAGE_DEPS));
+    serveHtml(res, req, dashboardHtml(PAGE_DEPS));
     return;
   }
 
@@ -6597,8 +6640,7 @@ const server = http.createServer((req, res) => {
       else if (!getAccessibleProfiles(vk).some(p => p.protocol === "responses")) state = "no-profile";
       else catalog = buildCodexModelCatalog(CODEX_DEPS, vk);
     }
-    res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
-    res.end(codexSetupHtml(PAGE_DEPS, vk, state, catalog));
+    serveHtml(res, req, codexSetupHtml(PAGE_DEPS, vk, state, catalog));
     return;
   }
   // Codex installer scripts, personalized per member key. The Host header tells
@@ -6667,20 +6709,17 @@ const server = http.createServer((req, res) => {
       res.end(keyNotFoundHtml);
       return;
     }
-    res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
-    res.end(personalUsageHtml(PAGE_DEPS, vk, personalCodexExtras(vk), personalClaudeExtras(vk), personalReviewExtras(vk)));
+    serveHtml(res, req, personalUsageHtml(PAGE_DEPS, vk, personalCodexExtras(vk), personalClaudeExtras(vk), personalReviewExtras(vk)));
     return;
   }
   if (req.method === "GET" && req.url.startsWith("/my-usage")) {
     const url = new URL(req.url, `http://${req.headers.host}`);
     const vk = url.searchParams.get("key");
     if (!rt || !vk || (!rt.users[vk] && !rt.globalUsers[vk])) {
-      res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
-      res.end(personalUsageLandingHtml(PAGE_DEPS));
+      serveHtml(res, req, personalUsageLandingHtml(PAGE_DEPS));
       return;
     }
-    res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
-    res.end(personalUsageHtml(PAGE_DEPS, vk, personalCodexExtras(vk), personalClaudeExtras(vk), personalReviewExtras(vk)));
+    serveHtml(res, req, personalUsageHtml(PAGE_DEPS, vk, personalCodexExtras(vk), personalClaudeExtras(vk), personalReviewExtras(vk)));
     return;
   }
 
@@ -7102,7 +7141,9 @@ const server = http.createServer((req, res) => {
       const usageRange = parseDateRange(url.searchParams.get("start"), url.searchParams.get("end"));
       const payload = usageApi.getPersonalUsageData(apiKey, profileSuffix, protocolParam, usageRange);
       res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
-      res.end(JSON.stringify(payload, null, 2));
+      // 不再 pretty-print:载荷里的 heatmap/rateCards 让缩进版比紧凑版大 ~70%,
+      // 这个端点被「我的用量」页每 30s 轮询,出网带宽上不去一点都浪费。
+      res.end(JSON.stringify(payload));
     } catch (err) {
       if (!res.headersSent) {
         res.writeHead(err.statusCode || 400, { "Content-Type": "application/json; charset=utf-8" });

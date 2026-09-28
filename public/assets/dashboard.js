@@ -155,8 +155,9 @@ function filteredDaily(){
 function c(l,v,cl,k){return'<div class="card"><div class="l">'+l+'</div><div class="v" data-cu="'+v+'"'+(k?' data-cu-k':'')+'>0</div></div>'}
 const fmtBytes=n=>{if(n>=1073741824)return(n/1073741824).toFixed(2)+" GB";if(n>=1048576)return(n/1048576).toFixed(1)+" MB";if(n>=1024)return(n/1024).toFixed(1)+" KB";return n+" B"};
 // 今日出网卡片:↑ 发往上游的请求体字节(含重试累计)/ ↓ 回传客户端字节。数字过大不适合
-// count-up 动画,直接格式化文本(不带 data-cu,runCountUps 会跳过)。
-function egressCard(){const e=D.egress;if(!e)return"";return'<div class="card" title="上行 '+e.upstreamPosts+' 次上传 / '+e.requests+' 个请求,北京日界重置,重启后按今日日志回填"><div class="l">今日出网</div><div class="v"><span style="color:var(--orange)">↑ '+fmtBytes(e.upBytes)+'</span><span style="color:var(--blue);margin-left:10px">↓ '+fmtBytes(e.downBytes)+'</span></div></div>'}
+// count-up 动画,直接格式化文本(不带 data-cu,runCountUps 会跳过)。两段一律单行
+// (white-space:nowrap),字号降到 16px —— 与其他卡的 21px 比略小,但两个方向塞得下。
+function egressCard(){const e=D.egress;if(!e)return"";return'<div class="card" title="上行 '+e.upstreamPosts+' 次上传 / '+e.requests+' 个请求,北京日界重置,重启后按今日日志回填"><div class="l">今日出网</div><div class="v" style="font-size:16px;white-space:nowrap"><span style="color:var(--orange)">↑ '+fmtBytes(e.upBytes)+'</span><span style="color:var(--blue);margin-left:12px">↓ '+fmtBytes(e.downBytes)+'</span></div></div>'}
 let chartResizeFrame=0;
 function doughnutLegend(){const compact=innerWidth<1280;return{position:"bottom",labels:{color:"#686863",font:{size:compact?10:11},padding:compact?6:10,boxWidth:compact?16:24}}}
 function trendLegend(){const compact=innerWidth<=820;return{labels:{color:"#686863",font:{size:compact?9:11},padding:compact?6:10,boxWidth:compact?16:40}}}

@@ -7094,6 +7094,9 @@ const server = http.createServer((req, res) => {
   }
 
   // ── 系统通知（站内信，成员端，虚拟Key 鉴权 — 同 /api/my-review 口径）──
+  // 缺省 = 全量带正文(旧前端兼容,响应逐字节不变);?poll=1 = 轮询瘦身版,只回
+  // id/标题/时间/已读(正文 2 万字/条,公告一多 60s 全量轮询就是持续出网),
+  // 正文改由下方 ?id= 按需拉。
   if (req.method === "GET" && req.url.split("?")[0] === "/api/my-notifications") {
     const apiKey = getApiKey(req);
     if (!hasGlobalUser(apiKey)) {
@@ -7101,7 +7104,21 @@ const server = http.createServer((req, res) => {
       res.end(JSON.stringify({ error: "认证失败：请提供有效的虚拟Key (Authorization: Bearer jx-...)" }));
       return;
     }
-    const items = notificationsApi.forUser(apiKey);
+    const url = new URL(req.url, "http://localhost");
+    const idParam = url.searchParams.get("id");
+    if (idParam !== null) {
+      const item = notificationsApi.forUserById(apiKey, idParam);
+      if (!item) {
+        res.writeHead(404, { "Content-Type": "application/json; charset=utf-8" });
+        res.end(JSON.stringify({ error: "通知不存在或不属于你" }));
+        return;
+      }
+      res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+      res.end(JSON.stringify(item));
+      return;
+    }
+    const poll = url.searchParams.get("poll") === "1";
+    const items = notificationsApi.forUser(apiKey, { withoutContent: poll });
     res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
     res.end(JSON.stringify({ items, unread: items.filter(n => !n.readAt).length }));
     return;
@@ -7141,6 +7158,9 @@ const server = http.createServer((req, res) => {
       const usageRange = parseDateRange(url.searchParams.get("start"), url.searchParams.get("end"));
       const payload = usageApi.getPersonalUsageData(apiKey, profileSuffix, protocolParam, usageRange);
       res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+      // heatmap=0:30s 轮询瘦身 —— 370 天使用日历每次随载荷下发太浪费,前端首轮拉全量
+      // 后本地缓存,轮询只刷今日格(由 today 数据驱动),日期范围变化时再拉全量。
+      if (url.searchParams.get("heatmap") === "0") delete payload.heatmap;
       // 不再 pretty-print:载荷里的 heatmap/rateCards 让缩进版比紧凑版大 ~70%,
       // 这个端点被「我的用量」页每 30s 轮询,出网带宽上不去一点都浪费。
       res.end(JSON.stringify(payload));

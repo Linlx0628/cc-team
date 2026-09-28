@@ -968,7 +968,13 @@ async function loadSessions(){
     document.getElementById('sessSummary').textContent='加载失败: '+e.message;
   }
 }
-function startAutoRefresh(){if(refreshTimer)clearInterval(refreshTimer);refreshTimer=setInterval(()=>{if(autoRefresh)refreshCurrent()},30000)}
+// 轮询治理:页面隐藏/最小化时暂停 30s 自动刷新(后台标签挂一天不再持续打满出网),
+// 切回可见时立即刷一次。
+function startAutoRefresh(){
+  if(refreshTimer)clearInterval(refreshTimer);
+  refreshTimer=setInterval(()=>{if(autoRefresh&&!document.hidden)refreshCurrent()},30000);
+}
+document.addEventListener('visibilitychange',()=>{if(!document.hidden&&autoRefresh)refreshCurrent()});
 document.getElementById("autoRefreshBtn").addEventListener("click",()=>{autoRefresh=!autoRefresh;const btn=document.getElementById("autoRefreshBtn");btn.textContent="自动刷新: "+(autoRefresh?"开":"关");btn.className=autoRefresh?"ar-on":"ar-off"});
 window.addEventListener("resize",scheduleChartResize);
 setWorkspaceTab('overview',false);ensureSection('overview');startAutoRefresh();

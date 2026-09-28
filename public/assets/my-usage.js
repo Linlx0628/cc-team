@@ -4,6 +4,8 @@ Chart.defaults.color='#686863';Chart.defaults.font.family='-apple-system,BlinkMa
 //   VK（虚拟 key）/ toast() 及 UI_HELPERS 提供的辅助函数
 // 其余数据均由本文件运行时经 /api/my-usage 拉取，文件可长期强缓存（?v= 内容版本号）。
 let D=null,C={h:null,t:null},currentProfile='all',PROTO='',SECTION='overview';
+// 使用日历的本地缓存:轮询(heatmap=0)返回不带日历,渲染前把缓存补回去。
+let HEAT=null;
 const fmtT=n=>n.toLocaleString("zh-CN");
 // Profile names come from admin-authored config; this page renders them into
 // markup, so escape here rather than trusting them.
@@ -216,16 +218,28 @@ function mascotHelloLine(){
   if(c&&c.checkedInToday&&c.todayAmount)line+=(t?'，':'')+'签到的 '+fmtTk(c.todayAmount)+' token 已到账';
   return line;
 }
-async function load(){
+async function load(slim){
   try{
     const qs=['profile='+encodeURIComponent(currentProfile)];
     if(currentProfile==='all'&&PROTO)qs.push('protocol='+PROTO);
     // 用量分析的日期窗口(ANA):默认档「今日」也照常传 start/end,口径由服务端回显。
     qs.push('start='+encodeURIComponent(ANA.start||''));
     qs.push('end='+encodeURIComponent(ANA.end||''));
+    // 30s 轮询走 slim:不带 370 天使用日历(每次数十 KB 的持续出网),本地沿用上次
+    // 全量缓存的日历,今日格由本次返回的 today 数据驱动。首轮与日期/方案变化仍拉全量。
+    if(slim)qs.push('heatmap=0');
     const r=await fetch('/api/my-usage?'+qs.join('&'),{headers:{'Authorization':'Bearer '+VK}});
     if(!r.ok){document.getElementById('meta').textContent='认证失败';return}
     D=await r.json();
+    if(slim&&HEAT!=null&&!D.heatmap){
+      D.heatmap=HEAT;
+      // 今日格随本次返回的 today 数据刷新(日历其余格子是历史,30s 内不会变):
+      // 签到加量、新请求都实时反映到格子上,视觉行为与拉全量一致。
+      const td=new Date(Date.now()+8*3600000).toISOString().slice(0,10);
+      const cell=Array.isArray(HEAT.days)&&HEAT.days.find(d=>d.date===td);
+      if(cell&&D.today){cell.total=D.today.total||0;cell.requests=D.today.requests||0}
+    }
+    if(!slim)HEAT=D.heatmap||null;
     // 纯 innerHTML 的部分(头部、KPI 卡、各方案配额、价目表)不依赖面板宽度,隐藏时也照刷。
     renderChrome();
     renderProfileQuotas();
@@ -625,7 +639,11 @@ function renderRangeCtl(boxId,state,onChange){
 }
 function analysisRangeChanged(){load()}
 function sessRangeChanged(){ACT.data=null;fetchActivity()}
-load();setInterval(load,30000);
+// 轮询治理:页面隐藏/最小化时暂停 30s 轮询(后台标签挂一天也不再持续打满出网),
+// 切回可见时立即刷一次。轮询走 slim(不带使用日历)。
+load();
+setInterval(function(){if(!document.hidden)load(true)},30000);
+document.addEventListener('visibilitychange',function(){if(!document.hidden)load(true)});
 
 
 // ── 面板切换 ──
@@ -1367,12 +1385,17 @@ renderRangeCtl('sessRangeCtl',SESS,sessRangeChanged);
 // ── 消息通知(站内信):铃铛 hover 弹未读,点击开完整列表;60s 轮询未读数 ──
 const NT={items:[],unread:0,timer:null};
 function noticeTime(iso){const d=new Date(new Date(iso).getTime()+8*3600000);const p=n=>String(n).padStart(2,'0');return d.getUTCFullYear()+'-'+p(d.getUTCMonth()+1)+'-'+p(d.getUTCDate())+' '+p(d.getUTCHours())+':'+p(d.getUTCMinutes())}
-async function fetchNotices(){
+async function fetchNotices(poll){
   try{
-    const r=await fetch('/api/my-notifications',{headers:{'Authorization':'Bearer '+VK}});
+    // poll=1:轮询瘦身版,不带 markdown 正文(单条上限 2 万字,公告一多 60s 全量拉
+    // 就是持续出网)。首轮不带 poll,拉全文供公告弹屏;已缓存的正文在合并时保留,
+    // 展开的条目不会因为一次轮询把内容丢掉。
+    const r=await fetch('/api/my-notifications'+(poll?'?poll=1':''),{headers:{'Authorization':'Bearer '+VK}});
     if(!r.ok)return;
     const j=await r.json();
-    NT.items=j.items||[];NT.unread=j.unread||0;
+    const prev=new Map(NT.items.map(n=>[n.id,n]));
+    NT.items=(j.items||[]).map(n=>(n.content===undefined&&prev.has(n.id)&&prev.get(n.id).content!==undefined)?Object.assign({},n,{content:prev.get(n.id).content}):n);
+    NT.unread=j.unread||0;
     renderNoticeBadge();
     if(!NT.popupDone){NT.popupDone=true;queueAnnouncements()}   // 只在进页后首次成功拉取时弹公告,60s 轮询不打断
     if(!document.getElementById('noticePop').hidden)renderNoticePop();
@@ -1417,7 +1440,7 @@ function renderNoticeList(){
   if(!NT.items.length){list.innerHTML='<div class="notice-pop-empty">还没有收到通知</div>';return}
   list.innerHTML=NT.items.map(n=>'<div class="notice-item'+(n.readAt?'':' unread')+'" data-id="'+n.id+'">'
     +'<div class="notice-item-hd" onclick="toggleNotice('+n.id+')"><span class="ni-dot"></span>'+noticeTag(n)+'<span class="ni-title">'+esc(n.title)+'</span><span class="ni-time">'+noticeTime(n.publishedAt)+(n.readAt?'':' · 未读')+'</span></div>'
-    +'<div class="notice-item-body" hidden><div class="md-preview">'+window.renderMarkdown(n.content)+'</div></div>'
+    +'<div class="notice-item-body" hidden><div class="md-preview">'+window.renderMarkdown(n.content||'')+'</div></div>'
     +'</div>').join('');
 }
 async function toggleNotice(id){
@@ -1426,6 +1449,13 @@ async function toggleNotice(id){
   const body=item.querySelector('.notice-item-body');
   body.hidden=!body.hidden;
   const n=NT.items.find(x=>x.id===id);
+  // 增量轮询来的条目没有正文:展开时按需拉一次并缓存,之后不再请求。
+  if(n&&!body.hidden&&n.content===undefined){
+    try{
+      const r=await fetch('/api/my-notifications?id='+id,{headers:{'Authorization':'Bearer '+VK}});
+      if(r.ok){const one=await r.json();if(one&&one.id===id){n.content=one.content||'';body.querySelector('.md-preview').innerHTML=window.renderMarkdown(n.content)}}
+    }catch(e){/* 拉取失败保持折叠空态,下次展开再试 */}
+  }
   if(n&&!n.readAt&&!body.hidden){
     n.readAt=new Date().toISOString();
     item.classList.remove('unread');
@@ -1508,5 +1538,7 @@ async function closeAnnounce(read){
     closeNoticeModal();
   });
   fetchNotices();
-  NT.timer=setInterval(fetchNotices,60000);
+  // 隐藏暂停 + 切回立刷,同 30s 轮询治理;轮询走增量(poll=1,不带正文)。
+  NT.timer=setInterval(function(){if(!document.hidden)fetchNotices(true)},60000);
+  document.addEventListener('visibilitychange',function(){if(!document.hidden)fetchNotices(true)});
 })();

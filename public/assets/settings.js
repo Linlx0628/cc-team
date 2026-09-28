@@ -1721,9 +1721,11 @@ function renderScheduleStatus(proto){
 }
 // 30s 轮询不再局限于调度视图打开时：侧栏 dock 的「调度生效中」提示也依赖这份状态，
 // 设置页停在方案表单上跨过时间边界时，侧栏要自己变回基础组编辑器。
+// 页面隐藏时暂停(后台标签不再持续打满出网),切回可见立刷一次。
 setInterval(function(){
-  updateScheduleStatus();
+  if(!document.hidden)updateScheduleStatus();
 },30000);
+document.addEventListener('visibilitychange',function(){if(!document.hidden)updateScheduleStatus()});
 // Editing an alias's target model changes the set of models the rate rows can
 // point at, so keep those dropdowns in sync with every keystroke.
 document.getElementById('aliasRows').addEventListener('input',()=>{refreshPeakSelects();updateAllowedTags();refreshAllRateSelects()});

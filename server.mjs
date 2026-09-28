@@ -47,6 +47,7 @@ import { createToolPatternCompat } from "./lib/tool-pattern-compat.mjs";
 import { createProxyCore } from "./lib/proxy-core.mjs";
 import { createEgressMeter } from "./lib/egress-meter.mjs";
 import { installApiGzip } from "./lib/api-gzip.mjs";
+import { normalizeUpstreamGzipMode, prepareUpstreamBody, runUpstreamGzipProbe, UPSTREAM_GZIP_PROBE_DELAY_MS, UPSTREAM_GZIP_PROBE_INTERVAL_MS } from "./lib/upstream-gzip.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -1422,6 +1423,13 @@ function createProfileRuntime(profileName, profile) {
     protocol: normalizeProfileProtocol(profile.protocol),
     toolPatternCompat: toolPatternApi.normalizeToolPatternCompat(profile.toolPatternCompat),
     toolPatternsActive: toolPatternApi.computeToolPatternsActive(profile, upstreamUrl),
+    // 上游请求体压缩的 per-profile 开关("on"/"off" 显式;**缺省 null 跟全局**,不能
+    // 归一成 "auto" —— 否则会压过全局的显式设置)。运行态 gzState/gzRejects/gzRetryAt
+    // 由 lib/upstream-gzip.mjs 维护,重载即重探。
+    requestGzip: profile.requestGzip ? normalizeUpstreamGzipMode(profile.requestGzip) : null,
+    gzState: "unknown",
+    gzRejects: 0,
+    gzRetryAt: 0,
     // 是否要求非空 input(Responses 协议)。默认 false;被上游以「Input items array
     // must not be empty」拒绝一次后由 lib/empty-input-compat.mjs 置位(sticky,重载即清零)。
     requiresInputItems: false,
@@ -3480,21 +3488,28 @@ function getRealKeyFromProfile(profileCfg) {
   return "";
 }
 
-function sendUpstream(body, reqUrl, reqMethod, reqHeaders, timeout, _rt, clientState) {
-  return new Promise((resolve, reject) => {
+async function sendUpstream(body, reqUrl, reqMethod, reqHeaders, timeout, _rt, clientState) {
+  const runtime = _rt || rt;
+  // 上游压缩在发送咽喉的最后一刻决策(handleJsonProxy 重试/自愈与图片桥接共用这里):
+  // 返回浅拷贝头,绝不 mutate 调用方的 reqHeaders。gzUsed 随响应带回,编码拒绝时
+  // 调用方据以触发一次明文重发。
+  const gzPrep = await prepareUpstreamBody(body, reqHeaders, runtime, gProxy, { skip: clientState && clientState.gzSkip, gzCache: clientState && clientState.gzCache });
+  const sendBody = gzPrep ? gzPrep.body : body;
+  const sendHeaders = gzPrep ? gzPrep.headers : reqHeaders;
+  const gzUsed = !!gzPrep;
+  return await new Promise((resolve, reject) => {
     try {
       throwIfClientAborted(clientState);
     } catch (err) {
       reject(err);
       return;
     }
-    const runtime = _rt || rt;
     const opts = {
       hostname: runtime.upstreamUrl.hostname,
       port: runtime.upstreamUrl.port || (runtime.upstreamUrl.protocol === "https:" ? 443 : 80),
       path: buildUpstreamPath(reqUrl, runtime),
       method: reqMethod,
-      headers: reqHeaders,
+      headers: sendHeaders,
       agent: runtime.agent,
     };
 
@@ -3508,6 +3523,7 @@ function sendUpstream(body, reqUrl, reqMethod, reqHeaders, timeout, _rt, clientS
           statusCode: upRes.statusCode,
           headers: upRes.headers,
           body: Buffer.concat(chunks),
+          gzUsed,
         });
       });
     });
@@ -3523,10 +3539,10 @@ function sendUpstream(body, reqUrl, reqMethod, reqHeaders, timeout, _rt, clientS
       reject(err);
     });
     if (clientState && clientState.egress) {
-      clientState.egress.up += body.length;
+      clientState.egress.up += sendBody.length;   // 压缩后的真实出网字节
       clientState.egress.att += 1;
     }
-    upReq.write(body);
+    upReq.write(sendBody);
     upReq.end();
   });
 }
@@ -7217,6 +7233,18 @@ server.listen(port, "0.0.0.0", () => {
   console.log(`[团队AI Coding监控] Settings: http://localhost:${port}/settings`);
   console.log(`[团队AI Coding监控] Users: ${Object.values(rt?.globalUsers || {}).map(u => u.username || "").join(", ")}`);
   toolPatternApi.scheduleToolPatternProbes();
+  // 上游 gzip 探测:仅 auto 模式需要(显式 on/off 是用户的判断,不探);每个方案按
+  // 自身冷却节奏(unknown 10 分钟 / 结论 6 小时)决定这一轮要不要真发。
+  const runGzProbePass = () => {
+    for (const r of Object.values(runtimes)) {
+      if (normalizeUpstreamGzipMode(r.requestGzip || gProxy.upstreamRequestGzip) !== "auto") continue;
+      runUpstreamGzipProbe(r, () => getRealKeyFromProfile(config.profiles[r.profileName] || {}));
+    }
+  };
+  const gzFirst = setTimeout(runGzProbePass, UPSTREAM_GZIP_PROBE_DELAY_MS);
+  const gzTimer = setInterval(runGzProbePass, UPSTREAM_GZIP_PROBE_INTERVAL_MS);
+  gzFirst.unref?.();
+  gzTimer.unref?.();
   reseedEgressFromTodayLog();
 });
 

@@ -16,8 +16,15 @@
 | 流式空闲超时 | `proxy.streamIdleTimeout` | 120,000ms | ⚠️ **无 UI** | 流内多久没数据判死，0 = 关闭 |
 | 粘性会话 TTL | `proxy.stickySessionTtlSeconds` | 300s | ⚠️ **无 UI** | 0 = 关闭 |
 | 限流回退秒数 | `proxy.rateLimitFallbackSeconds` | 120 | ⚠️ **无 UI** | 上游 429 无恢复信息时的兜底窗口 |
+| 429 重试节奏 | `proxy.retry429Mode` | `backoff` | ⚠️ **无 UI** | `backoff`=指数退避（旧行为）；`retry-after`=尊重上游 Retry-After 头（见下方重试算法） |
+| 上游请求压缩 | `proxy.upstreamRequestGzip` | `auto` | ⚠️ **无 UI** | 发往上游的请求体是否 gzip（见[上游请求体压缩](#上游请求体压缩)） |
+| 上游压缩级别 | `proxy.upstreamGzipLevel` | 1 | ⚠️ **无 UI** | zlib 级别 1–9，1 与 9 比率只差 3–8% 而快 5–10 倍 |
+| 上游压缩阈值 | `proxy.upstreamGzipMinBytes` | 4096 | ⚠️ **无 UI** | 请求体小于此字节数不值得压缩 |
+| 上传预算次数 | `proxy.uploadBudgetAttempts` | 8 | ⚠️ **无 UI** | 单请求上游上传次数上限（见[单请求上传预算](#单请求上传预算)，0 = 关闭） |
+| 上传预算倍数 | `proxy.uploadBudgetBytesMult` | 4 | ⚠️ **无 UI** | 字节上限 = max(首传字节 × 此倍数, 8MB) |
+| 面板 API 压缩 | `proxy.apiGzip` | `true` | ⚠️ **无 UI** | `/api/*` JSON 响应是否 gzip，false 一键关闭 |
 
-> ⚠️ 三个「无 UI」字段设置页没有输入框，**必须手改 config.json 并重启**才能生效（启动时快照）；其余有 UI 的字段保存即热更新。
+> ⚠️ 「无 UI」字段设置页没有输入框，**必须手改 config.json**；其中重试/压缩/预算相关字段**每请求热读**（改完保存即对新请求生效，无需重启），`streamIdleTimeout` 等启动快照类仍需重启。
 
 进程级：服务自身超时 = max(流式, JSON) + 60 秒；请求体上限 50MB。
 
@@ -26,6 +33,16 @@
 ```text
 attempt = 0 .. maxRetries:
   延迟 = retryDelay × 2^attempt（封顶 10s）± 25% 随机抖动
+```
+
+`retry429Mode = "retry-after"`（可选）时的变化——**只影响频率类 429 的等待节奏**，套餐判定/failover 语义一行不动：
+
+```text
+频率类 429 且上游带 Retry-After 头:
+  waitMs = clamp( max(Retry-After, 指数退避), 1s, 20s )   # 尊重服务端但设上限
+  Retry-After > 20s:
+    不再持着 MB 级请求体原地空等 —— 429 原样透传给客户端(带原 Retry-After 头)，
+    交给 CLI 自带的指数退避；粘性会话保住，上游缓存前缀不浪费
 ```
 
 什么情况才走「同上游重试」（判定顺序）：
@@ -53,6 +70,58 @@ attempt = 0 .. maxRetries:
 | 每用户频率 | 60 次/分钟（1–600） | 60 秒**滚动窗口**（保留最近 60s 的时间戳） | 429 `rate_limit_exceeded`，Retry-After: 60 |
 | IP 限流 | 120 次/分钟（**硬编码**，不可配） | 同上滚动窗口 | 429，Retry-After: 60 |
 | 登录尝试 | 5 次失败锁 15 分钟 | 针对后台登录接口 | 锁定期拒绝 |
+
+## 上游请求体压缩
+
+**为什么**：Claude Code / Codex 是「整段对话重放」协议——每一轮都把完整上下文（几百 KB～几 MB）重新发上游，这是本网关**出网带宽的大头**（约占 2/3 以上）。JSON 文本 gzip 压缩比 4~6x，开启后同一流量只出网 1/4~1/6。
+
+**怎么压缩**：在发往上游的最后一刻（非流式 `sendUpstream` / 流式 `streamUpstreamOnce` 两个发送咽喉）压缩请求体并附 `content-encoding: gzip` 头。压缩发生在**自愈重发、图片桥接改写、工具 pattern 剔除之后**，改写过的 body 每次重新评估；同一 body 的重试走单槽缓存免重压。`zlib` 异步线程池 + 默认 level 1，1~5MB 请求体压缩耗时约 10~60ms，不阻塞事件循环。
+
+**开关**（手改 config.json，每请求热读）：
+
+| 层级 | 字段 | 取值 |
+|---|---|---|
+| 全局 | `proxy.upstreamRequestGzip` | `auto`（默认，探测门控）/ `on`（无条件压缩）/ `off`（一键全体明文） |
+| 单方案 | `profiles.<名称>.requestGzip` | 同上；**缺省跟全局**，显式设置优先于全局 |
+
+**auto 探测门控**——上游对 gzip 请求体的支持没有契约（Anthropic 官方 API 支持；国内 OpenAI 兼容端点多数支持但个别会拒），所以不赌文档、先探后压：
+
+```text
+启动 45s 后(以及之后每 5 分钟)对 auto 方案发一个 max_tokens=1 的压缩 ping:
+  200                     → gzState=ok  ,真实请求开始压缩;6 小时后复考
+  400/415/422 + 编码指纹* → gzState=no  ,保持明文;6 小时后重探
+  429/5xx/网络错          → gzState=unknown,10 分钟后重试探测
+* 编码指纹 = 错误文命中 content-encoding/gzip/gunzip/decompress/invalid json/
+  无法解析/编码/解压 等关键词(前 500 字符)
+```
+
+探测状态纯内存（`gzState`），重启后重探，成本是每次一条几百字节的请求。
+
+**三层降级**（真实流量与探测结论不一致时的保险）：
+
+1. **请求级**：真实请求命中编码指纹 → 同一请求**透明重发一次明文**（用户无感，客户端照常拿到 200；不占自愈名额）
+2. **方案级**：指纹累计 ≥2 次 → 该方案粘性禁用压缩，6 小时后自动重探（防单次假阳性永久关死）
+3. **全局**：`upstreamRequestGzip: "off"` 一键全体明文
+
+**误判说明**：真正的 malformed-JSON 400（客户端自己的错）撞上压缩开启也会命中指纹——明文重发一次仍 400 照常回给客户端，无害；要连续误判两次才会粘性关闭。
+
+**注意**：`upB`（出网观测的上行字节）在开启压缩后计的是**压缩后字节**；工具 pattern 探针体积小、不压缩。
+
+## 单请求上传预算
+
+**为什么**：重试（同上游最多 4 次）× failover（默认组 3 候选）× 自愈（1~3 种）的最坏链，可把同一个 MB 级请求体上传 **6~12 遍**——上游故障时段的出网放大主要来自这里。预算给「一个逻辑请求的全部上传」设上限，超限直接 503 交给客户端 CLI 自带的指数退避。
+
+**算式**（两个上限任一超限即触发）：
+
+```text
+次数上限: egress.att ≥ uploadBudgetAttempts        (默认 8, 0=关闭)
+字节上限: egress.up + 本次字节 > max(首传字节 × uploadBudgetBytesMult, 8MB)
+                                            (默认倍数 4)
+```
+
+数字代入示例：首传 2MB 的请求 → 字节上限 = max(8MB, 8MB) = 8MB ≈ 4 次全量重传的量；次数上限 8 允许 3 候选 × 2 次尝试的合法链，只砍 6~12 次的病态尾部。开启上游压缩后按**压缩后字节**计数，同样的预算允许更多次合法 failover。
+
+**触发后的响应**：Anthropic 协议 → `503` + `{"type":"error","error":{"type":"overloaded_error",…}}` + `Retry-After: 30`；Responses 协议 → `sendOpenAiError(503, "upload_budget_exceeded", …)`。请求日志（JSONL）该行 `budget: true`。配置每请求热读（`uploadBudgetAttempts` 改 0 即时关闭，无需重启）。
 
 ## 熔断器状态机
 

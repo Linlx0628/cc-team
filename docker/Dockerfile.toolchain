@@ -1,0 +1,62 @@
+# Dockerfile.toolchain —— 在 1Panel 现有镜像之上叠加「代码评审工具链」：
+# git >= 2.41（Debian 12 的 apt 只有 2.39.5，源码编译）+ OCR 评审引擎。
+#
+# 为什么需要它：容器可写层里的安装会在**重建容器时全部还原**（1Panel 重启/重新部署
+# 都会走到重建）。把工具链做进镜像，重建多少次都在。
+#
+# 用法（在服务器上）：
+#   1) 查出 1Panel 当前用的镜像：
+#        docker inspect <容器名> --format '{{.Config.Image}}'
+#   2) 构建（把 BASE_IMAGE 换成上一步的结果）：
+#        docker build -f docker/Dockerfile.toolchain --build-arg BASE_IMAGE=<镜像名> -t cc-team:toolchain .
+#   3) 1Panel → 容器 → 编辑 → 镜像改为 cc-team:toolchain → 重建容器
+#
+# ⚠️ 前提：BASE_IMAGE 是 **Debian 系**（bookworm 等）。若为 Alpine，把 apt-get 换成
+#    apk add、并把 git 编译阶段的依赖换成 Alpine 包（或直接 apk add git —— Alpine 的
+#    git 本身 ≥2.45，无需编译）。
+#
+# 国内网络：npm 走 npmmirror；git 源码下载已做三源回退。
+
+ARG BASE_IMAGE=debian:12
+
+# ── 阶段 1：编译 git（Debian 12 上编译，产物与 Debian 系基础镜像同 glibc）──────
+FROM debian:12 AS gitbuild
+ARG GIT_VERSION=2.47.3
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      build-essential ca-certificates curl xz-utils gettext \
+      libcurl4-openssl-dev libexpat1-dev zlib1g-dev libpcre2-dev \
+ && rm -rf /var/lib/apt/lists/*
+RUN for U in \
+      "https://mirrors.edge.kernel.org/pub/software/scm/git/git-${GIT_VERSION}.tar.xz" \
+      "https://www.kernel.org/pub/software/scm/git/git-${GIT_VERSION}.tar.xz" \
+      "https://github.com/git/git/archive/refs/tags/v${GIT_VERSION}.tar.gz" \
+    ; do curl -fL --connect-timeout 15 --retry 2 -o /tmp/git.tar "$U" && break; done \
+ && mkdir -p /tmp/git-src && tar -xf /tmp/git.tar -C /tmp/git-src --strip-components=1 \
+ && make -C /tmp/git-src -j"$(nproc)" NO_TCLTK=1 NO_GETTEXT=1 NO_PERL=1 NO_PYTHON=1 prefix=/opt/git all \
+ && make -C /tmp/git-src NO_TCLTK=1 NO_GETTEXT=1 NO_PERL=1 NO_PYTHON=1 prefix=/opt/git install
+
+# ── 阶段 2：叠加到 1Panel 现有镜像 ─────────────────────────────────────────
+FROM ${BASE_IMAGE}
+
+# git 本体 + 它依赖的运行时库（libcurl 用于 https 拉仓库，缺了 clone 直接失败）
+COPY --from=gitbuild /opt/git /opt/git
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      libcurl4 libpcre2-8-0 zlib1g libexpat1 ca-certificates openssh-client \
+ && rm -rf /var/lib/apt/lists/*
+
+# OCR 评审引擎：原生二进制随 npm optionalDependencies 分发，走 npmmirror 即可完整安装
+ARG NPM_REGISTRY=https://registry.npmmirror.com
+RUN npm i -g @alibaba-group/open-code-review --registry="${NPM_REGISTRY}" \
+ && ocr version
+
+# /opt/git/bin 前置：盖过系统自带的旧 git
+ENV PATH="/opt/git/bin:${PATH}"
+
+# 构建期自检：任一失败会让 build 直接报错，避免装出一个「看着成功、评审跑不动」的镜像
+RUN git --version | grep -Eq '2\.(4[1-9]|[5-9][0-9])' \
+ && cd /tmp && rm -rf gc && mkdir gc && cd gc && git init -q . \
+ && echo hi > a.txt && git add a.txt \
+ && git -c user.email=b@b -c user.name=b commit -qm x \
+ && git merge-base --end-of-options HEAD HEAD >/dev/null \
+ && git show --diff-merges=first-parent --end-of-options HEAD >/dev/null \
+ && echo "✅ 工具链校验通过"

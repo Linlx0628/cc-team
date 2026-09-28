@@ -10,12 +10,26 @@
 #              docker exec -it <容器名> sh /tmp/upgrade-git.sh
 #   2) 或直接把本文件内容粘进容器终端执行。
 #
-# 可用环境变量覆盖：GIT_VERSION（默认 2.47.3）、PREFIX（默认 /usr/local）。
-# ⚠️ 产物在容器可写层：1Panel 重建容器后需重跑本脚本（要一劳永逸请用派生镜像方案）。
+# 可用环境变量覆盖：
+#   GIT_VERSION  默认 2.47.3
+#   PREFIX       默认 /usr/local（装到哪）
+#   LIBDIR       可选。设了就把 git 依赖的非基础库复制到该目录 —— 用于「工具链放挂载卷」
+#                场景（配合 LD_LIBRARY_PATH，见脚本末尾）
+#   NPM_PREFIX   可选。设了就顺带把 OCR 评审引擎装到该 npm 前缀（用于挂载卷场景）
+#   FORCE=1      已经是 ≥2.41 也强制重装
+#
+# ⚠️ 产物在容器可写层：1Panel 重建容器后需重跑本脚本。
+#   一劳永逸二选一：① 派生镜像（docker/Dockerfile.toolchain）；
+#   ② 工具链放挂载卷：把本脚本拷进容器后这样跑（/opt/toolchain 是挂载进来的宿主机目录）：
+#        PREFIX=/opt/toolchain/git LIBDIR=/opt/toolchain/lib \
+#        NPM_PREFIX=/opt/toolchain/npm sh /tmp/upgrade-git.sh
+#      然后在 1Panel 给容器加两个环境变量（见脚本末尾输出）。
 set -eu
 
 GIT_VERSION="${GIT_VERSION:-2.47.3}"
 PREFIX="${PREFIX:-/usr/local}"
+LIBDIR="${LIBDIR:-}"
+NPM_PREFIX="${NPM_PREFIX:-}"
 
 log() { echo "==> $*"; }
 
@@ -109,6 +123,38 @@ if [ "$FAIL" = "0" ]; then
   echo "✅ 全部通过。重启容器使环境完全就绪：docker restart <容器名>"
 else
   echo "❌ 有检查未通过，把上面的输出发给管理员排查。"
+fi
+
+# ── 挂载卷场景的收尾：库复制 + 环境变量提示 ──────────────────────────────
+# 目的：让 git 与 OCR 都活在挂载目录里，容器重建后不丢。容器重建会把 apt 装的
+# 运行时库(libcurl 等)还原掉，所以把这些 .so 一起复制进挂载目录兜底。
+if [ -n "$LIBDIR" ]; then
+  log "复制 git 依赖的共享库到 $LIBDIR"
+  mkdir -p "$LIBDIR"
+  # ldd 列出全部依赖；跳过基础库(glibc/pthread/dl 等容器必然自带的)
+  ldd "$(command -v git)" 2>/dev/null | grep -oE '/[^ ]+\.so[^ ]*' | while read -r so; do
+    case "$so" in
+      */libc.so*|*/libm.so*|*/libpthread.so*|*/libdl.so*|*/librt.so*|*/libgcc_s.so*|*/ld-linux*) ;;
+      *) cp -n "$so" "$LIBDIR/" 2>/dev/null || true ;;
+    esac
+  done
+  echo "  已复制: $(ls "$LIBDIR" 2>/dev/null | tr '\n' ' ')"
+fi
+
+if [ -n "$NPM_PREFIX" ]; then
+  log "安装 OCR 评审引擎到 $NPM_PREFIX（来源 npmmirror，二进制随 optionalDependencies 分发）"
+  mkdir -p "$NPM_PREFIX"
+  npm i -g @alibaba-group/open-code-review --prefix "$NPM_PREFIX" --registry=https://registry.npmmirror.com
+  "$NPM_PREFIX/bin/ocr" version || true
+fi
+
+if [ -n "$LIBDIR" ] || [ -n "$NPM_PREFIX" ]; then
+  echo
+  echo "================ 还需在 1Panel 配置（容器 → 环境变量）================"
+  echo "  PATH=/opt/toolchain/git/bin:/opt/toolchain/npm/bin:\$PATH"
+  [ -n "$LIBDIR" ] && echo "  LD_LIBRARY_PATH=$LIBDIR:\$LD_LIBRARY_PATH"
+  echo "（把 /opt/toolchain 换成本机实际的挂载路径；改完重建容器，工具链仍在）"
+  echo "===================================================================="
 fi
 
 # ── apt 太慢？把 Debian 源换成国内镜像后再重跑本脚本 ────────────────────

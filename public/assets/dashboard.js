@@ -57,9 +57,11 @@ async function ensureSection(name,{force=false}={}){
     const qs=new URLSearchParams({section:src});
     if(currentProfile!=="all")qs.set("profile",currentProfile);
     else if(PROTO)qs.set("protocol",PROTO);
+    qs.set("start",statsFloor());       // 宽表按当前图表窗口取数,见 statsFloor 注释
     const r=await fetch("/api/stats?"+qs);
     const payload=await r.json();
     D=Object.assign(D||{},payload);     // 合并进既有全局:渲染函数继续读 D.*
+    FLOOR=qs.get("start")||FLOOR;       // 记录本次实际取到的最早起点(放宽筛选时才需重拉)
     sectionLoaded[name]=true;
     renderSection(name);
   }catch(e){document.getElementById("meta").textContent="Error: "+e.message}
@@ -116,7 +118,21 @@ function onDateRangeChange(){
   DS=document.getElementById("dateStart").value||"";
   DE=document.getElementById("dateEnd").value||"";
   if(DS&&DE&&DS>DE){[DS,DE]=[DE,DS];document.getElementById("dateStart").value=DS;document.getElementById("dateEnd").value=DE}
-  render();
+  rerenderOrReload();
+}
+// ── 宽表(dailyModels/dailyClients)按需取数(P3 出网优化)──
+// 服务端只下发这个起点之后的宽表行;daily(趋势图)/profileDaily(方案图)恒为全史不受影响。
+// 「模型筛选生效且未设日期范围」时趋势图经 filteredDaily() 用 dailyModels 重建**全史**,
+// 这种情形传 0000-01-01 放开;其余场景宽表消费方(模型/客户端分布图)都按 effBounds 窗口
+// 过滤,传窗口起点即可 —— 默认按日视图只需今天,30s 轮询的载荷大幅缩小。
+let FLOOR="";
+function statsFloor(){
+  const eb=effBounds();
+  return (MDL!=="all"&&!eb.ranged)?"0000-01-01":eb.start;
+}
+// 筛选变化时:需要的起点比已取的更早就重拉,否则纯前端过滤就够(切 Tab 不再无条件打服务端)。
+function rerenderOrReload(){
+  if(statsFloor()<FLOOR)load();else render();
 }
 // 图表数据源：模型筛选生效时由 dailyModels（已按掩码 key 对齐）重建不含缓存的日粒度数据；
 // 仅用户筛选时过滤 daily；无筛选直接用 daily。与 grp()/totalTokens() 的字段约定兼容。
@@ -799,9 +815,9 @@ function renderErrorsPanel(){
 // 一次只拉当前菜单的 section —— 所有既有调用点(清除错误、重置筛选)语义不变。
 function load(){refreshCurrent()}
 function toggleSec(id){const body=document.getElementById(id+"Body");const icon=document.getElementById(id+"Icon");const open=body.classList.toggle("open");icon.classList.toggle("open",open)}
-document.querySelectorAll(".tab").forEach(b=>b.addEventListener("click",()=>{document.querySelectorAll(".tab").forEach(x=>x.classList.remove("on"));b.classList.add("on");P=b.dataset.p;resetDetailGrouping();render()}));
+document.querySelectorAll(".tab").forEach(b=>b.addEventListener("click",()=>{document.querySelectorAll(".tab").forEach(x=>x.classList.remove("on"));b.classList.add("on");P=b.dataset.p;resetDetailGrouping();rerenderOrReload()}));
 document.getElementById("metricSel").addEventListener("change",e=>{MT=e.target.value;render()});
-document.getElementById("modelSel").addEventListener("change",e=>{MDL=e.target.value;resetDetailGrouping();render()});
+document.getElementById("modelSel").addEventListener("change",e=>{MDL=e.target.value;resetDetailGrouping();rerenderOrReload()});
 document.getElementById("userSel").addEventListener("change",e=>{USR=e.target.value;render()});
 function resetChartFilters(){P="day";MT="tokens";MDL="all";USR="all";DS="";DE="";PROTO="";setPieDim("user");setModelDim("model");setProtoSeg("");document.querySelectorAll("#globalTabs .tab").forEach(x=>x.classList.toggle("on",x.dataset.p==="day"));document.getElementById("metricSel").value="tokens";document.getElementById("modelSel").value="all";document.getElementById("userSel").value="all";document.getElementById("dateStart").value="";document.getElementById("dateEnd").value="";if(currentProfile!=="all"){currentProfile="all";document.getElementById("profileSel").value="all"}resetDetailGrouping();load()}
 (function bindDashNav(){

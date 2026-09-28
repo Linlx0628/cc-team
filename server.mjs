@@ -2202,7 +2202,7 @@ function loadRateLimitState() {
 }
 
 // ── Profile snapshot: assemble nested object for sanitizeStore (single profile) ──
-function loadProfileSnapshot(suffix) {
+function loadProfileSnapshot(suffix, wideFloor) {
   const users = {};
   for (const r of db.prepare("SELECT user_key,name,total_input,total_output,total_requests,cache_creation,cache_read,last_active FROM users WHERE profile=?").all(suffix)) {
     users[r.user_key] = { name: r.name, totalInputTokens: r.total_input, totalOutputTokens: r.total_output, totalRequests: r.total_requests, cacheCreationTokens: r.cache_creation, cacheReadTokens: r.cache_read, lastActive: r.last_active };
@@ -2223,8 +2223,13 @@ function loadProfileSnapshot(suffix) {
     if (!hourly[r.date]) hourly[r.date] = {};
     hourly[r.date][r.hour] = { requests: r.requests, inputTokens: r.input_tokens, outputTokens: r.output_tokens, cacheCreationTokens: r.cache_creation, cacheReadTokens: r.cache_read };
   }
+  // 宽表按 wideFloor 收窄(与聚合视图同源同值):单方案与全部方案两个视图在同一筛选下
+  // 必须显示同一历史范围,下界不一致会让同一天的图对不上。dailyModels/dailyClients 的
+  // 消费方(模型/客户端分布图)都是窗口过滤的;daily 保留全史(趋势图)。
+  const widePred = wideFloor ? " AND date>=?" : "";
+  const wideBinds = wideFloor ? [wideFloor] : [];
   const dailyModels = {};
-  for (const r of db.prepare("SELECT date,user_key,model,input_tokens,output_tokens,requests FROM usage_daily_model WHERE profile=?").all(suffix)) {
+  for (const r of db.prepare(`SELECT date,user_key,model,input_tokens,output_tokens,requests FROM usage_daily_model WHERE profile=?${widePred}`).all(suffix, ...wideBinds)) {
     if (!dailyModels[r.date]) dailyModels[r.date] = {};
     if (!dailyModels[r.date][r.user_key]) dailyModels[r.date][r.user_key] = {};
     dailyModels[r.date][r.user_key][r.model] = { inputTokens: r.input_tokens, outputTokens: r.output_tokens, requests: r.requests };
@@ -2238,7 +2243,7 @@ function loadProfileSnapshot(suffix) {
   // 客户端维度与 dailyModels 同形。单方案视图也必须带上 —— 否则切到具体方案时这一轴就空了,
   // 而「这个方案是谁在用哪个客户端」恰恰是单方案视图下最想问的。
   const dailyClients = {};
-  for (const r of db.prepare("SELECT date,user_key,client,input_tokens,output_tokens,requests FROM usage_daily_client WHERE profile=?").all(suffix)) {
+  for (const r of db.prepare(`SELECT date,user_key,client,input_tokens,output_tokens,requests FROM usage_daily_client WHERE profile=?${widePred}`).all(suffix, ...wideBinds)) {
     if (!dailyClients[r.date]) dailyClients[r.date] = {};
     if (!dailyClients[r.date][r.user_key]) dailyClients[r.date][r.user_key] = {};
     dailyClients[r.date][r.user_key][r.client] = { inputTokens: r.input_tokens, outputTokens: r.output_tokens, requests: r.requests };
@@ -5213,10 +5218,15 @@ const server = http.createServer((req, res) => {
       protocolView = protocolParam;
       protoFilter = statsApi.protocolSuffixes(protocolParam);
     }
+    // 宽表(dailyModels/dailyClients)取数下界:前端按当前图表窗口传 ?start=(模型筛选+无
+    // 日期范围时传 0000-01-01 放开全史,趋势图要用);缺省退到年内(与 24h 图同款,老调用
+    // 方/MCP 的保守默认)。daily 与 profileDaily 是全史分桶图的口粮,不受此参数影响。
+    const startParam = url.searchParams.get("start");
+    const wideFloor = /^\d{4}-\d{2}-\d{2}$/.test(startParam || "") ? startParam : hourlyChartFloor();
     let data;
     if (profileSuffix === "all") {
       // Aggregate all profiles (optionally narrowed to one protocol)
-      const agg = statsApi.getAggregatedStore(protoFilter);
+      const agg = statsApi.getAggregatedStore(protoFilter, { wideFloor });
       data = sanitizeStore(agg);
       data.profileView = "all";
       data.protocolView = protocolView;
@@ -5227,7 +5237,7 @@ const server = http.createServer((req, res) => {
       const targetSuffix = normalizeProfileSuffix(profileSuffix);
       const targetRt = runtimes[targetSuffix];
       if (targetRt) {
-        const s = loadProfileSnapshot(targetSuffix);
+        const s = loadProfileSnapshot(targetSuffix, wideFloor);
         data = sanitizeStore(s);
         data.profileView = targetRt.profileName;
         data.profileSuffix = targetSuffix;

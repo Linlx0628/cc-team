@@ -41,7 +41,7 @@ import { createSessionsReader } from "./lib/sessions.mjs";
 import { createNotifier } from "./lib/notifier.mjs";
 import { createPersistence } from "./lib/persistence.mjs";
 import { createMemberRewards } from "./lib/member-rewards.mjs";
-import { getApiKey, makeClientAbortError, isClientAbortError, createClientAbortState, markClientAborted, addClientAbortListener, setActiveUpstreamRequest, throwIfClientAborted, sleepWithClientAbort, jitter, buildUpstreamPath, extractClientSignal, uploadBudgetExceeded } from "./lib/proxy-helpers.mjs";
+import { getApiKey, makeClientAbortError, isClientAbortError, createClientAbortState, markClientAborted, addClientAbortListener, setActiveUpstreamRequest, throwIfClientAborted, sleepWithClientAbort, jitter, buildUpstreamPath, extractClientSignal, noteUploadBudget, uploadBudgetExceeded } from "./lib/proxy-helpers.mjs";
 import { createVisionBridge } from "./lib/vision-bridge.mjs";
 import { createToolPatternCompat } from "./lib/tool-pattern-compat.mjs";
 import { createProxyCore } from "./lib/proxy-core.mjs";
@@ -3490,7 +3490,7 @@ function getRealKeyFromProfile(profileCfg) {
   return "";
 }
 
-async function sendUpstream(body, reqUrl, reqMethod, reqHeaders, timeout, _rt, clientState) {
+async function sendUpstream(body, reqUrl, reqMethod, reqHeaders, timeout, _rt, clientState, opts = {}) {
   const runtime = _rt || rt;
   // 上游压缩在发送咽喉的最后一刻决策(handleJsonProxy 重试/自愈与图片桥接共用这里):
   // 返回浅拷贝头,绝不 mutate 调用方的 reqHeaders。gzUsed 随响应带回,编码拒绝时
@@ -3500,7 +3500,10 @@ async function sendUpstream(body, reqUrl, reqMethod, reqHeaders, timeout, _rt, c
   const sendHeaders = gzPrep ? gzPrep.headers : reqHeaders;
   const gzUsed = !!gzPrep;
   // 上传预算(次数/字节)在写出前检查:非流式重试/自愈每次都经这里,超限即整单 503。
-  const budgetHit = uploadBudgetExceeded(clientState && clientState.uploadBudget, clientState && clientState.egress, sendBody.length);
+  // 图片桥接的辅助调用(exemptBudget / clientState.budgetExempt 深度>0)—— 计入出网
+  // 观测但不吃预算:它是一次性的新图识别,不是重试放大(见 proxy-helpers 注释)。
+  const budgetExempt = opts.exemptBudget || (clientState && clientState.budgetExempt);
+  const budgetHit = budgetExempt ? null : uploadBudgetExceeded(clientState && clientState.uploadBudget, sendBody.length);
   if (budgetHit) {
     const err = new Error(budgetHit.reason === "attempts"
       ? `Upstream upload budget exceeded (${budgetHit.attempts} posts, cap ${budgetHit.cap}). Try again later.`
@@ -3554,6 +3557,7 @@ async function sendUpstream(body, reqUrl, reqMethod, reqHeaders, timeout, _rt, c
       clientState.egress.up += sendBody.length;   // 压缩后的真实出网字节
       clientState.egress.att += 1;
     }
+    if (!budgetExempt) noteUploadBudget(clientState && clientState.uploadBudget, sendBody.length);
     upReq.write(sendBody);
     upReq.end();
   });

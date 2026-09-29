@@ -86,7 +86,20 @@ PREFIX=<源码目录>/toolchain/git LIBDIR=<源码目录>/toolchain/lib NPM_PREF
 
 > `start:toolchain` 降级安全：工具链目录不存在时，多出来的 PATH 项无害，程序回落到系统 git 正常启动。
 > 若面板的启动命令不支持选择脚本，用「自定义启动命令」填：
-> `sh -c 'export PATH=$PWD/toolchain/git/bin:$PWD/toolchain/npm/bin:$PATH; export LD_LIBRARY_PATH=$PWD/toolchain/lib; exec node server.mjs'`
+> `sh -c 'export PATH=$PWD/toolchain/git/bin:$PWD/toolchain/npm/bin:$PATH; export LD_LIBRARY_PATH=$PWD/toolchain/lib GIT_EXEC_PATH=$PWD/toolchain/git/libexec/git-core; exec node server.mjs'`
+
+**⚠️ 工具链被搬动过就必须设 `GIT_EXEC_PATH`**：`git-remote-https` 等远程 helper 不在主二进制里，
+git 按**编译时写死的前缀**去 `<前缀>/libexec/git-core` 找。若编译前缀与最终目录不一致
+（典型场景：先装在 `/opt/toolchain` 再拷进应用目录），本地命令一切正常，唯独 **https 克隆/拉取**
+报 `git: 'remote-https' is not a git command`。两种解法：
+- 启动脚本里设 `GIT_EXEC_PATH=<工具链>/git/libexec/git-core`（`start:toolchain` 已内置）；
+- 或编译时加 `RUNTIME_PREFIX=1`（升级脚本与 `Dockerfile.toolchain` 已默认带上），git 改为
+  相对自身位置查找，此后搬到哪里都不用配。
+
+自检一条命令（在容器内）：
+```sh
+GIT_EXEC_PATH=/app/toolchain/git/libexec/git-core /app/toolchain/git/bin/git ls-remote https://gitee.com/mirrors/git.git HEAD
+```
 
 容器化部署（`docker/docker-compose.yml`）已经把工作区挂成**命名卷** `code-review-workspaces`（对应容器内 `/app/code-review-workspaces`）——不挂也能跑，只是每次重建容器都要重新 clone 仓库：
 

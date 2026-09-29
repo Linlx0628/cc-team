@@ -85,8 +85,11 @@ log "编译（几分钟，与容器 CPU 核数有关）"
 mkdir -p /tmp/git-src
 tar -xf /tmp/git.tar -C /tmp/git-src --strip-components=1
 cd /tmp/git-src
-make -j"$(nproc)" NO_TCLTK=1 NO_GETTEXT=1 NO_PERL=1 NO_PYTHON=1 prefix="$PREFIX" all
-make NO_TCLTK=1 NO_GETTEXT=1 NO_PERL=1 NO_PYTHON=1 prefix="$PREFIX" install
+# RUNTIME_PREFIX=1: 让 git 相对自身所在位置查找 libexec(远程 helper git-remote-https 等)
+# 与 templates —— 否则它会按编译时写死的前缀找,整棵树被搬走(拷进应用目录)后
+# https 克隆会报 "git: 'remote-https' is not a git command"。
+make -j"$(nproc)" NO_TCLTK=1 NO_GETTEXT=1 NO_PERL=1 NO_PYTHON=1 RUNTIME_PREFIX=1 prefix="$PREFIX" all
+make NO_TCLTK=1 NO_GETTEXT=1 NO_PERL=1 NO_PYTHON=1 RUNTIME_PREFIX=1 prefix="$PREFIX" install
 hash -r 2>/dev/null || true
 
 # ── 4) 验证：版本 + OCR 实际依赖的五个调用 ─────────────────────────────
@@ -109,6 +112,7 @@ FAIL=0
 check() { # 名称 + 命令
   if sh -c "$2" >/dev/null 2>&1; then echo "  ✅ $1"; else echo "  ❌ $1"; FAIL=1; fi
 }
+check "https 远程 helper 可用"        "git --exec-path | grep -q . && ls \"\$(git --exec-path)/git-remote-https\""
 check "merge-base --end-of-options" "git merge-base --end-of-options HEAD HEAD"
 check "log --end-of-options"          "git log -1 --format=%B --end-of-options HEAD"
 check "rev-list --end-of-options"     "git rev-list --parents -n 1 --end-of-options HEAD"

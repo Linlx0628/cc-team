@@ -32,8 +32,8 @@ RUN for U in \
       "https://github.com/git/git/archive/refs/tags/v${GIT_VERSION}.tar.gz" \
     ; do curl -fL --connect-timeout 15 --retry 2 -o /tmp/git.tar "$U" && break; done \
  && mkdir -p /tmp/git-src && tar -xf /tmp/git.tar -C /tmp/git-src --strip-components=1 \
- && make -C /tmp/git-src -j"$(nproc)" NO_TCLTK=1 NO_GETTEXT=1 NO_PERL=1 NO_PYTHON=1 prefix=/opt/git all \
- && make -C /tmp/git-src NO_TCLTK=1 NO_GETTEXT=1 NO_PERL=1 NO_PYTHON=1 prefix=/opt/git install
+ && make -C /tmp/git-src -j"$(nproc)" NO_TCLTK=1 NO_GETTEXT=1 NO_PERL=1 NO_PYTHON=1 RUNTIME_PREFIX=1 prefix=/opt/git all \
+ && make -C /tmp/git-src NO_TCLTK=1 NO_GETTEXT=1 NO_PERL=1 NO_PYTHON=1 RUNTIME_PREFIX=1 prefix=/opt/git install
 
 # ── 阶段 2：叠加到 1Panel 现有镜像 ─────────────────────────────────────────
 FROM ${BASE_IMAGE}

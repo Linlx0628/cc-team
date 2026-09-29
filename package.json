@@ -2,7 +2,8 @@
   "name": "token-monitor",
   "version": "1.0.0",
   "scripts": {
-    "start": "node server.mjs"
+    "start": "node server.mjs",
+    "start:toolchain": "PATH=$PWD/toolchain/git/bin:$PWD/toolchain/npm/bin:$PATH LD_LIBRARY_PATH=$PWD/toolchain/lib node server.mjs"
   },
   "dependencies": {
     "better-sqlite3": "^12.11.1"

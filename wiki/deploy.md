@@ -50,9 +50,43 @@ docker cp docker/upgrade-git-in-container.sh <容器名>:/tmp/upgrade-git.sh
 docker exec -it <容器名> sh /tmp/upgrade-git.sh     # 装依赖→编译→验证，幂等可重跑
 ```
 
-脚本编译安装到 `/usr/local`（不覆盖系统 git），末尾会自动验证 OCR 实际依赖的五个 git 调用。⚠️ 产物在容器可写层，**1Panel/Compose 重建容器后需重跑**；要一劳永逸请改用派生镜像（`FROM <现有镜像>` + `COPY` 编译好的 git）。
+脚本编译安装到 `/usr/local`（不覆盖系统 git），末尾会自动验证 OCR 实际依赖的五个 git 调用。
 
 > OCR 本身的版本检查是**软警告**（版本不足只在 stderr 打一行字、不拦截），所以升级前也可先跑一次评审验证：若 diff 生成正常，可暂不升级。
+
+#### ⚠️ 容器可写层会被重置 —— 必须把工具链放进「持久目录」
+
+上面两步装进的是**容器可写层**，容器一重建（1Panel 重启/重新部署、`docker compose up --force-recreate`）就全没了。持久化二选一：
+
+**方式 1：派生镜像（任何部署方式都适用，最干净）**
+
+```bash
+docker inspect <容器名> --format '{{.Config.Image}}'      # 查出当前镜像名
+docker build -f docker/Dockerfile.toolchain --build-arg BASE_IMAGE=<镜像名> -t cc-team:toolchain .
+# 再把容器/应用的镜像改成 cc-team:toolchain
+```
+
+**方式 2：工具链放进挂载目录（1Panel「运行环境」这类由面板托管容器的场景）**
+
+1Panel 的运行环境是「按应用配置重新生成容器」，**手动在容器里加的挂载与环境变量每次重启都会被覆盖**；但它自己的**源码目录挂载是持久的**，把工具链放进去即可：
+
+```bash
+# 1) 看源码目录映射到容器哪里（形如 /home/<应用名> → /app）
+docker inspect <容器名> --format '{{range .Mounts}}{{.Source}} → {{.Destination}}{{"\n"}}{{end}}'
+
+# 2) 把工具链装进源码目录（宿主机路径）
+PREFIX=<源码目录>/toolchain/git LIBDIR=<源码目录>/toolchain/lib NPM_PREFIX=<源码目录>/toolchain/npm \
+  sh docker/upgrade-git-in-container.sh        # 在容器内执行该脚本，PREFIX 指向挂载进来的路径
+
+# 3) 让程序用上它：项目的 package.json 已内置 start:toolchain 脚本
+#    在 1Panel「运行环境 → 编辑 → 启动命令」下拉里选 start:toolchain
+#    （该下拉从源码目录的 package.json 解析；脚本内容给 node 进程注入
+#      PATH=$PWD/toolchain/git/bin:$PWD/toolchain/npm/bin 与 LD_LIBRARY_PATH=$PWD/toolchain/lib）
+```
+
+> `start:toolchain` 降级安全：工具链目录不存在时，多出来的 PATH 项无害，程序回落到系统 git 正常启动。
+> 若面板的启动命令不支持选择脚本，用「自定义启动命令」填：
+> `sh -c 'export PATH=$PWD/toolchain/git/bin:$PWD/toolchain/npm/bin:$PATH; export LD_LIBRARY_PATH=$PWD/toolchain/lib; exec node server.mjs'`
 
 容器化部署（`docker/docker-compose.yml`）已经把工作区挂成**命名卷** `code-review-workspaces`（对应容器内 `/app/code-review-workspaces`）——不挂也能跑，只是每次重建容器都要重新 clone 仓库：
 

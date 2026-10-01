@@ -38,6 +38,20 @@ const CR_STATUS_LABEL = {
   skipped: "已跳过", failed: "失败", timeout: "超时", canceled: "已取消",
 };
 function crShort(sha) { return sha ? String(sha).slice(0, 8) : ""; }
+// 「已解决」是谁、什么时候点的(展示用)。存储层记的是当时的名字快照(成员改名后不回改),
+// 管理员代为标记时记「管理员」——管理端是共享口令,没有逐人身份,要追到 IP 看审计日志。
+function crWhen(iso) {
+  if (!iso) return "";
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return "";
+  return d.toLocaleString("zh-CN", { timeZone: "Asia/Shanghai", hour12: false, month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" });
+}
+function crResolvedNote(r) {
+  if (!r || !r.resolved) return "";
+  const who = r.resolved_by ? escH(r.resolved_by) : "管理员";
+  const when = crWhen(r.resolved_at);
+  return " · 已解决 " + who + (when ? " " + escH(when) : "");
+}
 function crDur(ms) { if (!ms) return "-"; const s = Math.round(ms / 1000); return s < 60 ? s + "s" : Math.floor(s / 60) + "m" + (s % 60) + "s"; }
 
 function fmtMB(bytes) { return (bytes / 1048576).toFixed(1) + "MB"; }
@@ -146,6 +160,7 @@ function crRunRow(r) {
     + (r.comments_count > 0 ? (r.resolved ? '<span class="pill pill-dim">已解决</span>' : '<span class="pill pill-warn">未解决</span>') : "")
     + trig + '</div>'
     + '<div class="cr-run-meta">' + escH(new Date(r.created_at).toLocaleString("zh-CN", { timeZone: "Asia/Shanghai", hour12: false }))
+    + crResolvedNote(r)
     + " · " + escH(r.range_mode === "single" ? "单提交 " + crShort(r.to_commit) : `${crShort(r.from_commit)}→${crShort(r.to_commit)}`)
     + ` · 文件 ${r.files_reviewed} · 意见 ${r.comments_count} · ${fmtT(r.input_tokens + r.output_tokens)} token · ${crDur(r.elapsed_ms)}`
     + '</div>'
@@ -231,6 +246,8 @@ async function openReviewRun(id) {
       (run.range_mode === "single" ? "单提交 " : "增量 ") + crShort(run.to_commit),
       run.author_name ? `提交人 ${run.author_name}` : "",
       `${run.comments_count} 条意见 · ${run.files_reviewed} 个文件 · ${fmtT(run.input_tokens + run.output_tokens)} token · ${crDur(run.elapsed_ms)}`,
+      // 已解决时把「谁、什么时候」放进详情副标题(列表里也有一份,格式一致)
+      run.resolved ? (`已解决 ${run.resolved_by || "管理员"}${crWhen(run.resolved_at) ? " " + crWhen(run.resolved_at) : ""}`) : "",
     ].filter(Boolean).join(" · ");
     if (exp) { exp.href = "/api/code-review/report?id=" + run.id; exp.style.display = ""; }
     // 「已解决」按钮:有意见的终结态运行才显示,点了与成员页共享同一个状态

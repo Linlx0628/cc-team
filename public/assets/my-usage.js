@@ -1194,6 +1194,10 @@ function mrClass(s){
   return'bad';
 }
 function mrTime(iso){return iso?new Date(iso).toLocaleString('zh-CN',{timeZone:'Asia/Shanghai',hour12:false}):'—'}
+// 「已解决」是谁、什么时候点的(紧凑格式,放列表行里)。存储层记当时的名字快照;
+// 管理员代为标记记「管理员」(管理端共享口令,无逐人身份,要追 IP 看审计日志)。
+function mrWhen(iso){if(!iso)return'';const d=new Date(iso);return Number.isNaN(d.getTime())?'':d.toLocaleString('zh-CN',{timeZone:'Asia/Shanghai',hour12:false,month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'})}
+function mrResolvedWho(r){return r&&r.resolved?(r.resolvedBy||'管理员'):''}
 (function(){
   const el=document.getElementById('mrRunSearch');
   if(el)el.addEventListener('input',function(){if(MR.data)renderMyReview()});
@@ -1234,7 +1238,8 @@ function renderMyReview(){
     return '<div class="lb-row"><div class="lb-who"><div class="lb-name">'+esc(r.repo)+
       ' <span class="mr-pill mr-pill-'+mrClass(r.status)+'">'+esc(MR_LABEL[r.status]||r.status)+'</span>'+resolvePill+'</div>'+
       '<div class="lb-det">'+esc(mrTime(r.createdAt))+' · '+esc(r.rangeMode==='single'?'单提交':'增量')+' '+
-      esc(String(r.toCommit||'').slice(0,8))+' · 文件 '+r.filesReviewed+' · 意见 '+r.comments+' · '+fmtTk(r.tokens)+' token</div>'+
+      esc(String(r.toCommit||'').slice(0,8))+' · 文件 '+r.filesReviewed+' · 意见 '+r.comments+' · '+fmtTk(r.tokens)+' token'+
+      (r.resolved?' · 已解决 '+esc(mrResolvedWho(r))+(mrWhen(r.resolvedAt)?' '+esc(mrWhen(r.resolvedAt)):''):'')+'</div>'+
       (r.note?'<div class="lb-det" style="white-space:normal">'+esc(r.note)+'</div>':'')+
       (r.error?'<div class="lb-det" style="white-space:normal;color:var(--red)">'+esc(String(r.error).slice(0,160))+'</div>':'')+
       '</div><button type="button" class="mu-btn mu-btn-outline mu-btn-sm" onclick="openMyReviewRun('+r.id+')">详情</button></div>';
@@ -1276,7 +1281,9 @@ function openMyReviewRun(id){
     if(title)title.textContent='运行 #'+run.id+' · '+run.repo_name;
     if(sub)sub.textContent=[
       (run.range_mode==='single'?'单提交':'增量')+String(run.to_commit||'').slice(0,8),
-      run.comments_count+' 条意见 · '+run.files_reviewed+' 个文件'
+      run.comments_count+' 条意见 · '+run.files_reviewed+' 个文件',
+      // 谁点的已解决(此接口回原始行,字段是蛇形)
+      run.resolved?('已解决 '+(run.resolved_by||'管理员')+(mrWhen(run.resolved_at)?' '+mrWhen(run.resolved_at):'')):''
     ].filter(Boolean).join(' · ');
     mrDetailResolvePaint(run);
     let html='<div class="note" style="margin-bottom:10px">'+esc(run.note||'')+'</div>';

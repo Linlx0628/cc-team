@@ -6381,7 +6381,7 @@ const server = http.createServer((req, res) => {
         try {
           const run = codeReviewApi.setRunResolved(Number(body.id), body.resolved !== false, "管理员");
           recordAdminAudit(req, "codereview.resolve", `run #${body.id}`, `${run.resolved ? "标记已解决" : "撤销已解决"}`);
-          json(200, { ok: true, run: { id: run.id, resolved: !!run.resolved, resolvedAt: run.resolved_at || null } });
+          json(200, { ok: true, run: { id: run.id, resolved: !!run.resolved, resolvedAt: run.resolved_at || null, resolvedBy: run.resolved_by || null } });
         } catch (err) {
           json(err.statusCode || 400, { error: err.message });
         }

@@ -284,3 +284,16 @@ td{padding:8px 12px;font-size:11px;border-bottom:1px solid #ecece8;white-space:n
 .btn-outline{background:var(--surface);border-color:var(--border);color:var(--text)}
 .btn-outline:hover:not(:disabled){background:var(--surface-subtle);border-color:var(--border-strong)}
 .btn-sm{padding:5px 10px;font-size:11px}
+
+/* 明细记录下钻:按模型 / 按方案请求情况(横条按各自最大值归一) */
+.detail-breakdowns{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px;margin-top:12px}
+@media(max-width:860px){.detail-breakdowns{grid-template-columns:1fr}}
+.detail-bd{background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:9px 11px;min-width:0}
+.detail-bd-title{font-size:11px;font-weight:650;color:var(--dim);margin-bottom:6px;letter-spacing:.02em}
+.detail-bd-title span{font-weight:400;color:var(--dim)}
+.detail-bd-row{display:grid;grid-template-columns:minmax(0,1.15fr) minmax(0,1.3fr) auto;gap:8px;align-items:center;padding:2.5px 0;font-size:11.5px}
+.detail-bd-name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--text);font-family:var(--font-mono)}
+.detail-bd-track{height:7px;background:var(--surface-subtle);border-radius:4px;overflow:hidden;min-width:40px}
+.detail-bd-track i{display:block;height:100%;background:var(--accent);border-radius:4px}
+.detail-bd-val{color:var(--dim);white-space:nowrap;font-variant-numeric:tabular-nums}
+.detail-bd-more,.detail-bd-empty{font-size:10.5px;color:var(--dim);margin-top:4px}

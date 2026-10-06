@@ -453,6 +453,29 @@ function loadUserHours(periodKey,userKey){
   if(currentProfile!=="all")qs.set("profile",currentProfile);else if(PROTO)qs.set("protocol",PROTO);
   fetch("/api/user-hours?"+qs).then(r=>r.json()).then(payload=>{hoursCache.set(id,payload||{start,end,hours:{}})}).catch(()=>{hoursCache.set(id,{start,end,hours:{},error:true})}).finally(()=>{hoursLoading.delete(id);if(expandedUserHours.has(id))renderDetail()});
 }
+// 该用户该时段的两个横切面:按模型请求 / 按方案请求(数据与小时明细同一次请求返回)。
+// 横条按各自列表内的最大值归一 —— 看的是"哪个占大头",不是绝对刻度。
+// token 口径:输入+输出(usage_daily_model 没有缓存列,两栏保持一致才好比)。
+function detailBreakdownHTML(payload){
+  const block=(title,list,labelOf)=>{
+    if(!list||!list.length)return '<div class="detail-bd"><div class="detail-bd-title">'+title+'</div><div class="detail-bd-empty">该时段无数据</div></div>';
+    const max=Math.max.apply(null,list.map(x=>x.requests||0))||1;
+    const rows=list.slice(0,8).map(it=>{
+      const w=Math.max(2,Math.round((it.requests||0)/max*100));
+      return '<div class="detail-bd-row"><span class="detail-bd-name" title="'+escH(labelOf(it))+'">'+escH(labelOf(it))+'</span>'
+        +'<span class="detail-bd-track"><i style="width:'+w+'%"></i></span>'
+        +'<span class="detail-bd-val" title="请求数 · 输入+输出 token（不含缓存）">'+fmtT(it.requests||0)+' 次 · '+fmtTk((it.inputTokens||0)+(it.outputTokens||0))+'</span></div>';
+    }).join("");
+    const more=list.length>8?'<div class="detail-bd-more">另有 '+(list.length-8)+' 项未显示</div>':'';
+    return '<div class="detail-bd"><div class="detail-bd-title">'+title+' <span>'+list.length+' 项</span></div>'+rows+more+'</div>';
+  };
+  const models=payload.models||[],profiles=payload.profiles||[];
+  if(!models.length&&!profiles.length)return "";
+  return '<div class="detail-breakdowns">'
+    + block("按模型请求",models,m=>m.model)
+    + block("按方案请求",profiles,p=>p.name)
+    + '</div>';
+}
 function renderDetail(){
   if(!D)return;
   const grouped=grp(detailRangeDaily(D.daily||{}),P);
@@ -476,7 +499,7 @@ function renderDetail(){
     if(open){for(const member of period.members){
       const data=member.data,totalTokens=detailTokens(data),share=detailTokens(total)>0?Math.round(totalTokens/detailTokens(total)*100):0;
       const hoursId=period.key+""+member.key;
-      rows.push('<tr class="detail-member"><td class="detail-sticky"><span class="detail-user detail-user-click" title="点击查看该时段 24 小时请求分布" onclick="toggleUserHours(\''+escH(period.key)+'\',\''+escH(member.key)+'\')"><span class="detail-user-name">'+escH(member.name)+'</span><span class="detail-key">'+escH(maskDetailKey(member.key))+'</span></span></td><td class="n">'+fmtT(data.requests||0)+'</td><td class="n">'+fmtT(data.inputTokens||0)+'</td><td class="n">'+fmtT(data.outputTokens||0)+'</td><td class="n">'+fmtT(data.cacheCreationTokens||0)+'</td><td class="n">'+fmtT(data.cacheReadTokens||0)+'</td><td class="n hl">'+fmtT(totalTokens)+'<span class="detail-share">'+share+'%</span></td></tr>');
+      rows.push('<tr class="detail-member"><td class="detail-sticky"><span class="detail-user detail-user-click" title="点击展开：24 小时请求分布 + 该时段按模型/按方案请求" onclick="toggleUserHours(\''+escH(period.key)+'\',\''+escH(member.key)+'\')"><span class="detail-user-name">'+escH(member.name)+'</span><span class="detail-key">'+escH(maskDetailKey(member.key))+'</span></span></td><td class="n">'+fmtT(data.requests||0)+'</td><td class="n">'+fmtT(data.inputTokens||0)+'</td><td class="n">'+fmtT(data.outputTokens||0)+'</td><td class="n">'+fmtT(data.cacheCreationTokens||0)+'</td><td class="n">'+fmtT(data.cacheReadTokens||0)+'</td><td class="n hl">'+fmtT(totalTokens)+'<span class="detail-share">'+share+'%</span></td></tr>');
       // 下钻行:点击用户名才拉取(懒加载)。缓存命中直接画;否则占位 + 异步请求,回来重画。
       if(expandedUserHours.has(hoursId)){
         const payload=hoursCache.get(hoursId);
@@ -488,12 +511,13 @@ function renderDetail(){
           // 注意:此处处于成员循环内,局部 const totalTokens 遮蔽了 ui.js 的全局 totalTokens(),
           // 所以 token 合计必须内联求和,不能调用 totalTokens(v)。
           for(const[i,v,w] of halfHourSlots(payload.hours||{})){agg[i]+=(v.requests||0)*w;aggTk[i]+=(((v.inputTokens||0)+(v.outputTokens||0)+(v.cacheCreationTokens||0)+(v.cacheReadTokens||0)))*w}
+          const bd=detailBreakdownHTML(payload);
           if(!agg.some(x=>x>0)){
             const outOfRetention=payload.retentionStart&&detailPeriodRange(period.key).end<payload.retentionStart;
-            rows.push('<tr class="detail-hours-row"><td colspan="7"><div class="detail-hours-note">'+(outOfRetention?'该时段超出小时明细保留期（小时数据仅保留近 7 天）':'该时段暂无小时明细')+'</div></td></tr>');
+            rows.push('<tr class="detail-hours-row"><td colspan="7"><div class="detail-hours"><div class="detail-hours-note">'+(outOfRetention?'该时段超出小时明细保留期（小时数据仅保留近 7 天）':'该时段暂无小时明细')+'</div>'+bd+'</div></td></tr>');
           }else{
             const idx=hoursChartSeq++;
-            rows.push('<tr class="detail-hours-row"><td colspan="7"><div class="detail-hours"><div class="detail-hours-title">'+escH(member.name)+' · '+escH(detailPeriodLabel(period.key))+' 24 小时请求分布（半小时粒度 · 柱=请求数，线=总 Token · 点击用户名收起）</div><div class="detail-hours-canvas"><canvas id="hoursCanvas-'+idx+'"></canvas></div></div></td></tr>');
+            rows.push('<tr class="detail-hours-row"><td colspan="7"><div class="detail-hours"><div class="detail-hours-title">'+escH(member.name)+' · '+escH(detailPeriodLabel(period.key))+' 24 小时请求分布（半小时粒度 · 柱=请求数，线=总 Token · 点击用户名收起）</div><div class="detail-hours-canvas"><canvas id="hoursCanvas-'+idx+'"></canvas></div>'+bd+'</div></td></tr>');
             hoursChartPending.push({id:hoursId,idx,agg,aggTk});
           }
         }

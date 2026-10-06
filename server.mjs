@@ -7058,10 +7058,37 @@ const server = http.createServer((req, res) => {
           hours[r.hour] = { requests: r.requests, inputTokens: r.input_tokens, outputTokens: r.output_tokens, cacheCreationTokens: r.cache_creation, cacheReadTokens: r.cache_read };
         }
       }
+      // 同一用户、同一时段的两个横切面:按模型 / 按方案。回答「他这一天用了哪些模型、
+      // 走的是哪些方案」——之前只有按用户×日期的合计,这两个维度看不出来。
+      // 数据源比小时表保留得久(usage_daily_model 400 天 / usage_daily 永久),
+      // 所以超出小时保留期时这两块照样有数。
+      let models = [];
+      let profiles = [];
+      if (candidates.size && start) {
+        const keys = [...candidates];
+        const conds = [`date BETWEEN ? AND ?`, `user_key IN (${keys.map(() => "?").join(",")})`];
+        const params = [start, end, ...keys];
+        const pf = (profileFilter && profileFilter.length) ? ` AND profile IN (${profileFilter.map(() => "?").join(",")})` : "";
+        const pfBinds = (profileFilter && profileFilter.length) ? [...profileFilter] : [];
+        models = db.prepare(`SELECT model, SUM(requests) AS requests, SUM(input_tokens) AS input_tokens, SUM(output_tokens) AS output_tokens
+          FROM usage_daily_model WHERE ${conds.join(" AND ")}${pf} GROUP BY model ORDER BY requests DESC LIMIT 200`)
+          .all(...params, ...pfBinds)
+          .map((r) => ({ model: r.model, requests: r.requests || 0, inputTokens: r.input_tokens || 0, outputTokens: r.output_tokens || 0 }));
+        profiles = db.prepare(`SELECT profile, SUM(requests) AS requests, SUM(input_tokens) AS input_tokens, SUM(output_tokens) AS output_tokens,
+            SUM(cache_creation) AS cache_creation, SUM(cache_read) AS cache_read
+          FROM usage_daily WHERE ${conds.join(" AND ")}${pf} GROUP BY profile ORDER BY requests DESC LIMIT 200`)
+          .all(...params, ...pfBinds)
+          .map((r) => ({
+            suffix: r.profile,
+            name: (runtimes[r.profile] && runtimes[r.profile].profileName) || r.profile,
+            requests: r.requests || 0, inputTokens: r.input_tokens || 0, outputTokens: r.output_tokens || 0,
+            cacheCreationTokens: r.cache_creation || 0, cacheReadTokens: r.cache_read || 0,
+          }));
+      }
       // usage_daily_hourly 只保留 7 天(pruneDailyHourly),retentionStart 供前端提示「更早无明细」。
       const retentionStart = new Date(Date.now() - 7 * 86400000 + 8 * 3600000).toISOString().slice(0, 10);
       res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
-      res.end(JSON.stringify({ start, end, hours, retentionStart }));
+      res.end(JSON.stringify({ start, end, hours, models, profiles, retentionStart }));
     } catch (err) {
       if (!res.headersSent) {
         res.writeHead(err.statusCode || 500, { "Content-Type": "application/json; charset=utf-8" });

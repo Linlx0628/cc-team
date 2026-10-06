@@ -6259,8 +6259,9 @@ const server = http.createServer((req, res) => {
         if (!next.webhookSecret && prev.webhookSecret) next.webhookSecret = prev.webhookSecret;
         // 这几个字段界面没有对应控件(只在 config.json 里手改):载荷里**缺省**时保留原值,
         // 否则管理员每在界面点一次保存,工作区目录就被换回默认、OCR 隔离模式被改回 isolated、
-        // 评审背景说明被清空 —— 全是静默的。显式传值(含空串)仍然生效,所以想清回默认做得到。
-        for (const k of ["ocrConfigMode", "workspaceDir", "providerName", "background"]) {
+        // 评审背景说明被清空、评审语言被改回默认 —— 全是静默的。显式传值(含空串)仍然生效,
+        // 所以想清回默认做得到。
+        for (const k of ["ocrConfigMode", "workspaceDir", "providerName", "background", "language"]) {
           if (body[k] === undefined && prev[k] !== undefined) next[k] = prev[k];
         }
         // 引擎参数与仓库是两块独立的表单:payload 没带 repos 时保留现有仓库,

@@ -6390,6 +6390,26 @@ const server = http.createServer((req, res) => {
       return;
     }
 
+    // 单条意见的「不用处理」(管理端):与成员端同一份状态,管理员可代为标记/撤销。
+    // 理由同样必填 —— 这条记录的价值全在理由里。
+    if (req.method === "POST" && crPath === "/api/code-review/comment/dismiss") {
+      if (!adminWriteGate()) return;
+      readJsonBody().then((body) => {
+        try {
+          const c = codeReviewApi.setCommentDismissed(Number(body.id), {
+            dismissed: body.dismissed !== false, reason: body.reason, by: "管理员",
+          });
+          recordAdminAudit(req, "codereview.dismiss", `comment #${c.id}`,
+            `${c.dismissed ? "标记不处理" : "撤销不处理"}（${c.path}${c.start_line ? " L" + c.start_line : ""}）${c.dismissed && c.dismiss_reason ? "，理由: " + c.dismiss_reason : ""}`);
+          json(200, { ok: true, comment: {
+            id: c.id, dismissed: !!c.dismissed, dismissedAt: c.dismissed_at || null,
+            dismissedBy: c.dismissed_by || null, dismissReason: c.dismiss_reason || null,
+          } });
+        } catch (err) { json(err.statusCode || 400, { error: err.message }); }
+      }).catch((err) => json(400, { error: err.message }));
+      return;
+    }
+
     // 详情页「发送给负责人」:把这条评审的报告邮件手动发一次(负责人判定与自动通知同一套
     // 邮箱定向规则)。自动通知只在评审完成时发一次 —— 事后补发/换邮箱后重发靠这个按钮。
     if (req.method === "POST" && crPath === "/api/code-review/runs/notify") {
@@ -6858,6 +6878,37 @@ const server = http.createServer((req, res) => {
         const run = codeReviewApi.setRunResolved(seen.id, body.resolved !== false, getUserName(apiKey) || apiKey);
         res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
         res.end(JSON.stringify({ ok: true, run: { id: run.id, resolved: !!run.resolved, resolvedAt: run.resolved_at || null } }));
+      } catch (err) {
+        res.writeHead(err.statusCode || 400, { "Content-Type": "application/json; charset=utf-8" });
+        res.end(JSON.stringify({ error: err.message }));
+      }
+    }).catch(() => { res.writeHead(413); res.end("Request too large"); });
+    return;
+  }
+
+  // 单条意见的「不用处理」(成员端,虚拟Key 鉴权)。理由必填 —— 接口层也挡一道,
+  // 不留「无声忽略」的口子;可见性复用运行级口径(能看这条运行 = 能处置其中的意见)。
+  if (req.method === "POST" && req.url.split("?")[0] === "/api/my-review/comment/dismiss") {
+    const apiKey = getApiKey(req);
+    readBody(req, 20_000).then((buf) => {
+      try {
+        if (!hasGlobalUser(apiKey)) {
+          res.writeHead(401, { "Content-Type": "application/json; charset=utf-8" });
+          res.end(JSON.stringify({ error: "认证失败：请提供有效的虚拟Key (Authorization: Bearer jx-...)" }));
+          return;
+        }
+        const body = JSON.parse(buf.toString() || "{}");
+        const email = (memberNotifyApi.get(apiKey) || {}).email || "";
+        const mine = codeReviewApi.commentForMember(apiKey, body.id, email);
+        if (!mine) { res.writeHead(404, { "Content-Type": "application/json; charset=utf-8" }); res.end(JSON.stringify({ error: "意见不存在" })); return; }
+        const c = codeReviewApi.setCommentDismissed(mine.id, {
+          dismissed: body.dismissed !== false, reason: body.reason, by: getUserName(apiKey) || apiKey,
+        });
+        res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+        res.end(JSON.stringify({ ok: true, comment: {
+          id: c.id, dismissed: !!c.dismissed, dismissedAt: c.dismissed_at || null,
+          dismissedBy: c.dismissed_by || null, dismissReason: c.dismiss_reason || null,
+        } }));
       } catch (err) {
         res.writeHead(err.statusCode || 400, { "Content-Type": "application/json; charset=utf-8" });
         res.end(JSON.stringify({ error: err.message }));

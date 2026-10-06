@@ -254,3 +254,14 @@ td{padding:8px 12px;font-size:11px;border-bottom:1px solid #ecece8;white-space:n
    (加载中/无意见这类占位文本),在管理面板上没有样式 → 就是普通正文。
    这里按 my-usage.css 的原值补一条,别再跨页借类名。 */
 .lb-msg{font-size:11.5px;color:var(--dim);padding:2px 0}
+
+/* 单条意见的「不用处理」:按钮/理由输入框/已处置态(与成员端 mr-cmt-* 同一套交互) */
+.cr-comment-act{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-top:8px}
+.cr-comment-act .cr-run-meta{margin:0}
+.cr-comment-form{margin-top:6px;display:flex;flex-direction:column;gap:6px}
+.cr-comment-form[hidden]{display:none}
+.cr-comment-reason{width:100%;min-height:58px;resize:vertical;font:12.5px/1.6 inherit;color:var(--text);
+  background:var(--card);border:1px solid var(--border);border-radius:6px;padding:8px 10px}
+.cr-comment-form-act{display:flex;gap:6px}
+.cr-comment.is-dismissed{opacity:.72}
+.cr-comment.is-dismissed .cr-comment-body{color:var(--dim)}

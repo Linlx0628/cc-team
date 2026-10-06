@@ -160,6 +160,7 @@ function crRunRow(r) {
     + (r.comments_count > 0 ? (r.resolved ? '<span class="pill pill-dim">已解决</span>' : '<span class="pill pill-warn">未解决</span>') : "")
     + trig + '</div>'
     + '<div class="cr-run-meta">' + escH(new Date(r.created_at).toLocaleString("zh-CN", { timeZone: "Asia/Shanghai", hour12: false }))
+    + (Number(r.dismissed_count) > 0 ? ` · ${r.dismissed_count} 条不处理` : "")
     + crResolvedNote(r)
     + " · " + escH(r.range_mode === "single" ? "单提交 " + crShort(r.to_commit) : `${crShort(r.from_commit)}→${crShort(r.to_commit)}`)
     + ` · 文件 ${r.files_reviewed} · 意见 ${r.comments_count} · ${fmtT(r.input_tokens + r.output_tokens)} token · ${crDur(r.elapsed_ms)}`
@@ -211,16 +212,46 @@ function crToolText(t) {
 // 详情弹层(不再堆在列表下面):弹层内带搜索 + 分页,意见再多也只渲染当前页。
 // 分页/搜索的公共实现在 ui.js 的 dlgPager —— 两页共用,别各写一套。
 let crDetailPager = null;
+// 单条意见的「不用处理」:理由必填,输入框原地展开(与成员端同一套交互)。
+let CR_DETAIL_RUN_ID = null;
+function crDismissAsk(id) { const f = document.getElementById("crCmtForm" + id); if (!f) return; f.hidden = false; const t = document.getElementById("crCmtReason" + id); if (t) t.focus(); }
+function crDismissCancel(id) { const f = document.getElementById("crCmtForm" + id); if (f) f.hidden = true; }
+async function crDismissPost(id, dismissed, reason, okMsg) {
+  try {
+    await crApi("/api/code-review/comment/dismiss", { method: "POST", body: JSON.stringify({ id, dismissed: !!dismissed, reason: reason || "" }) });
+    crSetStatus(okMsg, "ok");
+    if (CR_DETAIL_RUN_ID != null) openReviewRun(CR_DETAIL_RUN_ID);
+  } catch (err) { crSetStatus("操作失败：" + err.message, "err"); }
+}
+function crDismissSubmit(id) {
+  const t = document.getElementById("crCmtReason" + id);
+  const reason = t ? t.value.trim() : "";
+  if (!reason) { crSetStatus("请填写不处理的理由", "err"); if (t) t.focus(); return; }
+  crDismissPost(id, true, reason, "已标记不处理");
+}
+function crDismissUndo(id) { crDismissPost(id, false, "", "已撤销不处理"); }
 function crDetailRender(c) {
   const lines = c.start_line ? `:${c.start_line}${c.end_line && c.end_line !== c.start_line ? "–" + c.end_line : ""}` : "";
-  return '<div class="cr-comment"><div class="cr-comment-loc">' + escH(c.path) + escH(lines) + '</div>'
+  const dismissed = Number(c.dismissed) === 1;
+  const act = dismissed
+    ? '<div class="cr-comment-act"><span class="pill pill-dim">不处理</span>'
+      + '<span class="cr-run-meta" style="white-space:normal">' + escH(c.dismiss_reason || "") + (c.dismissed_by ? " · " + escH(c.dismissed_by) : "") + (c.dismissed_at ? " " + escH(crWhen(c.dismissed_at)) : "") + '</span>'
+      + `<button type="button" class="btn btn-outline btn-sm" onclick="crDismissUndo(${Number(c.id)})">撤销</button></div>`
+    : `<div class="cr-comment-act"><button type="button" class="btn btn-outline btn-sm" onclick="crDismissAsk(${Number(c.id)})">不用处理</button></div>`
+      + `<div class="cr-comment-form" id="crCmtForm${Number(c.id)}" hidden>`
+      + `<textarea class="cr-comment-reason" id="crCmtReason${Number(c.id)}" maxlength="500" placeholder="请说明不处理的理由（必填，≤500 字）"></textarea>`
+      + `<div class="cr-comment-form-act"><button type="button" class="btn btn-primary btn-sm" onclick="crDismissSubmit(${Number(c.id)})">提交</button>`
+      + `<button type="button" class="btn btn-outline btn-sm" onclick="crDismissCancel(${Number(c.id)})">取消</button></div></div>`;
+  return '<div class="cr-comment' + (dismissed ? ' is-dismissed' : '') + '"><div class="cr-comment-loc">' + escH(c.path) + escH(lines) + '</div>'
     + '<div class="cr-comment-body">' + escH(c.content || "") + '</div>'
     + (c.existing_code ? `<details><summary>原代码</summary><pre>${escH(c.existing_code)}</pre></details>` : "")
     + (c.suggestion_code ? `<details open><summary>建议改法</summary><pre>${escH(c.suggestion_code)}</pre></details>` : "")
     + (c.thinking ? `<details><summary>推理</summary><div class="cr-run-note" style="white-space:pre-wrap">${escH(c.thinking)}</div></details>` : "")
+    + act
     + '</div>';
 }
 async function openReviewRun(id) {
+  CR_DETAIL_RUN_ID = id;
   dlgInit("crDetailDlg");
   dlgOpen("crDetailDlg");
   const title = document.getElementById("crDetailDlgTitle");
@@ -245,7 +276,7 @@ async function openReviewRun(id) {
     if (sub) sub.textContent = [
       (run.range_mode === "single" ? "单提交 " : "增量 ") + crShort(run.to_commit),
       run.author_name ? `提交人 ${run.author_name}` : "",
-      `${run.comments_count} 条意见 · ${run.files_reviewed} 个文件 · ${fmtT(run.input_tokens + run.output_tokens)} token · ${crDur(run.elapsed_ms)}`,
+      `${run.comments_count} 条意见${Number(run.dismissed_count) > 0 ? `（${run.dismissed_count} 条已标记不处理）` : ""} · ${run.files_reviewed} 个文件 · ${fmtT(run.input_tokens + run.output_tokens)} token · ${crDur(run.elapsed_ms)}`,
       // 已解决时把「谁、什么时候」放进详情副标题(列表里也有一份,格式一致)
       run.resolved ? (`已解决 ${run.resolved_by || "管理员"}${crWhen(run.resolved_at) ? " " + crWhen(run.resolved_at) : ""}`) : "",
     ].filter(Boolean).join(" · ");

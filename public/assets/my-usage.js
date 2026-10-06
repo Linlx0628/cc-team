@@ -1239,6 +1239,7 @@ function renderMyReview(){
       ' <span class="mr-pill mr-pill-'+mrClass(r.status)+'">'+esc(MR_LABEL[r.status]||r.status)+'</span>'+resolvePill+'</div>'+
       '<div class="lb-det">'+esc(mrTime(r.createdAt))+' · '+esc(r.rangeMode==='single'?'单提交':'增量')+' '+
       esc(String(r.toCommit||'').slice(0,8))+' · 文件 '+r.filesReviewed+' · 意见 '+r.comments+' · '+fmtTk(r.tokens)+' token'+
+      (Number(r.dismissed)>0?' · '+r.dismissed+' 条不处理':'')+
       (r.resolved?' · 已解决 '+esc(mrResolvedWho(r))+(mrWhen(r.resolvedAt)?' '+esc(mrWhen(r.resolvedAt)):''):'')+'</div>'+
       (r.note?'<div class="lb-det" style="white-space:normal">'+esc(r.note)+'</div>':'')+
       (r.error?'<div class="lb-det" style="white-space:normal;color:var(--red)">'+esc(String(r.error).slice(0,160))+'</div>':'')+
@@ -1248,16 +1249,46 @@ function renderMyReview(){
 // 详情弹层(不再堆在列表下面):弹层内带搜索 + 分页,意见再多也只渲染当前页。
 // 分页/搜索的实现在 ui.js 的 dlgPager(两页共用),这里只提供渲染与口径。
 let MR_DETAIL_PAGER=null;
+// 单条意见的「不用处理」:开发认为这条不需要改动时点它,必须写理由。
+// 交互用原地展开的输入框(不弹窗),与管理员端同一套;理由必填,提交后原地刷新详情。
+let MR_DETAIL_RUN_ID=null;   // 处置后重新拉取用
+function mrDismissAsk(id){const f=document.getElementById('mrCmtForm'+id);if(!f)return;f.hidden=false;const t=document.getElementById('mrCmtReason'+id);if(t)t.focus()}
+function mrDismissCancel(id){const f=document.getElementById('mrCmtForm'+id);if(f)f.hidden=true}
+function mrDismissPost(id,dismissed,reason,okMsg){
+  fetch('/api/my-review/comment/dismiss',{method:'POST',headers:{'Authorization':'Bearer '+VK,'Content-Type':'application/json'},body:JSON.stringify({id:id,dismissed:!!dismissed,reason:reason||''})})
+    .then(function(r){return r.json().then(function(j){if(!r.ok)throw new Error(j.error||('HTTP '+r.status));return j})})
+    .then(function(){toast(okMsg);if(MR_DETAIL_RUN_ID!=null)openMyReviewRun(MR_DETAIL_RUN_ID)})
+    .catch(function(e){toast('操作失败：'+e.message)});
+}
+function mrDismissSubmit(id){
+  const t=document.getElementById('mrCmtReason'+id);
+  const reason=t?t.value.trim():'';
+  if(!reason){toast('请填写不处理的理由');if(t)t.focus();return}
+  mrDismissPost(id,true,reason,'已标记不处理');
+}
+function mrDismissUndo(id){mrDismissPost(id,false,'','已撤销不处理')}
 function mrDetailRow(c){
   const loc=c.start_line?(':'+c.start_line+(c.end_line&&c.end_line!==c.start_line?'-'+c.end_line:'')):'';
-  return '<div class="box" style="padding:10px 12px;margin-bottom:8px">'+
+  const dismissed=Number(c.dismissed)===1;
+  const act=dismissed
+    ? '<div class="mr-cmt-act"><span class="mr-pill mr-pill-dim">不处理</span>'+
+      '<span class="mr-cmt-reason-txt">'+esc(c.dismiss_reason||'')+(c.dismissed_by?' · '+esc(c.dismissed_by):'')+(c.dismissed_at?' '+esc(mrWhen(c.dismissed_at)):'')+'</span>'+
+      '<button type="button" class="mu-btn mu-btn-outline mu-btn-sm" onclick="mrDismissUndo('+c.id+')">撤销</button></div>'
+    : '<div class="mr-cmt-act"><button type="button" class="mu-btn mu-btn-outline mu-btn-sm" onclick="mrDismissAsk('+c.id+')">不用处理</button></div>'+
+      '<div class="mr-cmt-form" id="mrCmtForm'+c.id+'" hidden>'+
+      '<textarea class="mr-cmt-reason" id="mrCmtReason'+c.id+'" maxlength="500" placeholder="请说明不处理的理由（必填，≤500 字）"></textarea>'+
+      '<div class="mr-cmt-form-act"><button type="button" class="mu-btn mu-btn-sm" onclick="mrDismissSubmit('+c.id+')">提交</button>'+
+      '<button type="button" class="mu-btn mu-btn-outline mu-btn-sm" onclick="mrDismissCancel('+c.id+')">取消</button></div></div>';
+  return '<div class="box'+(dismissed?' is-dismissed':'')+'" style="padding:10px 12px;margin-bottom:8px">'+
     '<div class="lb-det" style="font-family:var(--font-mono)">'+esc(c.path)+esc(loc)+'</div>'+
     '<div style="font-size:12.5px;margin:6px 0;white-space:pre-wrap">'+esc(c.content||'')+'</div>'+
     (c.existing_code?'<details><summary class="lb-det" style="cursor:pointer">原代码</summary><pre style="white-space:pre-wrap;background:var(--surface-subtle);padding:8px;border-radius:4px;font-size:11.5px;overflow:auto">'+esc(c.existing_code)+'</pre></details>':'')+
     (c.suggestion_code?'<details open><summary class="lb-det" style="cursor:pointer">建议改法</summary><pre style="white-space:pre-wrap;background:var(--surface-subtle);padding:8px;border-radius:4px;font-size:11.5px;overflow:auto">'+esc(c.suggestion_code)+'</pre></details>':'')+
+    act+
     '</div>';
 }
 function openMyReviewRun(id){
+  MR_DETAIL_RUN_ID=id;
   dlgInit('mrDetailDlg');
   dlgOpen('mrDetailDlg');
   const title=document.getElementById('mrDetailDlgTitle');
@@ -1281,7 +1312,7 @@ function openMyReviewRun(id){
     if(title)title.textContent='运行 #'+run.id+' · '+run.repo_name;
     if(sub)sub.textContent=[
       (run.range_mode==='single'?'单提交':'增量')+String(run.to_commit||'').slice(0,8),
-      run.comments_count+' 条意见 · '+run.files_reviewed+' 个文件',
+      run.comments_count+' 条意见 · '+run.files_reviewed+' 个文件'+(Number(run.dismissed_count)>0?(' · '+run.dismissed_count+' 条已标记不处理'):''),
       // 谁点的已解决(此接口回原始行,字段是蛇形)
       run.resolved?('已解决 '+(run.resolved_by||'管理员')+(mrWhen(run.resolved_at)?' '+mrWhen(run.resolved_at):'')):''
     ].filter(Boolean).join(' · ');

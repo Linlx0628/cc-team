@@ -88,12 +88,20 @@ attempt = 0 .. maxRetries:
 
 ```text
 启动 45s 后(以及之后每 5 分钟)对 auto 方案发一个 max_tokens=1 的压缩 ping:
-  200                     → gzState=ok  ,真实请求开始压缩;6 小时后复考
-  400/415/422 + 编码指纹* → gzState=no  ,保持明文;6 小时后重探
-  429/5xx/网络错          → gzState=unknown,10 分钟后重试探测
+  200 且响应体不是错误 JSON → gzState=ok     ,真实请求开始压缩;6 小时后复考
+  200 但响应体是错误 JSON   → gzState=unknown,不启用(有些网关用 200 包错误)
+  400/415/422 + 编码指纹*   → gzState=no     ,保持明文;6 小时后重探
+  其余(429/5xx/网络错)      → gzState=unknown,10 分钟后重试探测
 * 编码指纹 = 错误文命中 content-encoding/gzip/gunzip/decompress/invalid json/
   无法解析/编码/解压 等关键词(前 500 字符)
 ```
+
+**探针路径与真实请求同源**：用 `base + 该方案自己的 responsesPath`（Anthropic 协议为 `/v1/messages`）——
+写死 `/v1/responses` 会让 `responsesPath` 自定义的方案（如 `base=/api/coding/v3` + `responsesPath=/responses`）
+探测永远打到不存在的地址、结论恒为 unknown、**永远压不了**。
+
+**三种结论都打日志**（`[上游压缩] 方案「X」: 探测通过 / 探测到上游拒绝 / 探测未出结论 | <状态码与响应片段>`）——
+`unknown` 以前是静默的，方案为什么压不上完全看不出来；排查压缩问题时先看这几行。
 
 探测状态纯内存（`gzState`），重启后重探，成本是每次一条几百字节的请求。
 

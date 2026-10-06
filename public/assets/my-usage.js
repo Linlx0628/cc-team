@@ -1277,7 +1277,7 @@ function mrDetailRow(c){
     : '<div class="mr-cmt-act"><button type="button" class="mu-btn mu-btn-outline mu-btn-sm" onclick="mrDismissAsk('+c.id+')">不用处理</button></div>'+
       '<div class="mr-cmt-form" id="mrCmtForm'+c.id+'" hidden>'+
       '<textarea class="mr-cmt-reason" id="mrCmtReason'+c.id+'" maxlength="500" placeholder="请说明不处理的理由（必填，≤500 字）"></textarea>'+
-      '<div class="mr-cmt-form-act"><button type="button" class="mu-btn mu-btn-sm" onclick="mrDismissSubmit('+c.id+')">提交</button>'+
+      '<div class="mr-cmt-form-act"><button type="button" class="mu-btn mu-btn-primary mu-btn-sm" onclick="mrDismissSubmit('+c.id+')">提交</button>'+
       '<button type="button" class="mu-btn mu-btn-outline mu-btn-sm" onclick="mrDismissCancel('+c.id+')">取消</button></div></div>';
   return '<div class="box'+(dismissed?' is-dismissed':'')+'" style="padding:10px 12px;margin-bottom:8px">'+
     '<div class="lb-det" style="font-family:var(--font-mono)">'+esc(c.path)+esc(loc)+'</div>'+

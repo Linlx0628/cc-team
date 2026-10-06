@@ -236,12 +236,12 @@ function crDetailRender(c) {
   const act = dismissed
     ? '<div class="cr-comment-act"><span class="pill pill-dim">不处理</span>'
       + '<span class="cr-run-meta" style="white-space:normal">' + escH(c.dismiss_reason || "") + (c.dismissed_by ? " · " + escH(c.dismissed_by) : "") + (c.dismissed_at ? " " + escH(crWhen(c.dismissed_at)) : "") + '</span>'
-      + `<button type="button" class="btn btn-outline btn-sm" onclick="crDismissUndo(${Number(c.id)})">撤销</button></div>`
-    : `<div class="cr-comment-act"><button type="button" class="btn btn-outline btn-sm" onclick="crDismissAsk(${Number(c.id)})">不用处理</button></div>`
+      + `<button type="button" class="pager-btn" onclick="crDismissUndo(${Number(c.id)})">撤销</button></div>`
+    : `<div class="cr-comment-act"><button type="button" class="pager-btn" onclick="crDismissAsk(${Number(c.id)})">不用处理</button></div>`
       + `<div class="cr-comment-form" id="crCmtForm${Number(c.id)}" hidden>`
       + `<textarea class="cr-comment-reason" id="crCmtReason${Number(c.id)}" maxlength="500" placeholder="请说明不处理的理由（必填，≤500 字）"></textarea>`
-      + `<div class="cr-comment-form-act"><button type="button" class="btn btn-primary btn-sm" onclick="crDismissSubmit(${Number(c.id)})">提交</button>`
-      + `<button type="button" class="btn btn-outline btn-sm" onclick="crDismissCancel(${Number(c.id)})">取消</button></div></div>`;
+      + `<div class="cr-comment-form-act"><button type="button" class="pager-btn is-primary" onclick="crDismissSubmit(${Number(c.id)})">提交</button>`
+      + `<button type="button" class="pager-btn" onclick="crDismissCancel(${Number(c.id)})">取消</button></div></div>`;
   return '<div class="cr-comment' + (dismissed ? ' is-dismissed' : '') + '"><div class="cr-comment-loc">' + escH(c.path) + escH(lines) + '</div>'
     + '<div class="cr-comment-body">' + escH(c.content || "") + '</div>'
     + (c.existing_code ? `<details><summary>原代码</summary><pre>${escH(c.existing_code)}</pre></details>` : "")

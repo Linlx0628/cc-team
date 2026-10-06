@@ -260,8 +260,27 @@ td{padding:8px 12px;font-size:11px;border-bottom:1px solid #ecece8;white-space:n
 .cr-comment-act .cr-run-meta{margin:0}
 .cr-comment-form{margin-top:6px;display:flex;flex-direction:column;gap:6px}
 .cr-comment-form[hidden]{display:none}
-.cr-comment-reason{width:100%;min-height:58px;resize:vertical;font:12.5px/1.6 inherit;color:var(--text);
-  background:var(--card);border:1px solid var(--border);border-radius:6px;padding:8px 10px}
+/* 变量对齐 theme.css(--card 是成员端的,这里没有):与 .dlg-search 同一套观感 */
+.cr-comment-reason{width:100%;min-height:58px;resize:vertical;font:12.5px/1.6 var(--font-body);color:var(--text);
+  background:var(--surface);border:1px solid var(--border-strong);border-radius:5px;padding:7px 10px}
+.cr-comment-reason:focus{outline:none;border-color:var(--accent)}
+.pager-btn.is-primary{background:var(--accent);border-color:var(--accent);color:#fff}
+.pager-btn.is-primary:hover:not(:disabled){background:var(--accent);border-color:var(--accent);opacity:.9}
 .cr-comment-form-act{display:flex;gap:6px}
 .cr-comment.is-dismissed{opacity:.72}
 .cr-comment.is-dismissed .cr-comment-body{color:var(--dim)}
+
+/* ── 最小按钮套件 ─────────────────────────────────────────────────────────
+   dashboard 页面只加载 theme.css + dashboard.css,而 .btn 系列定义在 settings.css
+   (设置页专用) —— 于是 dashboard 上所有 `class="btn btn-outline btn-sm"` /
+   `btn btn-primary` 都退化成浏览器原生按钮(实测:「开始评审」「详情/取消」)。
+   这里按设置页同一套观感补齐最小集,让既有标记直接生效;样式来源统一走 theme 变量。
+   新增按钮优先用 .pager-btn(弹层里既有的小按钮类),非弹层的主操作才用 .btn-primary。 */
+.btn{padding:8px 15px;border:1px solid transparent;border-radius:5px;font:600 12px/1.4 var(--font-body);cursor:pointer;transition:background .15s,border-color .15s,opacity .15s}
+.btn:active{transform:translateY(1px)}
+.btn:disabled{opacity:.5;cursor:not-allowed}
+.btn-primary{background:var(--text);color:#fff}
+.btn-primary:hover:not(:disabled){background:#33332f}
+.btn-outline{background:var(--surface);border-color:var(--border);color:var(--text)}
+.btn-outline:hover:not(:disabled){background:var(--surface-subtle);border-color:var(--border-strong)}
+.btn-sm{padding:5px 10px;font-size:11px}

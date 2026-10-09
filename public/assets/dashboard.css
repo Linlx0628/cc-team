@@ -72,6 +72,15 @@ body{padding:0;overflow:hidden;height:100vh}
    放进 24px 的 chart-head 会把标题栏撑高、直接吃掉画布高度,所以收小一档。 */
 .chart-head .proto-seg{height:22px;align-self:center}.chart-head .proto-seg button{font-size:10px;padding:0 9px}
 .chart-canvas{position:relative;flex:1;min-height:0}.chart-canvas canvas{position:absolute!important;inset:0;width:100%!important;height:100%!important}
+/* 模型图这一格的画布高度由 JS 按**行数**撑开(见 dashboard.js 的 sizeModelCanvas)。
+   原因:它的 y 轴标签是「模型名 / (方案名)」两行,而 Chart.js 把多行 tick 以每个分类带的
+   中线为基准上下排 —— 带高不够时相邻两行直接压在一起。生产上十几二十个模型×方案时,
+   固定高度会把每带压到十几 px,两行 11px 文字糊成一片(实测截图确认)。
+   所以:画布高度 = 行数 × 每行所需高度,sizer 负责那个高度,.chart-canvas 只负责滚动。
+   min-height:100% 保证行数很少时画布仍然铺满面板,不留空档。
+   代价:行数多、需要滚动时,x 轴刻度会随画布滚出视野(用户确认接受)。*/
+.chart-models .chart-canvas{overflow-y:auto;overflow-x:hidden}
+.chart-models .canvas-sizer{position:relative;width:100%;min-height:100%}
 .tabs{display:flex;gap:1px;background:var(--surface-subtle);border:1px solid var(--border);border-radius:5px;padding:2px;width:fit-content;flex-shrink:0}
 .tab{padding:3px 9px;font-size:10px;border:0;border-radius:3px;background:transparent;color:var(--dim);cursor:pointer}.tab:hover{color:var(--text)}.tab.on{background:var(--surface);color:var(--text);font-weight:600}
 /* 工作区:旧「横条 tabs + 固定高容器」撤了,面板改成内容区里自然流式的 pane。

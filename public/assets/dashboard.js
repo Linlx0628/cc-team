@@ -178,6 +178,22 @@ function keepHead(s,budget){if(budget<=0)return"";let w=0,out="";for(const ch of
 function shortAxisLabel(s){const max=axisLabelBudget();return dispW(s)<=max?s:keepHead(s,max-1)+"…"}
 // 轴上一格排几行:每一行都独立截断,超长的那一行(通常是模型名)才被截
 function fitAxisLines(lines){const max=axisLabelBudget();return lines.map(l=>dispW(l)<=max?l:keepHead(l,max-1)+"…")}
+// 模型图的画布高度按**行数**撑开。Chart.js 把多行 tick 标签以每个分类带的中线为基准上下排,
+// 带高不够就相邻两行压在一起 —— 生产上十几二十个模型×方案时,固定高度(实测常见桌面窗口下
+// 画布可见高只有 234px)会把每带压到十几 px,两行 11px 文字糊成一片。所以每行给足
+// 「标签行数 × 行高」,总高超过面板时由 .chart-canvas 纵向滚动(样式见 dashboard.css 的 .chart-models 段)。
+const MODEL_ROW_PX={1:20,2:34};   // 11px 字号:单行带 20px、两行带 34px(实测不重叠)
+const MODEL_AXIS_PAD=34;          // x 轴刻度 + 画布上下留白
+function sizeModelCanvas(rows,lines){
+  const box=document.getElementById("modelCanvasBox"),sizer=document.getElementById("modelSizer");
+  if(!box||!sizer)return;
+  // 这里**只写行数算出来的高度**,不掺面板高度:「行数少时铺满面板」由 CSS 的
+  // min-height:100% 实时兜底(样式就在 .chart-models .canvas-sizer)。好处是这个值
+  // 与窗口尺寸无关 —— 不需要测量、也就不会留下过期的测量值,窗口缩放不必重算
+  // (测出来的面板高度反之会在窗口变矮后把图撑得虚高、白白多出滚动)。
+  sizer.style.height=rows*(MODEL_ROW_PX[lines]||MODEL_ROW_PX[1])+MODEL_AXIS_PAD+"px";
+  box.scrollTop=0;   // 换维度/换窗口后从头看,别停在上一份数据的滚动位置
+}
 // y 轴 ticks 回调的两条分支(mTicks 只有「按模型×方案」才非空):
 //   mTicks 非空 → 返回排好版的两行标签数组(Chart.js 的多行 tick 要求返回字符串数组)
 //   否则       → **必须**走 getLabelForValue(v)
@@ -789,6 +805,9 @@ function renderCharts(){
     const mIdx=mv.map((_,i)=>i).sort((a,b)=>mv[b]-mv[a]);
     mLabels=mIdx.map(i=>mNames[i]);mVal=mIdx.map(i=>mv[i]);
   }
+  // 画布高度按行数撑开(「按模型×方案」是两行标签,每行要更高的带)—— 必须在建图之前设好,
+  // Chart.js 初始化时就按容器高度定画布尺寸,建完再改只会拉伸已算好的布局
+  sizeModelCanvas(mLabels.length,MDLDIM==="modelProfile"?2:1);
   C.m=new Chart(document.getElementById("modelChart"),{type:"bar",data:{labels:mLabels,datasets:[{label:MT==="requests"?"请求数":"Token",data:mVal,backgroundColor:mBg||mVal.map((_,i)=>COL[i%COL.length]+"cc"),borderWidth:0,borderRadius:3,borderSkipped:false}]},options:{indexAxis:"y",responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false},tooltip:{callbacks:{title:items=>mFull?mFull[items[0].dataIndex]:items[0].label,label:ctx=>MT==="requests"?fmtT(ctx.raw)+" 次请求":fmtT(ctx.raw)+" tokens"}}},scales:{x:{ticks:{color:"#686863",callback:v=>fmtTk(v)},grid:{color:"rgba(24,24,22,.08)"}},y:{ticks:{color:"#686863",font:{size:11},autoSkip:false,callback:function(v,i){return mTicks?mTicks[i]:this.getLabelForValue(v)}},grid:{display:false}}}}});
 
   // 两张 24 小时图只做「单日」统计:按日=今天;日期范围生效时要求开始=结束(同一天,只填

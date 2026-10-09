@@ -1209,10 +1209,10 @@ function mrTime(iso){return iso?new Date(iso).toLocaleString('zh-CN',{timeZone:'
 // 管理员代为标记记「管理员」(管理端共享口令,无逐人身份,要追 IP 看审计日志)。
 function mrWhen(iso){if(!iso)return'';const d=new Date(iso);return Number.isNaN(d.getTime())?'':d.toLocaleString('zh-CN',{timeZone:'Asia/Shanghai',hour12:false,month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'})}
 function mrResolvedWho(r){return r&&r.resolved?(r.resolvedBy||'管理员'):''}
-// 评审范围文案。⚠️ 与管理端 code-review.js 的 crRangeText、lib/code-review.mjs 的 resolveRange 同步:
+// 评审范围文案。注意:与管理端 code-review.js 的 crRangeText、lib/code-review.mjs 的 resolveRange 同步:
 // cursor=常态增量、cold=这条分支首次评(回溯最近 N 个提交)、rewritten=上次评到的提交被改写、
 // manual=管理员按范围补评(不推进游标)。老记录没有 range_source,按 range_mode 兜底。
-// ⚠️ 列表行是 memberView 的驼峰字段,详情接口回的是原始蛇形行 —— 两种形状都认,别再混用。
+// 注意:列表行是 memberView 的驼峰字段,详情接口回的是原始蛇形行 —— 两种形状都认,别再混用。
 const MR_RANGE_LABEL={cold:'冷启动回溯',rewritten:'游标失效回溯',manual:'手动补评',cursor:'增量'};
 function mrRangeText(r,snake){
   const mode=snake?r.range_mode:r.rangeMode;
@@ -1269,7 +1269,7 @@ function renderMyReview(){
     const filesText=unrev>0?('文件 '+Math.max(0,(Number(r.filesReviewed)||0)-unrev)+'/'+r.filesReviewed):('文件 '+r.filesReviewed);
     return '<div class="lb-row"><div class="lb-who"><div class="lb-name">'+esc(r.repo)+
       ' <span class="mr-pill mr-pill-'+mrClass(legacyInc?'partial':r.status)+'">'+esc(MR_LABEL[legacyInc?'partial':r.status]||r.status)+'</span>'+resolvePill+
-      (inc?' <span class="mr-cov-warn">⚠ 覆盖不全,详见详情</span>':'')+'</div>'+
+      (inc?' <span class="mr-cov-warn">覆盖不全,详见详情</span>':'')+'</div>'+
       '<div class="lb-det">'+esc(mrTime(r.createdAt))+' · '+esc(mrRangeText(r,false))+' '+
       (mrCommitCount(r,false)>0?' · 提交 '+mrCommitCount(r,false):'')+
       ' · '+filesText+' · 意见 '+r.comments+' · '+fmtTk(r.tokens)+' token'+
@@ -1369,7 +1369,7 @@ function openMyReviewRun(id){
     const run=d.run,cs=d.comments||[];
     if(title)title.textContent='运行 #'+run.id+' · '+run.repo_name;
     // 覆盖率:新记录由服务端落库后透出(run.coverage),老记录由详情接口按需读原始报告补上。
-    // ⚠️ files_json 那份清单是**选中**集,不是已评集 —— 没有 coverage 就**不编造**「评全了」。
+    // 注意:files_json 那份清单是**选中**集,不是已评集 —— 没有 coverage 就**不编造**「评全了」。
     const cov=(run.coverage&&typeof run.coverage==='object')?run.coverage:(function(){try{const o=JSON.parse(run.coverage_json||'null');return (o&&typeof o==='object')?o:null}catch(e){return null}})();
     const covFailed=cov?Math.max(0,Number(cov.failed)||0):0;
     const covDone=cov?Math.max(0,Number(cov.completed)||0):0;
@@ -1394,7 +1394,7 @@ function openMyReviewRun(id){
     let html='<div class="note" style="margin-bottom:10px">'+esc(run.note||'')+'</div>';
     // 覆盖不全:把真相放在结论**下面、意见上面** —— 否则读完意见就关了,不知道没评完。
     if(incomplete){
-      html+='<div class="mr-cov-box">⚠ 本次没有评完:'+(cov?('选取 '+(covSel||run.files_reviewed)+' 个文件,评了 '+covDone+' 个,'+covFailed+' 个未评审'):'覆盖不全')+
+      html+='<div class="mr-cov-box">本次没有评完:'+(cov?('选取 '+(covSel||run.files_reviewed)+' 个文件,评了 '+covDone+' 个,'+covFailed+' 个未评审'):'覆盖不全')+
         (covWhy?('（'+esc(covWhy)+'）'):'')+'。<br>下面的结论与意见<strong>只覆盖已评部分</strong>;未评审的文件没有被检查过,不能说它们没问题。'+
         (cov&&cov.budgetNotice?'<br><span class="lb-det">'+esc(String(cov.budgetNotice).slice(0,400))+'</span>':'')+
         (cov&&cov.sample&&cov.sample.length?'<div class="lb-det" style="margin-top:6px;font-family:var(--font-mono)">'+cov.sample.map(function(s){return esc(String(s.path||''))}).filter(Boolean).join('<br>')+
@@ -1414,13 +1414,13 @@ function openMyReviewRun(id){
         }).join('')+'</div></details>';
     }
     if(!cs.length){
-      // ⚠️ 「已跳过」不能说绿字「本次没有提出意见」—— 那次**根本没评**(超当日 token 预算 /
+      // 注意:「已跳过」不能说绿字「本次没有提出意见」—— 那次**根本没评**(超当日 token 预算 /
       // 没有新提交),绿字会被读成「检查过了,这块没问题」。绿色只留给真正跑完的完成态。
       // (失败/超时/已取消进不到这里:memberRun 直接 404,连弹层都打不开。)
       if(run.status==='skipped'){
         html+='<div class="lb-msg">本次已跳过,没有进行评审'+(run.note?'(原因见上方)':'')+'</div>';
       }else if(incomplete){
-        // ⚠️ 覆盖不全时**不给绿字**:绿字的意思是「检查过了,这块没问题」,而这里
+        // 覆盖不全时**不给绿字** —— 绿字的意思是「检查过了,这块没问题」,而这里
         // 有几个文件压根没被读过。判定必须按 coverage,不能按 status —— 库里老记录
         // (#8/#9)的 status 至今还是 completed_with_errors,只看 status 会原样漏掉。
         html+='<div class="lb-msg" style="color:var(--degraded)">已评审的 '+(cov?covDone:'部分')+' 个文件没有提出意见 —— 这不等于「没有问题」,未评审的文件没有被检查过。</div>';

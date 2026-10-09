@@ -42,7 +42,7 @@ const CR_STATUS_LABEL = {
   skipped: "已跳过", failed: "失败", timeout: "超时", canceled: "已取消",
 };
 function crShort(sha) { return sha ? String(sha).slice(0, 8) : ""; }
-// 未评原因的机器词 → 人话。⚠️ 认不出的分类**原样透出**,别吞:引擎将来加新分类,
+// 未评原因的机器词 → 人话。注意:认不出的分类**原样透出**,别吞:引擎将来加新分类,
 // 界面上一眼看得见比「什么都没说」强。
 const CR_CLASS_ZH = { budget: "超出单次 token 预算" };
 function crCoverWhy(cov) {
@@ -63,7 +63,7 @@ function crWarnText(w) {
   const msg = String((w && w.message) || "").trim();
   const f = String((w && w.file) || "").trim();
   return (msg || "（引擎未给出说明）") + (f ? ` [${f.length > 200 ? f.slice(0, 200) + "…" : f}]` : "");
-}// 「这一段是怎么定出来的」。⚠️ 与 lib/code-review.mjs 的 resolveRange / manualRange 保持同步:
+}// 「这一段是怎么定出来的」。注意:与 lib/code-review.mjs 的 resolveRange / manualRange 保持同步:
 //   cursor    按上次评到的提交做增量(常态)
 //   cold      这条分支首次评审 —— 回溯最近 N 个提交
 //   rewritten 上次评到的提交已被改写(force push / rebase)—— 同样回溯最近 N 个提交
@@ -203,7 +203,7 @@ function crRunsToolbar() {
 // 行渲染拆出来给 dlgPager 用(它每页只 render 一页的行)
 function crRunRow(r) {
   // 覆盖率不全(新记录看 unreviewed_count,老记录由服务端从 warnings_json 派生)。
-  // ⚠️ 老记录(#8/#9)库里的 status 当年经兜底写成了 completed_with_errors、note 还写着
+  // 注意:老记录(#8/#9)库里的 status 当年经兜底写成了 completed_with_errors、note 还写着
   // 「未发现问题」—— 列表这一行是它**唯一**能被看出来的地方,不标就是继续骗人。
   const unreviewed = Number(r.unreviewed_count) || 0;
   const covIncomplete = !!r.coverageIncomplete;
@@ -216,11 +216,11 @@ function crRunRow(r) {
   const fileHint = files.length
     ? `<div class="cr-run-files">${files.slice(0, 3).map((f) => `<span class="cr-file-chip" title="${escH(f)}">${escH(crBase(f))}</span>`).join("")}${files.length > 3 ? `<span class="cr-file-more">+${files.length - 3}</span>` : ""}</div>`
     : "";
-  // 「文件 10/39」= 已评/选取。老记录只有派生布尔、没有具体数,就给 ⚠ 让它去详情看。
+  // 「文件 10/39」= 已评/选取。老记录只有派生布尔、没有具体数,就给个「覆盖不全」标记让它去详情看。
   const sel = Number(r.files_reviewed) || 0;
   const filesText = unreviewed > 0 ? `文件 ${Math.max(0, sel - unreviewed)}/${sel}` : `文件 ${sel}`;
   const covTag = covIncomplete
-    ? ` <span class="cr-cov-warn" title="${unreviewed > 0 ? `本次只评了 ${Math.max(0, sel - unreviewed)}/${sel} 个文件` : "本次评审覆盖不全"}">⚠ 覆盖不全,详见详情</span>`
+    ? ` <span class="cr-cov-warn" title="${unreviewed > 0 ? `本次只评了 ${Math.max(0, sel - unreviewed)}/${sel} 个文件` : "本次评审覆盖不全"}">覆盖不全,详见详情</span>`
     : "";
   return `<div class="cr-run is-${cls}"><span class="cr-run-num">#${r.id}</span>`
     + '<div class="cr-run-main"><div class="cr-run-title">'
@@ -406,7 +406,7 @@ async function openReviewRun(id) {
     const commits = crParseFiles(run.commits_json);
     const commitsTotal = Number(run.commits_count) || commits.length;
     // ── 覆盖率:选了 N 个 ≠ 评了 M 个 ─────────────────────────────────────────
-    // ⚠️ files_json(下面那份「选取的文件」)是**选中**集,不是已评集;未评的文件列在
+    // 注意:files_json(下面那份「选取的文件」)是**选中**集,不是已评集;未评的文件列在
     // coverage.sample 里。这一段就是把「没评完」从引擎的 manifest 里搬到人眼前。
     const cov = crCoverage(run);
     const covFailed = cov ? Math.max(0, Number(cov.failed) || 0) : 0;
@@ -441,7 +441,7 @@ async function openReviewRun(id) {
     // 否则读完 17 条意见就关掉了,根本不知道它们只覆盖了 39 个文件里的 10 个。
     if (incomplete) {
       html += '<div class="cr-notice is-degraded" style="margin:0 0 12px">'
-        + `⚠ 本次没有评完:${cov ? `选取 ${covSel || Number(run.files_reviewed) || 0} 个文件,评了 ${covDone} 个,${covFailed} 个未评审` : "覆盖不全"}`
+        + `本次没有评完:${cov ? `选取 ${covSel || Number(run.files_reviewed) || 0} 个文件,评了 ${covDone} 个,${covFailed} 个未评审` : "覆盖不全"}`
         + (covWhy ? `（${escH(covWhy)}）` : "") + '。<br>'
         + "下面的结论与意见**只覆盖已评部分**;未评审的文件没有被检查过,不能说它们没问题。"
         + (cov && cov.budgetNotice ? `<br><span class="cr-hint-inline">${escH(String(cov.budgetNotice).slice(0, 400))}</span>` : "")
@@ -478,12 +478,12 @@ async function openReviewRun(id) {
         : '<div class="cr-empty-d" style="text-align:left;margin:0">范围里没有可评审的改动。若是「已跳过」,通常表示自上次评审以来没有新提交。</div>')
       + '</div>';
     if (!comments.length) {
-      // ⚠️ 这里曾经**无条件**渲染绿勾「本次范围(上面列出的文件)未发现需要修改的问题」——
+      // 注意:这里曾经**无条件**渲染绿勾「本次范围(上面列出的文件)未发现需要修改的问题」——
       // 而上面那份清单来自 files_json,是**选中**集(#9 是 39 个),等于替 29 个从没被读过的
       // 文件打包票。判定必须按 **coverage**,不能按 status:库里 #8/#9 的 status 至今还是
       // completed_with_errors,只看 status 会原样漏掉它们。
       html += incomplete
-        ? '<div class="cr-empty is-degraded" style="padding:22px"><div class="cr-empty-ico">⚠</div><div class="cr-empty-t">未评完，结论不完整</div>'
+        ? '<div class="cr-empty is-degraded" style="padding:22px"><div class="cr-empty-ico" aria-hidden="true"><svg width="30" height="30" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3.4 21.6 20.2H2.4z"/><path d="M12 9.7v5.1"/><path d="M12 17.9h.01"/></svg></div><div class="cr-empty-t">未评完，结论不完整</div>'
           + `<div class="cr-empty-d">本次只评审了 ${cov ? `${covDone}/${covSel || Number(run.files_reviewed) || 0}` : "一部分"} 个文件,`
           + `已评部分没有提出意见 —— 这<strong>不等于</strong>「没有问题」,未评审的文件没有被检查过。</div></div>`
         : '<div class="cr-empty" style="padding:22px"><div class="cr-empty-ico">✓</div><div class="cr-empty-t">无意见</div><div class="cr-empty-d">本次范围(上面列出的文件)未发现需要修改的问题。</div></div>';

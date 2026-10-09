@@ -154,6 +154,30 @@ function filteredDaily(){
 }
 function c(l,v,cl,k){return'<div class="card"><div class="l">'+l+'</div><div class="v" data-cu="'+v+'"'+(k?' data-cu-k':'')+'>0</div></div>'}
 const fmtBytes=n=>{if(n>=1073741824)return(n/1073741824).toFixed(2)+" GB";if(n>=1048576)return(n/1048576).toFixed(1)+" MB";if(n>=1024)return(n/1024).toFixed(1)+" KB";return n+" B"};
+// 模型图「按方案 / 按模型×方案」两个维度的 y 轴标签会很宽(模型 ID 后面还叠一个方案名)。
+// 超出轴宽时 Chart.js 不换行,直接把多出来的部分画到画布外**裁掉** —— 最长的几根柱子会变成
+// 缺头少尾的半个名字(实测 deepseek-v4-flash-ga-260731(火山引擎-cc-高阶版) 掉了开头)。
+//
+// 所以「按模型×方案」的轴标签排成**两行**(第一行模型名、第二行 (方案名)):轴的宽度只受较长
+// 的那一行约束,和「按模型」一样宽 —— 这个维度不会比原维度更容易裁字,而且两个名字都是全的。
+// 窄窗口 / 超长模型 ID 下连一行都放不下时才逐行截断(汉字算 2、其余算 1,见 dispW),
+// 被截掉的部分由 tooltip 用完整名字补回(mFull)。
+//
+// 预算按**画布宽度**算而不是写死字符数:实测 Chart.js 给 y 轴的宽度上限就是画布的 50%
+// (616/536/420/279px 画布对应 284/268/210/140px),写死字符数在窄窗口(半屏)会重新裁字。
+const AXIS_UNIT_PX=6.1;                       // 11px 字号下一个宽度单位约 6.1px(汉字算 2 单位)
+function axisLabelBudget(){
+  const el=document.getElementById("modelChart");
+  // Number() 而不是直接取:量不到宽度(DOM 桩、面板隐藏)时退回保守值,别让 NaN 把截断逻辑带跑偏
+  const w=(el&&Number(el.clientWidth))||520;
+  return Math.max(10,Math.floor((w*0.5-10)/AXIS_UNIT_PX));
+}
+const charW=ch=>/[㐀-鿿　-〿＀-￯]/.test(ch)?2:1;
+const dispW=s=>{let w=0;for(const ch of s)w+=charW(ch);return w};
+function keepHead(s,budget){if(budget<=0)return"";let w=0,out="";for(const ch of s){const c=charW(ch);if(w+c>budget)break;out+=ch;w+=c}return out}
+function shortAxisLabel(s){const max=axisLabelBudget();return dispW(s)<=max?s:keepHead(s,max-1)+"…"}
+// 轴上一格排几行:每一行都独立截断,超长的那一行(通常是模型名)才被截
+function fitAxisLines(lines){const max=axisLabelBudget();return lines.map(l=>dispW(l)<=max?l:keepHead(l,max-1)+"…")}
 // 今日出网卡片:↑ 发往上游的请求体字节(含重试累计)/ ↓ 回传客户端字节。数字过大不适合
 // count-up 动画,直接格式化文本(不带 data-cu,runCountUps 会跳过)。两段一律单行
 // (white-space:nowrap),字号降到 16px —— 与其他卡的 21px 比略小,但两个方向塞得下。
@@ -554,15 +578,16 @@ document.querySelectorAll("#pieDim button").forEach(b=>b.addEventListener("click
 // 模型请求分布图的维度切换(按模型 / 按方案),与用户分布图的 seg 同款。只重画不重新拉数
 // —— profileDailyModels(方案×日期×模型聚合)与 dailyModels 一样已在 /api/stats 返回里。
 function setModelDim(dim){
-  MDLDIM=dim==="profile"?"profile":"model";
+  // 三个维度共用这一张图:按模型 / 按方案 / 按模型×方案。后两者都吃 profileDailyModels
+  // —— 最大表的第二次全表扫描,是全页面最贵的一项,所以它们**不进数据总览的载荷**,
+  // 切到该维度时才单独拉一次(用户确认的取舍)。
+  MDLDIM=(dim==="profile"||dim==="modelProfile")?dim:"model";
   document.querySelectorAll("#modelDim button").forEach(b=>b.classList.toggle("on",b.dataset.dim===MDLDIM));
-  // 「按方案」维度要的是 profileDailyModels —— 最大表的第二次全表扫描,是全页面最贵的一项。
-  // 所以它**不进数据总览的载荷**,切到这个维度时才单独拉一次(用户确认的取舍)。
-  if(MDLDIM==="profile"&&D&&!D.profileDailyModels){
+  if(MDLDIM!=="model"&&D&&!D.profileDailyModels){
     const qs=new URLSearchParams({section:"profile-daily-models"});
     if(PROTO)qs.set("protocol",PROTO);
     fetch("/api/stats?"+qs).then(r=>r.json())
-      .then(payload=>{if(D)Object.assign(D,payload);if(MDLDIM==="profile"&&D)render()})
+      .then(payload=>{if(D)Object.assign(D,payload);if(MDLDIM!=="model"&&D)render()})
       .catch(e=>{document.getElementById("meta").textContent="Error: "+e.message});
     return;
   }
@@ -685,10 +710,14 @@ function renderCharts(){
   C.p=new Chart(document.getElementById("pie"),{type:"bar",data:{labels:pieLabels,datasets:[{label:MT==="requests"?"请求数":"总 Token",data:pieVals,backgroundColor:pieVals.map((_,i)=>COL[i%COL.length]+"cc"),borderWidth:0,borderRadius:3,borderSkipped:false}]},options:{indexAxis:"y",responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false},tooltip:{callbacks:{label:ctx=>MT==="requests"?fmtT(ctx.raw)+" 次请求":fmtT(ctx.raw)+" tokens"}}},scales:{x:{ticks:{color:"#686863",callback:v=>fmtTk(v)},grid:{color:"rgba(24,24,22,.08)"}},y:{ticks:{color:"#686863",font:{size:11},autoSkip:false},grid:{display:false}}}}});
 
   // 模型请求分布：按有效窗口(日期范围优先,否则周期窗口,北京时间)求和，可按指标筛选。
-  // seg 切两个维度:按模型(usage_daily_model,可按用户筛选) / 按方案(profileDailyModels,
-  // 方案×日期×模型聚合,无 user 维度所以不响应 USR —— 与「方案请求情况」图口径一致;
-  // 两源都不含缓存 Token)。横向柱状图便于读取名称。
-  let mLabels,mVal;
+  // seg 切三个维度:
+  //   按模型      usage_daily_model[日期][用户][模型],可响应 USR 筛选;
+  //   按方案      profileDailyModels[方案][日期][模型],无 user 维度所以不响应 USR
+  //               —— 与「方案请求情况」图口径一致;
+  //   按模型×方案 同吃 profileDailyModels,把「同模型不同方案」拆成独立柱子,
+  //               标签写「模型(方案)」而不是合并成一根(见下面分支内的说明)。
+  // 三源都不含缓存 Token。横向柱状图便于读取名称。
+  let mLabels,mVal,mBg=null,mFull=null,mTicks=null;
   if(MDLDIM==="profile"){
     const sfxName={};for(const p of (Array.isArray(D.profiles)?D.profiles:[]))sfxName[p.suffix]=p.name;
     const pAgg={};
@@ -705,6 +734,36 @@ function renderCharts(){
     const pVal=pNames.map(s=>MT==="requests"?pAgg[s].requests:pAgg[s].tokens);
     const pIdx=pVal.map((_,i)=>i).sort((a,b)=>pVal[b]-pVal[a]);
     mLabels=pIdx.map(i=>sfxName[pNames[i]]||pNames[i]);mVal=pIdx.map(i=>pVal[i]);
+    // 方案名也可能很长(见 shortAxisLabel):轴上是截断版,悬停看全名
+    mFull=mLabels;mLabels=mFull.map(s=>shortAxisLabel(s));
+  }else if(MDLDIM==="modelProfile"){
+    // 按模型×方案:同一个模型被多个方案服务时**拆成独立柱子**(标签「模型(方案)」),不合并。
+    // 这么做的前提是 profileDailyModels 带日期 —— 所以窗口过滤与柱子口径完全一致,和「按方案」
+    // 分支同源同算法。该表没有 user 维度,所以这一维度同样不响应 USR(与「按方案」同一取舍)。
+    // 配色按**模型**取:同模型的几根柱子共用一色,一眼看出它们是一个模型的不同来源。
+    const sfxName={};for(const p of (Array.isArray(D.profiles)?D.profiles:[]))sfxName[p.suffix]=p.name;
+    const agg={};
+    for(const [sfx,days] of Object.entries(D.profileDailyModels||{})){
+      for(const [date,models] of Object.entries(days)){
+        if(date<eb.start||date>eb.end)continue;
+        for(const [m,v] of Object.entries(models||{})){
+          const k=m+"\u0000"+sfx;
+          if(!agg[k])agg[k]={model:m,sfx,requests:0,tokens:0};
+          agg[k].requests+=(v.requests||0);agg[k].tokens+=((v.inputTokens||0)+(v.outputTokens||0));
+        }
+      }
+    }
+    const keys=Object.keys(agg);
+    const mv=keys.map(k=>MT==="requests"?agg[k].requests:agg[k].tokens);
+    const rows=mv.map((_,i)=>i).sort((a,b)=>mv[b]-mv[a]).map(i=>agg[keys[i]]);
+    const colOf={};let ci=0;
+    // 配色按**模型**取:同模型的几根柱子共用一色
+    mBg=rows.map(r=>{if(colOf[r.model]===undefined)colOf[r.model]=COL[ci++%COL.length];return colOf[r.model]+"cc"});
+    // 模型名 + 方案名叠起来很长:轴上**排两行**(模型名 / (方案名)),完整名字另给 tooltip
+    mFull=rows.map(r=>r.model+"("+(sfxName[r.sfx]||r.sfx)+")");
+    mTicks=rows.map(r=>fitAxisLines([r.model,"("+(sfxName[r.sfx]||r.sfx)+")"]));
+    mLabels=mFull;
+    mVal=rows.map(r=>MT==="requests"?r.requests:r.tokens);
   }else{
     const dm=D.dailyModels||{};
     const mAgg={};
@@ -723,7 +782,7 @@ function renderCharts(){
     const mIdx=mv.map((_,i)=>i).sort((a,b)=>mv[b]-mv[a]);
     mLabels=mIdx.map(i=>mNames[i]);mVal=mIdx.map(i=>mv[i]);
   }
-  C.m=new Chart(document.getElementById("modelChart"),{type:"bar",data:{labels:mLabels,datasets:[{label:MT==="requests"?"请求数":"Token",data:mVal,backgroundColor:mVal.map((_,i)=>COL[i%COL.length]+"cc"),borderWidth:0,borderRadius:3,borderSkipped:false}]},options:{indexAxis:"y",responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false},tooltip:{callbacks:{label:ctx=>MT==="requests"?fmtT(ctx.raw)+" 次请求":fmtT(ctx.raw)+" tokens"}}},scales:{x:{ticks:{color:"#686863",callback:v=>fmtTk(v)},grid:{color:"rgba(24,24,22,.08)"}},y:{ticks:{color:"#686863",font:{size:11},autoSkip:false},grid:{display:false}}}}});
+  C.m=new Chart(document.getElementById("modelChart"),{type:"bar",data:{labels:mLabels,datasets:[{label:MT==="requests"?"请求数":"Token",data:mVal,backgroundColor:mBg||mVal.map((_,i)=>COL[i%COL.length]+"cc"),borderWidth:0,borderRadius:3,borderSkipped:false}]},options:{indexAxis:"y",responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false},tooltip:{callbacks:{title:items=>mFull?mFull[items[0].dataIndex]:items[0].label,label:ctx=>MT==="requests"?fmtT(ctx.raw)+" 次请求":fmtT(ctx.raw)+" tokens"}}},scales:{x:{ticks:{color:"#686863",callback:v=>fmtTk(v)},grid:{color:"rgba(24,24,22,.08)"}},y:{ticks:{color:"#686863",font:{size:11},autoSkip:false,callback:(v,i)=>mTicks?mTicks[i]:v},grid:{display:false}}}}});
 
   // 两张 24 小时图只做「单日」统计:按日=今天;日期范围生效时要求开始=结束(同一天,只填
   // 今天开始那一头也算)。选了周/月/年、或范围跨多天时不统计 —— 数据留空(坐标轴照常渲染),

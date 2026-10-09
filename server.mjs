@@ -2382,7 +2382,7 @@ function pushCodeReviewNotice(ev) {
   if (!c.enabled) return;
   const isRun = ev.kind === "run";
   const failed = ev.kind === "disk_full" || (isRun && TERMINAL.has(ev.report.status) && !TERMINAL_OK.has(ev.report.status));
-  // 「跑完了但没跑全 / 有保留」:partial、有警告、有错误。⚠️ 不能用
+  // 「跑完了但没跑全 / 有保留」:partial、有警告、有错误。注意:不能用
   // `TERMINAL && !TERMINAL_OK` 反推 —— partial 在 TERMINAL_OK 里(游标照常推进),
   // 反推不出来,这正是「撞了 token 预算却一声不响」的老病根。
   // 只影响**管理员渠道**:成员渠道的「有意见才通知」不动。
@@ -2397,7 +2397,7 @@ function pushCodeReviewNotice(ev) {
     const covTxt = covInfo && covInfo.unreviewed > 0 ? ` · 只评了 ${covInfo.done}/${covInfo.selected} 个文件` : "";
     const msg = ev.kind === "disk_full"
       ? `【代码评审】仓库「${ev.repo.name}」工作区磁盘超限,已拒绝入队\n—— ${notifierApi.beijingTimeString()}（token-monitor）`
-      // ⚠️ 状态用中文标签:从前直接把英文 partial 推给管理员,等于什么都没说。
+      // 状态用中文标签 —— 从前直接把英文 partial 推给管理员,等于什么都没说。
       : `【代码评审】${ev.repo.name} #${ev.runId} ${STATUS_LABEL[ev.report.status] || ev.report.status}${degraded && !failed ? "（未评完）" : ""} · ${findings.length} 条意见${covTxt}\n—— ${notifierApi.beijingTimeString()}（token-monitor）`;
     for (const s of notifierApi.NOTIFY_SENDERS.filter(x => x.enabled(n))) {
       s.send(n, msg).catch(err => console.error(`[通知] ${s.channel} 推送失败: ${err.message}`));
@@ -2412,7 +2412,7 @@ function pushCodeReviewNotice(ev) {
 
 // 覆盖率摘要(通知与邮件主题共用)。入参是 **report.coverage**(新记录)或 run 行上
 // 按需补读出来的 coverage —— 两者形状相同。拿不到就返回 null,**不编造**「评全了」。
-// ⚠️ byClass 是机器词(budget),要翻成人话**并原样透出认不出的分类**。
+// 注意:byClass 是机器词(budget),要翻成人话**并原样透出认不出的分类**。
 const COVER_CLASS_ZH = { budget: "超出单次 token 预算" };
 function coverageBrief(cov) {
   if (!cov || typeof cov !== "object") return null;
@@ -2424,7 +2424,7 @@ function coverageBrief(cov) {
   return { selected, done, unreviewed: Math.max(0, Number(cov.failed) || 0), why };
 }
 
-// 通知里的范围口径。⚠️ 与报告(lib/code-review.mjs 的 buildReviewReportHTML)和界面
+// 通知里的范围口径。注意:与报告(lib/code-review.mjs 的 buildReviewReportHTML)和界面
 // (crRangeText / mrRangeText)三处同源;不能都写成「提交 xxx」—— 「合并进来 5 个提交却只看到
 // 1 个」的错觉正是从这里来的。
 const REVIEW_RANGE_TAG = { cold: "冷启动回溯", rewritten: "游标失效回溯", manual: "手动补评", cursor: "增量" };
@@ -2457,9 +2457,9 @@ function reviewFindingsText(ev) {
     `仓库：${ev.repo.name}${ev.branch ? `（分支 ${ev.branch}）` : ""}`,
     `范围：${reviewRangeText(ev)}${ev.commitsCount > 0 ? ` · 覆盖 ${ev.commitsCount} 个提交` : ""}`,
     `HEAD：${String(ev.to || "").slice(0, 8)}${ev.author && ev.author.name ? ` · ${ev.author.name}` : ""}`,
-    // ⚠️ 未评完的警告放在意见列表**之前**:读完意见就走的人,才不会漏掉这一句。
+    // 未评完的警告放在意见列表**之前** —— 读完意见就走的人,才不会漏掉这一句。
     ...(cov && cov.unreviewed > 0
-      ? [`⚠ 本次未评完：选取 ${cov.selected} 个文件、评了 ${cov.done} 个，${cov.unreviewed} 个未评审${cov.why ? `（${cov.why}）` : ""}。下面的意见只覆盖已评部分。`]
+      ? [`本次未评完：选取 ${cov.selected} 个文件、评了 ${cov.done} 个，${cov.unreviewed} 个未评审${cov.why ? `（${cov.why}）` : ""}。下面的意见只覆盖已评部分。`]
       : []),
     // 用的是哪版统一评审标准:HTML 正文(报告)里本来就有这一行,纯文本降级时也别丢 ——
     // 「这版意见怎么变少了」的唯一归因线索
@@ -6303,7 +6303,7 @@ const server = http.createServer((req, res) => {
 
     // 统一评审标准的**只读**视图(设置页展示用)。标准正文内置在 lib/review-standard/,
     // 改它走代码发版与评审,界面不提供编辑 —— 所以这里只有 GET,没有写接口。
-    // ⚠️ 标准坏掉时**不以 500 拒绝**:那会让设置页只剩一句「请求失败」,而「坏在哪一行」
+    // 标准坏掉时**不以 500 拒绝** ——那会让设置页只剩一句「请求失败」,而「坏在哪一行」
     // 恰恰是管理员此刻唯一需要知道的事。统一回 200 + {ok:false,error},与自检项的呈现同构。
     if (req.method === "GET" && crPath === "/api/code-review/standard") {
       if (!adminGate()) return;

@@ -1844,7 +1844,7 @@ function crOnRepoSourceChange() {
 }
 // ── 统一评审标准（只读展示）────────────────────────────────────────────────
 // 标准正文内置在服务端 lib/review-standard/，改它走代码发版 —— 这一屏只读，没有保存入口。
-// ⚠️ 标准坏掉时服务端**不是**回 HTTP 错误，而是 200 + {ok:false,error}：坏在哪一行正是此刻
+// 标准坏掉时服务端**不是**回 HTTP 错误，而是 200 + {ok:false,error}：坏在哪一行正是此刻
 // 唯一要看的东西，压成一句「请求失败」就白跑了这一趟。所以这里把 error 原样摊开，并说清后果
 // —— 评审会失败，而不是退回引擎自带标准凑合评。
 async function loadReviewStandard(reload) {
@@ -2183,7 +2183,7 @@ async function fetchReviewRepoBranches() {
 // 把编辑器里当前填的值拼成 repo 对象(保存与「测试连接」共用,保证测的就是要存的)
 function collectReviewRepoForm() {
   const source = crEl('crRepoSource').value;
-  // ⚠️ overrides 必须**带全**:服务端保存仓库时用 sanitizeRepo 重建整个对象,载荷里
+  // 注意:overrides 必须**带全** ——服务端保存仓库时用 sanitizeRepo 重建整个对象,载荷里
   // 没有的字段会被落回 null —— 早先这里不返回 overrides,于是每点一次「保存仓库」就把
   // exclude/background/timeoutMinutes 静默清空。现在按「现有值 + 本次编辑的字段」合并。
   const prev = CR.repos.find((x) => x.id === CR.editingRepoId) || {};

@@ -6413,6 +6413,22 @@ const server = http.createServer((req, res) => {
       return;
     }
 
+    // 删除**单条**运行记录(面板行上的动作)。比「清空数据」轻一档:同级破坏性操作
+    // (repos/delete、notifications/delete)都只用 adminWriteGate + 审计,二次密码留给
+    // 批量清空那一档(data-clear)。
+    if (req.method === "POST" && crPath === "/api/code-review/runs/delete") {
+      if (!adminWriteGate()) return;
+      readJsonBody().then((body) => {
+        const r = codeReviewApi.deleteRun(body.id);
+        if (!r) { json(404, { error: "运行记录不存在" }); return; }
+        if (r.inFlight) { json(400, { error: "这次评审还在进行中,请先取消再删除" }); return; }
+        recordAdminAudit(req, "codereview.run.delete", `run #${r.run.id}`,
+          `删除评审运行（${r.run.repo_name} ${r.run.status}${r.files ? ",含报告文件" : ""}）`);
+        json(200, { ok: true, id: r.run.id, files: r.files });
+      }).catch((err) => json(400, { error: err.message }));
+      return;
+    }
+
     if (req.method === "POST" && crPath === "/api/code-review/repos/test") {
       if (!adminWriteGate()) return;
       readJsonBody().then(async (body) => {

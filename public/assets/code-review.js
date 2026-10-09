@@ -246,7 +246,11 @@ function crRunRow(r) {
     + '</div>'
     + '<div class="cr-run-actions">'
     + `<button type="button" class="btn btn-outline btn-sm" onclick="openReviewRun(${r.id})">详情</button>`
-    + (active ? `<button type="button" class="btn btn-outline btn-sm" onclick="cancelReviewRun(${r.id})">取消</button>` : "")
+    // 进行中只给「取消」:运行中删 run 行会留下孤儿意见(persistReport 结束后还要往
+    // code_review_comments 插行,表间没有外键,不报错)—— 后端也会拦,但按钮就不该出现
+    + (active
+      ? `<button type="button" class="btn btn-outline btn-sm" onclick="cancelReviewRun(${r.id})">取消</button>`
+      : `<button type="button" class="btn btn-outline btn-sm" onclick="deleteReviewRun(${r.id})">删除</button>`)
     + '</div></div>';
 }
 let crRunsPager = null;
@@ -576,6 +580,25 @@ async function cancelReviewRun(id) {
     const r = await crApi("/api/code-review/runs/cancel", { method: "POST", headers: crCsrfHeaders({ "Content-Type": "application/json" }), body: JSON.stringify({ id }) });
     crSetStatus(r.canceled ? "已取消" : (r.note || "未取消"), r.canceled ? "ok" : "error");
     setTimeout(loadCodeReview, 800);
+  } catch (err) { crSetStatus(err.message, "error"); }
+}
+// 删除单条评审记录(不可撤销)。confirm 里必须点名三件事,尤其第三件:当日 token 用量是
+// 对 code_review_runs 的**实时 SUM**,删掉这条今天就少算这些 token —— 不是「删个日志」那么无害。
+async function deleteReviewRun(id) {
+  if (!confirm(`删除评审记录 #${id}?\n\n`
+    + "· 不可撤销:这条记录连同它的全部意见一起删除\n"
+    + "· 已生成的报告文件一并删除\n"
+    + "· 这次消耗的 token 会从「今日用量」中退还(预算是实时统计的)\n"
+    + "· 仓库状态退回上一条记录(游标不动,已评审过的代码不会因此重跑)")) return;
+  try {
+    const r = await crApi("/api/code-review/runs/delete", { method: "POST", headers: crCsrfHeaders({ "Content-Type": "application/json" }), body: JSON.stringify({ id }) });
+    crSetStatus(`已删除运行 #${r.id}${r.files ? "(含报告文件)" : ""}`, "ok");
+    // 详情弹层正开着这条 → 先关掉,否则它继续显示一条已经不存在的记录
+    if (CR_DETAIL_RUN_ID != null && Number(CR_DETAIL_RUN_ID) === Number(id)) {
+      CR_DETAIL_RUN_ID = null;
+      dlgClose("crDetailDlg");
+    }
+    loadCodeReview();
   } catch (err) { crSetStatus(err.message, "error"); }
 }
 // 详情弹层里的「已解决」切换(管理端):与成员端同一个后端状态,谁点都生效

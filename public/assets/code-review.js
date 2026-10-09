@@ -290,6 +290,8 @@ async function openReviewRun(id) {
         rb.dataset.runId = String(run.id);
         rb.dataset.resolved = run.resolved ? "1" : "0";
         rb.textContent = run.resolved ? "撤销已解决" : "标记已解决";
+        // 实心只给「可推进的那一步」:未解决时是主操作,已解决后点下去是撤销 —— 撤销不该继续抢眼
+        rb.classList.toggle("is-primary", !run.resolved);
       }
     }
     // 「发送给负责人」:评出过意见的运行才可手动补发报告邮件(自动通知只发一次)
@@ -399,6 +401,7 @@ document.getElementById("crDetailResolve")?.addEventListener("click", async func
     await crApi("/api/code-review/runs/resolve", { method: "POST", headers: crCsrfHeaders({ "Content-Type": "application/json" }), body: JSON.stringify({ id: Number(id), resolved: want }) });
     rb.dataset.resolved = want ? "1" : "0";
     rb.textContent = want ? "撤销已解决" : "标记已解决";
+    rb.classList.toggle("is-primary", !want);
     crSetStatus(want ? "已标记为已解决" : "已恢复为未解决", "ok");
     loadCodeReview();   // 列表行的 pill 同步
   } catch (err) { crSetStatus(err.message, "error"); }

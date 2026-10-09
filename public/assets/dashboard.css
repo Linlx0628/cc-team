@@ -169,8 +169,9 @@ td{padding:8px 12px;font-size:11px;border-bottom:1px solid #ecece8;white-space:n
 .cr-toolbar-main{display:flex;align-items:flex-end;gap:12px;flex-wrap:wrap}
 .cr-field{display:flex;flex-direction:column;gap:5px;min-width:0;flex:1;max-width:340px}
 .cr-field label{font-size:11px;font-weight:650;color:var(--dim);letter-spacing:.01em}
-.cr-field select{font-family:var(--font-mono);font-size:13px;padding:8px 10px;border:1px solid var(--border-strong);border-radius:5px;background:var(--surface);color:var(--text)}
-.cr-field select:focus{border-color:var(--accent);outline:none}
+.cr-field select,.cr-field input{font-family:var(--font-mono);font-size:13px;padding:8px 10px;border:1px solid var(--border-strong);border-radius:5px;background:var(--surface);color:var(--text);min-width:0;width:100%}
+.cr-field select:focus,.cr-field input:focus{border-color:var(--accent);outline:none}
+.cr-field input::placeholder{color:var(--dim2)}
 .cr-go{display:inline-flex;align-items:center;gap:6px;padding:9px 16px;font-size:13px;font-weight:650;flex-shrink:0}
 .cr-go-ico{font-size:11px;line-height:1;transform:translateY(.5px)}
 .cr-go:disabled{opacity:.5;cursor:not-allowed}
@@ -264,8 +265,8 @@ td{padding:8px 12px;font-size:11px;border-bottom:1px solid #ecece8;white-space:n
 .cr-comment-reason{width:100%;min-height:58px;resize:vertical;font:12.5px/1.6 var(--font-body);color:var(--text);
   background:var(--surface);border:1px solid var(--border-strong);border-radius:5px;padding:7px 10px}
 .cr-comment-reason:focus{outline:none;border-color:var(--accent)}
-.pager-btn.is-primary{background:var(--accent);border-color:var(--accent);color:#fff}
-.pager-btn.is-primary:hover:not(:disabled){background:var(--accent);border-color:var(--accent);opacity:.9}
+/* 注:.pager-btn.is-primary / .is-accent 的取值已统一挪到 theme.css —— 评审详情弹层由管理面板与
+   成员端共用同一份外壳,动作按钮的语义分级必须两页一致,不能只在这里定义。 */
 .cr-comment-form-act{display:flex;gap:6px}
 .cr-comment.is-dismissed{opacity:.72}
 .cr-comment.is-dismissed .cr-comment-body{color:var(--dim)}

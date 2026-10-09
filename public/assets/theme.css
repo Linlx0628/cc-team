@@ -53,6 +53,13 @@ button:active,.btn:active{transform:translateY(1px)}
 .pager-btn{font-size:11px;background:var(--surface);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:4px 11px;cursor:pointer;text-decoration:none;display:inline-block;line-height:1.5}
 .pager-btn:hover:not(:disabled){border-color:var(--border-strong);background:var(--surface-subtle)}
 .pager-btn:disabled{opacity:.4;cursor:default}
+/* 弹层动作按钮的语义分级:三个动作并排时不能长得一样(白底白底白底 → 点错)。
+   默认 .pager-btn = 中性(取文件这类无副作用的动作);is-accent = 描边强调(会往外发东西);
+   is-primary = 实心主操作(当前可推进的那一步)。三档同出一套主题色,不引入新色相。 */
+.pager-btn.is-accent{background:var(--surface);border-color:var(--accent);color:var(--accent)}
+.pager-btn.is-accent:hover:not(:disabled){background:var(--accent-soft);border-color:var(--accent)}
+.pager-btn.is-primary{background:var(--accent);border-color:var(--accent);color:#fff}
+.pager-btn.is-primary:hover:not(:disabled){opacity:.9}
 @media(max-width:560px){.dlg-overlay{padding:10px}.dlg-card{max-height:93vh}.dlg-body{padding:11px}.dlg-tools{padding:8px 11px}}
 
 /* ── Markdown 渲染容器(md.js 输出;管理端通知预览/查看 与 成员端站内信共用)── */

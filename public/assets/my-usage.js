@@ -1342,6 +1342,8 @@ function mrDetailResolvePaint(run){
   rb.dataset.runId=String(run.id);
   rb.dataset.resolved=run.resolved?'1':'0';
   rb.textContent=run.resolved?'撤销已解决':'标记已解决';
+  // 实心只给「可推进的那一步」:未解决时是主操作,已解决后点下去是撤销(与管理端同一口径)
+  rb.classList.toggle('is-primary',!run.resolved);
 }
 (function(){
   const rb=document.getElementById('mrDetailResolve');
@@ -1358,6 +1360,7 @@ function mrDetailResolvePaint(run){
         if(!res.ok)throw new Error(res.d&&res.d.error||('HTTP '+res.status));
         rb.dataset.resolved=want?'1':'0';
         rb.textContent=want?'撤销已解决':'标记已解决';
+        rb.classList.toggle('is-primary',!want);
         toast(want?'已标记为已解决':'已恢复为未解决');
         fetchMyReview();   // 列表行的 chip 同步
         loadReviewBadge(); // 角标(未解决数)同步

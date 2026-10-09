@@ -178,6 +178,13 @@ function keepHead(s,budget){if(budget<=0)return"";let w=0,out="";for(const ch of
 function shortAxisLabel(s){const max=axisLabelBudget();return dispW(s)<=max?s:keepHead(s,max-1)+"…"}
 // 轴上一格排几行:每一行都独立截断,超长的那一行(通常是模型名)才被截
 function fitAxisLines(lines){const max=axisLabelBudget();return lines.map(l=>dispW(l)<=max?l:keepHead(l,max-1)+"…")}
+// y 轴 ticks 回调的两条分支(mTicks 只有「按模型×方案」才非空):
+//   mTicks 非空 → 返回排好版的两行标签数组(Chart.js 的多行 tick 要求返回字符串数组)
+//   否则       → **必须**走 getLabelForValue(v)
+// 注意:这里不能写成 `return v`。category 轴的 ticks 回调第一个入参是**索引(数字)**,不是标签
+// (实测 Chart.js 4.4.7:回调收到的是 number 0/1) —— 直接返回它,「按模型 / 按方案」两个
+// 维度的轴标签会全部变成 0、1、2…… 这就是 getLabelForValue 存在的原因,它正是默认回调。
+// 也正因为要 `this`,这里必须是 function 而不是箭头函数(Chart.js 以 scale 为 this 调用)。
 // 今日出网卡片:↑ 发往上游的请求体字节(含重试累计)/ ↓ 回传客户端字节。数字过大不适合
 // count-up 动画,直接格式化文本(不带 data-cu,runCountUps 会跳过)。两段一律单行
 // (white-space:nowrap),字号降到 16px —— 与其他卡的 21px 比略小,但两个方向塞得下。
@@ -782,7 +789,7 @@ function renderCharts(){
     const mIdx=mv.map((_,i)=>i).sort((a,b)=>mv[b]-mv[a]);
     mLabels=mIdx.map(i=>mNames[i]);mVal=mIdx.map(i=>mv[i]);
   }
-  C.m=new Chart(document.getElementById("modelChart"),{type:"bar",data:{labels:mLabels,datasets:[{label:MT==="requests"?"请求数":"Token",data:mVal,backgroundColor:mBg||mVal.map((_,i)=>COL[i%COL.length]+"cc"),borderWidth:0,borderRadius:3,borderSkipped:false}]},options:{indexAxis:"y",responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false},tooltip:{callbacks:{title:items=>mFull?mFull[items[0].dataIndex]:items[0].label,label:ctx=>MT==="requests"?fmtT(ctx.raw)+" 次请求":fmtT(ctx.raw)+" tokens"}}},scales:{x:{ticks:{color:"#686863",callback:v=>fmtTk(v)},grid:{color:"rgba(24,24,22,.08)"}},y:{ticks:{color:"#686863",font:{size:11},autoSkip:false,callback:(v,i)=>mTicks?mTicks[i]:v},grid:{display:false}}}}});
+  C.m=new Chart(document.getElementById("modelChart"),{type:"bar",data:{labels:mLabels,datasets:[{label:MT==="requests"?"请求数":"Token",data:mVal,backgroundColor:mBg||mVal.map((_,i)=>COL[i%COL.length]+"cc"),borderWidth:0,borderRadius:3,borderSkipped:false}]},options:{indexAxis:"y",responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false},tooltip:{callbacks:{title:items=>mFull?mFull[items[0].dataIndex]:items[0].label,label:ctx=>MT==="requests"?fmtT(ctx.raw)+" 次请求":fmtT(ctx.raw)+" tokens"}}},scales:{x:{ticks:{color:"#686863",callback:v=>fmtTk(v)},grid:{color:"rgba(24,24,22,.08)"}},y:{ticks:{color:"#686863",font:{size:11},autoSkip:false,callback:function(v,i){return mTicks?mTicks[i]:this.getLabelForValue(v)}},grid:{display:false}}}}});
 
   // 两张 24 小时图只做「单日」统计:按日=今天;日期范围生效时要求开始=结束(同一天,只填
   // 今天开始那一头也算)。选了周/月/年、或范围跨多天时不统计 —— 数据留空(坐标轴照常渲染),

@@ -342,7 +342,10 @@ function handleMcpPost(res, body, ctx) {
               consecutiveFailures: st.consecutive_failures || 0,
             };
           }),
-          recentRuns: rows.filter(r => allowed.has(r.repo_id)).slice(0, limit).map(r => ({
+          // 与成员页**同一口径**:没跑出结果的运行(失败/超时/已取消)不露给成员 ——
+          // MCP 也是成员侧接口,两处口径不一致会让「页面上没有、问模型却有」变成新的困惑源。
+          // 管理员要看这些,走面板的评审列表。
+          recentRuns: rows.filter(r => allowed.has(r.repo_id) && memberVisibleStatus(r.status)).slice(0, limit).map(r => ({
             id: r.id, repo: r.repo_name, status: r.status, trigger: r.trigger,
             // 范围口径与界面/报告一致:冷启动、游标失效回退、手动补评不能都显示成「增量」——
             // 否则模型会把「合并进来 6 个提交」看成「只评了 1 个」

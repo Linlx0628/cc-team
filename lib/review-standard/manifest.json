@@ -1,0 +1,45 @@
+{
+  "_note": "顺序即优先级 —— OCR 的 --rule 是「首条匹配生效」，所以具体类型必须排在兜底 **/* 之前，**/* 必须是最后一条（加载时硬校验，见 lib/code-review-standard.mjs）。每条 entry 都会带 merge_system_rule:true：引擎自带的分语言检查清单会与本标准合并生效（不抄写、因而不存在抄漏）。改标准请同时更新 wiki/code-review.md。",
+  "version": 1,
+  "segments": {
+    "common": {
+      "title": "通用（对所有文件生效）",
+      "file": "common.md",
+      "marker": "## 统一评审标准"
+    },
+    "java": {
+      "title": "后端 Java / JVM（含 Maven POM 与 MyBatis XML）",
+      "file": "java.md",
+      "marker": "### 段：后端 Java / JVM"
+    },
+    "frontend": {
+      "title": "前端 JavaScript / TypeScript / Vue",
+      "file": "frontend.md",
+      "marker": "### 段：前端"
+    },
+    "go": {
+      "title": "Go",
+      "file": "go.md",
+      "marker": "### 段：Go"
+    },
+    "python": {
+      "title": "Python",
+      "file": "python.md",
+      "marker": "### 段：Python"
+    },
+    "default": {
+      "title": "兜底（SQL / 配置 / 脚本 / 其他）",
+      "file": "default.md",
+      "marker": "### 段：兜底"
+    }
+  },
+  "rules": [
+    { "path": "**/pom.xml", "segment": "java" },
+    { "path": "**/*{mapper,dao}*.xml", "segment": "java" },
+    { "path": "**/*.{java,kt,kts}", "segment": "java" },
+    { "path": "**/*.{ts,tsx,js,jsx,mjs,cjs,vue}", "segment": "frontend" },
+    { "path": "**/*.go", "segment": "go" },
+    { "path": "**/*.{py,pyi,ipynb}", "segment": "python" },
+    { "path": "**/*", "segment": "default" }
+  ]
+}

@@ -24,7 +24,8 @@ import { wsAcceptUpgrade, wsRejectUpgrade, WsConn } from "./lib/ws-server.mjs";
 import { isCompactionRequest, transformCompactSseEvent } from "./lib/compact-bridge.mjs";
 import { tryThinkingPassbackSelfHeal } from "./lib/thinking-passback.mjs";
 import { createCodeReviewOcr } from "./lib/code-review-ocr.mjs";
-import { createCodeReview, initCodeReviewDb, sanitizeCodeReviewConfig, maskCredential, buildReviewReportHTML, migrateLegacyTriggerKeys, isValidBranch, TERMINAL, TERMINAL_OK } from "./lib/code-review.mjs";
+import { standardView } from "./lib/code-review-standard.mjs";
+import { createCodeReview, initCodeReviewDb, sanitizeCodeReviewConfig, maskCredential, buildReviewReportHTML, migrateLegacyTriggerKeys, isValidBranch, isValidCommitRef, TERMINAL, TERMINAL_OK } from "./lib/code-review.mjs";
 import { createMemberNotify, initMemberNotifyDb, pickNotifyTarget } from "./lib/member-notify.mjs";
 import { createNotifications, initNotificationsDb } from "./lib/notifications.mjs";
 import { PassThrough } from "node:stream";
@@ -206,7 +207,7 @@ const MCP_TOOLS = [
   { name: "request_quota", description: "向管理员提交加量申请（写操作）。每北京日限提交 1 次、每周被处理数有上限；不限量的池无需申请。", inputSchema: { type: "object", properties: { reason: { type: "string", description: "申请理由（必填，200 字以内）" }, pool: { type: "string", description: "额度池名（可选，缺省取第一个可申请的池）" } }, required: ["reason"] } },
   { name: "my_usage", description: "查询我的 token 用量明细：今日（或指定日期范围）合计、按模型统计（真实 token 与计入配额的计权值并排）、24 小时请求分布、按客户端统计。用户问「我今天用了多少/花在哪」时调用。", inputSchema: { type: "object", properties: { start: { type: "string", description: "起始日期 YYYY-MM-DD（北京时间，可选）" }, end: { type: "string", description: "结束日期 YYYY-MM-DD（可选，缺省=起始日）" }, protocol: { type: "string", enum: ["anthropic", "responses"], description: "可选协议过滤" } }, required: [] } },
   { name: "leaderboard", description: "团队排行榜：7 个维度（cache_rate 缓存率 / code_quality 代码质量 / code_lines 代码行数 / tokens 用量 / efficiency 效率比 / context_health 上下文健康度 / activity 活跃度）× 时间窗（today/week/month）。", inputSchema: { type: "object", properties: { dimension: { type: "string", enum: ["cache_rate", "code_quality", "code_lines", "tokens", "efficiency", "context_health", "activity"] }, window: { type: "string", enum: ["today", "week", "month"] } }, required: [] } },
-  { name: "code_review_list", description: "查看代码评审：哪些仓库允许在线触发、各自上次评审状态、最近的评审运行（状态/意见数/token）。想知道「我的改动评过没有」时调用。仅对获授权的 Key 可见。", inputSchema: { type: "object", properties: { limit: { type: "number", description: "返回最近多少次运行（默认 10，最多 50）" } }, required: [] } },
+  { name: "code_review_list", description: "查看代码评审：哪些仓库允许在线触发、各自上次评审状态、最近的评审运行（评审范围/覆盖提交数/状态/意见数/token）。范围里的 commits 是本次增量覆盖的提交个数——合并带进来的提交会一起算进去。想知道「我的改动评过没有」时调用。仅对获授权的 Key 可见。", inputSchema: { type: "object", properties: { limit: { type: "number", description: "返回最近多少次运行（默认 10，最多 50）" } }, required: [] } },
   { name: "code_review_trigger", description: "触发一次代码评审（写操作，消耗 token）。评审的是仓库里**已提交**的最新代码，不是工作区未提交的改动。每 Key 60 秒只能触发一次；仓库需管理员开启「允许在线触发」。", inputSchema: { type: "object", properties: { repo: { type: "string", description: "仓库名称或 ID（可选，缺省=全部已开启在线触发的仓库）" } }, required: [] } },
   { name: "code_review_findings", description: "查询代码评审**发现的具体问题**（文件、行号、问题描述、建议改法）。用户问「最近有没有代码评审的问题」「我负责的仓库有哪些要改的」时调用这个（而不是 code_review_list —— 那个只有计数）。只返回自己是成员的仓库。", inputSchema: { type: "object", properties: {
     repo: { type: "string", description: "仓库名称或 ID（可选，缺省=自己负责的全部仓库）" },
@@ -343,10 +344,17 @@ function handleMcpPost(res, body, ctx) {
           }),
           recentRuns: rows.filter(r => allowed.has(r.repo_id)).slice(0, limit).map(r => ({
             id: r.id, repo: r.repo_name, status: r.status, trigger: r.trigger,
-            range: r.range_mode === "single" ? `单提交 ${String(r.to_commit || "").slice(0, 8)}` : `${String(r.from_commit || "").slice(0, 8)}→${String(r.to_commit || "").slice(0, 8)}`,
+            // 范围口径与界面/报告一致:冷启动、游标失效回退、手动补评不能都显示成「增量」——
+            // 否则模型会把「合并进来 6 个提交」看成「只评了 1 个」
+            range: reviewRangeText({
+              rangeMode: r.range_mode, rangeSrc: r.range_source,
+              from: r.from_commit, to: r.to_commit,
+            }),
+            commits: r.commits_count || 0,
             files: r.files_reviewed, comments: r.comments_count,
             tokens: (r.input_tokens || 0) + (r.output_tokens || 0),
-            createdAt: bjStamp(r.created_at), note: r.note || undefined, error: r.error || undefined,
+            createdAt: bjStamp(r.created_at), note: r.note || undefined,
+            rangeNote: r.range_note || undefined, error: r.error || undefined,
           })),
         };
       } else if (name === "code_review_findings") {
@@ -386,6 +394,8 @@ function handleMcpPost(res, body, ctx) {
             at: bjStamp(c.created_at),
             branch: c.branch || undefined,
             commit: String(c.to_commit || "").slice(0, 8) || undefined,
+            // 这条意见出自哪一段评审(commit 只是该段的 HEAD,合并带进来的提交也算在范围内)
+            range: reviewRangeText({ rangeMode: c.range_mode, rangeSrc: c.range_source, from: c.from_commit, to: c.to_commit }),
             author: c.author_name || undefined,
             path: c.path,
             line: c.start_line ? (c.end_line && c.end_line !== c.start_line ? `${c.start_line}-${c.end_line}` : String(c.start_line)) : undefined,
@@ -2262,7 +2272,9 @@ function loadProfileSnapshot(suffix, wideFloor) {
 
 ({ db, stmts } = persistenceApi.initDb());
 initProductionDb(db);   // 产出质量表(tool_events / production_alerts),先于 tracker 建语句
-initCodeReviewDb(db);   // 代码评审表(runs / comments / repo_state);功能默认关闭,建表无害
+// 代码评审表(runs / comments / repo_state);功能默认关闭,建表无害。
+// backup 回调只在**游标表换主键那次破坏性重建**时被调用一次(不在重启时白白拷库)。
+initCodeReviewDb(db, { backup: () => backupDatabaseSync("code-review-cursor-per-branch") });
 initMemberNotifyDb(db); // 成员自助的通知渠道(成员用量页里配)
 const memberNotifyApi = createMemberNotify({ get db() { return db; } });
 initNotificationsDb(db); // 管理员系统通知(站内信,成员铃铛)
@@ -2380,6 +2392,18 @@ function pushCodeReviewNotice(ev) {
   }
 }
 
+// 通知里的范围口径。⚠️ 与报告(lib/code-review.mjs 的 buildReviewReportHTML)和界面
+// (crRangeText / mrRangeText)三处同源;不能都写成「提交 xxx」—— 「合并进来 5 个提交却只看到
+// 1 个」的错觉正是从这里来的。
+const REVIEW_RANGE_TAG = { cold: "冷启动回溯", rewritten: "游标失效回溯", manual: "手动补评", cursor: "增量" };
+function reviewRangeText(ev) {
+  const src = ev.rangeSrc || (ev.rangeMode === "single" ? "single" : "cursor");
+  const tag = REVIEW_RANGE_TAG[src] || (ev.rangeMode === "single" ? "单提交" : "增量");
+  const ends = (ev.rangeMode === "single" || !ev.from)
+    ? String(ev.to || "").slice(0, 8)
+    : `${String(ev.from).slice(0, 8)}→${String(ev.to || "").slice(0, 8)}`;
+  return tag + " " + ends;
+}
 // 把「这次评审发现了什么」拼成一段人话。摘要只取前几条、每条截断 ——
 // 通知是提醒,不是全文;详情让成员去「我的用量」页或 MCP 里看。
 function reviewFindingsText(ev) {
@@ -2396,7 +2420,13 @@ function reviewFindingsText(ev) {
     head,
     "",
     `仓库：${ev.repo.name}${ev.branch ? `（分支 ${ev.branch}）` : ""}`,
-    `提交：${String(ev.to || "").slice(0, 8)}${ev.author && ev.author.name ? ` · ${ev.author.name}` : ""}`,
+    `范围：${reviewRangeText(ev)}${ev.commitsCount > 0 ? ` · 覆盖 ${ev.commitsCount} 个提交` : ""}`,
+    `HEAD：${String(ev.to || "").slice(0, 8)}${ev.author && ev.author.name ? ` · ${ev.author.name}` : ""}`,
+    // 用的是哪版统一评审标准:HTML 正文(报告)里本来就有这一行,纯文本降级时也别丢 ——
+    // 「这版意见怎么变少了」的唯一归因线索
+    ...(ev.standardVersion ? [`评审标准：v${ev.standardVersion}`] : []),
+    // 为什么是这一段(冷启动回溯 / 游标失效回退 / 手动补评),有才写
+    ...(ev.rangeNote ? [`说明：${ev.rangeNote}`] : []),
     "",
     shown + more,
     "",
@@ -2424,6 +2454,11 @@ async function sendReviewFindingsNotice({ repo, run, reportComments, author = nu
     to: run.to_commit,
     author: author || (run.author_email || run.author_name ? { name: run.author_name || "", email: run.author_email || "" } : null),
     report: { comments: reportComments },
+    // 范围口径(纯文本通知用;HTML 正文走报告,自己会算)
+    rangeMode: run.range_mode || null, rangeSrc: run.range_source || null,
+    from: run.from_commit || null, rangeNote: run.range_note || null,
+    commitsCount: Number(run.commits_count) || 0,
+    standardVersion: run.standard_version || null,
   };
   const text = reviewFindingsText(ev);
   const subject = `【代码评审】${repo.name} 发现 ${reportComments.length} 处问题`;
@@ -3700,7 +3735,9 @@ function getPublicSettings() {
         maxParallelJobs: c.maxParallelJobs,
         defaultTimeoutMinutes: c.defaultTimeoutMinutes,
         defaultConcurrency: c.defaultConcurrency,
+        defaultEffort: c.defaultEffort || "high",
         defaultMaxTokensBudget: c.defaultMaxTokensBudget,
+        coldStartCommits: c.coldStartCommits,
         dailyTokenBudget: c.dailyTokenBudget,
         runRetentionDays: c.runRetentionDays,
         keepRunsPerRepo: c.keepRunsPerRepo,
@@ -6218,6 +6255,20 @@ const server = http.createServer((req, res) => {
       return;
     }
 
+    // 统一评审标准的**只读**视图(设置页展示用)。标准正文内置在 lib/review-standard/,
+    // 改它走代码发版与评审,界面不提供编辑 —— 所以这里只有 GET,没有写接口。
+    // ⚠️ 标准坏掉时**不以 500 拒绝**:那会让设置页只剩一句「请求失败」,而「坏在哪一行」
+    // 恰恰是管理员此刻唯一需要知道的事。统一回 200 + {ok:false,error},与自检项的呈现同构。
+    if (req.method === "GET" && crPath === "/api/code-review/standard") {
+      if (!adminGate()) return;
+      try {
+        json(200, { ok: true, ...standardView() });
+      } catch (err) {
+        json(200, { ok: false, error: err.message });
+      }
+      return;
+    }
+
     if (req.method === "GET" && crPath === "/api/code-review/runs") {
       if (!adminGate()) return;
       const { rows, total } = codeReviewApi.listRuns({
@@ -6350,9 +6401,19 @@ const server = http.createServer((req, res) => {
           // 它只对单个仓库有意义 —— 「不带仓库 = 触发全部授权仓库」时给不出统一分支。
           const branch = body.branch == null || body.branch === "" ? null : String(body.branch);
           if (branch && !body.repo) { json(400, { error: "指定分支时必须同时指定仓库(不能一次给多个仓库设同一分支)" }); return; }
-          const r = codeReviewApi.enqueue(String(body.repo || ""), { trigger: "manual", actor: "admin", branch });
+          // 按范围补评:显式给一对提交号,补评一段历史(不推进游标)。
+          // 只接受十六进制提交号 —— `HEAD~1`/`main`/`$(...)` 这类表达式一律 400,
+          // 它们会变成 git 的参数,不能由请求方自由发挥(与 enqueue 的校验同一口径)。
+          const from = body.from == null || body.from === "" ? null : String(body.from).trim().toLowerCase();
+          const to = body.to == null || body.to === "" ? null : String(body.to).trim().toLowerCase();
+          if (from || to) {
+            if (!body.repo) { json(400, { error: "按范围补评必须指定仓库" }); return; }
+            if (!isValidCommitRef(from) || !isValidCommitRef(to)) { json(400, { error: "补评范围需要同时给出合法的 from 与 to（7~40 位十六进制提交号）" }); return; }
+          }
+          const r = codeReviewApi.enqueue(String(body.repo || ""), { trigger: "manual", actor: "admin", branch, from, to });
+          const rangeText = from && to ? `，补评范围 ${from.slice(0, 8)}→${to.slice(0, 8)}（不推进游标）` : "";
           recordAdminAudit(req, "codereview.run", String(body.repo || ""),
-            `手动触发代码评审（run #${r.runId}${r.deduped ? "，与进行中的任务合并" : ""}${branch ? `，分支 ${branch}` : ""}）`);
+            `手动触发代码评审（run #${r.runId}${r.deduped ? "，与进行中的任务合并" : ""}${branch ? `，分支 ${branch}` : ""}${rangeText}）`);
           json(r.deduped ? 200 : 202, r);
         } catch (err) {
           json(err.statusCode || 400, { error: err.message });

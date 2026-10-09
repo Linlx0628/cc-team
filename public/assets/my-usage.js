@@ -1198,6 +1198,21 @@ function mrTime(iso){return iso?new Date(iso).toLocaleString('zh-CN',{timeZone:'
 // 管理员代为标记记「管理员」(管理端共享口令,无逐人身份,要追 IP 看审计日志)。
 function mrWhen(iso){if(!iso)return'';const d=new Date(iso);return Number.isNaN(d.getTime())?'':d.toLocaleString('zh-CN',{timeZone:'Asia/Shanghai',hour12:false,month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'})}
 function mrResolvedWho(r){return r&&r.resolved?(r.resolvedBy||'管理员'):''}
+// 评审范围文案。⚠️ 与管理端 code-review.js 的 crRangeText、lib/code-review.mjs 的 resolveRange 同步:
+// cursor=常态增量、cold=这条分支首次评(回溯最近 N 个提交)、rewritten=上次评到的提交被改写、
+// manual=管理员按范围补评(不推进游标)。老记录没有 range_source,按 range_mode 兜底。
+// ⚠️ 列表行是 memberView 的驼峰字段,详情接口回的是原始蛇形行 —— 两种形状都认,别再混用。
+const MR_RANGE_LABEL={cold:'冷启动回溯',rewritten:'游标失效回溯',manual:'手动补评',cursor:'增量'};
+function mrRangeText(r,snake){
+  const mode=snake?r.range_mode:r.rangeMode;
+  const from=snake?r.from_commit:r.fromCommit;
+  const to=snake?r.to_commit:r.toCommit;
+  const src=(snake?r.range_source:r.rangeSource)||(mode==='single'?'single':'cursor');
+  const tag=MR_RANGE_LABEL[src]||(mode==='single'?'单提交':'增量');
+  return tag+' '+((mode==='single'||!from)?String(to||'').slice(0,8):(String(from||'').slice(0,8)+'→'+String(to||'').slice(0,8)));
+}
+function mrCommitCount(r,snake){return Number(snake?r.commits_count:r.commitsCount)||0}
+function mrParseCommits(json){try{const a=JSON.parse(json||'[]');return Array.isArray(a)?a:[]}catch(e){return[]}}
 (function(){
   const el=document.getElementById('mrRunSearch');
   if(el)el.addEventListener('input',function(){if(MR.data)renderMyReview()});
@@ -1237,8 +1252,9 @@ function renderMyReview(){
     const resolvePill=r.comments>0?(r.resolved?' <span class="mr-pill mr-pill-dim">已解决</span>':' <span class="mr-pill mr-pill-warn">未解决</span>'):'';
     return '<div class="lb-row"><div class="lb-who"><div class="lb-name">'+esc(r.repo)+
       ' <span class="mr-pill mr-pill-'+mrClass(r.status)+'">'+esc(MR_LABEL[r.status]||r.status)+'</span>'+resolvePill+'</div>'+
-      '<div class="lb-det">'+esc(mrTime(r.createdAt))+' · '+esc(r.rangeMode==='single'?'单提交':'增量')+' '+
-      esc(String(r.toCommit||'').slice(0,8))+' · 文件 '+r.filesReviewed+' · 意见 '+r.comments+' · '+fmtTk(r.tokens)+' token'+
+      '<div class="lb-det">'+esc(mrTime(r.createdAt))+' · '+esc(mrRangeText(r,false))+' '+
+      (mrCommitCount(r,false)>0?' · 提交 '+mrCommitCount(r,false):'')+
+      ' · 文件 '+r.filesReviewed+' · 意见 '+r.comments+' · '+fmtTk(r.tokens)+' token'+
       (Number(r.dismissed)>0?' · '+r.dismissed+' 条不处理':'')+
       (r.resolved?' · 已解决 '+esc(mrResolvedWho(r))+(mrWhen(r.resolvedAt)?' '+esc(mrWhen(r.resolvedAt)):''):'')+'</div>'+
       (r.note?'<div class="lb-det" style="white-space:normal">'+esc(r.note)+'</div>':'')+
@@ -1311,13 +1327,31 @@ function openMyReviewRun(id){
     const run=d.run,cs=d.comments||[];
     if(title)title.textContent='运行 #'+run.id+' · '+run.repo_name;
     if(sub)sub.textContent=[
-      (run.range_mode==='single'?'单提交':'增量')+String(run.to_commit||'').slice(0,8),
+      mrRangeText(run,true),
+      mrCommitCount(run,true)>0?(mrCommitCount(run,true)+' 个提交'):'',
       run.comments_count+' 条意见 · '+run.files_reviewed+' 个文件'+(Number(run.dismissed_count)>0?(' · '+run.dismissed_count+' 条已标记不处理'):''),
+      // 用的是哪版统一评审标准(此接口回原始行,字段是蛇形)。两次意见数不同时,先看这一项:
+      // 换过标准前后的意见条数不可直接比较。
+      run.standard_version?('评审标准 v'+run.standard_version):'',
+      // 被机械兜底丢弃的条数:不说的话「这版意见变少了」会被当成「没问题」
+      Number(run.dropped_comments)>0?('丢弃 '+run.dropped_comments+' 条（缺少取证推理）'):'',
       // 谁点的已解决(此接口回原始行,字段是蛇形)
       run.resolved?('已解决 '+(run.resolved_by||'管理员')+(mrWhen(run.resolved_at)?' '+mrWhen(run.resolved_at):'')):''
     ].filter(Boolean).join(' · ');
     mrDetailResolvePaint(run);
     let html='<div class="note" style="margin-bottom:10px">'+esc(run.note||'')+'</div>';
+    // 范围来源(为什么评的是这一段)—— 与结论分开显示,「回退为最近 N 个提交」不该被结论盖掉
+    if(run.range_note)html+='<div class="lb-det" style="margin-bottom:10px">范围来源:'+esc(run.range_note)+'</div>';
+    // 覆盖了哪些提交:范围对了也得能核对「那 5 个提交到底评没评」
+    const commits=mrParseCommits(run.commits_json),ctotal=mrCommitCount(run,true)||commits.length;
+    if(commits.length){
+      html+='<details style="margin-bottom:10px"><summary class="lb-det" style="cursor:pointer">本次覆盖的 '+ctotal+' 个提交'+
+        (commits.length<ctotal?('（清单只留最近 '+commits.length+' 条)'):'')+'</summary>'+
+        '<div style="margin-top:6px">'+commits.map(function(c){
+          return '<div class="lb-det" style="font-family:var(--font-mono)">'+esc(String(c.sha||'').slice(0,8))+' '+esc(c.subject||'(无标题)')+
+            '<span style="font-family:inherit"> · '+esc(c.author||'?')+(mrWhen(c.at)?' '+esc(mrWhen(c.at)):'')+'</span></div>';
+        }).join('')+'</div></details>';
+    }
     if(!cs.length){
       html+='<div class="lb-msg" style="color:var(--green)">本次没有提出意见</div>';
       if(body)body.innerHTML=html;

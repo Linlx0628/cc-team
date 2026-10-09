@@ -38,6 +38,20 @@ const CR_STATUS_LABEL = {
   skipped: "已跳过", failed: "失败", timeout: "超时", canceled: "已取消",
 };
 function crShort(sha) { return sha ? String(sha).slice(0, 8) : ""; }
+// 「这一段是怎么定出来的」。⚠️ 与 lib/code-review.mjs 的 resolveRange / manualRange 保持同步:
+//   cursor    按上次评到的提交做增量(常态)
+//   cold      这条分支首次评审 —— 回溯最近 N 个提交
+//   rewritten 上次评到的提交已被改写(force push / rebase)—— 同样回溯最近 N 个提交
+//   manual    手动按范围补评(不推进游标)
+// 老记录没有 range_source(列是后加的),按 range_mode 兜底成单提交/增量。
+const CR_RANGE_LABEL = { cold: "冷启动回溯", rewritten: "游标失效回溯", manual: "手动补评", cursor: "增量" };
+function crRangeText(r) {
+  if (!r) return "";
+  const src = r.range_source || (r.range_mode === "single" ? "single" : "cursor");
+  const tag = CR_RANGE_LABEL[src] || (r.range_mode === "single" ? "单提交" : "增量");
+  const ends = (r.range_mode === "single" || !r.from_commit) ? crShort(r.to_commit) : `${crShort(r.from_commit)}→${crShort(r.to_commit)}`;
+  return tag + " " + ends;
+}
 // 「已解决」是谁、什么时候点的(展示用)。存储层记的是当时的名字快照(成员改名后不回改),
 // 管理员代为标记时记「管理员」——管理端是共享口令,没有逐人身份,要追到 IP 看审计日志。
 function crWhen(iso) {
@@ -91,6 +105,23 @@ function crEngineStrip(ocr, st) {
     + '</div>';
 }
 
+// 「按范围补评」折叠块。用于「某一段历史当时漏评了」——显式范围覆盖游标判定,且不推进游标
+// (补历史不该把高水位线往回拉)。默认收起,不干扰常态触发。
+function crManualBox() {
+  return '<details class="cr-manual" style="margin-top:11px">'
+    + '<summary style="cursor:pointer;font-size:11.5px;font-weight:650;color:var(--dim)">按范围补评(可选 · 不推进游标)</summary>'
+    + '<div class="cr-toolbar-main" style="margin-top:10px">'
+    + '<div class="cr-field"><label for="crManualFrom">起始提交 <span class="cr-hint-inline">(不含)</span></label>'
+    + '<input type="text" id="crManualFrom" placeholder="7~40 位十六进制提交号" autocomplete="off" spellcheck="false"></div>'
+    + '<div class="cr-field"><label for="crManualTo">结束提交 <span class="cr-hint-inline">(含)</span></label>'
+    + '<input type="text" id="crManualTo" placeholder="7~40 位十六进制提交号" autocomplete="off" spellcheck="false"></div>'
+    + '<button type="button" class="btn btn-outline cr-go" onclick="startReviewRange()">补评这一段</button>'
+    + '</div>'
+    + '<div class="cr-toolbar-hint">两个提交号必须同时填,且都要在所选分支的克隆里(工作区只拉取所选分支那一条线,跨分支的提交补不了)。'
+    + '只能填提交号,不能写 <code>HEAD~1</code> 这类表达式。<b>补评不推进游标</b>,也不影响定时计划;仓库正在跑时会排队而不是被合并掉。</div>'
+    + '</details>';
+}
+
 function renderCodeReview(ocr) {
   const body = document.getElementById("crPanelBody");
   ocr = ocr || (crData && crData.ocr) || {};
@@ -105,8 +136,10 @@ function renderCodeReview(ocr) {
     + `<select id="crRunBranch" disabled><option value="">（选仓库后加载）</option></select></div>`
     + '<button type="button" class="btn btn-primary cr-go" id="crGoBtn" onclick="startReviewRun()"><span class="cr-go-ico">▸</span>开始评审</button>'
     + '</div>'
-    + '<div class="cr-toolbar-hint">首次只评最新一个 <code>commit</code>;之后按「上次评到 → 现在 HEAD」的<b>增量</b>评审,不会整个仓库重跑。评审的是<b>已推送</b>的提交。</div>'
+    + '<div class="cr-toolbar-hint">每条分支各记一份游标:首次评这条分支会<b>回溯最近 N 个提交</b>(默认 10,设置页可调),'
+    + '之后按「上次评到 → 现在 HEAD」的<b>增量</b>评审,不会整个仓库重跑。合并带进来的多个提交属于同一段增量,会一起评。评审的是<b>已推送</b>的提交。</div>'
     + '<div class="inline-status cr-run-status" id="crRunStatus" role="status"></div>'
+    + crManualBox()
     + '</div>';
 
   if (!repos.length) {
@@ -161,8 +194,12 @@ function crRunRow(r) {
     + trig + '</div>'
     + '<div class="cr-run-meta">' + escH(new Date(r.created_at).toLocaleString("zh-CN", { timeZone: "Asia/Shanghai", hour12: false }))
     + (Number(r.dismissed_count) > 0 ? ` · ${r.dismissed_count} 条不处理` : "")
+    // 「意见被丢了几条」必须在列表上就看得见:否则「这版标准更严了」和「评审没跑完」
+    // 在列表里长得一模一样(都是意见变少)。
+    + (Number(r.dropped_comments) > 0 ? ` · 丢弃 ${r.dropped_comments} 条(缺取证推理)` : "")
     + crResolvedNote(r)
-    + " · " + escH(r.range_mode === "single" ? "单提交 " + crShort(r.to_commit) : `${crShort(r.from_commit)}→${crShort(r.to_commit)}`)
+    + " · " + escH(crRangeText(r))
+    + (Number(r.commits_count) > 0 ? ` · 提交 ${r.commits_count}` : "")
     + ` · 文件 ${r.files_reviewed} · 意见 ${r.comments_count} · ${fmtT(r.input_tokens + r.output_tokens)} token · ${crDur(r.elapsed_ms)}`
     + '</div>'
     // 一句话结论(note):「已跳过」到底是没新提交还是别的原因,靠它说清楚
@@ -274,7 +311,7 @@ async function openReviewRun(id) {
     const tools = crParseTools(run.tool_calls_json);
     if (title) title.textContent = `运行 #${run.id} · ${run.repo_name} ${CR_STATUS_LABEL[run.status] || run.status}`;
     if (sub) sub.textContent = [
-      (run.range_mode === "single" ? "单提交 " : "增量 ") + crShort(run.to_commit),
+      crRangeText(run),
       run.author_name ? `提交人 ${run.author_name}` : "",
       `${run.comments_count} 条意见${Number(run.dismissed_count) > 0 ? `（${run.dismissed_count} 条已标记不处理）` : ""} · ${run.files_reviewed} 个文件 · ${fmtT(run.input_tokens + run.output_tokens)} token · ${crDur(run.elapsed_ms)}`,
       // 已解决时把「谁、什么时候」放进详情副标题(列表里也有一份,格式一致)
@@ -301,16 +338,35 @@ async function openReviewRun(id) {
       nb.dataset.runId = String(run.id);
     }
     // 结论 + 引擎实际干了多少活:这条是回答「有没有真干活」的关键
+    const commits = crParseFiles(run.commits_json);
+    const commitsTotal = Number(run.commits_count) || commits.length;
     let html = '<div class="cr-detail"><div class="cr-facts">'
       + crFact("结论", run.note || "—")
-      + crFact("评审范围", (run.range_mode === "single" ? "单提交 " : "增量 ") + escH(crShort(run.from_commit) || "—") + " → " + escH(crShort(run.to_commit) || "—"))
+      + crFact("评审范围", escH(crRangeText(run)))
+      // 为什么是这一段 —— 与结论(note)分开显示:「回退为最近 N 个提交」这类原因不该被结论盖掉
+      + (run.range_note ? crFact("范围来源", escH(run.range_note)) : "")
+      + (commitsTotal > 0 ? crFact("覆盖提交", `${commitsTotal} 个`) : "")
       + (run.author_name || run.author_email ? crFact("提交人", escH(run.author_name || "—") + (run.author_email ? ` &lt;${escH(run.author_email)}&gt;` : "")) : "")
       + crFact("模型", escH(run.ocr_model || "—") + (run.ocr_provider ? `（${escH(run.ocr_provider)}）` : ""))
+      // 用的是哪版标准:两次评审意见条数不同时,先看这一行 —— 换过标准前后的意见数不可直接比
+      + crFact("评审标准", run.standard_version ? `v${escH(run.standard_version)}` : "—（此记录早于统一标准）")
+      + (Number(run.dropped_comments) > 0 ? crFact("丢弃意见", `${Number(run.dropped_comments)} 条（缺少取证推理，未入库）`) : "")
       + (tools ? crFact("引擎动作", escH(crToolText(tools))) : "")
       + crFact("token", `网关计 ${fmtT(run.attributed_input + run.attributed_output)} · 引擎自报 ${fmtT(run.input_tokens + run.output_tokens)}`)
       + crFact("耗时", crDur(run.elapsed_ms))
       + '</div>';
     if (run.error) html += `<div class="cr-notice is-error" style="margin:0 0 12px">${escH(run.error)}</div>`;
+    // 覆盖了哪些提交:范围对了也得能核对「那 5 个提交到底评没评」——这是本次修的核心诉求
+    html += '<div class="cr-files-block"><div class="cr-files-title">'
+      + (commits.length ? `本次覆盖的 ${commitsTotal} 个提交${commits.length < commitsTotal ? `（清单只留最近 ${commits.length} 条）` : ""}` : "本次没有覆盖任何提交")
+      + '</div>'
+      + (commits.length
+        ? '<details' + (commits.length <= 12 ? ' open' : '') + '><summary style="cursor:pointer;font-size:12px;font-weight:650;color:var(--dim)">提交清单</summary>'
+          + '<div class="cr-files-list" style="margin-top:8px">' + commits.map((c) => '<div class="cr-files-item">'
+            + `<span class="cr-hint-inline">${escH(crShort(c.sha))}</span> ${escH(c.subject || "(无标题)")}`
+            + `<span class="cr-hint-inline"> · ${escH(c.author || "?")}${crWhen(c.at) ? " " + escH(crWhen(c.at)) : ""}</span></div>`).join("") + '</div></details>'
+        : '<div class="cr-empty-d" style="text-align:left;margin:0">这条记录没留提交清单(旧版本产生的运行,或范围为空)。</div>')
+      + '</div>';
     // 被评文件清单:即使 0 意见也把评过的文件列出来 —— 证明它确实读了这些文件
     html += '<div class="cr-files-block"><div class="cr-files-title">'
       + (files.length ? `本次评审选取的 ${files.length} 个文件` : "本次没有选取任何文件")
@@ -380,6 +436,27 @@ async function startReviewRun() {
   try {
     const r = await crApi("/api/code-review/runs/start", { method: "POST", headers: crCsrfHeaders({ "Content-Type": "application/json" }), body: JSON.stringify({ repo, branch }) });
     crSetStatus(r.deduped ? "该仓库已有进行中的评审,已合并" : `已入队 #${r.runId}`, "ok");
+    setTimeout(loadCodeReview, 1500);
+  } catch (err) { crSetStatus(err.message, "error"); }
+}
+// 按范围补评。与上面共用同一个接口,只多了 from/to;服务端会拒绝「只给一头」的请求。
+async function startReviewRange() {
+  const repo = document.getElementById("crRunRepo")?.value;
+  if (!repo) { crSetStatus("请先在设置页添加仓库", "error"); return; }
+  // 与服务端 isValidCommitRef 同一口径:只收 7~40 位十六进制。表达式(HEAD~1 / 分支名)一律不收,
+  // 因为它们进的是 git argv —— 这里拦住比让服务端报错体验好
+  const hex = /^[0-9a-f]{7,40}$/;
+  const from = (document.getElementById("crManualFrom")?.value || "").trim().toLowerCase();
+  const to = (document.getElementById("crManualTo")?.value || "").trim().toLowerCase();
+  if (!hex.test(from) || !hex.test(to)) {
+    crSetStatus("起始与结束都要填 7~40 位十六进制提交号(不能写 HEAD~1 这类表达式)", "error");
+    return;
+  }
+  const branch = document.getElementById("crRunBranch")?.value || "";
+  crSetStatus("已提交补评,排队中…");
+  try {
+    const r = await crApi("/api/code-review/runs/start", { method: "POST", headers: crCsrfHeaders({ "Content-Type": "application/json" }), body: JSON.stringify({ repo, branch, from, to }) });
+    crSetStatus(`补评已入队 #${r.runId}(不推进游标)`, "ok");
     setTimeout(loadCodeReview, 1500);
   } catch (err) { crSetStatus(err.message, "error"); }
 }

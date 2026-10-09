@@ -141,7 +141,7 @@ docker volume rm token-monitor_code-review-workspaces   # 想彻底清空工作�
 | `quotaRequest` | 加量申请开关与参数 |
 | `autoQuotaAdjust` | 自动配额调整（周期 / 命中率阈值 / 冷却） |
 | `productionTracking` | 产出质量追踪（含文件路径记录开关） |
-| `codeReview` | 代码评审（仓库白名单 / 方案 / 账号 / 定时 / 预算；建议在设置页里维护，凭据在这个字段里明文存放） |
+| `codeReview` | 代码评审（仓库白名单 / 方案 / 账号 / 定时 / 预算 / 业务背景；建议在设置页里维护，凭据在这个字段里明文存放）。其中 `defaultEffort`（探索深度，默认 `high`）、`defaultMaxTokensBudget`（单次 token 预算，默认 8000000）、`dailyTokenBudget`（当日 token 预算，默认 50000000，0 = 不限）、`background`（全局业务背景，上限 20000 字）是本次新增/变更的键；评审标准本身**不在配置文件里**，它内置在代码 `lib/review-standard/` 下（改标准走代码发版） |
 | `notifier` | 通知渠道（飞书 / 钉钉 / 企微 / Server酱 / Bark） |
 | `proxy` | 超时 / 重试 / 并发 / 限速 / 熔断 / 粘性会话 TTL 等 |
 
@@ -162,7 +162,7 @@ docker volume rm token-monitor_code-review-workspaces   # 想彻底清空工作�
 | `config.json` | 全部配置（设置页写回） |
 | `data.db`（+shm/wal） | SQLite：统计、错误记录、审计日志、配额历史 |
 | `backups/` | 破坏性操作与数据迁移前的自动备份 |
-| `code-review-workspaces/` | 代码评审的工作区：拉下来的仓库副本 + OCR 隔离 HOME（派生数据，可随时删，已在 `.gitignore`） |
+| `code-review-workspaces/` | 代码评审的工作区：拉下来的仓库副本 + OCR 隔离 HOME + `inputs/`（派生数据，可随时删，已在 `.gitignore`）。`inputs/` 里放本次要交给引擎的**统一评审标准**（`standard-v<版本>.json`）与**业务背景**（`background-<hash>.md`），文件名按内容寻址；同一工作区里陈旧的同名输入文件 1 小时后自动清理 |
 | `logs/` | 请求日志 `requests-YYYY-MM-DD.jsonl`（保留 30 天，不记对话内容） |
 
 ## 健康检查
@@ -186,5 +186,8 @@ location /v1/responses {
 ## 升级与维护
 
 - **升级**：拉新代码后按原部署方式重启；启动时自动做数据库结构迁移（迁移前备份）
+- ⚠️ **升级提醒（代码评审的默认值变了，老配置不会自动改）**：本次把**单次 token 预算**的默认值从 `2000000` 改成 `8000000`、**当日 token 预算**从 `0`(不限) 改成 `50000000`，并新增 **探索深度** `defaultEffort`(默认 `high`)。默认值只在**新建**配置时生效 —— 已部署环境的 `config.json` 里存的是**旧值**，重启不会改写它。要让新默认值生效，去「设置页 → 代码评审 → 高级参数」把「单次 token 预算」「当日 token 预算」改成想要的数再保存（或直接改 `config.json` 后重启）。老配置**不改也能正常跑**：只是仍按 200 万 / 不限额执行，`--effort` 会按 `defaultEffort` 缺省走 `high`
+- 有一次评审表的结构变化值得知道：**代码评审的游标从「每仓库一份」改成「每仓库 + 每分支一份」**（SQLite 改主键只能重建表）。升级时系统会先把数据库备份到 `backups/`（文件名带 `code-review-cursor-per-branch`），再按运行记录里的分支把旧游标**回填**到对应分支；推不出分支的旧行会落到空分支，相当于该仓库下次评审走一次**冷启动回溯**（最近 N 个提交，默认 10）。运行记录与意见一条都不会丢
+- 另有一次加列迁移：`code_review_runs` 新增 `standard_version`（这次评审用的统一评审标准版本）与 `dropped_comments`（被机械兜底丢弃的意见条数）。加列是自动的，旧记录这两列为空，详情里显示「—（此记录早于统一标准）」
 - **备份**：重点照顾 `config.json`、`data.db`、`backups/` 三个位置
 - **统计数据膨胀**：系统自动修剪 400 天前的统计与 30 天前的请求日志（见[后台自动化](automation.md)），也可在设置页「统计数据清理」手动处理

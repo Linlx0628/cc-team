@@ -1795,7 +1795,7 @@ function saveProdSettings(){
 // 数据源是页面注入的 INITIAL_REVIEW(getPublicSettings().codeReview,已脱敏)。
 // 设计要点:管理员**不需要重复配置 API 信息** —— 评审就是经本网关发往所选方案,
 // 端点/协议由服务端按方案推导;评审账号一键创建(超级用户,借用方案已有的真实 Key)。
-let CR = { repos: [], editingRepoId: null };
+let CR = { repos: [], editingRepoId: null, standard: null };
 
 function crEl(id) { return document.getElementById(id); }
 function crSetStatus(text, cls) {
@@ -1842,9 +1842,61 @@ function crOnRepoSourceChange() {
   crEl('crRepoUrlLabel').textContent = local ? '本地仓库绝对路径' : '仓库地址';
   crEl('crRepoUrl').placeholder = local ? '/srv/repos/my-project' : 'https://github.com/org/repo.git';
 }
+// ── 统一评审标准（只读展示）────────────────────────────────────────────────
+// 标准正文内置在服务端 lib/review-standard/，改它走代码发版 —— 这一屏只读，没有保存入口。
+// ⚠️ 标准坏掉时服务端**不是**回 HTTP 错误，而是 200 + {ok:false,error}：坏在哪一行正是此刻
+// 唯一要看的东西，压成一句「请求失败」就白跑了这一趟。所以这里把 error 原样摊开，并说清后果
+// —— 评审会失败，而不是退回引擎自带标准凑合评。
+async function loadReviewStandard(reload) {
+  const body = crEl('crStdBody');
+  const pill = crEl('crStdPill');
+  if (!body) return;
+  if (reload) body.innerHTML = '<div class="note">重新载入中…</div>';
+  try {
+    const s = await crApi('/api/code-review/standard');
+    if (!s || s.ok !== true) throw new Error((s && s.error) || '标准不可用');
+    CR.standard = s;
+    renderReviewStandard(s);
+    if (pill) { pill.textContent = 'v' + s.version; pill.className = 'status status-ok'; }
+  } catch (e) {
+    CR.standard = null;
+    if (pill) { pill.textContent = '不可用'; pill.className = 'status status-error'; }
+    body.innerHTML = '<div class="note" style="color:var(--danger)">评审标准不可用：' + h(e.message || '')
+      + '<br>这期间发起的评审会直接失败并写明原因（不会退回引擎自带标准凑合评）。修好 lib/review-standard/ 下的正文后重启服务，再点「重新载入」。</div>';
+  }
+}
+function renderReviewStandard(s) {
+  const body = crEl('crStdBody');
+  if (!body) return;
+  const kb = (n) => (n / 1024).toFixed(1) + ' KB';
+  const segTitle = (id) => { const g = (s.segments || []).find((x) => x.id === id); return g ? g.title : id; };
+  const rules = (s.rules || []).map((r) => '<tr><td style="font-family:var(--font-mono);font-size:11px">' + h(r.path)
+    + '</td><td style="font-size:12px">' + h(segTitle(r.segment)) + '</td></tr>').join('');
+  const segs = (s.segments || []).map((g, i) => '<details' + (i === 0 ? ' open' : '')
+    + ' style="margin-top:6px;border:1px solid var(--border);border-radius:5px;padding:8px 10px">'
+    + '<summary style="cursor:pointer;font-size:12px;font-weight:600">' + h(g.title)
+    + ' <span class="note" style="font-weight:400">' + h(g.file) + ' · ' + kb(g.bytes) + '</span></summary>'
+    + '<pre style="margin:8px 0 0;font-size:11px;line-height:1.55;white-space:pre-wrap;max-height:340px;overflow:auto">' + h(g.text) + '</pre>'
+    + '</details>').join('');
+  body.innerHTML = '<div class="note" style="margin:0">版本 <b>v' + h(s.version) + '</b>（完整指纹 ' + h(s.versionFull || '')
+    + '）· ' + (s.segments || []).length + ' 段 · 合计 ' + kb(s.bytes) + '。命中顺序从上往下、第一条匹配即生效，所以具体类型排在兜底之后是不行的；而每一段都自带通用段，任何文件都逃不掉这份标准。</div>'
+    + '<div style="margin-top:8px;overflow-x:auto"><table><thead><tr><th>文件（glob）</th><th>用哪一段</th></tr></thead><tbody>' + rules + '</tbody></table></div>'
+    + '<div style="margin-top:10px;font-size:12px;font-weight:600">各段正文</div>' + segs;
+}
+// 全局业务背景的字数提示：上限 20000 是硬截断，先说清比让人自己数好
+function renderBackgroundNote() {
+  const el = crEl('crBackground');
+  const note = crEl('crBackgroundNote');
+  if (!el || !note) return;
+  const n = (el.value || '').length;
+  note.textContent = n
+    ? ('已填 ' + n + ' / 20000 字' + (n >= 20000 ? '（已达上限，超出部分保存时会被截断）' : ''))
+    : '留空 = 不给评审任何团队级业务背景，只靠标准正文与代码本身。';
+}
 function initReviewForm() {
   if (!crEl('crEnabled')) return;
   const c = INITIAL_REVIEW || {};
+  loadReviewStandard();
   CR.repos = (c.repos || []).map((x) => Object.assign({}, x));
   crEl('crEnabled').checked = !!c.enabled;
   crEl('crOcrPath').value = c.ocrPath || '';
@@ -1856,9 +1908,13 @@ function initReviewForm() {
   crEl('crKeepRuns').value = c.keepRunsPerRepo || 50;
   crEl('crDiskLimit').value = c.perRepoDiskLimitMB || 2048;
   crEl('crDailyBudget').value = c.dailyTokenBudget || 0;
+  crEl('crColdStart').value = c.coldStartCommits || 10;
   crEl('crNotifyOn').value = c.notifyOn || 'always';
   crEl('crExclude').value = (c.exclude || []).join(',');
   crEl('crStoreComments').checked = c.storeComments !== false;
+  crEl('crEffort').value = c.defaultEffort || 'high';
+  crEl('crBackground').value = c.background || '';
+  renderBackgroundNote();
   const pill = crEl('crStatusPill');
   if (pill) { pill.textContent = c.enabled ? '已启用' : '未启用'; pill.className = 'status ' + (c.enabled ? 'status-ok' : ''); }
   // 评审方案下拉(含模型联动)
@@ -1949,7 +2005,7 @@ function addReviewRepo() {
   crEl('crRepoName').value = ''; crEl('crRepoSource').value = 'remote'; crEl('crRepoUrl').value = '';
   crEl('crRepoBranch').value = 'main'; crEl('crRepoAuth').value = 'none'; crEl('crRepoCred').value = '';
   crEl('crRepoSched').value = 'off'; crEl('crRepoInterval').value = '6'; crEl('crRepoAt').value = '03:00';
-  crEl('crRepoWeekdays').value = '';
+  crEl('crRepoWeekdays').value = ''; crEl('crRepoColdStart').value = '';
   crEl('crRepoApiTrigger').checked = false;
   crEl('crRepoPushTrigger').checked = false;
   renderReviewRepoMembers([]);   // 新仓库:成员从空开始勾
@@ -1972,6 +2028,8 @@ function editReviewRepo(id) {
   crEl('crRepoInterval').value = (r.schedule && r.schedule.intervalHours) || 6;
   crEl('crRepoAt').value = (r.schedule && r.schedule.at) || '03:00';
   crEl('crRepoWeekdays').value = ((r.schedule && r.schedule.weekdays) || []).join(',');
+  crEl('crRepoColdStart').value = (r.overrides && r.overrides.coldStartCommits) || '';   // 空 = 跟随全局
+  crEl('crRepoBackground').value = (r.overrides && r.overrides.background) || '';       // 空 = 只用全局背景
   crEl('crRepoApiTrigger').checked = !!r.apiTrigger;
   crEl('crRepoPushTrigger').checked = !!r.pushTrigger;
   renderReviewRepoMembers(r.members || []);   // 预置该仓库的成员勾选
@@ -2007,12 +2065,17 @@ function collectReviewSettings() {
     ocrPath: crEl('crOcrPath').value.trim(),
     defaultConcurrency: parseInt(crEl('crConcurrency').value, 10) || 4,
     defaultTimeoutMinutes: parseInt(crEl('crTimeout').value, 10) || 30,
+    defaultEffort: crEl('crEffort') ? crEl('crEffort').value : 'high',
+    // 全局业务背景:显式提交(空串 = 清空)。服务端对「载荷缺省」才保留原值,这里**总是**带上,
+    // 否则把框清空再保存会清不掉。
+    background: crEl('crBackground') ? crEl('crBackground').value : '',
     defaultMaxTokensBudget: parseInt(crEl('crBudget').value, 10) || 0,
     maxParallelJobs: parseInt(crEl('crParallel').value, 10) || 2,
     runRetentionDays: parseInt(crEl('crRetention').value, 10) || 90,
     keepRunsPerRepo: parseInt(crEl('crKeepRuns').value, 10) || 50,
     perRepoDiskLimitMB: parseInt(crEl('crDiskLimit').value, 10) || 2048,
     dailyTokenBudget: parseInt(crEl('crDailyBudget').value, 10) || 0,
+    coldStartCommits: parseInt(crEl('crColdStart').value, 10) || 10,
     notifyOn: crEl('crNotifyOn').value,
     exclude: crEl('crExclude').value.split(',').map((x) => x.trim()).filter(Boolean),
     storeComments: crEl('crStoreComments').checked,
@@ -2120,6 +2183,17 @@ async function fetchReviewRepoBranches() {
 // 把编辑器里当前填的值拼成 repo 对象(保存与「测试连接」共用,保证测的就是要存的)
 function collectReviewRepoForm() {
   const source = crEl('crRepoSource').value;
+  // ⚠️ overrides 必须**带全**:服务端保存仓库时用 sanitizeRepo 重建整个对象,载荷里
+  // 没有的字段会被落回 null —— 早先这里不返回 overrides,于是每点一次「保存仓库」就把
+  // exclude/background/timeoutMinutes 静默清空。现在按「现有值 + 本次编辑的字段」合并。
+  const prev = CR.repos.find((x) => x.id === CR.editingRepoId) || {};
+  const coldStart = parseInt(crEl('crRepoColdStart').value, 10);
+  const overrides = Object.assign({}, prev.overrides || {});
+  overrides.coldStartCommits = Number.isFinite(coldStart) && coldStart > 0 ? Math.min(500, coldStart) : null;
+  // 本仓库业务背景:空串 = 清空(服务端 sanitizeRepo 是「按载荷重建」,整字段回写才清得掉)。
+  // 控件不存在时不动 overrides —— 保留 Object.assign 带过来的旧值,免得旧缓存页面把背景抹掉。
+  const bgEl = crEl('crRepoBackground');
+  if (bgEl) overrides.background = bgEl.value.trim().slice(0, 20000);
   return {
     id: CR.editingRepoId || undefined,
     name: crEl('crRepoName').value.trim(),
@@ -2140,6 +2214,7 @@ function collectReviewRepoForm() {
       // 星期用「1,3,5」这种最省事的写法:能填错的只有数字,服务端还会二次过滤
       weekdays: crEl('crRepoWeekdays').value.split(',').map((x) => parseInt(x.trim(), 10)).filter((d) => d >= 1 && d <= 7),
     },
+    overrides,
   };
 }
 // 保存前就地测连接:测的是编辑器里当前的值(还没落库),填错能当场看到,不用先存再改

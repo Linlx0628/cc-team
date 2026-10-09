@@ -1185,13 +1185,24 @@ async function testMyNotify(){
   }catch(e){mnStatus(e.message||'测试失败','error')}
 }
 const MR_LABEL={queued:'排队中',syncing:'同步代码',running:'评审中',parsing:'解析结果',success:'完成',
-  completed_with_warnings:'完成(有警告)',completed_with_errors:'完成(有错误)',skipped:'已跳过',failed:'失败',timeout:'超时',canceled:'已取消'};
+  completed_with_warnings:'完成(有警告)',completed_with_errors:'完成(有错误)',partial:'部分完成',
+  skipped:'已跳过',failed:'失败',timeout:'超时',canceled:'已取消'};
 function mrClass(s){
   if(s==='success')return'ok';
+  // 「部分完成」单独一档(深橙):与「完成(有警告)」同档的话,成员在列表里根本看不出
+  // 「选了 39 个只评了 10 个」和「评完了但有几条警告」的区别。
+  if(s==='partial')return'degraded';
   if(s==='completed_with_warnings'||s==='completed_with_errors')return'warn';
   if(s==='skipped')return'dim';
   if(['queued','syncing','running','parsing'].indexOf(s)>=0)return'run';
   return'bad';
+}
+// 未评原因的机器词 → 人话(与 lib/code-review.mjs、code-review.js 三处同一份口径)
+const MR_CLASS_ZH={budget:'超出单次 token 预算'};
+function mrCoverWhy(cov){
+  const by=(cov&&cov.byClass&&typeof cov.byClass==='object')?cov.byClass:{};
+  const es=Object.keys(by).filter(function(k){return Number(by[k])>0});
+  return es.length?es.map(function(k){return by[k]+' 个'+(MR_CLASS_ZH[k]||k)}).join(' / '):'';
 }
 function mrTime(iso){return iso?new Date(iso).toLocaleString('zh-CN',{timeZone:'Asia/Shanghai',hour12:false}):'—'}
 // 「已解决」是谁、什么时候点的(紧凑格式,放列表行里)。存储层记当时的名字快照;
@@ -1250,11 +1261,18 @@ function renderMyReview(){
   runs.innerHTML='<h3 style="font-size:13px;font-weight:650;margin:16px 0 8px">评审记录</h3><div class="lb-list">'+rows.map(function(r){
     // 评出过意见的记录带「已解决/未解决」:不点已解决就一直挂着未解决(角标因此常驻)
     const resolvePill=r.comments>0?(r.resolved?' <span class="mr-pill mr-pill-dim">已解决</span>':' <span class="mr-pill mr-pill-warn">未解决</span>'):'';
+    // 覆盖不全:新记录看 unreviewed(数字),老记录只有服务端派生的 coverageIncomplete
+    // —— 老记录的结论句仍写着「未发现问题」,不标这一行就是继续骗人。
+    const unrev=Number(r.unreviewed)||0;
+    const inc=r.coverageIncomplete||unrev>0;
+    const legacyInc=inc&&r.status!=='partial';
+    const filesText=unrev>0?('文件 '+Math.max(0,(Number(r.filesReviewed)||0)-unrev)+'/'+r.filesReviewed):('文件 '+r.filesReviewed);
     return '<div class="lb-row"><div class="lb-who"><div class="lb-name">'+esc(r.repo)+
-      ' <span class="mr-pill mr-pill-'+mrClass(r.status)+'">'+esc(MR_LABEL[r.status]||r.status)+'</span>'+resolvePill+'</div>'+
+      ' <span class="mr-pill mr-pill-'+mrClass(legacyInc?'partial':r.status)+'">'+esc(MR_LABEL[legacyInc?'partial':r.status]||r.status)+'</span>'+resolvePill+
+      (inc?' <span class="mr-cov-warn">⚠ 覆盖不全,详见详情</span>':'')+'</div>'+
       '<div class="lb-det">'+esc(mrTime(r.createdAt))+' · '+esc(mrRangeText(r,false))+' '+
       (mrCommitCount(r,false)>0?' · 提交 '+mrCommitCount(r,false):'')+
-      ' · 文件 '+r.filesReviewed+' · 意见 '+r.comments+' · '+fmtTk(r.tokens)+' token'+
+      ' · '+filesText+' · 意见 '+r.comments+' · '+fmtTk(r.tokens)+' token'+
       (Number(r.dismissed)>0?' · '+r.dismissed+' 条不处理':'')+
       (r.resolved?' · 已解决 '+esc(mrResolvedWho(r))+(mrWhen(r.resolvedAt)?' '+esc(mrWhen(r.resolvedAt)):''):'')+'</div>'+
       (r.note?'<div class="lb-det" style="white-space:normal">'+esc(r.note)+'</div>':'')+
@@ -1303,18 +1321,42 @@ function mrDetailRow(c){
     act+
     '</div>';
 }
+// 详情弹层里「静态事实块」与「意见列表」必须是两个容器:分页器 set() 会整块重写自己的
+// 列表容器,写进同一个元素的话,事实块(结论/覆盖率/警告/提交清单)一渲染就被冲掉 ——
+// 0 条意见的运行只剩一句「没有内容」,看起来就是「详情没有数据」。
+function mrDetailStaticBox(){
+  const body=document.getElementById('mrDetailDlgBody');
+  if(!body)return null;
+  const st=document.getElementById('mrDetailDlgStatic');
+  if(st)return st;
+  // 兜底:页面骨架里没有这两个容器(旧缓存页面)就地补,别退回会被覆盖的那个元素
+  const box=document.createElement('div');box.id='mrDetailDlgStatic';
+  const li=document.createElement('div');li.id='mrDetailDlgList';
+  body.innerHTML='';
+  body.appendChild(box);body.appendChild(li);
+  return box;
+}
+// 0 条意见时事实块自己给出结论,再挂个空列表和搜索框是噪声
+function mrDetailTools(show){
+  const li=document.getElementById('mrDetailDlgList');
+  if(li)li.style.display=show?'':'none';
+  const s=document.getElementById('mrDetailDlgSearch');
+  const tools=s?s.closest('.dlg-tools'):null;
+  if(tools)tools.style.display=show?'':'none';
+}
 function openMyReviewRun(id){
   MR_DETAIL_RUN_ID=id;
   dlgInit('mrDetailDlg');
   dlgOpen('mrDetailDlg');
   const title=document.getElementById('mrDetailDlgTitle');
   const sub=document.getElementById('mrDetailDlgSub');
-  const body=document.getElementById('mrDetailDlgBody');
+  const body=mrDetailStaticBox();
   if(sub)sub.textContent='加载中…';
   if(body)body.innerHTML='<div class="lb-msg">加载中…</div>';
+  mrDetailTools(false);
   if(!MR_DETAIL_PAGER){
     MR_DETAIL_PAGER=dlgPager({
-      prefix:'mrDetailDlg',perPage:20,
+      prefix:'mrDetailDlg',listId:'mrDetailDlgList',perPage:20,
       match:function(c){return (c.path||'')+' '+(c.start_line||'')+' '+(c.content||'')+' '+(c.suggestion_code||'')},
       render:mrDetailRow
     });
@@ -1326,10 +1368,20 @@ function openMyReviewRun(id){
     // 这里别再混用两套字段名(早先读驼峰,副标题全是 undefined)。
     const run=d.run,cs=d.comments||[];
     if(title)title.textContent='运行 #'+run.id+' · '+run.repo_name;
+    // 覆盖率:新记录由服务端落库后透出(run.coverage),老记录由详情接口按需读原始报告补上。
+    // ⚠️ files_json 那份清单是**选中**集,不是已评集 —— 没有 coverage 就**不编造**「评全了」。
+    const cov=(run.coverage&&typeof run.coverage==='object')?run.coverage:(function(){try{const o=JSON.parse(run.coverage_json||'null');return (o&&typeof o==='object')?o:null}catch(e){return null}})();
+    const covFailed=cov?Math.max(0,Number(cov.failed)||0):0;
+    const covDone=cov?Math.max(0,Number(cov.completed)||0):0;
+    const covSel=cov?Math.max(0,Number(cov.selected)||0):0;
+    const covWhy=mrCoverWhy(cov);
+    const incomplete=cov?covFailed>0:!!run.coverageIncomplete;
     if(sub)sub.textContent=[
       mrRangeText(run,true),
       mrCommitCount(run,true)>0?(mrCommitCount(run,true)+' 个提交'):'',
-      run.comments_count+' 条意见 · '+run.files_reviewed+' 个文件'+(Number(run.dismissed_count)>0?(' · '+run.dismissed_count+' 条已标记不处理'):''),
+      run.comments_count+' 条意见 · '+(incomplete&&cov
+        ?(covDone+'/'+(covSel||run.files_reviewed)+' 个文件'+(covWhy?('（'+covWhy+'）'):''))
+        :(run.files_reviewed+' 个文件'))+(Number(run.dismissed_count)>0?(' · '+run.dismissed_count+' 条已标记不处理'):''),
       // 用的是哪版统一评审标准(此接口回原始行,字段是蛇形)。两次意见数不同时,先看这一项:
       // 换过标准前后的意见条数不可直接比较。
       run.standard_version?('评审标准 v'+run.standard_version):'',
@@ -1340,6 +1392,15 @@ function openMyReviewRun(id){
     ].filter(Boolean).join(' · ');
     mrDetailResolvePaint(run);
     let html='<div class="note" style="margin-bottom:10px">'+esc(run.note||'')+'</div>';
+    // 覆盖不全:把真相放在结论**下面、意见上面** —— 否则读完意见就关了,不知道没评完。
+    if(incomplete){
+      html+='<div class="mr-cov-box">⚠ 本次没有评完:'+(cov?('选取 '+(covSel||run.files_reviewed)+' 个文件,评了 '+covDone+' 个,'+covFailed+' 个未评审'):'覆盖不全')+
+        (covWhy?('（'+esc(covWhy)+'）'):'')+'。<br>下面的结论与意见<strong>只覆盖已评部分</strong>;未评审的文件没有被检查过,不能说它们没问题。'+
+        (cov&&cov.budgetNotice?'<br><span class="lb-det">'+esc(String(cov.budgetNotice).slice(0,400))+'</span>':'')+
+        (cov&&cov.sample&&cov.sample.length?'<div class="lb-det" style="margin-top:6px;font-family:var(--font-mono)">'+cov.sample.map(function(s){return esc(String(s.path||''))}).filter(Boolean).join('<br>')+
+          (covFailed>cov.sample.length?'<br>… 另有 '+(covFailed-cov.sample.length)+' 个未列出':'')+'</div>':'')+
+        '</div>';
+    }
     // 范围来源(为什么评的是这一段)—— 与结论分开显示,「回退为最近 N 个提交」不该被结论盖掉
     if(run.range_note)html+='<div class="lb-det" style="margin-bottom:10px">范围来源:'+esc(run.range_note)+'</div>';
     // 覆盖了哪些提交:范围对了也得能核对「那 5 个提交到底评没评」
@@ -1353,17 +1414,32 @@ function openMyReviewRun(id){
         }).join('')+'</div></details>';
     }
     if(!cs.length){
-      html+='<div class="lb-msg" style="color:var(--green)">本次没有提出意见</div>';
+      // ⚠️ 「已跳过」不能说绿字「本次没有提出意见」—— 那次**根本没评**(超当日 token 预算 /
+      // 没有新提交),绿字会被读成「检查过了,这块没问题」。绿色只留给真正跑完的完成态。
+      // (失败/超时/已取消进不到这里:memberRun 直接 404,连弹层都打不开。)
+      if(run.status==='skipped'){
+        html+='<div class="lb-msg">本次已跳过,没有进行评审'+(run.note?'(原因见上方)':'')+'</div>';
+      }else if(incomplete){
+        // ⚠️ 覆盖不全时**不给绿字**:绿字的意思是「检查过了,这块没问题」,而这里
+        // 有几个文件压根没被读过。判定必须按 coverage,不能按 status —— 库里老记录
+        // (#8/#9)的 status 至今还是 completed_with_errors,只看 status 会原样漏掉。
+        html+='<div class="lb-msg" style="color:var(--degraded)">已评审的 '+(cov?covDone:'部分')+' 个文件没有提出意见 —— 这不等于「没有问题」,未评审的文件没有被检查过。</div>';
+      }else{
+        html+='<div class="lb-msg" style="color:var(--green)">本次没有提出意见</div>';
+      }
       if(body)body.innerHTML=html;
       MR_DETAIL_PAGER.set([]);
+      mrDetailTools(false);
       return;
     }
     if(body)body.innerHTML=html;
+    mrDetailTools(true);
     MR_DETAIL_PAGER.set(cs);
   }).catch(function(e){
     if(sub)sub.textContent='';
     if(body)body.innerHTML='<div class="lb-msg">加载失败:'+esc(e.message)+'</div>';
     MR_DETAIL_PAGER.set([]);
+    mrDetailTools(false);
   });
 }
 // 详情头部的「已解决」按钮:按整次运行一条,可撤销;点完刷新列表与角标。

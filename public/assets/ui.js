@@ -169,6 +169,10 @@ function dlgInit(id){
 // 分页 + 搜索渲染器。返回的对象由调用方在打开弹层时喂数据。
 //   match(item)   → 参与搜索的文本(整串小写匹配)
 //   render(item)  → 单条的 HTML(调用方自己转义!)
+//   listId        → 列表容器 id;缺省用 prefix+'Body'。
+//     ⚠️ paint() 是**整块重写**列表容器的 innerHTML。调用方若把「事实块」等静态内容写进
+//     prefix+'Body',一旦 set() 就会被冲掉(评审详情曾因此只剩一句「没有内容」)。
+//     这种「静态块 + 列表」共存的弹层必须传 listId,把两者拆成不同元素。
 function dlgPager(opt){
   const perPage=opt.perPage||20;
   const searchable=opt.searchable!==false;   // false = 过滤由调用方自己管(如列表带状态下拉时)
@@ -185,7 +189,7 @@ function dlgPager(opt){
     const pages=Math.max(1,Math.ceil(rows.length/perPage));
     if(page>pages)page=pages;
     const slice=rows.slice((page-1)*perPage,page*perPage);
-    const list=el('Body');
+    const list=opt.listId?document.getElementById(opt.listId):el('Body');
     if(list){
       list.innerHTML=slice.length
         ? slice.map(opt.render).join('')

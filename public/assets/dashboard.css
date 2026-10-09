@@ -110,6 +110,7 @@ body{padding:0;overflow:hidden;height:100vh}
 .pill-warn{display:inline-block;font-size:10px;line-height:1.5;color:var(--orange);border:1px solid var(--orange);border-radius:9px;padding:1px 7px;font-variant-numeric:tabular-nums}
 .pill-ok{display:inline-block;font-size:10px;line-height:1.5;color:var(--green);border:1px solid var(--green);border-radius:9px;padding:1px 7px;font-variant-numeric:tabular-nums}
 .pill-bad{display:inline-block;font-size:10px;line-height:1.5;color:var(--red);border:1px solid var(--red);border-radius:9px;padding:1px 7px;font-variant-numeric:tabular-nums}
+.pill-degraded{display:inline-block;font-size:10px;line-height:1.5;color:var(--degraded);border:1px solid var(--degraded);border-radius:9px;padding:1px 7px;font-variant-numeric:tabular-nums}
 .chip{display:inline-block;font-size:10px;color:var(--dim);border:1px solid var(--border-strong);border-radius:9px;padding:1px 8px;margin:0 4px 4px 0}.chip-warn{color:var(--orange);border-color:var(--orange)}
 .prod-bar{height:6px;background:var(--accent);border-radius:3px;display:inline-block;max-width:100%}
 .detail-table-wrap{flex:1;min-height:0;overflow:auto;border-top:1px solid var(--border)}
@@ -183,6 +184,7 @@ td{padding:8px 12px;font-size:11px;border-bottom:1px solid #ecece8;white-space:n
 .cr-run.is-run{border-left-color:var(--accent)}
 .cr-run.is-ok{border-left-color:var(--green)}
 .cr-run.is-warn{border-left-color:var(--orange)}
+.cr-run.is-degraded{border-left-color:var(--degraded)}
 .cr-run.is-bad{border-left-color:var(--red)}
 .cr-run.is-dim{border-left-color:var(--border-strong)}
 .cr-run-num{font-family:var(--font-mono);font-size:11px;color:var(--dim2);font-weight:650;flex:none;min-width:26px;font-variant-numeric:tabular-nums}
@@ -198,6 +200,16 @@ td{padding:8px 12px;font-size:11px;border-bottom:1px solid #ecece8;white-space:n
 .cr-empty-t{font-size:13.5px;font-weight:650;color:var(--text);margin-bottom:6px}
 .cr-empty-d{font-size:11.5px;line-height:1.6;max-width:420px;margin:0 auto}
 .cr-notice{padding:26px 18px;border:1px dashed var(--border-strong);border-radius:8px;text-align:center;color:var(--dim)}
+/* 覆盖不全的提示:左对齐 + 深橙,块内可能有算式/文件清单,居中的话没法读 */
+.cr-notice.is-degraded{padding:11px 13px;text-align:left;font-size:11.5px;line-height:1.75;color:var(--degraded);background:var(--degraded-soft);border:1px solid #e6c3ae;border-style:solid}
+/* 列表行上的「覆盖不全」角标 + 引擎警告列表 */
+.cr-cov-warn{color:var(--degraded);font-weight:650}
+.cr-warn-list{display:flex;flex-direction:column;gap:2px;border:1px solid var(--border);border-radius:6px;overflow:hidden}
+.cr-warn-item{font-family:var(--font-mono);font-size:11px;line-height:1.7;color:#8a6a2f;background:#fdf7ea;padding:6px 11px;word-break:break-word}
+.cr-warn-item+.cr-warn-item{border-top:1px solid var(--border)}
+/* 0 意见时:覆盖不全不再给绿勾,改深橙的「结论不完整」 */
+.cr-empty.is-degraded .cr-empty-ico{color:var(--degraded)}
+.cr-empty.is-degraded .cr-empty-t{color:var(--degraded)}
 #crPanelBody>.cr-notice{margin:auto;max-width:520px;align-self:stretch}
 .cr-notice b{color:var(--text)}
 .cr-notice a{color:var(--accent);font-weight:600}

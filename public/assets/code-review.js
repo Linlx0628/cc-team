@@ -27,6 +27,9 @@ function crApi(path, opts) {
 }
 function crStatusClass(s) {
   if (s === "success") return "ok";
+  // 「部分完成」单独一档(深橙):它读起来像小毛病,实际是「选了 39 个只评了 10 个」,
+  // 与「完成(有警告)」用同一个橙档会让它在列表里完全看不出来。
+  if (s === "partial") return "degraded";
   if (s === "completed_with_warnings" || s === "completed_with_errors") return "warn";
   if (s === "skipped") return "dim";
   if (["queued", "syncing", "running", "parsing"].includes(s)) return "run";   // 进行中:用强调色,别跟失败混
@@ -35,10 +38,32 @@ function crStatusClass(s) {
 const CR_STATUS_LABEL = {
   queued: "排队中", syncing: "同步代码", running: "评审中", parsing: "解析结果",
   success: "完成", completed_with_warnings: "完成(有警告)", completed_with_errors: "完成(有错误)",
+  partial: "部分完成",
   skipped: "已跳过", failed: "失败", timeout: "超时", canceled: "已取消",
 };
 function crShort(sha) { return sha ? String(sha).slice(0, 8) : ""; }
-// 「这一段是怎么定出来的」。⚠️ 与 lib/code-review.mjs 的 resolveRange / manualRange 保持同步:
+// 未评原因的机器词 → 人话。⚠️ 认不出的分类**原样透出**,别吞:引擎将来加新分类,
+// 界面上一眼看得见比「什么都没说」强。
+const CR_CLASS_ZH = { budget: "超出单次 token 预算" };
+function crCoverWhy(cov) {
+  const by = cov && cov.byClass && typeof cov.byClass === "object" ? cov.byClass : {};
+  const es = Object.entries(by).filter(([, n]) => Number(n) > 0);
+  return es.length ? es.map(([k, n]) => `${n} 个${CR_CLASS_ZH[k] || k}`).join(" / ") : "";
+}
+// 覆盖率:新记录由服务端落库后透出(run.coverage),老记录由详情接口按需读原始报告补上。
+// 拿不到就是 null —— **不编造**「评全了」。
+function crCoverage(run) {
+  if (run && run.coverage && typeof run.coverage === "object") return run.coverage;
+  try { const o = JSON.parse((run && run.coverage_json) || "null"); return o && typeof o === "object" ? o : null; } catch { return null; }
+}
+// 引擎警告是**对象数组**({file, message, type?}),type 还可能缺失,file 可能是一长串
+// 逗号拼接的路径 —— 糊成一坨 JSON 等于没写。
+function crWarnText(w) {
+  if (typeof w === "string") return w;
+  const msg = String((w && w.message) || "").trim();
+  const f = String((w && w.file) || "").trim();
+  return (msg || "（引擎未给出说明）") + (f ? ` [${f.length > 200 ? f.slice(0, 200) + "…" : f}]` : "");
+}// 「这一段是怎么定出来的」。⚠️ 与 lib/code-review.mjs 的 resolveRange / manualRange 保持同步:
 //   cursor    按上次评到的提交做增量(常态)
 //   cold      这条分支首次评审 —— 回溯最近 N 个提交
 //   rewritten 上次评到的提交已被改写(force push / rebase)—— 同样回溯最近 N 个提交
@@ -177,7 +202,13 @@ function crRunsToolbar() {
 }
 // 行渲染拆出来给 dlgPager 用(它每页只 render 一页的行)
 function crRunRow(r) {
-  const cls = crStatusClass(r.status);
+  // 覆盖率不全(新记录看 unreviewed_count,老记录由服务端从 warnings_json 派生)。
+  // ⚠️ 老记录(#8/#9)库里的 status 当年经兜底写成了 completed_with_errors、note 还写着
+  // 「未发现问题」—— 列表这一行是它**唯一**能被看出来的地方,不标就是继续骗人。
+  const unreviewed = Number(r.unreviewed_count) || 0;
+  const covIncomplete = !!r.coverageIncomplete;
+  const legacyPartial = covIncomplete && r.status !== "partial";
+  const cls = crStatusClass(legacyPartial ? "partial" : r.status);
   const active = ["queued", "syncing", "running", "parsing"].includes(r.status);
   const trig = r.trigger && r.trigger !== "manual" ? `<span class="cr-run-trig">${escH(r.trigger)}</span>` : "";
   const files = crParseFiles(r.files_json);
@@ -185,10 +216,16 @@ function crRunRow(r) {
   const fileHint = files.length
     ? `<div class="cr-run-files">${files.slice(0, 3).map((f) => `<span class="cr-file-chip" title="${escH(f)}">${escH(crBase(f))}</span>`).join("")}${files.length > 3 ? `<span class="cr-file-more">+${files.length - 3}</span>` : ""}</div>`
     : "";
+  // 「文件 10/39」= 已评/选取。老记录只有派生布尔、没有具体数,就给 ⚠ 让它去详情看。
+  const sel = Number(r.files_reviewed) || 0;
+  const filesText = unreviewed > 0 ? `文件 ${Math.max(0, sel - unreviewed)}/${sel}` : `文件 ${sel}`;
+  const covTag = covIncomplete
+    ? ` <span class="cr-cov-warn" title="${unreviewed > 0 ? `本次只评了 ${Math.max(0, sel - unreviewed)}/${sel} 个文件` : "本次评审覆盖不全"}">⚠ 覆盖不全,详见详情</span>`
+    : "";
   return `<div class="cr-run is-${cls}"><span class="cr-run-num">#${r.id}</span>`
     + '<div class="cr-run-main"><div class="cr-run-title">'
     + `<span class="cr-run-repo">${escH(r.repo_name)}</span>`
-    + `<span class="pill pill-${cls}">${escH(CR_STATUS_LABEL[r.status] || r.status)}</span>`
+    + `<span class="pill pill-${cls}">${escH(CR_STATUS_LABEL[legacyPartial ? "partial" : r.status] || r.status)}</span>`
     // 评出过意见的记录带「已解决/未解决」:和成员页同一状态,管理员也能代为标记
     + (r.comments_count > 0 ? (r.resolved ? '<span class="pill pill-dim">已解决</span>' : '<span class="pill pill-warn">未解决</span>') : "")
     + trig + '</div>'
@@ -200,7 +237,7 @@ function crRunRow(r) {
     + crResolvedNote(r)
     + " · " + escH(crRangeText(r))
     + (Number(r.commits_count) > 0 ? ` · 提交 ${r.commits_count}` : "")
-    + ` · 文件 ${r.files_reviewed} · 意见 ${r.comments_count} · ${fmtT(r.input_tokens + r.output_tokens)} token · ${crDur(r.elapsed_ms)}`
+    + ` · ${filesText}${covTag} · 意见 ${r.comments_count} · ${fmtT(r.input_tokens + r.output_tokens)} token · ${crDur(r.elapsed_ms)}`
     + '</div>'
     // 一句话结论(note):「已跳过」到底是没新提交还是别的原因,靠它说清楚
     + (r.note ? `<div class="cr-run-note">${escH(r.note)}</div>` : "")
@@ -287,19 +324,43 @@ function crDetailRender(c) {
     + act
     + '</div>';
 }
+// 详情弹层里「静态事实块」与「意见列表」必须是两个容器:分页器 set() 会整块重写自己的
+// 列表容器,写进同一个元素的话,事实块(结论/覆盖率/警告/提交清单)一渲染就被冲掉 ——
+// 0 条意见的运行只剩一句「没有内容」,看起来就是「详情没有数据」。
+function crDetailStaticBox() {
+  const body = document.getElementById("crDetailDlgBody");
+  if (!body) return null;
+  const st = document.getElementById("crDetailDlgStatic");
+  if (st) return st;
+  // 兜底:页面骨架里没有这两个容器(旧缓存页面)就地补,别退回会被覆盖的那个元素
+  const box = document.createElement("div"); box.id = "crDetailDlgStatic";
+  const li = document.createElement("div"); li.id = "crDetailDlgList";
+  body.innerHTML = "";
+  body.appendChild(box); body.appendChild(li);
+  return box;
+}
+// 0 条意见时事实块自己给出结论,再挂个空列表和搜索框是噪声
+function crDetailTools(show) {
+  const li = document.getElementById("crDetailDlgList");
+  if (li) li.style.display = show ? "" : "none";
+  const s = document.getElementById("crDetailDlgSearch");
+  const tools = s ? s.closest(".dlg-tools") : null;
+  if (tools) tools.style.display = show ? "" : "none";
+}
 async function openReviewRun(id) {
   CR_DETAIL_RUN_ID = id;
   dlgInit("crDetailDlg");
   dlgOpen("crDetailDlg");
   const title = document.getElementById("crDetailDlgTitle");
   const sub = document.getElementById("crDetailDlgSub");
-  const body = document.getElementById("crDetailDlgBody");
+  const body = crDetailStaticBox();
   const exp = document.getElementById("crDetailExport");
   if (sub) sub.textContent = "加载中…";
   if (body) body.innerHTML = '<div class="lb-msg">加载中…</div>';
+  crDetailTools(false);
   if (!crDetailPager) {
     crDetailPager = dlgPager({
-      prefix: "crDetailDlg", perPage: 20,
+      prefix: "crDetailDlg", listId: "crDetailDlgList", perPage: 20,
       match: (c) => `${c.path} ${c.start_line || ""} ${c.content || ""} ${c.suggestion_code || ""}`,
       render: crDetailRender,
     });
@@ -340,9 +401,25 @@ async function openReviewRun(id) {
     // 结论 + 引擎实际干了多少活:这条是回答「有没有真干活」的关键
     const commits = crParseFiles(run.commits_json);
     const commitsTotal = Number(run.commits_count) || commits.length;
+    // ── 覆盖率:选了 N 个 ≠ 评了 M 个 ─────────────────────────────────────────
+    // ⚠️ files_json(下面那份「选取的文件」)是**选中**集,不是已评集;未评的文件列在
+    // coverage.sample 里。这一段就是把「没评完」从引擎的 manifest 里搬到人眼前。
+    const cov = crCoverage(run);
+    const covFailed = cov ? Math.max(0, Number(cov.failed) || 0) : 0;
+    const covDone = cov ? Math.max(0, Number(cov.completed) || 0) : 0;
+    const covSel = cov ? Math.max(0, Number(cov.selected) || 0) : 0;
+    const covWhy = crCoverWhy(cov);
+    const incomplete = cov ? covFailed > 0 : !!run.coverageIncomplete;
+    const notReviewed = cov && Array.isArray(cov.sample) ? cov.sample : [];
     let html = '<div class="cr-detail"><div class="cr-facts">'
       + crFact("结论", run.note || "—")
       + crFact("评审范围", escH(crRangeText(run)))
+      // 覆盖率只对「没评全」才值得占一行;评全了不显示,免得每屏都是废话
+      + (incomplete
+        ? crFact("覆盖率", cov
+          ? `${covDone}/${covSel || Number(run.files_reviewed) || 0} 个文件${covWhy ? `（${escH(covWhy)}）` : ""}`
+          : "覆盖不全（详情缺失，原始报告可能已被清理）")
+        : "")
       // 为什么是这一段 —— 与结论(note)分开显示:「回退为最近 N 个提交」这类原因不该被结论盖掉
       + (run.range_note ? crFact("范围来源", escH(run.range_note)) : "")
       + (commitsTotal > 0 ? crFact("覆盖提交", `${commitsTotal} 个`) : "")
@@ -356,6 +433,28 @@ async function openReviewRun(id) {
       + crFact("耗时", crDur(run.elapsed_ms))
       + '</div>';
     if (run.error) html += `<div class="cr-notice is-error" style="margin:0 0 12px">${escH(run.error)}</div>`;
+    // 覆盖不全的醒目提示 + 引擎原话(自带算式:已用 + 预估 − 预算)。放在意见列表之前 ——
+    // 否则读完 17 条意见就关掉了,根本不知道它们只覆盖了 39 个文件里的 10 个。
+    if (incomplete) {
+      html += '<div class="cr-notice is-degraded" style="margin:0 0 12px">'
+        + `⚠ 本次没有评完:${cov ? `选取 ${covSel || Number(run.files_reviewed) || 0} 个文件,评了 ${covDone} 个,${covFailed} 个未评审` : "覆盖不全"}`
+        + (covWhy ? `（${escH(covWhy)}）` : "") + '。<br>'
+        + "下面的结论与意见**只覆盖已评部分**;未评审的文件没有被检查过,不能说它们没问题。"
+        + (cov && cov.budgetNotice ? `<br><span class="cr-hint-inline">${escH(String(cov.budgetNotice).slice(0, 400))}</span>` : "")
+        + (cov && cov.ocrVersion ? `<br><span class="cr-hint-inline">引擎 ${escH(cov.ocrVersion)}${cov.terminalState ? ` · terminal_state=${escH(cov.terminalState)}` : ""}</span>` : "")
+        + (notReviewed.length ? '<div class="cr-files-list" style="margin-top:8px">'
+            + notReviewed.map((s) => `<div class="cr-files-item" title="${escH(String(s.path || ""))}">${escH(String(s.path || ""))}${s.reason ? ` <span class="cr-hint-inline">— ${escH(String(s.reason).slice(0, 120))}</span>` : ""}</div>`).join("")
+            + (covFailed > notReviewed.length ? `<div class="cr-files-item cr-hint-inline">… 另有 ${covFailed - notReviewed.length} 个未列出</div>` : "")
+            + '</div>' : "")
+        + '</div>';
+    }
+    // 引擎警告(warnings):从前只在邮件模版里被读,面板上完全看不到 —— 而「撞预算」
+    // 往往就写在这里。语义化渲染,不糊 JSON。
+    const warnList = (() => { try { const a = JSON.parse(run.warnings_json || "[]"); return Array.isArray(a) ? a : []; } catch { return []; } })();
+    if (warnList.length) {
+      html += '<div class="cr-files-block"><div class="cr-files-title">引擎警告（' + warnList.length + ' 条）</div>'
+        + '<div class="cr-warn-list">' + warnList.map((w) => `<div class="cr-warn-item">${escH(crWarnText(w))}</div>`).join("") + '</div></div>';
+    }
     // 覆盖了哪些提交:范围对了也得能核对「那 5 个提交到底评没评」——这是本次修的核心诉求
     html += '<div class="cr-files-block"><div class="cr-files-title">'
       + (commits.length ? `本次覆盖的 ${commitsTotal} 个提交${commits.length < commitsTotal ? `（清单只留最近 ${commits.length} 条）` : ""}` : "本次没有覆盖任何提交")
@@ -375,18 +474,30 @@ async function openReviewRun(id) {
         : '<div class="cr-empty-d" style="text-align:left;margin:0">范围里没有可评审的改动。若是「已跳过」,通常表示自上次评审以来没有新提交。</div>')
       + '</div>';
     if (!comments.length) {
-      html += '<div class="cr-empty" style="padding:22px"><div class="cr-empty-ico">✓</div><div class="cr-empty-t">无意见</div><div class="cr-empty-d">本次范围(上面列出的文件)未发现需要修改的问题。</div></div></div>';
+      // ⚠️ 这里曾经**无条件**渲染绿勾「本次范围(上面列出的文件)未发现需要修改的问题」——
+      // 而上面那份清单来自 files_json,是**选中**集(#9 是 39 个),等于替 29 个从没被读过的
+      // 文件打包票。判定必须按 **coverage**,不能按 status:库里 #8/#9 的 status 至今还是
+      // completed_with_errors,只看 status 会原样漏掉它们。
+      html += incomplete
+        ? '<div class="cr-empty is-degraded" style="padding:22px"><div class="cr-empty-ico">⚠</div><div class="cr-empty-t">未评完，结论不完整</div>'
+          + `<div class="cr-empty-d">本次只评审了 ${cov ? `${covDone}/${covSel || Number(run.files_reviewed) || 0}` : "一部分"} 个文件,`
+          + `已评部分没有提出意见 —— 这<strong>不等于</strong>「没有问题」,未评审的文件没有被检查过。</div></div>`
+        : '<div class="cr-empty" style="padding:22px"><div class="cr-empty-ico">✓</div><div class="cr-empty-t">无意见</div><div class="cr-empty-d">本次范围(上面列出的文件)未发现需要修改的问题。</div></div>';
+      html += '</div>';
       body.innerHTML = html;
       crDetailPager.set([]);
+      crDetailTools(false);
       return;
     }
     html += `<div class="cr-files-title">评审意见（${comments.length} 条，可搜索、分页）</div></div>`;
     body.innerHTML = html;
+    crDetailTools(true);
     crDetailPager.set(comments);
   } catch (err) {
     if (sub) sub.textContent = "";
     if (body) body.innerHTML = '<div class="lb-msg">加载失败：' + escH(err.message) + "</div>";
     crDetailPager.set([]);
+    crDetailTools(false);
   }
 }
 

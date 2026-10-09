@@ -7,6 +7,9 @@
   --text:#181816;--dim:#686863;--dim2:#92928c;--border:#deded8;--border-strong:#c7c7c0;
   --accent:#2f6e50;--accent-soft:#e7efe9;--blue:#456b5a;--green:#2f6e50;
   --yellow:#956400;--orange:#9a6700;--red:#b42318;
+  /* 评审「部分完成」(选了 N 个只评了 M 个)单独一档:橙档已被「完成(有警告)/(有错误)」占用,
+     靠文字区分在列表里太弱,所以再深一档(砖橙)。 */
+  --degraded:#a1451c;--degraded-soft:#fdf0e6;
   --font-body:-apple-system,BlinkMacSystemFont,"SF Pro Text","PingFang SC","Microsoft YaHei","Segoe UI",sans-serif;
   --font-mono:"SFMono-Regular",Consolas,"Liberation Mono",monospace;
 }

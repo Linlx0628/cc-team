@@ -115,7 +115,7 @@ docker volume rm token-monitor_code-review-workspaces   # 想彻底清空工作�
 - **自定义 provider 的 `url` 是 API base**：配 `url = http://127.0.0.1:<port>/v1` + `protocol = anthropic` 时，OCR 实际 POST 到 **`<url>/messages`**（即 `/v1/messages`），鉴权头为 `Authorization: Bearer <api_key>`，请求体为标准 Anthropic 形状（`max_tokens/messages/model/system/tools`）→ 直接指向本网关即可，评审消耗自然计入配额与用量
 - **`--exclude` 是逗号分隔的单值**（`--exclude "a,b"`），不是重复传参
 - **`--timeout` 是「每子任务」分钟数**（默认 15），不是总时长 → 网关侧另有独立的进程级硬超时
-- **`--max-tokens-budget`**：`0` = 不限；超预算时已完成的局部结果仍会发布且**退出码 0**，只有全部子任务失败才非零
+- **`--max-tokens-budget`**：`0` = 不限；超预算时已完成的局部结果仍会发布且**退出码 0**，只有全部子任务失败才非零。⚠️ 网关把这种「预算掐断」的结局记为状态 **`partial`（部分完成）**，而不是失败 —— 面板/详情/成员页会写明「选取 39 个、只评了 10 个」并列出未评文件，报告里也不再写「未发现问题」；**没评到的文件不会自动重评**（游标照常推进），补的办法是调高单次预算 + 按范围补评，见[单次预算撞顶](code-review.md#单次预算撞顶部分完成)
 - **失败也会产出 JSON**：`status: "failed"` 且照常带 `summary` token 统计，退出码 1 → 以 JSON 里的 `status` 为准，退出码只作参考
 
 ## Webhook 自动评审的网络要求

@@ -25,7 +25,7 @@ import { isCompactionRequest, transformCompactSseEvent } from "./lib/compact-bri
 import { tryThinkingPassbackSelfHeal } from "./lib/thinking-passback.mjs";
 import { createCodeReviewOcr } from "./lib/code-review-ocr.mjs";
 import { standardView } from "./lib/code-review-standard.mjs";
-import { createCodeReview, initCodeReviewDb, sanitizeCodeReviewConfig, maskCredential, buildReviewReportHTML, migrateLegacyTriggerKeys, isValidBranch, isValidCommitRef, TERMINAL, TERMINAL_OK } from "./lib/code-review.mjs";
+import { createCodeReview, initCodeReviewDb, sanitizeCodeReviewConfig, maskCredential, buildReviewReportHTML, migrateLegacyTriggerKeys, isValidBranch, isValidCommitRef, TERMINAL, TERMINAL_OK, DEGRADED_STATUSES, STATUS_LABEL, coverageIncomplete, memberVisibleStatus } from "./lib/code-review.mjs";
 import { createMemberNotify, initMemberNotifyDb, pickNotifyTarget } from "./lib/member-notify.mjs";
 import { createNotifications, initNotificationsDb } from "./lib/notifications.mjs";
 import { PassThrough } from "node:stream";
@@ -207,7 +207,7 @@ const MCP_TOOLS = [
   { name: "request_quota", description: "向管理员提交加量申请（写操作）。每北京日限提交 1 次、每周被处理数有上限；不限量的池无需申请。", inputSchema: { type: "object", properties: { reason: { type: "string", description: "申请理由（必填，200 字以内）" }, pool: { type: "string", description: "额度池名（可选，缺省取第一个可申请的池）" } }, required: ["reason"] } },
   { name: "my_usage", description: "查询我的 token 用量明细：今日（或指定日期范围）合计、按模型统计（真实 token 与计入配额的计权值并排）、24 小时请求分布、按客户端统计。用户问「我今天用了多少/花在哪」时调用。", inputSchema: { type: "object", properties: { start: { type: "string", description: "起始日期 YYYY-MM-DD（北京时间，可选）" }, end: { type: "string", description: "结束日期 YYYY-MM-DD（可选，缺省=起始日）" }, protocol: { type: "string", enum: ["anthropic", "responses"], description: "可选协议过滤" } }, required: [] } },
   { name: "leaderboard", description: "团队排行榜：7 个维度（cache_rate 缓存率 / code_quality 代码质量 / code_lines 代码行数 / tokens 用量 / efficiency 效率比 / context_health 上下文健康度 / activity 活跃度）× 时间窗（today/week/month）。", inputSchema: { type: "object", properties: { dimension: { type: "string", enum: ["cache_rate", "code_quality", "code_lines", "tokens", "efficiency", "context_health", "activity"] }, window: { type: "string", enum: ["today", "week", "month"] } }, required: [] } },
-  { name: "code_review_list", description: "查看代码评审：哪些仓库允许在线触发、各自上次评审状态、最近的评审运行（评审范围/覆盖提交数/状态/意见数/token）。范围里的 commits 是本次增量覆盖的提交个数——合并带进来的提交会一起算进去。想知道「我的改动评过没有」时调用。仅对获授权的 Key 可见。", inputSchema: { type: "object", properties: { limit: { type: "number", description: "返回最近多少次运行（默认 10，最多 50）" } }, required: [] } },
+  { name: "code_review_list", description: "查看代码评审：哪些仓库允许在线触发、各自上次评审状态、最近的评审运行（评审范围/覆盖提交数/状态/意见数/token）。范围里的 commits 是本次增量覆盖的提交个数——合并带进来的提交会一起算进去。想知道「我的改动评过没有」时调用。状态为 partial（部分完成）或 coverageIncomplete 为 true 时，本次**没有评完**（unreviewed 是没评到的文件数，通常是撞了单次 token 预算）——这种运行不要说「没有问题」，未评审的文件从没被检查过。仅对获授权的 Key 可见。", inputSchema: { type: "object", properties: { limit: { type: "number", description: "返回最近多少次运行（默认 10，最多 50）" } }, required: [] } },
   { name: "code_review_trigger", description: "触发一次代码评审（写操作，消耗 token）。评审的是仓库里**已提交**的最新代码，不是工作区未提交的改动。每 Key 60 秒只能触发一次；仓库需管理员开启「允许在线触发」。", inputSchema: { type: "object", properties: { repo: { type: "string", description: "仓库名称或 ID（可选，缺省=全部已开启在线触发的仓库）" } }, required: [] } },
   { name: "code_review_findings", description: "查询代码评审**发现的具体问题**（文件、行号、问题描述、建议改法）。用户问「最近有没有代码评审的问题」「我负责的仓库有哪些要改的」时调用这个（而不是 code_review_list —— 那个只有计数）。只返回自己是成员的仓库。", inputSchema: { type: "object", properties: {
     repo: { type: "string", description: "仓库名称或 ID（可选，缺省=自己负责的全部仓库）" },
@@ -352,6 +352,11 @@ function handleMcpPost(res, body, ctx) {
             }),
             commits: r.commits_count || 0,
             files: r.files_reviewed, comments: r.comments_count,
+            // 「选了 39 个只评了 10 个」必须如实说出来:否则模型会把一条只评了四分之一的
+            // 运行答成「评过了,没问题」(老记录的 note 里那句「未发现问题」就是这么来的)。
+            // 老记录靠 warnings_json 派生,零额外 IO —— 与成员页、面板列表同一口径。
+            unreviewed: Number(r.unreviewed_count) || 0,
+            coverageIncomplete: coverageIncomplete(r),
             tokens: (r.input_tokens || 0) + (r.output_tokens || 0),
             createdAt: bjStamp(r.created_at), note: r.note || undefined,
             rangeNote: r.range_note || undefined, error: r.error || undefined,
@@ -2374,13 +2379,23 @@ function pushCodeReviewNotice(ev) {
   if (!c.enabled) return;
   const isRun = ev.kind === "run";
   const failed = ev.kind === "disk_full" || (isRun && TERMINAL.has(ev.report.status) && !TERMINAL_OK.has(ev.report.status));
+  // 「跑完了但没跑全 / 有保留」:partial、有警告、有错误。⚠️ 不能用
+  // `TERMINAL && !TERMINAL_OK` 反推 —— partial 在 TERMINAL_OK 里(游标照常推进),
+  // 反推不出来,这正是「撞了 token 预算却一声不响」的老病根。
+  // 只影响**管理员渠道**:成员渠道的「有意见才通知」不动。
+  const degraded = isRun && DEGRADED_STATUSES.has(ev.report.status);
   const findings = isRun ? (ev.report.comments || []) : [];
 
   // ① 管理员渠道
-  if (n.enabled && c.notifyOn !== "never" && (failed || c.notifyOn === "always")) {
+  if (n.enabled && c.notifyOn !== "never" && (failed || degraded || c.notifyOn === "always")) {
+    // 覆盖率:库里的 unreviewed_count(老记录为 0,那就只报状态)。管理员拿到通知时
+    // 只看得到「部分完成」三个字,不给数就不知道是漏了 1 个还是 29 个。
+    const covInfo = isRun ? coverageBrief(ev.report && ev.report.coverage) : null;
+    const covTxt = covInfo && covInfo.unreviewed > 0 ? ` · 只评了 ${covInfo.done}/${covInfo.selected} 个文件` : "";
     const msg = ev.kind === "disk_full"
       ? `【代码评审】仓库「${ev.repo.name}」工作区磁盘超限,已拒绝入队\n—— ${notifierApi.beijingTimeString()}（token-monitor）`
-      : `【代码评审】${ev.repo.name} #${ev.runId} ${ev.report.status} · ${findings.length} 条意见\n—— ${notifierApi.beijingTimeString()}（token-monitor）`;
+      // ⚠️ 状态用中文标签:从前直接把英文 partial 推给管理员,等于什么都没说。
+      : `【代码评审】${ev.repo.name} #${ev.runId} ${STATUS_LABEL[ev.report.status] || ev.report.status}${degraded && !failed ? "（未评完）" : ""} · ${findings.length} 条意见${covTxt}\n—— ${notifierApi.beijingTimeString()}（token-monitor）`;
     for (const s of notifierApi.NOTIFY_SENDERS.filter(x => x.enabled(n))) {
       s.send(n, msg).catch(err => console.error(`[通知] ${s.channel} 推送失败: ${err.message}`));
     }
@@ -2390,6 +2405,20 @@ function pushCodeReviewNotice(ev) {
   if (isRun && findings.length) {
     notifyReviewFindings(ev).catch(err => console.error(`[代码评审] 通知负责人失败: ${err.message}`));
   }
+}
+
+// 覆盖率摘要(通知与邮件主题共用)。入参是 **report.coverage**(新记录)或 run 行上
+// 按需补读出来的 coverage —— 两者形状相同。拿不到就返回 null,**不编造**「评全了」。
+// ⚠️ byClass 是机器词(budget),要翻成人话**并原样透出认不出的分类**。
+const COVER_CLASS_ZH = { budget: "超出单次 token 预算" };
+function coverageBrief(cov) {
+  if (!cov || typeof cov !== "object") return null;
+  const by = cov.byClass && typeof cov.byClass === "object" ? cov.byClass : {};
+  const why = Object.keys(by).filter((k) => Number(by[k]) > 0)
+    .map((k) => `${by[k]} 个${COVER_CLASS_ZH[k] || k}`).join(" / ");
+  const selected = Math.max(0, Number(cov.selected) || 0);
+  const done = Math.max(0, Number(cov.completed) || 0);
+  return { selected, done, unreviewed: Math.max(0, Number(cov.failed) || 0), why };
 }
 
 // 通知里的范围口径。⚠️ 与报告(lib/code-review.mjs 的 buildReviewReportHTML)和界面
@@ -2416,12 +2445,19 @@ function reviewFindingsText(ev) {
   };
   const shown = findings.slice(0, 5).map(at).join("\n");
   const more = findings.length > 5 ? `\n…另有 ${findings.length - 5} 条` : "";
+  // 覆盖不全时**必须**在纯文本正文里说 —— 收到 #8 那 17 条意见的人,如果只看这一封,
+  // 会以为「整个范围都查过了」。HTML 正文里另有醒目块(见 buildReviewReportHTML)。
+  const cov = coverageBrief(ev.coverage);
   return [
     head,
     "",
     `仓库：${ev.repo.name}${ev.branch ? `（分支 ${ev.branch}）` : ""}`,
     `范围：${reviewRangeText(ev)}${ev.commitsCount > 0 ? ` · 覆盖 ${ev.commitsCount} 个提交` : ""}`,
     `HEAD：${String(ev.to || "").slice(0, 8)}${ev.author && ev.author.name ? ` · ${ev.author.name}` : ""}`,
+    // ⚠️ 未评完的警告放在意见列表**之前**:读完意见就走的人,才不会漏掉这一句。
+    ...(cov && cov.unreviewed > 0
+      ? [`⚠ 本次未评完：选取 ${cov.selected} 个文件、评了 ${cov.done} 个，${cov.unreviewed} 个未评审${cov.why ? `（${cov.why}）` : ""}。下面的意见只覆盖已评部分。`]
+      : []),
     // 用的是哪版统一评审标准:HTML 正文(报告)里本来就有这一行,纯文本降级时也别丢 ——
     // 「这版意见怎么变少了」的唯一归因线索
     ...(ev.standardVersion ? [`评审标准：v${ev.standardVersion}`] : []),
@@ -2459,9 +2495,16 @@ async function sendReviewFindingsNotice({ repo, run, reportComments, author = nu
     from: run.from_commit || null, rangeNote: run.range_note || null,
     commitsCount: Number(run.commits_count) || 0,
     standardVersion: run.standard_version || null,
+    // 覆盖率:run 是**展示层**行(getRun 装饰过)—— 老记录(#8/#9)的 coverage 是按需
+    // 从原始报告读出来的,新记录是落库的 coverage_json。没有就是 null,不编造。
+    coverage: run.coverage || null,
   };
   const text = reviewFindingsText(ev);
-  const subject = `【代码评审】${repo.name} 发现 ${reportComments.length} 处问题`;
+  const covMail = coverageBrief(run.coverage);
+  // 主题也带上覆盖率:收件人可能只扫一眼标题 —— #8 就是「17 条意见发出去了,
+  // 却没人知道另外 2 个文件从没被读过」。
+  const subject = `【代码评审】${repo.name} 发现 ${reportComments.length} 处问题`
+    + (covMail && covMail.unreviewed > 0 ? `（另有 ${covMail.unreviewed} 个文件未评审）` : "");
   const jobs = [];
   const mail = notifierApi.NOTIFY_SENDERS.find((s) => s.channel === "邮件");
   const authorEmail = ev.author && ev.author.email;
@@ -2471,7 +2514,7 @@ async function sendReviewFindingsNotice({ repo, run, reportComments, author = nu
   // 体积护栏:最坏几百条 × 8KB 的意见能拼出十几 MB,任何 SMTP 都会拒 —— 超限降级纯文本。
   let html = "";
   try {
-    html = buildReviewReportHTML({ run, comments: codeReviewApi.listComments(run.id, { limit: 100 }), repo });
+    html = buildReviewReportHTML({ run, comments: codeReviewApi.listComments(run.id, { limit: 100 }), repo, coverage: run.coverage || null });
     if (html.length > 1_500_000) {
       console.warn(`[代码评审] run#${run.id} 报告 ${(html.length / 1048576).toFixed(1)}MB 过大,邮件降级纯文本`);
       html = "";
@@ -6542,7 +6585,7 @@ const server = http.createServer((req, res) => {
       const run = codeReviewApi.getRun(crUrl.searchParams.get("id"));
       if (!run) { json(404, { error: "运行不存在" }); return; }
       const repo = codeReviewApi.findRepo(run.repo_id) || { name: run.repo_name };
-      const html = buildReviewReportHTML({ run, comments: codeReviewApi.listComments(run.id, { limit: 500 }), repo });
+      const html = buildReviewReportHTML({ run, comments: codeReviewApi.listComments(run.id, { limit: 500 }), repo, coverage: run.coverage || null });
       res.writeHead(200, { "Content-Type": "text/html; charset=utf-8", "Content-Disposition": `attachment; filename="code-review-run-${run.id}.html"` });
       res.end(html);
       return;

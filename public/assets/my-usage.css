@@ -427,6 +427,10 @@ table{width:100%;border-collapse:collapse;min-width:560px}th{text-align:left;pad
 .mr-pill-ok{background:var(--accent-soft);color:var(--green)}
 .mr-pill-warn{background:#faf5e6;color:var(--orange)}
 .mr-pill-bad{background:#fbeae8;color:var(--red)}
+.mr-pill-degraded{background:var(--degraded-soft);color:var(--degraded)}
+/* 覆盖不全:列表行角标 + 详情里的提示块(左对齐,块里有算式与文件清单) */
+.mr-cov-warn{font-size:10.5px;font-weight:650;color:var(--degraded)}
+.mr-cov-box{margin-bottom:10px;padding:10px 12px;font-size:11.5px;line-height:1.75;color:var(--degraded);background:var(--degraded-soft);border:1px solid #e6c3ae;border-radius:6px;word-break:break-word}
 .mr-pill-run{background:var(--accent-soft);color:var(--accent);border-color:var(--accent)}
 .mr-pill-dim{background:var(--surface-subtle);color:var(--dim)}
 .mn-status{font-size:11.5px;color:var(--dim);margin-top:10px;min-height:16px}

@@ -106,6 +106,22 @@ function ago(iso){if(!iso)return"-";const d=Date.now()-new Date(iso).getTime();c
 function wk(s){const d=new Date(s),day=d.getDay()||7,mon=new Date(d);mon.setDate(d.getDate()-day+1);return mon.toISOString().slice(0,10)}
 function grp(daily,p){const g={};for(const[day,ud]of Object.entries(daily)){const k=p==="week"?wk(day):p==="month"?day.slice(0,7):p==="year"?day.slice(0,4):day;if(!g[k])g[k]={};for(const[u,s]of Object.entries(ud)){if(!g[k][u])g[k][u]={inputTokens:0,outputTokens:0,requests:0,cacheCreationTokens:0,cacheReadTokens:0};g[k][u].inputTokens+=s.inputTokens;g[k][u].outputTokens+=s.outputTokens;g[k][u].requests+=s.requests;g[k][u].cacheCreationTokens+=(s.cacheCreationTokens||0);g[k][u].cacheReadTokens+=(s.cacheReadTokens||0)}}return g}
 function lbl(p,k){if(p==="day")return k.slice(5);if(p==="week")return k.slice(5)+" 周";if(p==="month")return k;return k+"年"}
+// 「Token 用量趋势」与「方案请求情况」是仅有的两张**默认吃全史**的分桶图(其余图都按
+// 周期窗口或日期范围收窄)。真实数据下全史按日分桶有两百多根柱子,挤成一片谁也读不出来 ——
+// 所以**没设日期范围时最多画最近 30 个桶**(按日就是最近 30 天,周/月/年同样是最多 30 个桶)。
+// 设了日期范围就以范围为准:这里只裁「前端要画几个桶」,服务端那份全史数据照旧下发,
+// 所以换范围不必重拉。注意不能改成「默认填上 30 天的日期范围」—— effBounds 是全图共用的,
+// 一旦带上范围,要求单日的两张 24 小时图会直接变成空的。
+const RECENT_BUCKETS=30;
+const PERIOD_UNIT={day:"天",week:"周",month:"个月",year:"年"};
+// tip 只在**确实裁掉了**才给:数据本身不足 30 个桶时不必打扰用户
+function recentBuckets(keys,ranged){
+  if(ranged||keys.length<=RECENT_BUCKETS)return{keys,tip:""};
+  // 数字与中文之间留空格(「近 30 天」而不是「近 30天」)
+  return{keys:keys.slice(-RECENT_BUCKETS),tip:"近 "+RECENT_BUCKETS+" "+PERIOD_UNIT[P]+"（设日期范围可看更早）"};
+}
+// 面板右上角那句小字:多个提示用「；」串起来,都没有就留空
+function chartNote(...parts){return parts.filter(Boolean).join("；")}
 // 当前周期窗口（北京时间）：日=今天、周=本周一、月=本月 1 日、年=本年 1 月 1 日。
 function winBounds(){const t=todayBJ();return{wStart:P==="day"?t:P==="week"?wk(t):P==="month"?t.slice(0,7)+"-01":t.slice(0,4)+"-01-01",td:t}}
 // 四张非 24h 图的有效窗口:日期范围(开始/结束)生效时用它,否则退回周期窗口。
@@ -694,9 +710,11 @@ function renderCharts(){
   const eb=effBounds();
   let fd=fd0;
   if(eb.ranged){const rf={};for(const[date,ud]of Object.entries(fd0)){if(date<eb.start||date>eb.end)continue;rf[date]=ud}fd=rf}
-  const g=grp(fd,P),keys=Object.keys(g).sort(),uks=Object.keys(D.users);
+  const g=grp(fd,P),uks=Object.keys(D.users);
   const val=s=>MT==="requests"?(s.requests||0):totalTokens(s);
-  document.getElementById("trendNote").textContent=MDL!=="all"?"模型筛选：不含缓存 Token":"";
+  const trendCut=recentBuckets(Object.keys(g).sort(),eb.ranged);
+  const keys=trendCut.keys;
+  document.getElementById("trendNote").textContent=chartNote(trendCut.tip,MDL!=="all"?"模型筛选：不含缓存 Token":"");
   if(C.t)C.t.destroy();if(C.p)C.p.destroy();if(C.m)C.m.destroy();if(C.h)C.h.destroy();if(C.hm)C.hm.destroy();if(C.pr)C.pr.destroy();
   C.t=new Chart(document.getElementById("trend"),{type:"bar",data:{labels:keys.map(k=>lbl(P,k)),datasets:uks.map((u,i)=>({label:D.users[u].name,data:keys.map(k=>val(g[k][u]||{})),backgroundColor:COL[i%COL.length]+"cc",borderRadius:3,borderSkipped:false}))},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:trendLegend(),tooltip:{callbacks:{label:ctx=>ctx.dataset.label+": "+fmtT(ctx.raw)}}},scales:{x:{stacked:true,ticks:{color:"#686863",font:{size:10}},grid:{color:"rgba(24,24,22,.08)"}},y:{stacked:true,ticks:{color:"#686863",callback:v=>fmtTk(v)},grid:{color:"rgba(24,24,22,.08)"}}}}});
   // 用户分布 / 客户端分布:共用 #pie 这张横向柱状图,顶部 seg 切维度。
@@ -851,9 +869,9 @@ function renderCharts(){
   C.hm=new Chart(document.getElementById("hourModelChart"),{type:"line",data:{labels:hrs,datasets:hmSeries.map((s,i)=>({label:s.label,data:s.data,borderColor:COL[i%COL.length],backgroundColor:COL[i%COL.length]+"22",fill:i===0,tension:.28,pointRadius:0,pointHitRadius:10,pointBackgroundColor:COL[i%COL.length],pointHoverRadius:4,borderWidth:2}))},options:{responsive:true,maintainAspectRatio:false,interaction:{mode:"index",intersect:false},plugins:{legend:trendLegend(),tooltip:{callbacks:{label:ctx=>ctx.dataset.label+": "+fmtT(ctx.raw)+(MT==="requests"?" 次请求":" tokens")}}},scales:{x:{ticks:{color:"#686863",font:{size:9},maxRotation:0,autoSkip:true,maxTicksLimit:12},grid:{display:false}},y:{ticks:{color:"#686863",callback:v=>fmtTk(v)},grid:{color:"rgba(24,24,22,.08)"}}}}});
 
   // 方案请求情况：跨方案维度（恒为全部方案，不随方案下拉收窄），按周期分桶的堆叠柱。
-  // 统计逻辑与 Token 用量趋势一致:默认全史按周期分桶,日期范围生效时才收窄窗口。
+  // 统计逻辑与 Token 用量趋势完全一致:共用 recentBuckets 那条「最近 30 个桶」的默认窗口,
+  // 日期范围生效时才以范围为准(提示文案在上面 pSorted 算出来之后写,那时才知道有没有裁)。
   // 模型筛选生效时切换到 profileDailyModels 数据源（不含缓存 Token）。
-  document.getElementById("profileNote").textContent=MDL!=="all"?"模型筛选：不含缓存 Token":"";
   const pdBase=MDL==="all"?(D.profileDaily||{}):(D.profileDailyModels||{});
   const suffixName={};for(const p of (Array.isArray(D.profiles)?D.profiles:[]))suffixName[p.suffix]=p.name;
   const pBuckets={};
@@ -871,8 +889,12 @@ function renderCharts(){
       }
     }
   }
-  const pSorted=Object.keys(pBuckets).sort();
   const pSfx=Object.keys(pdBase).sort();
+  const pCut=recentBuckets(Object.keys(pBuckets).sort(),eb.ranged),pSorted=pCut.keys;
+  // 注意 pSfx(图例/系列的来源)仍取自全量 pdBase:某个方案在窗口内没有用量时,它会是一条
+  // 全 0 的系列 —— 与趋势图「所有用户都在图例里」的既有口径一致,不额外隐藏(「掉下去了」
+  // 本身是信息)。只有「画几个桶」被裁,系列的集合不变。
+  document.getElementById("profileNote").textContent=chartNote(pCut.tip,MDL!=="all"?"模型筛选：不含缓存 Token":"");
   C.pr=new Chart(document.getElementById("profileChart"),{type:"bar",data:{labels:pSorted.map(k=>lbl(P,k)),datasets:pSfx.map((sfx,i)=>({label:suffixName[sfx]||sfx,data:pSorted.map(k=>{const s=(pBuckets[k]||{})[sfx];return s?(MT==="requests"?s.requests:s.tokens):0}),backgroundColor:COL[i%COL.length]+"cc",borderRadius:3,borderSkipped:false}))},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:trendLegend(),tooltip:{callbacks:{label:ctx=>ctx.dataset.label+": "+fmtT(ctx.raw)+(MT==="requests"?" 次请求":" tokens")}}},scales:{x:{stacked:true,ticks:{color:"#686863",font:{size:10}},grid:{color:"rgba(24,24,22,.08)"}},y:{stacked:true,ticks:{color:"#686863",callback:v=>fmtTk(v)},grid:{color:"rgba(24,24,22,.08)"}}}}});
 }
 

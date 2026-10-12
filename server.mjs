@@ -2179,7 +2179,10 @@ function getAvailableDefaultProfiles(apiKey, group) {
     // isAvailable() (not status().state) so a profile whose cooldown has elapsed
     // is offered again — allowRequest() then performs the half-open transition.
     if (!runtime.breaker.isAvailable()) continue;
-    if (!canUseProfile(apiKey, runtime)) continue;
+    // 用户对没配真实 Key 的方案无权 —— 必须取 .allowed 判定（canUseProfile 恒返回对象，
+    // 直接放在 if 里永远为真，无权成员会混进候选，请求派过去只能把虚拟 Key 发往上游）。
+    // 跳过他无权的成员、落到他有权的成员上，就是「组里自动跳过不可用方案」的语义。
+    if (!canUseProfile(apiKey, runtime).allowed) continue;
     // 超级用户借 key 转发：组内一个真实Key都没有的方案不进候选，避免借不到 key
     // 时虚拟Key泄漏到上游（普通用户已被 canUseProfile 保证有 key）。
     if (isSuperUser(apiKey, runtime) && !hasProfileRealKey(apiKey, runtime) && !borrowProfileRealKey(runtime)) continue;
@@ -2202,12 +2205,29 @@ function getAvailableResponsesProfiles(apiKey, group) {
     if (!runtime || runtime.protocol !== "responses") continue;
     if (isRateLimited(name)) continue;
     if (!runtime.breaker.isAvailable()) continue;
-    if (!canUseProfile(apiKey, runtime)) continue;
+    // 同上：必须取 .allowed —— canUseProfile 恒返回对象，真值判定过滤不掉无权成员。
+    if (!canUseProfile(apiKey, runtime).allowed) continue;
     // 同上：超级用户借用路径下，无任何真实Key的方案不进候选。
     if (isSuperUser(apiKey, runtime) && !hasProfileRealKey(apiKey, runtime) && !borrowProfileRealKey(runtime)) continue;
     out.push({ name, suffix, runtime });
   }
   return out;
+}
+
+// 默认入口 early-gate 的「宽门」判据：生效组里是否还有**任何一个**该用户能用的方案
+// （canUseProfile 通过 = 全局用户存在 + 该方案配了真实 Key + 未禁用未过期）。纯授权
+// 判断，不看限流/熔断 —— 健康度交给候选过滤与空候选兜底处理。用法：默认入口的组头
+// 对用户不可用（没给他配组头的 Key）时，组内其他成员有权就放行进门，候选构建会自动
+// 跳过无权成员；全组无权才在门口拒绝。成员遍历口径与上面两个过滤函数一致。
+function userHasUsableGroupProfile(apiKey, protocol, members) {
+  for (const name of (Array.isArray(members) ? members : [])) {
+    const profile = config.profiles[name];
+    if (!profile) continue;
+    const runtime = runtimes[normalizeProfileSuffix(profile.suffix)];
+    if (!runtime || runtime.protocol !== protocol) continue;
+    if (canUseProfile(apiKey, runtime).allowed) return true;
+  }
+  return false;
 }
 
 // Load persisted rate-limit state once the DB is ready.
@@ -3028,16 +3048,35 @@ function sendOpenAiError(res, status, code, message, extraHeaders = {}) {
 // the responses pool so client probes never touch upstream billing endpoints.
 function handleLocalModelsRequest(req, res, inbound) {
   const apiKey = getApiKey(req);
-  const runtime = inbound.suffix ? runtimes[inbound.suffix] : getResponsesDefaultRuntime();
+  let runtime = inbound.suffix ? runtimes[inbound.suffix] : null;
+  let groupHasResponses = false;
+  if (!inbound.suffix) {
+    // 顺着 Responses 组找第一个「这个 Key 能用」的方案，与 /v1/responses 的候选过滤同一
+    // 口径：组头对该成员无权时，请求路径会自动跳到后面有权的成员，探测口若死盯组头，
+    // Codex 在启动探测时就吃 401「Invalid API key」，根本走不到真正的请求。
+    const members = Array.isArray(config.responsesProfileGroup) ? config.responsesProfileGroup : [];
+    for (const name of members) {
+      const profile = config.profiles[name];
+      if (!profile) continue;
+      const candidate = runtimes[normalizeProfileSuffix(profile.suffix)];
+      if (!candidate || candidate.protocol !== "responses") continue;
+      groupHasResponses = true;
+      if (canUseProfile(apiKey, candidate).allowed) { runtime = candidate; break; }
+    }
+  }
   if (!runtime || runtime.protocol !== "responses") {
     if (inbound.suffix) {
       sendOpenAiError(res, 404, "profile_not_found", `No responses-protocol profile with suffix "${inbound.suffix}".`);
+    } else if (groupHasResponses) {
+      // 组里有 Responses 方案但没有一个该 Key 能用的：这不是「密钥无效」，是没分配方案。
+      sendOpenAiError(res, 401, "invalid_api_key", "Responses 方案组里没有你可用的方案，请联系管理员为你的 Key 分配组内方案。");
     } else {
       sendOpenAiError(res, 503, "no_responses_profile", "No responses profile configured yet. Create one in Settings to use Codex.");
     }
     return;
   }
   if (!canUseProfile(apiKey, runtime).allowed) {
+    // 走到这里只剩后缀直连无权方案的口（默认入口上面已经选过可用成员）。
     sendOpenAiError(res, 401, "invalid_api_key", "Invalid API key for this profile.");
     return;
   }
@@ -4099,6 +4138,7 @@ const PROXY_CORE_DEPS = {
   tryAcquireConcurrency,
   unsupportedInboundMessage,
   usageHasTokens,
+  userHasUsableGroupProfile,
   visionApi,
   get rt() { return rt; },
 };

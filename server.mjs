@@ -2151,13 +2151,19 @@ function noteFailoverServed(protocol, servedBy, userName, headName) {
     return;
   }
   const prev = failoverActive.get(key);
-  if (!prev || prev.member !== servedBy) {
-    const headRt = getRuntimeByProfileName(head);
-    const why = isRateLimited(head) ? "被限流" : (headRt && headRt.breaker.status().state === "OPEN" ? "熔断" : "");
-    failoverActive.set(key, { member: servedBy, at: Date.now() });
-    recordAudit("system", "failover.switch", `${head} → ${servedBy}`,
-      `组头 "${head}"${why ? `因${why}不可用` : "不可用"}，请求自动切换到备选方案 "${servedBy}"${userName ? `（触发用户: ${userName}）` : ""}`);
-  }
+  if (prev && prev.member === servedBy) return;   // 同一故障期间：重复事件静默
+  // 「这次由别的成员服务」不等于「组头坏了」。候选过滤会因**非可用性**原因跳过组头：
+  // 该用户没配组头的真实 Key（无权 —— 新用户只配部分方案是常态）、请求的模型不在组头
+  // 白名单、组头对该用户的额度用尽、粘性绑定/调度换组把别的成员排到前面。这些都发生在
+  // 组头**健康**时，写成「组头不可用」是假告警；更糟的是它会与「组头恢复接管」交替成对，
+  // 每配对一次就推一封通知 —— 无权用户与有权用户交替请求时，就成了邮件轰炸。
+  // 只有组头真的不可用（限流 / 熔断）才留痕告警；其余跳过是正常路由，静默。
+  const headRt = getRuntimeByProfileName(head);
+  const why = isRateLimited(head) ? "被限流" : (headRt && headRt.breaker.status().state === "OPEN" ? "熔断" : "");
+  if (!why) return;
+  failoverActive.set(key, { member: servedBy, at: Date.now() });
+  recordAudit("system", "failover.switch", `${head} → ${servedBy}`,
+    `组头 "${head}"因${why}不可用，请求自动切换到备选方案 "${servedBy}"${userName ? `（触发用户: ${userName}）` : ""}`);
 }
 
 

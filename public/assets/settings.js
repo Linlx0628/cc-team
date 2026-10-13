@@ -1903,6 +1903,9 @@ function initReviewForm() {
   crEl('crConcurrency').value = c.defaultConcurrency || 4;
   crEl('crTimeout').value = c.defaultTimeoutMinutes || 30;
   crEl('crBudget').value = c.defaultMaxTokensBudget || 0;
+  // 0 是有效值(关闭续评 / 不下发单请求超时),不能用 || 兜底成默认值
+  crEl('crResumeRounds').value = c.autoResumeRounds != null ? c.autoResumeRounds : 2;
+  crEl('crLlmTimeout').value = c.llmRequestTimeoutSeconds != null ? c.llmRequestTimeoutSeconds : 0;
   crEl('crParallel').value = c.maxParallelJobs || 2;
   crEl('crRetention').value = c.runRetentionDays || 90;
   crEl('crKeepRuns').value = c.keepRunsPerRepo || 50;
@@ -2070,6 +2073,9 @@ function collectReviewSettings() {
     // 否则把框清空再保存会清不掉。
     background: crEl('crBackground') ? crEl('crBackground').value : '',
     defaultMaxTokensBudget: parseInt(crEl('crBudget').value, 10) || 0,
+    // 0 是有效值(关闭自动续评 / 单请求超时不设),先判空再 parseInt,不能用 || 兜底
+    autoResumeRounds: crEl('crResumeRounds').value === '' ? 2 : (parseInt(crEl('crResumeRounds').value, 10) || 0),
+    llmRequestTimeoutSeconds: crEl('crLlmTimeout').value === '' ? 0 : (parseInt(crEl('crLlmTimeout').value, 10) || 0),
     maxParallelJobs: parseInt(crEl('crParallel').value, 10) || 2,
     runRetentionDays: parseInt(crEl('crRetention').value, 10) || 90,
     keepRunsPerRepo: parseInt(crEl('crKeepRuns').value, 10) || 50,

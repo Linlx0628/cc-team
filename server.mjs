@@ -3845,6 +3845,8 @@ function getPublicSettings() {
         defaultConcurrency: c.defaultConcurrency,
         defaultEffort: c.defaultEffort || "high",
         defaultMaxTokensBudget: c.defaultMaxTokensBudget,
+        autoResumeRounds: c.autoResumeRounds,
+        llmRequestTimeoutSeconds: c.llmRequestTimeoutSeconds,
         coldStartCommits: c.coldStartCommits,
         dailyTokenBudget: c.dailyTokenBudget,
         runRetentionDays: c.runRetentionDays,

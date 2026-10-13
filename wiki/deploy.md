@@ -115,7 +115,9 @@ docker volume rm token-monitor_code-review-workspaces   # 想彻底清空工作�
 - **自定义 provider 的 `url` 是 API base**：配 `url = http://127.0.0.1:<port>/v1` + `protocol = anthropic` 时，OCR 实际 POST 到 **`<url>/messages`**（即 `/v1/messages`），鉴权头为 `Authorization: Bearer <api_key>`，请求体为标准 Anthropic 形状（`max_tokens/messages/model/system/tools`）→ 直接指向本网关即可，评审消耗自然计入配额与用量
 - **`--exclude` 是逗号分隔的单值**（`--exclude "a,b"`），不是重复传参
 - **`--timeout` 是「每子任务」分钟数**（默认 15），不是总时长 → 网关侧另有独立的进程级硬超时
-- **`--max-tokens-budget`**：`0` = 不限；超预算时已完成的局部结果仍会发布且**退出码 0**，只有全部子任务失败才非零。⚠️ 网关把这种「预算掐断」的结局记为状态 **`partial`（部分完成）**，而不是失败 —— 面板/详情/成员页会写明「选取 39 个、只评了 10 个」并列出未评文件，报告里也不再写「未发现问题」；**没评到的文件不会自动重评**（游标照常推进），补的办法是调高单次预算 + 按范围补评，见[单次预算撞顶](code-review.md#单次预算撞顶部分完成)
+- **`--max-tokens-budget`**：`0` = 不限；超预算时已完成的局部结果仍会发布且**退出码 0**，只有全部子任务失败才非零。⚠️ 网关把这种「预算掐断」的结局记为状态 **`partial`（部分完成）**，而不是失败 —— 面板/详情/成员页会写明「选取 39 个、只评了 10 个」并列出未评文件，报告里也不再写「未发现问题」；撞顶后网关会用 **`--resume <session_id>`** 自动续评（同一会话只补未评部分，最多 `1 + 自动续评轮数` 轮，见[撞顶后自动续评](code-review.md#撞顶后自动续评默认开)），续评也补不完时残留文件不会在下次评审里自动补（游标照常推进），补的办法是调高单次预算/续评轮数 + 按范围补评
+- **`--resume <session-id>`**：续跑一个旧会话。引擎只把**没评完的条目**重新派发，已评完的条目走 `review_item_reused` 复用（不重复付费），返回的报告是**累计**的（复用条目的意见也在里面）⇒ 最后一次的 JSON 即可直接当最终结果，网关不需要自己合并多轮。⚠️ 引擎会校验「评审标准身份」：标准正文层或 include/exclude 过滤与那次会话不一致时会直接拒绝（`resume rejected: review rule identity changed`）—— 所以续评必须用**同一份 rule 文件**，标准一改就得重新起跑
+- **单次 LLM 请求超时**走环境变量 `OCR_LLM_TIMEOUT`（秒，引擎默认 300），**不是** `--timeout`（那是整个任务的分钟预算）。大 diff 时整组报 `LLM request timeout ... context deadline exceeded` 就是它，网关侧对应「单请求超时(秒)」设置项（默认 `0` = 不下发，沿用引擎默认）
 - **失败也会产出 JSON**：`status: "failed"` 且照常带 `summary` token 统计，退出码 1 → 以 JSON 里的 `status` 为准，退出码只作参考
 
 ## Webhook 自动评审的网络要求
@@ -141,7 +143,7 @@ docker volume rm token-monitor_code-review-workspaces   # 想彻底清空工作�
 | `quotaRequest` | 加量申请开关与参数 |
 | `autoQuotaAdjust` | 自动配额调整（周期 / 命中率阈值 / 冷却） |
 | `productionTracking` | 产出质量追踪（含文件路径记录开关） |
-| `codeReview` | 代码评审（仓库白名单 / 方案 / 账号 / 定时 / 预算 / 业务背景；建议在设置页里维护，凭据在这个字段里明文存放）。其中 `defaultEffort`（探索深度，默认 `high`）、`defaultMaxTokensBudget`（单次 token 预算，默认 8000000）、`dailyTokenBudget`（当日 token 预算，默认 50000000，0 = 不限）、`background`（全局业务背景，上限 20000 字）是本次新增/变更的键；评审标准本身**不在配置文件里**，它内置在代码 `lib/review-standard/` 下（改标准走代码发版） |
+| `codeReview` | 代码评审（仓库白名单 / 方案 / 账号 / 定时 / 预算 / 业务背景；建议在设置页里维护，凭据在这个字段里明文存放）。其中 `defaultEffort`（探索深度，默认 `high`）、`defaultMaxTokensBudget`（单次 token 预算，默认 8000000）、`dailyTokenBudget`（当日 token 预算，默认 50000000，0 = 不限）、`autoResumeRounds`（撞顶后自动续评轮数，默认 2，0 = 关闭，钳位 0~10）、`llmRequestTimeoutSeconds`（单次 LLM 请求超时秒数，默认 0 = 不下发 `OCR_LLM_TIMEOUT`，钳位 0~3600）、`background`（全局业务背景，上限 20000 字）是本次新增/变更的键；评审标准本身**不在配置文件里**，它内置在代码 `lib/review-standard/` 下（改标准走代码发版） |
 | `notifier` | 通知渠道（飞书 / 钉钉 / 企微 / Server酱 / Bark） |
 | `proxy` | 超时 / 重试 / 并发 / 限速 / 熔断 / 粘性会话 TTL 等 |
 
@@ -186,7 +188,9 @@ location /v1/responses {
 ## 升级与维护
 
 - **升级**：拉新代码后按原部署方式重启；启动时自动做数据库结构迁移（迁移前备份）
-- ⚠️ **升级提醒（代码评审的默认值变了，老配置不会自动改）**：本次把**单次 token 预算**的默认值从 `2000000` 改成 `8000000`、**当日 token 预算**从 `0`(不限) 改成 `50000000`，并新增 **探索深度** `defaultEffort`(默认 `high`)。默认值只在**新建**配置时生效 —— 已部署环境的 `config.json` 里存的是**旧值**，重启不会改写它。要让新默认值生效，去「设置页 → 代码评审 → 高级参数」把「单次 token 预算」「当日 token 预算」改成想要的数再保存（或直接改 `config.json` 后重启）。老配置**不改也能正常跑**：只是仍按 200 万 / 不限额执行，`--effort` 会按 `defaultEffort` 缺省走 `high`
+- ⚠️ **升级提醒（代码评审的默认值变了，老配置不会自动改）**：本次把**单次 token 预算**的默认值从 `2000000` 改成 `8000000`、**当日 token 预算**从 `0`(不限) 改成 `50000000`，并新增 **探索深度** `defaultEffort`(默认 `high`)、**自动续评轮数** `autoResumeRounds`(默认 `2`)、**单请求超时** `llmRequestTimeoutSeconds`(默认 `0` = 不下发)。默认值只在**新建**配置时生效 —— 已部署环境的 `config.json` 里存的是**旧值**，重启不会改写它。要让新默认值生效，去「设置页 → 代码评审 → 高级参数」把「单次 token 预算」「当日 token 预算」改成想要的数再保存（或直接改 `config.json` 后重启）。老配置**不改也能正常跑**：只是仍按 200 万 / 不限额执行，`--effort` 会按 `defaultEffort` 缺省走 `high`
+- ⚠️ **但新增的两个键在老配置上会立刻生效**（它们此前不存在，加载时按代码默认值补齐，不存在「旧值」）：`autoResumeRounds` 缺省 `2` ⇒ 老环境撞到单次预算后**也会**自动续评（这正是本次修复「大提交评不完」的本意；单次运行最坏 token = `(1 + autoResumeRounds) × 单次 token 预算`，且每轮续评前都要过「当日 token 预算」这道闸）。不想要自动续评，把「自动续评轮数」填 `0` 保存即可，行为与升级前一字不差。`llmRequestTimeoutSeconds` 缺省 `0` = 不下发 `OCR_LLM_TIMEOUT`，沿用引擎默认的 300 秒
+- 又一次加列迁移（自动、无需手工）：`code_review_runs` 新增 `auto_resume_json`（自动续评的轮次/复用项/停止原因）。旧记录该列为空，详情里不会显示续评那一行；续评各轮的 token 与耗时**累加**写进同一条运行记录，所以「当日 token 预算」的求和口径不受影响
 - 有一次评审表的结构变化值得知道：**代码评审的游标从「每仓库一份」改成「每仓库 + 每分支一份」**（SQLite 改主键只能重建表）。升级时系统会先把数据库备份到 `backups/`（文件名带 `code-review-cursor-per-branch`），再按运行记录里的分支把旧游标**回填**到对应分支；推不出分支的旧行会落到空分支，相当于该仓库下次评审走一次**冷启动回溯**（最近 N 个提交，默认 10）。运行记录与意见一条都不会丢
 - 另有一次加列迁移：`code_review_runs` 新增 `standard_version`（这次评审用的统一评审标准版本）与 `dropped_comments`（被机械兜底丢弃的意见条数）。加列是自动的，旧记录这两列为空，详情里显示「—（此记录早于统一标准）」
 - **备份**：重点照顾 `config.json`、`data.db`、`backups/` 三个位置

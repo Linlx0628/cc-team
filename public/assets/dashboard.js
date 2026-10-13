@@ -168,7 +168,13 @@ function filteredDaily(){
   if(USR==="all")return D.daily||{};
   const f={};for(const[date,ud]of Object.entries(D.daily||{})){if(ud[USR])f[date]={[USR]:ud[USR]}}return f;
 }
-function c(l,v,cl,k){return'<div class="card"><div class="l">'+l+'</div><div class="v" data-cu="'+v+'"'+(k?' data-cu-k':'')+'>0</div></div>'}
+function c(l,v,cl,k,tip){return'<div class="card"'+(tip?' title="'+tip+'"':'')+'><div class="l">'+l+'</div><div class="v" data-cu="'+v+'"'+(k?' data-cu-k':'')+'>0</div></div>'}
+// 「今日用量」「总用量」两张卡都是总Token(输入+输出+缓存读写)口径 —— 与右侧图表的
+// 输入+输出口径并排时数字会差出一个缓存量(个人页同名「今日用量」卡反而标的是输入+输出,
+// 两页口径相反)。副标签把口径直接标在卡上(与个人页那套副标签同一视觉语言),悬浮
+// title 给完整口径 + 「缓存不占额度」的提醒,防止拿含缓存数字去对配额误判超限。
+const CARD_CACHE_TAG=' <span style="font-size:9px;color:var(--dim);font-weight:400">含缓存</span>';
+const CARD_CACHE_TIP="总Token口径：输入+输出+缓存写入+缓存读取。缓存命中不占每日额度，配额按计权口径另算";
 const fmtBytes=n=>{if(n>=1073741824)return(n/1073741824).toFixed(2)+" GB";if(n>=1048576)return(n/1048576).toFixed(1)+" MB";if(n>=1024)return(n/1024).toFixed(1)+" KB";return n+" B"};
 // 模型图「按方案 / 按模型×方案」两个维度的 y 轴标签会很宽(模型 ID 后面还叠一个方案名)。
 // 超出轴宽时 Chart.js 不换行,直接把多出来的部分画到画布外**裁掉** —— 最长的几根柱子会变成
@@ -696,7 +702,7 @@ function render(){
   const us=Object.values(D.users),allTokens=us.reduce((s,u)=>s+totalTokens(u),0),tr=us.reduce((s,u)=>s+u.totalRequests,0);
   const tday=todayBJ(),tdd=(D.daily||{})[tday]||{};
   const todayTokens=Object.values(tdd).reduce((s,d)=>s+totalTokens(d),0),tR=Object.values(tdd).reduce((s,d)=>s+d.requests,0);
-  document.getElementById("cards").innerHTML=c("今日用量",todayTokens,"var(--accent)",1)+c("今日请求",tR,"var(--blue)",1)+c("总用量",allTokens,"var(--green)",1)+c("总请求",tr,"var(--orange)",1)+c("今日错误",(Array.isArray(D.errors)?D.errors:[]).filter(e=>e.time&&bjDateStr(e.time)===tday).length,"var(--red)",1)+egressCard();
+  document.getElementById("cards").innerHTML=c("今日用量"+CARD_CACHE_TAG,todayTokens,"var(--accent)",1,CARD_CACHE_TIP)+c("今日请求",tR,"var(--blue)",1)+c("总用量"+CARD_CACHE_TAG,allTokens,"var(--green)",1,CARD_CACHE_TIP+"（各用户终身累计）")+c("总请求",tr,"var(--orange)",1)+c("今日错误",(Array.isArray(D.errors)?D.errors:[]).filter(e=>e.time&&bjDateStr(e.time)===tday).length,"var(--red)",1)+egressCard();
   runCountUps(document.getElementById("cards"));
   // overview 只画自己那一份(卡片 + 图表);其余菜单的数据由各自的 section 懒加载后渲染
   if(overviewVisible()){renderCharts()}else{chartsDirty=true}

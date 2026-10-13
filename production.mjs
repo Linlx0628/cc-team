@@ -74,8 +74,12 @@ export function createProductionTracker({ db, getConfig, log = console.log, now 
   }
   const DEFAULT_ALERTS = { idleHourTokens: 100000, loopWindowMinutes: 10, loopCount: 5,
     burstWindowMinutes: 30, burstMinEdits: 10, burstFailRate: 0.5, cooldownMinutes: 30,
-    errorLoopCooldownMinutes: 60, loopExcludedKinds: ["tool_error"] };
+    errorLoopCooldownMinutes: 60, loopExcludedKinds: ["tool_error"], idleEpisodeTtlMinutes: 120 };
   let lastPruneDate = null;
+  // 空转「回合」表:user_key → 最近一次仍在空转的扫描时刻(ms)。同一轮空转只在开头
+  // 告警一次,之后静默续期,直到产出文件类事件或中断超过 TTL(见 scanAlerts 注释)。
+  // 进程重启即清空 —— 由 recentAlert 冷却兜底并「认领」回未结束的回合。
+  const idleEpisodes = new Map();
   function alertCooldownKey(kind, user) { return kind + ":" + user; }
   function scanAlerts(thresholds = {}, now = Date.now()) {
     const cfg = { ...DEFAULT_ALERTS, ...thresholds };
@@ -97,9 +101,22 @@ export function createProductionTracker({ db, getConfig, log = console.log, now 
     const cutoffHour = new Date(now - 3600_000).toISOString();
     for (const u of hot) {
       const hasFiles = db.prepare(`SELECT COUNT(*) n FROM tool_events WHERE user_key=? AND ${FILE_SQL} AND time>=?`).get(u.user_key, cutoffHour).n;
-      if (hasFiles) continue;
-      if (recentAlert.get("idle_burn", u.user_key, new Date(now - cfg.cooldownMinutes * 60_000).toISOString()).n) continue;
+      if (hasFiles) { idleEpisodes.delete(u.user_key); continue; }
+      // 空转是一段**持续行为**,不是每过一个冷却期就值得再说一遍的新事实:同一轮空转
+      // 只在开头告警一次,之后每次命中都静默续期;直到当事人产出文件类事件(回合结束),
+      // 或连续 idleEpisodeTtlMinutes 没再命中阈值(空转中断,回合过期)才允许新一轮。
+      // 否则一场 8 小时的空转按 30 分钟冷却会轰炸 16 封邮件。recentAlert 冷却仍保留,
+      // 作为**回合表被进程重启清空**后的兜底 —— 命中时把未结束的回合认领回来,避免
+      // 冷却一过就对着同一场空转再炸一次。
+      const epAt = idleEpisodes.get(u.user_key);
+      if (epAt != null) {
+        idleEpisodes.set(u.user_key, now);   // 仍在烧 → 续期,回合保持开启
+        if (now - epAt < cfg.idleEpisodeTtlMinutes * 60_000) continue;
+        idleEpisodes.delete(u.user_key);     // 中断超过 TTL → 上一回合已结束,本轮按新回合处理
+      }
+      if (recentAlert.get("idle_burn", u.user_key, new Date(now - cfg.cooldownMinutes * 60_000).toISOString()).n) { idleEpisodes.set(u.user_key, now); continue; }
       insert.run(new Date(now).toISOString(), u.user_key, u.user_name, "idle_burn", JSON.stringify({ hour: hourPrefix, output_tokens: u.o }));
+      idleEpisodes.set(u.user_key, now);
       fired.push({ kind: "idle_burn", user_key: u.user_key, user_name: u.user_name, detail: `近一小时消耗 ${u.o.toLocaleString("zh-CN")} output tokens,无任何文件产出` });
     }
     // 2) error_loop:窗口内同 error_kind 次数 ≥ loopCount;有成功文件编辑(进展)不上报;可配置剔除杂音 kind
@@ -136,6 +153,8 @@ export function createProductionTracker({ db, getConfig, log = console.log, now 
     lastPruneDate = today;
     db.prepare(`DELETE FROM tool_events WHERE date(time,'+8 hours') < date(?, '-90 days')`).run(today);
     db.prepare(`DELETE FROM production_alerts WHERE date(time,'+8 hours') < date(?, '-90 days')`).run(today);
+    // 回合表只在「产出文件/TTL 过期后新回合覆盖」时删改,用户消失后条目会滞留 —— 按天顺手清一次
+    for (const [k, at] of idleEpisodes) if (Date.now() - at > 86_400_000) idleEpisodes.delete(k);
   }
   return { observe, scanAlerts, maybePrune, cursors };
 }

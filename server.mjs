@@ -2587,15 +2587,12 @@ async function sendReviewFindingsNotice({ repo, run, reportComments, author = nu
   await Promise.all(jobs);
   return summary;
 }
-// 成员的渠道存在 member_notify 表里(成员自助维护)。这里只做扇出,失败逐个吞掉 ——
-// 一个人配错了 webhook 不能让其他人都收不到。memberKeys 缺省 = 仓库全员;定向投递时
-// 传单元素数组(只发给匹配到的那个人)。
-async function pushReviewToMembers(ev, text, subject, memberKeys, html = "") {
-  const keys = Array.isArray(memberKeys) ? memberKeys : (Array.isArray(ev.repo.members) ? ev.repo.members : []);
-  if (!keys.length) return;
-  const cfg = config.notifier || {};
+// 成员渠道扇出(共用底座):评审结果投递与产出告警的「当事人拷贝」都走这里。邮件用
+// 全局 SMTP 凭据 + 成员自己的收件邮箱;webhook 类按成员自助配置直发。一个人配错了
+// webhook 不能让其他人都收不到 —— 失败逐个吞掉。subject/html 只给邮件用,webhook 忽略。
+async function pushToMemberKeys(cfg, text, memberKeys, { subject = "", html = "" } = {}) {
   const mailSender = notifierApi.NOTIFY_SENDERS.find((s) => s.channel === "邮件");
-  for (const key of keys) {
+  for (const key of memberKeys) {
     let prefs = null;
     try { prefs = memberNotifyApi.get(key); } catch { prefs = null; }
     if (!prefs || prefs.enabled === false) continue;
@@ -2610,6 +2607,12 @@ async function pushReviewToMembers(ev, text, subject, memberKeys, html = "") {
         .catch((err) => console.error(`[通知] ${ch.channel}(成员 ${key.slice(0, 10)}…) 推送失败: ${err.message}`));
     }
   }
+}
+// memberKeys 缺省 = 仓库全员;定向投递时传单元素数组(只发给匹配到的那个人)。
+async function pushReviewToMembers(ev, text, subject, memberKeys, html = "") {
+  const keys = Array.isArray(memberKeys) ? memberKeys : (Array.isArray(ev.repo.members) ? ev.repo.members : []);
+  if (!keys.length) return;
+  await pushToMemberKeys(config.notifier || {}, text, keys, { subject, html });
 }
 codeReviewApi.reapStale();   // 上一次进程留下的 queued/running 永远不会再推进
 
@@ -2773,14 +2776,22 @@ function pushProductionAlert(a) {
     s.send(cfg, msg).then(() => console.log(`[通知] 已推送 ${s.channel}: 产出告警 ${a.kind}`))
       .catch(err => console.error(`[通知] ${s.channel} 推送失败: ${err.message}`));
   }
+  // 当事人拷贝:最能立刻停手的人就是触发者本人,同一份告警同步发给他 —— 走「我的用量」
+  // 页自助配置的渠道(与评审通知同一扇出底座)。成员没配渠道 / 关了自助通知,自然没有
+  // 这份拷贝;管理员渠道照发,两路互不影响。告警本身不进 notifyAuditEvent 的故障事件
+  // 生命周期,去重由 scanAlerts 的冷却/回合机制负责。
+  if (a.user_key) pushToMemberKeys(cfg, msg, [a.user_key]);
 }
+// 周期可用 PROD_ALERT_TICK_MS 覆盖(测试用),下限 50ms —— 不设「至少 1 秒」那种下限,
+// 否则测试传的小周期会被静默抬回 1s,表现成「定时功能没生效」。
+const PROD_ALERT_TICK_MS = Math.max(50, Number(process.env.PROD_ALERT_TICK_MS) || 60_000);
 setInterval(() => {
   try {
     const fired = productionTracker.scanAlerts((config.productionTracking || {}).alerts || {});
     for (const a of fired) pushProductionAlert(a);
     productionTracker.maybePrune();
   } catch (err) { console.log(`[production] 告警扫描异常: ${err?.message}`); }
-}, 60_000).unref();
+}, PROD_ALERT_TICK_MS).unref();
 persistenceApi.migrateFromJsonIfNeeded();
 persistenceApi.pruneOldDataIfNewDay(); // also run at startup so rows pruned under an old policy converge immediately
 loadRateLimitState();

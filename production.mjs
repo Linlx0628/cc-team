@@ -99,7 +99,12 @@ export function createProductionTracker({ db, getConfig, log = console.log, now 
       FROM (SELECT user_key, SUM(output_tokens) o FROM usage_daily_hourly WHERE date=? AND substr(hour,1,2)=? GROUP BY user_key HAVING o >= ?) h
       LEFT JOIN users u ON u.user_key = h.user_key GROUP BY h.user_key`).all(dateKey, hourPrefix, cfg.idleHourTokens);
     const cutoffHour = new Date(now - 3600_000).toISOString();
+    // 排除名单(如代码评审专用虚拟 Key):定时评审一次烧十几万 output 却不产生文件类
+    // 事件,是预期行为而非空转。整条跳过,连回合表都不碰。错误循环/编辑失败爆发仍照常
+    // 判定 —— 评审任务反复报错依然值得知道。
+    const idleExcluded = new Set(Array.isArray(cfg.idleExcludeUserKeys) ? cfg.idleExcludeUserKeys.filter(Boolean) : []);
     for (const u of hot) {
+      if (idleExcluded.has(u.user_key)) continue;
       const hasFiles = db.prepare(`SELECT COUNT(*) n FROM tool_events WHERE user_key=? AND ${FILE_SQL} AND time>=?`).get(u.user_key, cutoffHour).n;
       if (hasFiles) { idleEpisodes.delete(u.user_key); continue; }
       // 空转是一段**持续行为**,不是每过一个冷却期就值得再说一遍的新事实:同一轮空转

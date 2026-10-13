@@ -2787,7 +2787,13 @@ function pushProductionAlert(a) {
 const PROD_ALERT_TICK_MS = Math.max(50, Number(process.env.PROD_ALERT_TICK_MS) || 60_000);
 setInterval(() => {
   try {
-    const fired = productionTracker.scanAlerts((config.productionTracking || {}).alerts || {});
+    // 代码评审专用虚拟 Key 不参与空转判定(定时评审烧 output 无文件产出是预期行为);
+    // 错误循环/编辑失败爆发对它照常生效。每次扫描实时取值,改配置/换评审账号即生效。
+    const reviewKey = (config.codeReview || {}).providerKey || "";
+    const fired = productionTracker.scanAlerts({
+      ...((config.productionTracking || {}).alerts || {}),
+      idleExcludeUserKeys: reviewKey ? [reviewKey] : [],
+    });
     for (const a of fired) pushProductionAlert(a);
     productionTracker.maybePrune();
   } catch (err) { console.log(`[production] 告警扫描异常: ${err?.message}`); }

@@ -714,7 +714,9 @@ function renderCharts(){
   const val=s=>MT==="requests"?(s.requests||0):totalTokens(s);
   const trendCut=recentBuckets(Object.keys(g).sort(),eb.ranged);
   const keys=trendCut.keys;
-  document.getElementById("trendNote").textContent=chartNote(trendCut.tip,MDL!=="all"?"模型筛选：不含缓存 Token":"");
+  // 图头 note 恒标口径:无模型筛选是总Token(含缓存),有筛选时数据源换成不含缓存的
+  // dailyModels —— 口径跟着变,note 也跟着变;指标切到请求数时 Token 口径无从谈起,不标
+  document.getElementById("trendNote").textContent=chartNote(trendCut.tip,MT==="requests"?"":(MDL!=="all"?"模型筛选：不含缓存 Token":"总Token(含缓存)"));
   if(C.t)C.t.destroy();if(C.p)C.p.destroy();if(C.m)C.m.destroy();if(C.h)C.h.destroy();if(C.hm)C.hm.destroy();if(C.pr)C.pr.destroy();
   C.t=new Chart(document.getElementById("trend"),{type:"bar",data:{labels:keys.map(k=>lbl(P,k)),datasets:uks.map((u,i)=>({label:D.users[u].name,data:keys.map(k=>val(g[k][u]||{})),backgroundColor:COL[i%COL.length]+"cc",borderRadius:3,borderSkipped:false}))},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:trendLegend(),tooltip:{callbacks:{label:ctx=>ctx.dataset.label+": "+fmtT(ctx.raw)}}},scales:{x:{stacked:true,ticks:{color:"#686863",font:{size:10}},grid:{color:"rgba(24,24,22,.08)"}},y:{stacked:true,ticks:{color:"#686863",callback:v=>fmtTk(v)},grid:{color:"rgba(24,24,22,.08)"}}}}});
   // 用户分布 / 客户端分布:共用 #pie 这张横向柱状图,顶部 seg 切维度。
@@ -748,7 +750,13 @@ function renderCharts(){
     pieLabels=uIdx.map(i=>D.users[uks[i]].name);pieVals=uIdx.map(i=>tot[i]);
     document.getElementById("pieTitle").textContent="用户分布";
   }
-  C.p=new Chart(document.getElementById("pie"),{type:"bar",data:{labels:pieLabels,datasets:[{label:MT==="requests"?"请求数":"总 Token",data:pieVals,backgroundColor:pieVals.map((_,i)=>COL[i%COL.length]+"cc"),borderWidth:0,borderRadius:3,borderSkipped:false}]},options:{indexAxis:"y",responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false},tooltip:{callbacks:{label:ctx=>MT==="requests"?fmtT(ctx.raw)+" 次请求":fmtT(ctx.raw)+" tokens"}}},scales:{x:{ticks:{color:"#686863",callback:v=>fmtTk(v)},grid:{color:"rgba(24,24,22,.08)"}},y:{ticks:{color:"#686863",font:{size:11},autoSkip:false},grid:{display:false}}}}});
+  // 这张图的 Token 口径随维度与筛选变化,标签必须跟着实际口径走,不能一律写 "tokens":
+  //   用户维度 + 无模型筛选 → totalTokens(输入+输出+缓存读写,含缓存);
+  //   客户端维度(usage_daily_client 没有缓存列)、或模型筛选生效(filteredDaily 由
+  //   dailyModels 重建,同样没有缓存列) → 只有 输入+输出(不含缓存)。
+  // 相邻的「模型请求分布」恒为不含缓存 —— 两图并排数字差出一个缓存量,不标口径必被当成对不上。
+  const pieBasis=(PIEDIM==="client"||MDL!=="all")?"Token(输入+输出)":"总Token(含缓存)";
+  C.p=new Chart(document.getElementById("pie"),{type:"bar",data:{labels:pieLabels,datasets:[{label:MT==="requests"?"请求数":pieBasis,data:pieVals,backgroundColor:pieVals.map((_,i)=>COL[i%COL.length]+"cc"),borderWidth:0,borderRadius:3,borderSkipped:false}]},options:{indexAxis:"y",responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false},tooltip:{callbacks:{label:ctx=>MT==="requests"?fmtT(ctx.raw)+" 次请求":fmtT(ctx.raw)+" "+pieBasis}}},scales:{x:{ticks:{color:"#686863",callback:v=>fmtTk(v)},grid:{color:"rgba(24,24,22,.08)"}},y:{ticks:{color:"#686863",font:{size:11},autoSkip:false},grid:{display:false}}}}});
 
   // 模型请求分布：按有效窗口(日期范围优先,否则周期窗口,北京时间)求和，可按指标筛选。
   // seg 切三个维度:
@@ -826,16 +834,20 @@ function renderCharts(){
   // 画布高度按行数撑开(「按模型×方案」是两行标签,每行要更高的带)—— 必须在建图之前设好,
   // Chart.js 初始化时就按容器高度定画布尺寸,建完再改只会拉伸已算好的布局
   sizeModelCanvas(mLabels.length,MDLDIM==="modelProfile"?2:1);
-  C.m=new Chart(document.getElementById("modelChart"),{type:"bar",data:{labels:mLabels,datasets:[{label:MT==="requests"?"请求数":"Token",data:mVal,backgroundColor:mBg||mVal.map((_,i)=>COL[i%COL.length]+"cc"),borderWidth:0,borderRadius:3,borderSkipped:false}]},options:{indexAxis:"y",responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false},tooltip:{callbacks:{title:items=>mFull?mFull[items[0].dataIndex]:items[0].label,label:ctx=>MT==="requests"?fmtT(ctx.raw)+" 次请求":fmtT(ctx.raw)+" tokens"}}},scales:{x:{ticks:{color:"#686863",callback:v=>fmtTk(v)},grid:{color:"rgba(24,24,22,.08)"}},y:{ticks:{color:"#686863",font:{size:11},autoSkip:false,callback:function(v,i){return mTicks?mTicks[i]:this.getLabelForValue(v)}},grid:{display:false}}}}});
+  // 三个维度的数据源都不含缓存 Token(见上面 760 行附近的注释),标签如实写 ——
+  // 与左边的用户分布(默认含缓存)并排时,口径不标会误读成「对不上」。
+  C.m=new Chart(document.getElementById("modelChart"),{type:"bar",data:{labels:mLabels,datasets:[{label:MT==="requests"?"请求数":"Token(输入+输出)",data:mVal,backgroundColor:mBg||mVal.map((_,i)=>COL[i%COL.length]+"cc"),borderWidth:0,borderRadius:3,borderSkipped:false}]},options:{indexAxis:"y",responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false},tooltip:{callbacks:{title:items=>mFull?mFull[items[0].dataIndex]:items[0].label,label:ctx=>MT==="requests"?fmtT(ctx.raw)+" 次请求":fmtT(ctx.raw)+" Token(输入+输出)"}}},scales:{x:{ticks:{color:"#686863",callback:v=>fmtTk(v)},grid:{color:"rgba(24,24,22,.08)"}},y:{ticks:{color:"#686863",font:{size:11},autoSkip:false,callback:function(v,i){return mTicks?mTicks[i]:this.getLabelForValue(v)}},grid:{display:false}}}}});
 
   // 两张 24 小时图只做「单日」统计:按日=今天;日期范围生效时要求开始=结束(同一天,只填
   // 今天开始那一头也算)。选了周/月/年、或范围跨多天时不统计 —— 数据留空(坐标轴照常渲染),
   // 图头 note 给出原因。跨天累加同槽位的口径(半小时是"各槽位累计分布"而非"当天真实曲线")
   // 容易误读,所以收窄到单日。服务端取数下界 hourlyChartFloor 与槽位映射 halfHourSlots 不变。
   const hDay=eb.ranged?(eb.start===eb.end?eb.start:null):(P==="day"?winBounds().td:null);
-  const hourNoteText=hDay?"":"仅统计单日：选「按日」，或将开始/结束日期设为同一天";
-  document.getElementById("hourNote").textContent=hourNoteText;
-  document.getElementById("hourModelNote").textContent=hourNoteText;
+  // 两张 24 小时图的 Token 口径不同(下面 C.h 用 totalTokens 含缓存,C.hm 只有输入+输出),
+  // note 各自标明:有数据时说明口径,无数据时说明为什么是空的 —— 不能再共用一句话。
+  const hourEmptyNote="仅统计单日：选「按日」，或将开始/结束日期设为同一天";
+  document.getElementById("hourNote").textContent=hDay?"Token 含缓存命中":hourEmptyNote;
+  document.getElementById("hourModelNote").textContent=!hDay?hourEmptyNote:(MT==="requests"?"":"Token 为输入+输出（不含缓存）");
   const hrs=halfHourLabels();
   const hAgg=Array.from({length:48},()=>({requests:0,tokens:0}));
   for(const [date,hours] of Object.entries(D.hourly||{})){
@@ -845,7 +857,7 @@ function renderCharts(){
     }
   }
   const hReq=hAgg.map(a=>a.requests),hTokens=hAgg.map(a=>a.tokens);
-  C.h=new Chart(document.getElementById("hourChart"),{type:"line",data:{labels:hrs,datasets:[{label:"请求数",data:hReq,borderColor:"#2f6e50",backgroundColor:"rgba(47,110,80,.12)",fill:true,tension:.28,pointRadius:0,pointHitRadius:10,pointBackgroundColor:"#2f6e50",pointHoverRadius:4,borderWidth:2,yAxisID:"y"},{label:"总 Token",data:hTokens,borderColor:"#181816",backgroundColor:"rgba(24,24,22,.08)",fill:true,tension:.28,pointRadius:0,pointHitRadius:10,pointBackgroundColor:"#181816",pointHoverRadius:4,borderWidth:2,yAxisID:"y1"}]},options:{responsive:true,maintainAspectRatio:false,interaction:{mode:"index",intersect:false},plugins:{legend:{labels:{color:"#686863",font:{size:11},usePointStyle:true,pointStyle:"circle"}},tooltip:{callbacks:{label:ctx=>ctx.dataset.label+": "+fmtT(ctx.raw)}}},scales:{x:{ticks:{color:"#686863",font:{size:9},maxRotation:0,autoSkip:true,maxTicksLimit:12},grid:{display:false}},y:{type:"linear",position:"left",ticks:{color:"#2f6e50"},grid:{color:"rgba(24,24,22,.08)"},title:{display:true,text:"请求数",color:"#2f6e50",font:{size:10}}},y1:{type:"linear",position:"right",ticks:{color:"#181816",callback:v=>fmtTk(v)},grid:{drawOnChartArea:false},title:{display:true,text:"Tokens",color:"#181816",font:{size:10}}}}}});
+  C.h=new Chart(document.getElementById("hourChart"),{type:"line",data:{labels:hrs,datasets:[{label:"请求数",data:hReq,borderColor:"#2f6e50",backgroundColor:"rgba(47,110,80,.12)",fill:true,tension:.28,pointRadius:0,pointHitRadius:10,pointBackgroundColor:"#2f6e50",pointHoverRadius:4,borderWidth:2,yAxisID:"y"},{label:"总Token(含缓存)",data:hTokens,borderColor:"#181816",backgroundColor:"rgba(24,24,22,.08)",fill:true,tension:.28,pointRadius:0,pointHitRadius:10,pointBackgroundColor:"#181816",pointHoverRadius:4,borderWidth:2,yAxisID:"y1"}]},options:{responsive:true,maintainAspectRatio:false,interaction:{mode:"index",intersect:false},plugins:{legend:{labels:{color:"#686863",font:{size:11},usePointStyle:true,pointStyle:"circle"}},tooltip:{callbacks:{label:ctx=>ctx.dataset.label+": "+fmtT(ctx.raw)}}},scales:{x:{ticks:{color:"#686863",font:{size:9},maxRotation:0,autoSkip:true,maxTicksLimit:12},grid:{display:false}},y:{type:"linear",position:"left",ticks:{color:"#2f6e50"},grid:{color:"rgba(24,24,22,.08)"},title:{display:true,text:"请求数",color:"#2f6e50",font:{size:10}}},y1:{type:"linear",position:"right",ticks:{color:"#181816",callback:v=>fmtTk(v)},grid:{drawOnChartArea:false},title:{display:true,text:"Tokens",color:"#181816",font:{size:10}}}}}});
 
   // 24小时模型使用趋势：与上面那张 24 小时图同一份单日口径(hDay),仅单日才统计。
   // 模型取当日总量 Top6，其余合并为「其他」，避免 legend 过长。数据自 usage_hourly_model 表启用日起累积。
@@ -866,7 +878,7 @@ function renderCharts(){
   const hasOther=Object.keys(hmTot).length>topModels.length;
   const hmSeries=topModels.map(m=>({label:m,data:hmAgg.map(a=>MT==="requests"?((a[m]||{}).requests||0):((a[m]||{}).tokens||0))}));
   if(hasOther)hmSeries.push({label:"其他",data:hmAgg.map(a=>{let t=0;for(const [m,v] of Object.entries(a))if(!topModels.includes(m))t+=MT==="requests"?v.requests:v.tokens;return t})});
-  C.hm=new Chart(document.getElementById("hourModelChart"),{type:"line",data:{labels:hrs,datasets:hmSeries.map((s,i)=>({label:s.label,data:s.data,borderColor:COL[i%COL.length],backgroundColor:COL[i%COL.length]+"22",fill:i===0,tension:.28,pointRadius:0,pointHitRadius:10,pointBackgroundColor:COL[i%COL.length],pointHoverRadius:4,borderWidth:2}))},options:{responsive:true,maintainAspectRatio:false,interaction:{mode:"index",intersect:false},plugins:{legend:trendLegend(),tooltip:{callbacks:{label:ctx=>ctx.dataset.label+": "+fmtT(ctx.raw)+(MT==="requests"?" 次请求":" tokens")}}},scales:{x:{ticks:{color:"#686863",font:{size:9},maxRotation:0,autoSkip:true,maxTicksLimit:12},grid:{display:false}},y:{ticks:{color:"#686863",callback:v=>fmtTk(v)},grid:{color:"rgba(24,24,22,.08)"}}}}});
+  C.hm=new Chart(document.getElementById("hourModelChart"),{type:"line",data:{labels:hrs,datasets:hmSeries.map((s,i)=>({label:s.label,data:s.data,borderColor:COL[i%COL.length],backgroundColor:COL[i%COL.length]+"22",fill:i===0,tension:.28,pointRadius:0,pointHitRadius:10,pointBackgroundColor:COL[i%COL.length],pointHoverRadius:4,borderWidth:2}))},options:{responsive:true,maintainAspectRatio:false,interaction:{mode:"index",intersect:false},plugins:{legend:trendLegend(),tooltip:{callbacks:{label:ctx=>ctx.dataset.label+": "+fmtT(ctx.raw)+(MT==="requests"?" 次请求":" Token(输入+输出)")}}},scales:{x:{ticks:{color:"#686863",font:{size:9},maxRotation:0,autoSkip:true,maxTicksLimit:12},grid:{display:false}},y:{ticks:{color:"#686863",callback:v=>fmtTk(v)},grid:{color:"rgba(24,24,22,.08)"}}}}});
 
   // 方案请求情况：跨方案维度（恒为全部方案，不随方案下拉收窄），按周期分桶的堆叠柱。
   // 统计逻辑与 Token 用量趋势完全一致:共用 recentBuckets 那条「最近 30 个桶」的默认窗口,
@@ -894,8 +906,10 @@ function renderCharts(){
   // 注意 pSfx(图例/系列的来源)仍取自全量 pdBase:某个方案在窗口内没有用量时,它会是一条
   // 全 0 的系列 —— 与趋势图「所有用户都在图例里」的既有口径一致,不额外隐藏(「掉下去了」
   // 本身是信息)。只有「画几个桶」被裁,系列的集合不变。
-  document.getElementById("profileNote").textContent=chartNote(pCut.tip,MDL!=="all"?"模型筛选：不含缓存 Token":"");
-  C.pr=new Chart(document.getElementById("profileChart"),{type:"bar",data:{labels:pSorted.map(k=>lbl(P,k)),datasets:pSfx.map((sfx,i)=>({label:suffixName[sfx]||sfx,data:pSorted.map(k=>{const s=(pBuckets[k]||{})[sfx];return s?(MT==="requests"?s.requests:s.tokens):0}),backgroundColor:COL[i%COL.length]+"cc",borderRadius:3,borderSkipped:false}))},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:trendLegend(),tooltip:{callbacks:{label:ctx=>ctx.dataset.label+": "+fmtT(ctx.raw)+(MT==="requests"?" 次请求":" tokens")}}},scales:{x:{stacked:true,ticks:{color:"#686863",font:{size:10}},grid:{color:"rgba(24,24,22,.08)"}},y:{stacked:true,ticks:{color:"#686863",callback:v=>fmtTk(v)},grid:{color:"rgba(24,24,22,.08)"}}}}});
+  // 同趋势图:note 恒标口径,tooltip 后缀也跟着实际口径走(MDL 筛选时 s.tokens 来自
+  // profileDailyModels,只有输入+输出;无筛选时来自 totalTokens,含缓存)
+  document.getElementById("profileNote").textContent=chartNote(pCut.tip,MT==="requests"?"":(MDL!=="all"?"模型筛选：不含缓存 Token":"总Token(含缓存)"));
+  C.pr=new Chart(document.getElementById("profileChart"),{type:"bar",data:{labels:pSorted.map(k=>lbl(P,k)),datasets:pSfx.map((sfx,i)=>({label:suffixName[sfx]||sfx,data:pSorted.map(k=>{const s=(pBuckets[k]||{})[sfx];return s?(MT==="requests"?s.requests:s.tokens):0}),backgroundColor:COL[i%COL.length]+"cc",borderRadius:3,borderSkipped:false}))},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:trendLegend(),tooltip:{callbacks:{label:ctx=>ctx.dataset.label+": "+fmtT(ctx.raw)+(MT==="requests"?" 次请求":(MDL!=="all"?" Token(输入+输出)":" 总Token(含缓存)"))}}},scales:{x:{stacked:true,ticks:{color:"#686863",font:{size:10}},grid:{color:"rgba(24,24,22,.08)"}},y:{stacked:true,ticks:{color:"#686863",callback:v=>fmtTk(v)},grid:{color:"rgba(24,24,22,.08)"}}}}});
 }
 
 // ── 用户用量(独立菜单 /api/stats?section=users)──

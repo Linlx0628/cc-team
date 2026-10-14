@@ -59,7 +59,13 @@
       ".uq-sec-hd{display:flex;align-items:baseline;gap:8px;font-size:11.5px;font-weight:650;color:var(--dim);letter-spacing:.06em;margin:0 0 8px;padding-bottom:5px;border-bottom:1px solid var(--border)}",
       ".uq-sec-hd em{font-style:normal;font-weight:400;font-size:11px;color:var(--dim2);letter-spacing:0}",
       // 236px 起排 → 常见 1000~1200px 的内容区一行 4 张卡，少滚动
-      ".uq-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(236px,1fr));gap:10px;align-items:start;align-content:start}",
+      // dense：让窄卡回填宽卡旁边留出的空位（宽卡必须整行起排，不然右边会空一格）
+      ".uq-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(236px,1fr));gap:10px;align-items:start;align-content:start;grid-auto-flow:dense}",
+      // 条目多的卡（>=5 项）横着占满整行，内部再按列自动分栏：一张长卡不会把整段的行高撑歪。
+      ".uq-card.wide{grid-column:1/-1}",
+      ".uq-card.wide .uq-body{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:0 18px;align-content:start}",
+      // 套餐信息行（规格 · 生效中 · 到期 …）
+      ".uq-plan{margin:4px 0 0;font-size:10.5px;color:var(--dim2);font-variant-numeric:tabular-nums}",
       // 卡片
       ".uq-card{display:flex;flex-direction:column;border:1px solid var(--border);border-radius:10px;background:var(--surface);padding:10px 12px}",
       ".uq-card.alarm{border-color:#e7b4ae;background:linear-gradient(180deg,#fff7f6,var(--surface) 58%)}",
@@ -259,6 +265,12 @@
     if (!Number.isFinite(n) || n <= 0) return "";
     return new Date(n + 8 * 3600e3).toISOString().slice(11, 16);
   };
+  // 订阅到期只写日期（2027-01-15）；带年份，跨年时不会看错。
+  const bjDate = (ms) => {
+    const n = Number(ms);
+    if (!Number.isFinite(n) || n <= 0) return "";
+    return new Date(n + 8 * 3600e3).toISOString().slice(0, 10);
+  };
   function ago(ms) {
     const n = Number(ms);
     if (!Number.isFinite(n) || n <= 0) return "";
@@ -358,6 +370,29 @@
       + '</div>';
   }
 
+  // 套餐本身的信息：规格 / 是否生效中 / 到期时间（+ 剩余天数）。
+  // 只有上游接口真的给了才渲染这一行（阿里云百炼个人版的控制台订阅接口给得出；多数平台
+  // 只给窗口重置时间，没给套餐到期 —— 那就什么都不显示，不猜、不占版面）。
+  const PLAN_STATUS_TEXT = { VALID: "生效中", RELEASE: "已释放", REFUNDED: "已退款", STOP: "已停用", LIMIT: "已受限" };
+  function planHTML(plan) {
+    if (!plan || typeof plan !== "object") return "";
+    const bits = [];
+    const spec = String(plan.name || "").trim();
+    if (spec) bits.push(spec.charAt(0).toUpperCase() + spec.slice(1));
+    const status = String(plan.status || "").trim();
+    if (status) bits.push(PLAN_STATUS_TEXT[status] || status);
+    const days = Number(plan.remainingDays);
+    const hasDays = Number.isFinite(days);
+    if (Number(plan.endAt) > 0) {
+      bits.push("到期 " + bjDate(plan.endAt) + (hasDays ? "（剩 " + Math.round(days) + " 天）" : ""));
+    } else if (hasDays) {
+      bits.push("剩 " + Math.round(days) + " 天");
+    }
+    if (plan.autoRenew === true) bits.push("自动续费");
+    if (!bits.length) return "";
+    return '<div class="uq-plan" title="套餐信息来自上游订阅接口">' + esc(bits.join(" · ")) + '</div>';
+  }
+
   function cardHTML(p, alertPercent) {
     const st = providerState(p, alertPercent);
     // 同一平台可能有多个同名窗口（智谱就有「每周窗口」的 tokens 与额度两条），
@@ -376,7 +411,11 @@
       const it = Object.assign({}, raw, { label: labelOf(raw) });
       return it.kind === "balance" ? balanceHTML(it) : quotaHTML(it, alertPercent);
     }).join("");
-    const cls = "uq-card" + (st.key === "alert" || st.key === "failed" ? " alarm" : (p.alert ? " warn" : ""));
+    // 条目多的卡（比如阿里云百炼：月额度 + 7 项 Harness 权益）横着铺开占满一整行，
+    // 内部再按列自动分栏 —— 否则一张卡会拉得特别长，把整段的行高都撑歪。
+    const wide = items.length >= 5;
+    const cls = "uq-card" + (wide ? " wide" : "")
+      + (st.key === "alert" || st.key === "failed" ? " alarm" : (p.alert ? " warn" : ""));
     return '<div class="' + cls + '" data-id="' + attr(p.id) + '">'
       + '<div class="uq-card-hd">'
       + '<span class="' + ledCls(p, alertPercent) + '"></span>'
@@ -386,8 +425,10 @@
       + '<button type="button" class="uq-icon" title="只刷新这个平台" onclick="UQ.refreshOne(\'' + attr(p.id) + '\')">↻</button>'
       + (p.note ? '<span class="uq-icon" title="' + attr(p.note) + '" style="cursor:help">ⓘ</span>' : "")
       + '</div>'
+      + planHTML(p.plan)
       // 查询失败时不要再说「没有可识别的额度字段」—— 下一行的错误原文才是原因。
-      + (body || (p.error ? "" : '<div class="uq-q-sub" style="margin-top:8px">上游没有返回可识别的额度字段</div>'))
+      + (body ? '<div class="uq-body">' + body + '</div>'
+        : (p.error ? "" : '<div class="uq-q-sub" style="margin-top:8px">上游没有返回可识别的额度字段</div>'))
       + (p.error ? '<div class="uq-alert" title="' + attr(p.error) + '">' + esc(clip(p.error, 180)) + '</div>' : "")
       + ((p.warnings && p.warnings.length) ? '<div class="uq-warnline" title="' + attr(p.warnings.join("；")) + '">' + esc(clip(p.warnings.join("；"), 140)) + '</div>' : "")
       + '<div class="uq-card-ft">'

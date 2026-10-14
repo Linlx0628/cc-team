@@ -180,7 +180,7 @@
 
 | 你的套餐 | 数据在哪 | 要什么凭据 | 卡片上看到 |
 |---|---|---|---|
-| **个人版**（控制台「Token Plan → 我的订阅」显示的 Lite / Essential / Standard / Pro，一个月限额） | 百炼**控制台网关**（控制台页面自己调的接口，`zeldaHttp.apikeyMgr./tokenplan/personal/api/v2/usage`） | **控制台令牌** —— 卡片页脚「一键获取令牌」，见下面的获取办法 | 「套餐月额度 0.27%」+「重置 11-15」；如果套餐带 Harness 权益，还会多出几行权益用量（剩 x / 共 y）。令牌在卡片页脚点「一键获取令牌」即可 |
+| **个人版**（控制台「Token Plan → 我的订阅」显示的 Lite / Essential / Standard / Pro，一个月限额） | 百炼**控制台网关**（控制台页面自己调的接口，`zeldaHttp.apikeyMgr./tokenplan/personal/api/v2/usage`；套餐本身走 `…/personal/api/v2/subscription`） | **控制台令牌** —— 卡片页脚「一键获取令牌」，见下面的获取办法 | 「套餐月额度 0.27%」+「重置 11-15」；如果套餐带 Harness 权益，还会多出几行权益用量（剩 x / 共 y）；另有一行套餐信息 `Standard · 生效中 · 到期 2027-01-15（剩 92 天）` |
 | **席位制团队版**（控制台「组织与成员 → 席位管理」里给成员分配席位） | 官方 OpenAPI（`GetSubscriptionStats` / `GetSubscriptionSeatDetails`） | **AccessKey ID / Secret**（可复用「阿里云账户余额」那份） | 「标准席位 Credits」等：总量 / 剩余 / 席位占用 / 订阅到期 |
 
 个人版各档的月限额（官方表，单位 Credits）：Lite `11,500` / Essential `25,500` / **Standard `45,000`** / Pro `180,000`。**控制台接口只给百分比**，所以我们照原样显示百分比：
@@ -194,6 +194,16 @@ percent = round(per1MonthPercentage × 10000) / 100      # per1MonthPercentage �
 ⚠️ 重置不是每月 1 日：额度按**订阅月**滚动（你 10-14 订阅，就每月 14 号刷新），所以看百分比旁边的重置日期，不要按自然月理解。
 
 ⚠️ 反过来不成立：**个人版用 AccessKey 查席位接口只会拿到空数据**（接口返回 `{"Success":true}`，连 `Data` 都没有）——那不是「没订阅」，而是这条路看不到个人月额度。所以个人版在设置页看到红字提示时，按下面拿一个控制台令牌就好。
+
+**套餐到期时间**（顺带拿到，只有阿里云百炼给得出）：个人版的订阅信息走控制台另一条接口，返回的就是控制台「Standard 套餐 / 剩余 92 天 / 开始 2026-10-14 17:22:21 / 结束 2027-01-15 00:00:00」那一排数字：
+
+```text
+GET/POST 控制台网关  api = zeldaHttp.apikeyMgr./tokenplan/personal/api/v2/subscription
+→ {"instanceCode":"sfm_tokenplansolo_public_cn-…","specCode":"standard","remainingDays":92,
+   "startTime":1791969741000,"endTime":1799942400000,"autoRenewFlag":false,"status":"VALID"}
+```
+
+卡片标题下方因此会多一行小字 `Standard · 生效中 · 到期 2027-01-15（剩 92 天）`：`specCode` 首字母大写当规格名，`status` 只在不是 `VALID` 时按原值显示（`VALID` → 生效中），`autoRenewFlag` 为 `true` 时才出现「自动续费」。**这条接口拿不到数据时这一行直接不渲染**，不影响上面的额度数字；其它套餐平台（智谱 GLM、火山方舟…）的接口只给窗口重置时间、没有套餐到期字段，所以那几张卡上不会出现这一行 —— 不是漏显示。（席位制团队版走 `GetSubscriptionStats`，它的 `SubscriptionStartTime/EndTime` 也会填进这一行。）
 
 **怎么拿控制台令牌**（只需一次，浏览器里点一下）：
 

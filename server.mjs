@@ -50,6 +50,7 @@ import { createProxyCore } from "./lib/proxy-core.mjs";
 import { createEgressMeter } from "./lib/egress-meter.mjs";
 import { installApiGzip } from "./lib/api-gzip.mjs";
 import { normalizeUpstreamGzipMode, prepareUpstreamBody, runUpstreamGzipProbe, UPSTREAM_GZIP_PROBE_DELAY_MS, UPSTREAM_GZIP_PROBE_INTERVAL_MS } from "./lib/upstream-gzip.mjs";
+import { runProfileTest, PROFILE_TEST_ERR_NO_UPSTREAM, PROFILE_TEST_ERR_NO_KEY } from "./lib/profile-test.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -5254,6 +5255,61 @@ const server = http.createServer((req, res) => {
         recordAdminAudit(req, "profile.clone", newName, `复制方案 "${profile}" → "${newName}"（后缀 /${newSuffix}，共享额度池 ${clone.quotaPool || "无"}，不复制用户）`);
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ ok: true, profile: newName, suffix: newSuffix }));
+      } catch (err) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: err.message }));
+      }
+    }).catch(() => {
+      res.writeHead(413); res.end("Request too large");
+    });
+    return;
+  }
+
+  // Profile: 用一次真实的上游请求验证这套方案能不能用。点一次测一次、写一条审计；
+  // 请求体只有 "hi"，失败的方案不会因为这次测试产生值得一提的费用。响应恒为 200 + 结构化
+  // 结果（除非鉴权 / 方案不存在 / 配置缺失），前端据 ok 字段决定弹成功还是失败。
+  if (req.method === "POST" && req.url === "/api/profile/test") {
+    if (!checkAuth(req)) { res.writeHead(401); res.end("Unauthorized"); return; }
+    if (!checkCsrf(req)) { res.writeHead(403); res.end("CSRF validation failed"); return; }
+    readBody(req).then(async buf => {
+      try {
+        const { profile } = JSON.parse(buf.toString());
+        const profileName = String(profile || "").trim();
+        const profileCfg = config.profiles[profileName];
+        if (!profileCfg) {
+          recordAdminAudit(req, "profile.test", profileName, "方案测试：失败（方案不存在）");
+          res.writeHead(404, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "方案不存在" }));
+          return;
+        }
+        // 配置缺失在发请求前就拦下：这类错误前端要照着改配置，用 400 + error 说话比
+        // 一个 status=0 的「失败」更明确。审计仍要留痕 —— 每次点击都算一次测试。
+        const realKey = getRealKeyFromProfile(profileCfg);
+        const missing = !String(profileCfg.upstream || "").trim() ? PROFILE_TEST_ERR_NO_UPSTREAM
+          : (!realKey ? PROFILE_TEST_ERR_NO_KEY : "");
+        if (missing) {
+          recordAdminAudit(req, "profile.test", profileName, `方案测试：失败（${missing}）`);
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: missing }));
+          return;
+        }
+        const result = await runProfileTest({
+          profileCfg,
+          profileName,
+          // 注入 server 现有的两个助手：模型映射要含高峰期别名覆盖，取 Key 口径也要
+          // 和代理请求完全一致，否则「测试通过但真实请求失败」会变得无法解释。
+          resolveModel,
+          getRealKey: getRealKeyFromProfile,
+          realKey,
+        });
+        // detail 只写状态码、耗时、模型与上游错误文案，绝不回显真实 Key。
+        const detail = result.ok
+          ? `方案测试：成功（HTTP ${result.status}，${result.ms} ms，模型 ${result.model || "默认"}）${result.text ? "：" + result.text : ""}`
+          : `方案测试：失败（${result.status ? "HTTP " + result.status : "未取得响应"}）：${result.error}`;
+        recordAdminAudit(req, "profile.test", profileName, detail);
+        console.log(`[PROFILE] Tested profile "${profileName}": ${result.ok ? "ok" : "fail"} (${result.status || "-"})`);
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify(result));
       } catch (err) {
         res.writeHead(400, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ error: err.message }));

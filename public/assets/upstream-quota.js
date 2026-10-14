@@ -557,6 +557,10 @@
     }
     return opts.join("");
   }
+  function profileNameOf(suffix) {
+    const p = metaList().find((x) => x.suffix === suffix);
+    return (p && p.name) || "";
+  }
   // 只列「配了密钥且没停用」的成员：选了一个没 Key 的成员，查的时候必然报「没有配置 Key」。
   function memberOptions(suffix, selected) {
     if (typeof SETTINGS === "undefined" || !SETTINGS || !SETTINGS.profileAssignments) return '<option value="">（无）</option>';
@@ -611,11 +615,13 @@
     const id = site ? def.id + ":" + site.key : def.id;
     const manual = !!def.manualOnly;
     const credential = def.credential || "apiKey";
+    const profOnly = !!def.profileOnly;   // Sub2API：地址 + Key 都只能从方案来
     const keySource = pc.keySource || "auto";
     const extra = pc.extra || {};
     const live = (lastSnap && (lastSnap.providers || []).find((p) => p.id === id)) || null;
     // 站点在自己这一行上就能改名（多个中转站要分得清哪个是哪个），普通平台的显示名在「高级」里。
-    const nameField = site
+    // profileOnly 型没有显示名：卡片名就跟着所选方案走。
+    const nameField = site && !profOnly
       ? '<div><label>显示名<span style="color:var(--dim2)">（例如「XX 中转」）</span></label>'
         + '<input type="text" data-f="label" autocomplete="off" value="' + attr(pc.label || "") + '" placeholder="' + attr(def.name) + '"></div>'
       : "";
@@ -632,9 +638,10 @@
       const token = !!def.tokenCredential;
       // 「方案」下拉：站点型平台（Sub2API / NewAPI）用它带出站点地址与成员 Key。
       // 管理面令牌型（NewAPI 的系统访问令牌）没有 keySource 下拉，所以这一格不挂 data-when。
-      const profileField = (when) => '<div' + (when
+      // 第二个参数 = 必选（Sub2API profileOnly：地址与 Key 都只能从方案来，不选就查不了）。
+      const profileField = (when, required) => '<div' + (when
         ? ' data-when="profile"' + (keySource === "profile" ? "" : ' style="display:none"') : "") + '>'
-        + '<label>方案' + (fromProfile ? '<span style="color:var(--dim2)">（带出站点地址）</span>' : "") + '</label>'
+        + '<label>方案' + (required ? '<span style="color:var(--dim2)">（必选 · 带出站点地址与成员 Key）</span>' : (fromProfile ? '<span style="color:var(--dim2)">（带出站点地址）</span>' : "")) + '</label>'
         + '<select data-f="profileSuffix" onchange="UQ.syncRow(this)">' + profileOptions(pc.profileSuffix || "") + '</select></div>';
       let cred;
       if (credential === "accessKey") {
@@ -645,6 +652,11 @@
         cred = nameField + (fromProfile ? profileField(false) : "")
           + '<div><label>系统访问令牌</label><input type="text" data-f="apiKey" autocomplete="off" value="' + attr(pc.apiKey || "") + '" placeholder="控制台「个人设置 → 生成系统访问令牌」"></div>'
           + fieldsOf(def).map((f) => inputHTML(f, extra)).join("");
+      } else if (profOnly) {
+        // Sub2API：一个方案 = 一个站点，地址与 Key 都从方案里来（方案是必选项），
+        // 所以不给「凭据来源」也不给「显示名」——卡片名就是方案名。
+        cred = profileField(false, true)
+          + '<div><label>成员</label><select data-f="memberKey">' + memberOptions(pc.profileSuffix || "", pc.memberKey || "") + '</select></div>';
       } else {
         cred = nameField
           + '<div><label>凭据来源</label><select data-f="keySource" onchange="UQ.syncRow(this)">' + keySourceOptions(keySource) + '</select></div>'
@@ -673,11 +685,12 @@
     // data-site-type / data-site-key：站点卡，collect() 按这两个属性收进 config.sites[]。
     const ksDef = def.defaultKeySource || (credential === "none" ? "inline" : "auto");
     return '<details class="uq-cfg uq-p" data-id="' + attr(id) + '" data-credential="' + attr(credential) + '" data-ksdef="' + attr(ksDef) + '"'
+      + (profOnly ? ' data-prof-only="1"' : "")
       + (site ? ' data-site-type="' + attr(def.id) + '" data-site-key="' + attr(site.key) + '"' : "") + '>'
       + '<summary>'
       + (manual ? "" : '<input type="checkbox" class="uq-en" data-f="enabled"' + (pc.enabled === false ? "" : " checked") + ' onclick="event.stopPropagation()" title="启用 / 停用这个平台">')
       + (manual ? '<span class="led"></span>' : '<span class="led' + (live && live.ok && live.enabled !== false ? " on" : "") + '"></span>')
-      + '<span class="uq-p-name">' + esc(site ? (pc.label || def.name) : def.name) + '</span>'
+      + '<span class="uq-p-name">' + esc(site ? (profOnly ? (profileNameOf(pc.profileSuffix) || def.name) : (pc.label || def.name)) : def.name) + '</span>'
       + (site ? '<span class="uq-p-tag" title="' + attr(def.name) + '">' + esc(def.name) + '</span>' : "")
       + (def.experimental ? '<span class="uq-p-tag exp" title="接口未文档化，上游随时可能改">实验</span>' : "")
       + liveHTML(id)
@@ -709,12 +722,19 @@
 
   // 中转站型平台：一段标题 + 「＋ 添加站点」按钮 + 每个站点一张卡（各自的名字 / 方案 / 令牌）。
   function sitesBlockHTML(def, list) {
+    const hint = def.profileOnly
+      ? "一个方案一个站点：选好方案就够了，地址与 Key 都从方案来（可以加多个）"
+      : (def.tokenCredential ? "一个站点一张卡：站点地址 + 系统访问令牌（可以加多个）"
+        : "一个站点一张卡：选方案带出地址与成员 Key（可以加多个）");
+    const empty = def.profileOnly
+      ? '还没有站点：点右上角「＋ 添加站点」，再选一个建好的中转方案（地址与 Key 都从方案来）。'
+      : '还没有站点：点右上角「＋ 添加站点」，填个显示名（例如「XX 中转」）；地址可以选一个中转方案带出来，也可以在「高级：接入点覆盖」里直接填站点根地址。';
     return '<div class="uq-sites" data-sites="' + attr(def.id) + '">'
       + '<div class="uq-sites-hd"><span class="uq-sites-name">' + esc(def.name) + '</span>'
-      + '<em>' + esc(def.id === "newapi" ? "一个站点一张卡：站点地址 + 系统访问令牌（可以加多个）" : "一个站点一张卡：选方案带出地址与成员 Key（可以加多个）") + '</em>'
+      + '<em>' + esc(hint) + '</em>'
       + '<button type="button" class="btn btn-outline btn-sm" onclick="UQ.addSite(\'' + attr(def.id) + '\')">＋ 添加站点</button></div>'
       + list.map((s) => cfgCardHTML(def, s, { site: s })).join("")
-      + '<p class="uq-p-note uq-sites-empty"' + (list.length ? ' style="display:none"' : "") + '>还没有站点：点右上角「＋ 添加站点」，填个显示名（例如「XX 中转」）；地址可以选一个中转方案带出来，也可以在「高级：接入点覆盖」里直接填站点根地址。</p>'
+      + '<p class="uq-p-note uq-sites-empty"' + (list.length ? ' style="display:none"' : "") + '>' + esc(empty) + '</p>'
       + '</div>';
   }
 
@@ -909,8 +929,9 @@
     card.open = true;
     if (empty) empty.style.display = "none";
     refreshSecCount(card.closest(".uq-sec"));
-    const name = card.querySelector('[data-f="label"]');
-    if (name) name.focus();
+    // Sub2API（profileOnly）没有「显示名」，第一个要填的是方案；NewAPI 先填显示名。
+    const focusTarget = card.querySelector('[data-f="label"]') || card.querySelector('[data-f="profileSuffix"]');
+    if (focusTarget) focusTarget.focus();
   }
 
   // 删除站点：只从页面上拿掉，点「保存全部」后服务端配置里那条才会消失。
@@ -968,8 +989,11 @@
       LIVE = Object.assign(LIVE, buildLive({ providers: [p], alertPercent: (lastSnap && lastSnap.alertPercent) || ALERT_FALLBACK }));
       fillLive();
     } catch (err) {
-      if (probe) probe.innerHTML = '<span class="uq-p-state alarm">查询失败</span> ' + esc(err.message);
-      setStatus("查询失败：" + clip(err.message, 60), "err");
+      // 新加的站点还没保存时后端不认识它的 id，报「未知平台」——这是操作顺序问题，不是配置坏了。
+      const unsavedSite = row && row.getAttribute("data-site-type") && /未知平台/.test(err.message || "");
+      const msg = unsavedSite ? "这个站点还没保存：先点右上角「保存全部」，再查询" : err.message;
+      if (probe) probe.innerHTML = '<span class="uq-p-state alarm">查询失败</span> ' + esc(msg);
+      setStatus("查询失败：" + clip(msg, 60), "err");
     } finally {
       if (btn) { btn.disabled = false; btn.textContent = "查询一次"; }
     }
@@ -998,6 +1022,12 @@
     if (el.getAttribute && el.getAttribute("data-f") === "profileSuffix") {
       const member = card.querySelector('[data-f="memberKey"]');
       if (member) member.innerHTML = memberOptions(el.value, "");
+      // profileOnly 型（Sub2API）：卡片名就是方案名，换方案时立刻跟着变。
+      if (card.getAttribute("data-prof-only") === "1") {
+        const nm = card.querySelector(".uq-p-name");
+        const tag = card.querySelector(".uq-p-tag");
+        if (nm) nm.textContent = profileNameOf(el.value) || (tag ? tag.textContent : "");
+      }
     }
   }
 

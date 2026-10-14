@@ -877,6 +877,27 @@ async function cloneProfile(n){
   const r=await fetch('/api/profile/clone',{method:'POST',headers:csrfHeaders({'Content-Type':'application/json'}),body:JSON.stringify({profile:n})});
   if(r.ok)toastThen('方案已复制（用户与真实Key不复制）',()=>location.reload());else{const e=await r.json().catch(()=>({}));alert('复制失败: '+(e.error||''))}
 }
+// 方案「测试」：服务端直接拿该方案的真实 Key 向上游发一个最小的 "hi" 请求，2xx 即算通。
+// 等待期间按钮要禁用并改成「测试中…」，无论成败都在 finally 里还原 —— 否则出错时按钮
+// 会永远卡在禁用态。测试不落库、不动侧栏结构，所以只弹提示，不整页重载。
+async function testProfile(n,btn){
+  const label=btn?btn.textContent:'测试';
+  if(btn){btn.disabled=true;btn.textContent='测试中…'}
+  try{
+    const r=await fetch('/api/profile/test',{method:'POST',headers:csrfHeaders({'Content-Type':'application/json'}),body:JSON.stringify({profile:n})});
+    const j=await r.json().catch(()=>({}));
+    if(r.ok&&j.ok){
+      const reply=j.text?('，回复「'+j.text+'」'):'';
+      toast('方案「'+n+'」测试成功：HTTP '+j.status+' · '+j.ms+' ms · 模型 '+(j.model||'-')+reply);
+    }else{
+      alert('方案「'+n+'」测试失败：'+(j.error||('HTTP '+r.status)));
+    }
+  }catch(e){
+    alert('方案「'+n+'」测试失败：'+((e&&e.message)||'网络错误'));
+  }finally{
+    if(btn){btn.disabled=false;btn.textContent=label}
+  }
+}
 // 把方案导出成可粘贴的"方案代码"放进剪贴板。含该方案的全部配置，但不含用户分配
 // （真实Key 不出机器）与额度池（目标环境自选）。剪贴板写不进去时（明文 http 下
 // navigator.clipboard 不存在）退到弹窗让用户手动复制，而不是静默失败。

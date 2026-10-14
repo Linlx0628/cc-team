@@ -372,8 +372,56 @@ function rememberPoolViewForReload(){
 // 用户看到的就是「先切回方案详情 → 等一会 → 才提示成功再跳回来」。而这几处编辑本身以
 // 当前 DOM 为真值（saveUsers/savePoolQuota 都是从 DOM 读的），服务端落库后只需把结果同步
 // 进内存态 SETTINGS（临时额度弹窗、方案下拉等派生视图要读它），再就地提示即可。
-// 结构性变更（新建/删除额度池、方案增删改、组、调度、清空数据）仍走重载 —— 那些会改动
-// 服务端渲染的整块结构，reload 才是唯一不会漂移的做法（加上服务器 gzip 后也已便宜很多）。
+// 结构性变更（新建/删除额度池、方案增删改、基础方案组）走 refreshServerContainers()：向服务端
+// 再要一次 /settings，把受影响的容器整块换掉 —— 服务端模板仍是唯一真值，客户端不重复实现第二套
+// 渲染，也就不会两处漂移。相比 location.reload()：视图不切走、滚动位置不丢、页面里其它未保存的
+// 编辑不会被冲掉（这三样 reload 都会丢）。一个容器都没换上时退回整页重载，宁可重载也不留旧界面。
+const PROFILE_STRUCT_IDS=['profileListBox-anthropic','profileListBox-responses','groupBox-anthropic','groupBox-responses','quotaPoolSelect','newProfilePool','userProfileSel'];
+const POOL_STRUCT_IDS=['quotaPoolSection','quotaPoolSelect','quotaPoolNav','newProfilePool'];
+const GROUP_STRUCT_IDS=['groupBox-anthropic','groupBox-responses'];
+// 内存态跟着服务端走：临时额度弹窗、方案下拉、用户计数等派生视图都从 SETTINGS 读。
+async function refreshSettingsState(){
+  try{
+    const r=await fetch('/api/settings',{headers:{'x-requested-with':'fetch'},credentials:'same-origin'});
+    if(!r.ok)return false;
+    const fresh=await r.json();
+    if(!fresh||typeof fresh!=='object'||fresh.error)return false;
+    Object.assign(SETTINGS,fresh);
+    return true;
+  }catch(e){return false}
+}
+async function refreshServerContainers(ids,opts){
+  opts=opts||{};
+  // 用户管理的「方案」下拉也是服务端渲染的：换完以后按换之前的选择把表格重画一遍，
+  // 否则下拉里多了一个新方案、而表格还停在旧方案上。
+  const userSelBefore=document.getElementById('userProfileSel')?document.getElementById('userProfileSel').value:null;
+  let doc=null;
+  try{
+    const r=await fetch('/settings',{headers:{'x-requested-with':'fetch'},credentials:'same-origin'});
+    if(r.ok)doc=new DOMParser().parseFromString(await r.text(),'text/html');
+  }catch(e){doc=null}
+  if(!doc){location.reload();return false}
+  let swapped=0;const missing=[];
+  (ids||[]).forEach(function(id){
+    const cur=document.getElementById(id),next=doc.getElementById(id);
+    if(cur&&next){cur.replaceWith(next);swapped++}else missing.push(id);
+  });
+  if(!swapped){location.reload();return false}
+  if(missing.length)console.warn('就地刷新缺少容器：'+missing.join('、'));
+  // 侧栏方案列表是服务端按「默认方案」渲染 active 的，而表单里显示的可能不是它 ——
+  // 换完容器把高亮重新对准当前正在编辑的那个方案（找不到就保留服务端的默认高亮）。
+  if(editingProfileName&&document.getElementById('pl-'+editingProfileName)){
+    document.querySelectorAll('.pl-item').forEach(el=>el.classList.remove('active'));
+    document.getElementById('pl-'+editingProfileName).classList.add('active');
+  }
+  await refreshSettingsState();
+  if(userSelBefore!==null){
+    const sel=document.getElementById('userProfileSel');
+    if(sel){sel.value=userSelBefore;if(typeof renderProfileUsers==='function')renderProfileUsers(userSelBefore)}
+  }
+  if(typeof opts.after==='function')opts.after();
+  return true;
+}
 function poolIndexByName(name){return (SETTINGS.quotaPools||[]).findIndex(p=>p.name===name)}
 // /api/quota-pool/save 直接回传 listQuotaPools() 里的那一项，形状与页面内联
 // SETTINGS.quotaPools 完全一致，原样采纳即可（不用再请求一次 /api/settings）。
@@ -453,8 +501,11 @@ async function createPool(){
     data=await r.json().catch(()=>({}));
   }catch(err){alert('创建失败: '+err.message);return}
   if(!r.ok){alert('创建失败: '+(data.error||r.status));return}
+  // 就地生效：池卡片、方案表单的池下拉、侧栏导航标题都跟着服务端重渲染，人留在额度池视图里。
   rememberPoolViewForReload();
-  toastThen('额度池「'+name+'」已创建',()=>location.reload());
+  await refreshServerContainers(POOL_STRUCT_IDS);
+  const inp2=document.getElementById('newPoolName');if(inp2)inp2.value='';
+  toast('额度池「'+name+'」已创建');
 }
 async function deletePool(name){
   if(!confirm('确定删除额度池「'+name+'」？该池当前没有成员方案，其池级限额与每人配额配置将一并删除。'))return;
@@ -465,7 +516,8 @@ async function deletePool(name){
   }catch(err){alert('删除失败: '+err.message);return}
   if(!r.ok){alert('删除失败: '+(data.error||r.status));return}
   rememberPoolViewForReload();
-  toastThen('额度池已删除',()=>location.reload());
+  await refreshServerContainers(POOL_STRUCT_IDS);
+  toast('额度池已删除');
 }
 // ─── 操作日志（audit_log）───
 let auditRows=[],auditOffset=0,auditCategory='',auditLoaded=false,auditTotal=0;
@@ -851,19 +903,36 @@ async function createProfile(){
     else alert('创建失败: '+(e.error||('HTTP '+r.status)));
     return;
   }
-  if(!importing){toastThen('方案已创建 — 点击左侧方案配置模型别名',()=>location.reload());return}
+  // 就地生效：侧栏方案列表、池下拉、两个方案组都从服务端重渲染，弹窗关掉、人留在当前视图。
+  const closeProfileModal=function(){const pm=document.getElementById('profileModal');if(pm)pm.classList.remove('open');resetProfileCode()};
+  if(!importing){
+    closeProfileModal();
+    await refreshServerContainers(PROFILE_STRUCT_IDS);
+    toast('方案已创建 — 点击左侧方案配置模型别名');
+    return;
+  }
   const j=await r.json().catch(()=>({}));
   const warn=(j.warnings&&j.warnings.length)?'。注意：'+j.warnings.join('；'):'';
-  toastThen('方案已导入（额度池'+(j.poolAction==='reused'?'复用 ':'新建 ')+(j.quotaPool||'')+'；不含用户分配，请分配真实Key并加入故障转移分组）'+warn,()=>location.reload());
+  closeProfileModal();
+  await refreshServerContainers(PROFILE_STRUCT_IDS);
+  toast('方案已导入（额度池'+(j.poolAction==='reused'?'复用 ':'新建 ')+(j.quotaPool||'')+'；不含用户分配，请分配真实Key并加入故障转移分组）'+warn);
 }
 async function setDefaultProfile(n,protocol){
   const r=await fetch('/api/profile/default',{method:'POST',headers:csrfHeaders({'Content-Type':'application/json'}),body:JSON.stringify({profile:n,protocol:protocol||'anthropic'})});
-  if(r.ok)toastThen('已设为默认方案',()=>location.reload());else{const e=await r.json();alert('设置失败: '+e.error)}
+  if(!r.ok){const e=await r.json().catch(()=>({}));alert('设置失败: '+(e.error||''));return}
+  await refreshServerContainers(PROFILE_STRUCT_IDS);
+  toast('已设为默认方案');
 }
 async function deleteProfile(n){
   if(!confirm('确定删除方案 "'+n+'"？'))return;
   const r=await fetch('/api/profile/delete',{method:'POST',headers:csrfHeaders({'Content-Type':'application/json'}),body:JSON.stringify({profile:n})});
-  if(r.ok)toastThen('方案已删除',()=>location.reload());else{const e=await r.json();alert('删除失败: '+e.error)}
+  if(!r.ok){const e=await r.json().catch(()=>({}));alert('删除失败: '+(e.error||''));return}
+  // 删掉的正是当前在编辑的那个方案时，表单也得换 —— 服务端会渲染成默认方案，否则表单里
+  // 还留着一个已经不存在的方案。
+  const ids=PROFILE_STRUCT_IDS.slice();
+  if(editingProfileName===n)ids.push('settingsForm');
+  await refreshServerContainers(ids);
+  toast('方案已删除');
 }
 async function renameProfile(n){
   const nn=prompt('新的方案名称（后缀 /xxx 与用量统计不受影响）',n);
@@ -871,11 +940,18 @@ async function renameProfile(n){
   const name=nn.trim();
   if(!name||name===n)return;
   const r=await fetch('/api/profile/rename',{method:'POST',headers:csrfHeaders({'Content-Type':'application/json'}),body:JSON.stringify({profile:n,name:name})});
-  if(r.ok)toastThen('方案已重命名',()=>location.reload());else{const e=await r.json().catch(()=>({}));alert('重命名失败: '+(e.error||''))}
+  if(!r.ok){const e=await r.json().catch(()=>({}));alert('重命名失败: '+(e.error||''));return}
+  const renamed=n;
+  const ids=PROFILE_STRUCT_IDS.slice();
+  if(editingProfileName===renamed){editingProfileName=name;ids.push('settingsForm')}
+  await refreshServerContainers(ids);
+  toast('方案已重命名');
 }
 async function cloneProfile(n){
   const r=await fetch('/api/profile/clone',{method:'POST',headers:csrfHeaders({'Content-Type':'application/json'}),body:JSON.stringify({profile:n})});
-  if(r.ok)toastThen('方案已复制（用户与真实Key不复制）',()=>location.reload());else{const e=await r.json().catch(()=>({}));alert('复制失败: '+(e.error||''))}
+  if(!r.ok){const e=await r.json().catch(()=>({}));alert('复制失败: '+(e.error||''));return}
+  await refreshServerContainers(PROFILE_STRUCT_IDS);
+  toast('方案已复制（用户与真实Key不复制）');
 }
 // 方案「测试」：服务端直接拿该方案的真实 Key 向上游发一个最小的 "hi" 请求，2xx 即算通。
 // 等待期间按钮要禁用并改成「测试中…」，无论成败都在 finally 里还原 —— 否则出错时按钮
@@ -965,7 +1041,11 @@ function applyProfileCode(){
 function clearProfileCode(){resetProfileCode();document.getElementById('profileCodePaste').focus()}
 async function saveDefaultGroup(group){
   const r=await fetch('/api/profile/default-group',{method:'POST',headers:csrfHeaders({'Content-Type':'application/json'}),body:JSON.stringify({group:group,protocol:'anthropic'})});
-  if(r.ok)toastThen('默认方案组已保存',()=>location.reload());else{const e=await r.json().catch(()=>({}));alert('保存失败: '+(e.error||''))}
+  if(!r.ok){const e=await r.json().catch(()=>({}));alert('保存失败: '+(e.error||''));return}
+  // 就地生效：组列表、组头、未加入方案的「＋ 加入」弹卡都从服务端重渲染；顺手关掉弹卡。
+  closeGroupAddPop();
+  await refreshServerContainers(GROUP_STRUCT_IDS);
+  toast('默认方案组已保存');
 }
 function currentDefaultGroupFromDom(){return Array.prototype.map.call(document.querySelectorAll('#defaultGroupList .group-item'),function(el){return el.dataset.name})}
 async function addToDefaultGroup(n){const g=currentDefaultGroupFromDom();if(!g.includes(n))g.push(n);saveDefaultGroup(g)}
@@ -973,7 +1053,10 @@ async function removeFromDefaultGroup(n){saveDefaultGroup(currentDefaultGroupFro
 async function moveDefaultGroup(n,d){const g=currentDefaultGroupFromDom();const i=g.indexOf(n);if(i<0)return;const j=i+d;if(j<0||j>=g.length)return;g.splice(i,1);g.splice(j,0,n);saveDefaultGroup(g)}
 async function saveResponsesGroup(group){
   const r=await fetch('/api/profile/default-group',{method:'POST',headers:csrfHeaders({'Content-Type':'application/json'}),body:JSON.stringify({group:group,protocol:'responses'})});
-  if(r.ok)toastThen('OpenAI 方案组已保存',()=>location.reload());else{const e=await r.json().catch(()=>({}));alert('保存失败: '+(e.error||''))}
+  if(!r.ok){const e=await r.json().catch(()=>({}));alert('保存失败: '+(e.error||''));return}
+  closeGroupAddPop();
+  await refreshServerContainers(GROUP_STRUCT_IDS);
+  toast('OpenAI 方案组已保存');
 }
 function currentResponsesGroupFromDom(){return Array.prototype.map.call(document.querySelectorAll('#responsesGroupList .group-item'),function(el){return el.dataset.name})}
 async function addToResponsesGroup(n){const g=currentResponsesGroupFromDom();if(!g.includes(n))g.push(n);saveResponsesGroup(g)}

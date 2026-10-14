@@ -20,7 +20,7 @@
 | Plan | 智谱 GLM / GLM Coding Plan | 5 小时窗口、周窗口、MCP 每月额度、账户余额 | API Key（国内站裸 Key / 国际站 Bearer，可选组织、项目 ID） | 私有（experimental） |
 | Plan | MiniMax | Token Plan 用量 | API Key | 私有（experimental） |
 | Plan | Claude 订阅（Claude Code） | 5 小时 / 7 天窗口用量 | OAuth Token（`sk-ant-oat…`，不是普通 API Key） | 私有（experimental） |
-| Plan | 阿里云百炼 Token Plan | **个人版**：套餐月额度已用 %、重置时间、Harness 权益用量；**席位制团队版**：席位数量、每类席位的 Credits 总量 / 剩余、逐席位（成员）剩余 | 控制台令牌（个人版，卡片页脚「一键获取令牌」；留空时自动读本机 `~/.bailian/config.json`）+ AccessKey ID / Secret（团队版席位，可复用「阿里云账户余额」那份） | 个人版走控制台网关；团队版走官方 OpenAPI（Model Studio 2026-02-10，ACS3-HMAC-SHA256） |
+| Plan | 阿里云百炼 Token Plan | **个人版**：套餐月额度已用 %、重置时间、Harness 权益用量；**席位制团队版**：席位数量、每类席位的 Credits 总量 / 剩余、逐席位（成员）剩余 | 控制台令牌（个人版，卡片页脚「一键获取令牌」；留空时自动读本机 `~/.bailian/config.json`，或给 AccessKey 加 `modelstudio:GenerateCLIAccessToken` 权限由平台自动换取 / 自动续期）+ AccessKey ID / Secret（团队版席位，可复用「阿里云账户余额」那份） | 个人版走控制台网关；团队版走官方 OpenAPI（Model Studio 2026-02-10，ACS3-HMAC-SHA256） |
 | Plan | OpenCode Go / Go Plus | 5 小时（rolling）/ 每周 / 每月三个窗口的已用百分比与重置时间 | Go 套餐 API Key；**留空则自动读本机** `~/.local/share/opencode/auth.json` 的登录态 | 官方 `GET /zen/go/v1/usage`（2026-08-11 起） |
 | 余额 | DeepSeek | 总余额（赠金 + 充值） | API Key | 官方 `GET /user/balance` |
 | 余额 | 阶跃星辰 StepFun | 预付费账户可用余额 | API Key | 官方 `GET /v1/accounts`（Step Plan 套餐额度只在控制台） |
@@ -189,24 +189,43 @@ percent = round(per1MonthPercentage × 10000) / 100      # per1MonthPercentage �
 
 **怎么拿控制台令牌**（只需一次，浏览器里点一下）：
 
-1. **面板里点一下就行**（推荐，不用装任何东西）：设置页 → 上游额度 → **阿里云百炼 Token Plan** 卡片页脚点「**一键获取令牌**」→ 浏览器弹出百炼控制台的授权页（已登录就点一下授权）→ 令牌自动回填到「控制台令牌」格里，卡片随即开始读数。
+1. **面板里点一下就行**（推荐）：设置页 → 上游额度 → **阿里云百炼 Token Plan** 卡片页脚点「**一键获取令牌**」→ 浏览器弹出百炼控制台的授权页（已登录就点一下授权）→ 令牌自动回填到「控制台令牌」格里，卡片随即开始读数。
 
-   原理与官方 CLI 完全一样：面板在本机 `127.0.0.1` 上开一个**一次性**回调端口（只用 5 分钟，拿到令牌就关），把控制台的 `/console-login` 授权页打开，页面把 `access_token` POST 回来，面板直接写进自己的配置（**不依赖 `~/.bailian`，也不读你的浏览器数据**）。回调只认本次随机生成的 `state`，`state` 不对一律 400。
-2. **CLI 路线**：本机装过 Node 的话也可以直接跑（首次会先下载 CLI）：
+   原理与官方 CLI 一样：面板生成一次性随机 `state`，把回调地址写成**你浏览器正在访问的这个面板地址**（`http://<你看到的地址>/?state=<state>`），然后打开控制台的 `/console-login` 授权页；页面把 `access_token` POST 回这个地址，面板校验 `state` 后直接写进自己的配置（**不依赖 `~/.bailian`，也不读你的浏览器数据**）。回调只认本次的 `state`（不对一律 400），会话只在内存里、10 分钟自动清掉。
+
+   ⚠️ 这条要求**浏览器能访问面板这个地址**：浏览器开 `http://127.0.0.1:6789`（面板在本机，或经 SSH 隧道转发）时正常；浏览器开 `http://<局域网/公网 IP>:6789` 时，https 的控制台页面发来的回调会被浏览器按**混合内容**拦掉 → 用下面第 2 / 3 条。
+2. **面板在服务器上、又没给 RAM 权限**：在**你自己的电脑**上跑仓库里的自取脚本，它把令牌打印出来，你粘到「控制台令牌」格：
 
    ```bash
-   npx -y bailian-cli auth login --console
+   node tools/bailian-console-login.mjs            # 国内站；国际站加 --intl，不想自动开浏览器加 --no-open
    ```
 
-   它会打开同一个授权页，令牌落到 `~/.bailian/config.json` 的 `access_token`。**之后不用再管**：平台的「控制台令牌」留空时会自动读这个文件。
-3. **纯手工路线**（不想让面板开端口时）：自己复刻上面那条回调（本机监听 `127.0.0.1:<端口>` + 打开 `https://bailian.console.aliyun.com/console-login?notice=127.0.0.1:<端口>?state=<state>`），把拿到的那串（36 位左右）粘到「**控制台令牌**」格里（密码型输入框，只存在本机 `config.json`，快照接口不回传）。
-4. 想换账号 / 换区域：`BAILIAN_CONFIG_DIR` 可以指定另一个配置目录；设置页的「控制台区域」默认 `cn-beijing`，海外站填 `ap-southeast-1`。
+   它在你本机 `127.0.0.1` 开一次性回调端口（15 分钟），拿到令牌直接打印，不依赖面板、不依赖 CLI。
+3. **用完就忘的自动路线**：给这把 AccessKey 对应的 RAM 用户加 `modelstudio:GenerateCLIAccessToken` 权限后，平台会用官方那条 OpenAPI **自动换一条新令牌**；令牌过期时（网关回 `NotLogined`）也会自动换一条再查一次，你基本不用再管。缺这个权限点时卡片红字会直接写明缺哪个权限点（实测默认那把子账号就是 403 `AccessDenied`）。
+
+   ```text
+   POST https://modelstudio.cn-beijing.aliyuncs.com/modelstudio/cli/generateAccessToken
+        # 国际站换 modelstudio.ap-southeast-1.aliyuncs.com；ACS3-HMAC-SHA256 签名，无请求体
+   → { "cliAccessToken": "<36 位左右的令牌>" }
+   ```
+4. **CLI 路线**：本机跑 `npx -y bailian-cli auth login --console`，令牌落到 `~/.bailian/config.json` 的 `access_token`。平台的「控制台令牌」留空时会自动读这个文件。
+5. **纯手工路线**：把拿到的 `access_token`（36 位左右）粘进「**控制台令牌**」格（密码型输入框，只存在本机 `config.json`，快照接口不回传）。
+6. 想换账号 / 换区域：`BAILIAN_CONFIG_DIR` 可以指定另一个配置目录；设置页的「控制台区域」默认 `cn-beijing`，海外站填 `ap-southeast-1`。
+
+**部署在 Linux 服务器上，能用「一键获取令牌」吗？** 取决于你从哪访问面板：
+
+| 你怎么访问面板 | 一键获取令牌 | 走哪条 |
+|---|---|---|
+| 浏览器开 `http://127.0.0.1:6789`（面板就在本机） | ✅ 能 | 第 1 条 |
+| `ssh -L 6789:127.0.0.1:6789 user@服务器` 后浏览器开 `http://127.0.0.1:6789` | ✅ 能（回调经隧道回到你本机） | 第 1 条 |
+| 浏览器开 `http://<服务器IP>:6789` | ❌ 不行（混合内容：https 授权页 → http 局域网地址） | 第 2 条（自己电脑上跑脚本）或第 3 条（加 RAM 权限，最省事） |
+| 服务器上没浏览器 / 无人值守 | — | 第 3 条（配一次权限点，之后全自动） |
 
 实测：浏览器里点一下授权就拿到令牌，接口随即返回真实数字（`per1MonthPercentage` 驱动「套餐月额度」）。
 
 > ⚠️ 自己看这个数字的位置：控制台 → **Token Plan → 我的订阅**（国内站 `bailian.console.aliyun.com/cn-beijing/subscription/token-plan`，国际站 `modelstudio.console.alibabacloud.com/ap-southeast-1/subscription/token-plan`）。
 > ⚠️ 控制台令牌按**个人账号**签发，看到的月额度就是这个账号的；它是控制台登录态，**权限比 AccessKey 大**，别再填到别处或分享出去。
-> ⚠️ 令牌**是控制台登录态，会过期**（不是永久凭据，本地也不存过期时间）：失效后网关回 `NotLogined`，界面提示「控制台令牌已失效或被拒绝」，按上面第 1 / 2 步重取一次即可。官方另有一条「用 AK/SK 换令牌」的路（OpenAPI `GenerateCLIAccessToken`，RAM 权限点 `modelstudio:GenerateCLIAccessToken`）可以用来自动续期，本平台暂未实现 —— 当前默认那把 AccessKey 是 RAM 子账号，缺这个权限点（实测 403 `AccessDenied`）。
+> ⚠️ 令牌**是控制台登录态，会过期**（不是永久凭据，官方 CLI 也不存过期时间）：失效后网关回 `NotLogined`，界面提示「控制台令牌已失效或被拒绝」，按上面第 1 / 2 / 3 条任意一条重取即可。想彻底免手工就配第 3 条（`modelstudio:GenerateCLIAccessToken` 权限点），之后过期会自动换新。
 
 > ⚠️ 凭据以**明文**存在 `config.json` 的 `upstreamQuota` 里（与 SMTP 密码、webhook 密钥同一套处理方式），靠设置页的密码门保护；查询结果的快照接口不回传密钥，页脚只显示**末 4 位**。给云平台配 Key 时，建议单开一个只带下述只读权限的 RAM/子账号：
 > - 阿里云账户余额：`QueryAccountBalance`，RAM 权限点写作 `bss:DescribeAcccount`（注意是**双 c**）
@@ -250,8 +269,9 @@ percent = round(per1MonthPercentage × 10000) / 100      # per1MonthPercentage �
 | 火山三个接口都 `HTTP 401` + `SignatureDoesNotMatch` | AK/SK 抄错或不成对（AK 应是 `AKLT` 开头，SK 一长串以 `=` 结尾），换成火山控制台「访问密钥」里的值 |
 | 阿里云 `Code: NotAuthorized / This API is not authorized for caller` | AK/SK 本身有效，但该 RAM 用户**没有 BSS 权限**：给它加 `AliyunBSSReadOnlyAccess` 或权限点 `bss:DescribeAcccount`（注意双 c） |
 | 百炼 Token Plan `HTTP 403` + `AccessDeniedDetail.AuthAction: modelstudio:GetSubscriptionStats` | 签名没问题，是 RAM 子账号缺这个权限点。官方口径（[Token Plan 个人版常见问题](https://help.aliyun.com/zh/model-studio/token-plan-personal-faq)）是给 RAM 用户挂 `AliyunTokenPlanReadOnlyAccess`（只读）或 `AliyunTokenPlanFullAccess`，**再挂 `AliyunBSSReadOnlyAccess`**，然后到控制台「账号管理」里给它分配管理员 / 订阅套餐权限。**但个人版套餐本来就没有席位**，加了权限也只会拿到空数据 —— 个人版请按下面一行配控制台令牌 |
-| 百炼 Token Plan 红字「读不到数据：…只能靠控制台令牌读取…」 | 这是**个人版套餐**（控制台「订阅」页有「套餐额度 / 月额度已用 x%」那种）。AccessKey 查的是席位制团队版接口，个人版拿不到。在卡片页脚点「一键获取令牌」（浏览器里点一下授权，令牌自动回填）；也可以跑一次 `npx -y bailian-cli auth login --console`，或自己拿 `access_token` 粘到「控制台令牌」格里 |
-| 百炼 Token Plan 提示 `NotLogined` / 「控制台令牌已失效或被拒绝」 | 控制台令牌过期或被撤销：在卡片页脚再点一次「一键获取令牌」即可（或 `npx -y bailian-cli auth login --console`），新令牌会覆盖「控制台令牌」格（留空时平台会重读 `~/.bailian/config.json`），然后点「刷新全部」 |
+| 百炼 Token Plan 红字「读不到数据：…只能靠控制台令牌读取…」 | 这是**个人版套餐**（控制台「订阅」页有「套餐额度 / 月额度已用 x%」那种）。三条路任选：①卡片页脚「一键获取令牌」（浏览器能访问面板地址时）；②在自己电脑上跑 `node tools/bailian-console-login.mjs` 拿令牌粘进来（面板在服务器上、浏览器开的是 IP 时用这条）；③给 AccessKey 加 `modelstudio:GenerateCLIAccessToken` 权限，平台自动换取 |
+| 百炼 Token Plan 提示 `NotLogined` / 「控制台令牌已失效或被拒绝」 | 控制台令牌过期或被撤销：再点一次「一键获取令牌」（或按上面三条路的任意一条重取）。配了第 3 条权限点的话，平台会自动换新令牌重试一次，仍失败才会提示 |
+| 百炼 Token Plan 点「一键获取令牌」后一直「等待授权」 | 回调回不到面板：浏览器必须能访问**面板这个地址**（本机 `127.0.0.1` 或 SSH 隧道都行）。面板开在服务器上、浏览器用 `http://<服务器IP>:6789` 访问时，https 授权页发的回调会被浏览器按混合内容拦掉 —— 改用 `ssh -L 6789:127.0.0.1:6789` 隧道访问，或在自己电脑上跑 `node tools/bailian-console-login.mjs` 拿令牌 |
 | 百炼 Token Plan 只有 Harness 权益、没有「套餐月额度」 | 该账号没有月额度上限（或额度还没发放，官方说发放比购买晚几分钟）：卡片会给一条说明而不是显示成 0% |
 | 腾讯云 `未配置 AccessKey ID / Secret` | 云平台必须手填 SecretId / SecretKey，不能靠「自动复用方案密钥」（方案里的 Key 是推理 Key） |
 | 硅基流动在设置页只有「控制台」、不给查询 | 官方 `/v1/user/info` 已下线（410 + code 20092），替代接口未公布，所以本工具只给控制台入口；余额请去 [控制台「余额充值」](https://cloud.siliconflow.cn/account/charge) 看。官方公布新接口后会恢复 |

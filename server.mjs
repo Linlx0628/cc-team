@@ -42,7 +42,9 @@ import { createSessionsReader } from "./lib/sessions.mjs";
 import { createNotifier } from "./lib/notifier.mjs";
 import { createPersistence } from "./lib/persistence.mjs";
 import { createUpstreamQuotaService, providerDef } from "./lib/upstream-quota.mjs";
-import { startBailianConsoleLogin } from "./lib/bailian-console-login.mjs";
+import {
+  bailianConsoleLoginUrl, bailianConsoleOrigin, extractBailianConsoleCredentials, BAILIAN_CALLBACK_CORS,
+} from "./lib/bailian-console-login.mjs";
 import { createMemberRewards } from "./lib/member-rewards.mjs";
 import { getApiKey, makeClientAbortError, isClientAbortError, createClientAbortState, markClientAborted, addClientAbortListener, setActiveUpstreamRequest, throwIfClientAborted, sleepWithClientAbort, jitter, buildUpstreamPath, extractClientSignal, noteUploadBudget, uploadBudgetExceeded } from "./lib/proxy-helpers.mjs";
 import { createVisionBridge } from "./lib/vision-bridge.mjs";
@@ -1053,17 +1055,14 @@ const removedOpenAIUserKeys = new Set();
 const UPSTREAM_QUOTA_META_KEY = "upstreamQuotaCache";
 let upstreamQuotaApiSvc = null;
 
-// 阿里云百炼「一键获取控制台令牌」的授权会话：state → { id, marker, session, status, error }
+// 阿里云百炼「一键获取控制台令牌」的授权会话：state → { id, def, marker, status, error, createdAt }
 // 一次性、内存里存（重启即失效），start 时顺手清掉 10 分钟前的陈货。
 const bailianConsoleLogins = new Map();
 const BAILIAN_LOGIN_TTL_MS = 10 * 60 * 1000;
 
 function sweepBailianConsoleLogins(now = Date.now()) {
   for (const [state, rec] of bailianConsoleLogins) {
-    if (now - rec.createdAt > BAILIAN_LOGIN_TTL_MS) {
-      try { rec.session.close(); } catch { /* 已关闭 */ }
-      bailianConsoleLogins.delete(state);
-    }
+    if (now - rec.createdAt > BAILIAN_LOGIN_TTL_MS) bailianConsoleLogins.delete(state);
   }
 }
 
@@ -1073,6 +1072,19 @@ function consoleLoginMarker(def) {
     ? def.extraFields.find((f) => f && f.consoleLogin)
     : null;
   return marker && marker.consoleLogin && marker.consoleLogin.kind === "bailian" ? marker : null;
+}
+
+// 把控制台授权拿到的令牌写进配置（回调与将来任何取令牌的路径共用）。
+function applyBailianConsoleToken(rec, creds) {
+  const now = upstreamQuotaApi().cfg();
+  const providers = { ...now.providers };
+  const p = providers[rec.id] || {};
+  const extraNext = { ...(p.extra || {}), [rec.marker.field]: creds.token };
+  if (creds.region && rec.marker.regionField) extraNext[rec.marker.regionField] = creds.region;
+  if (creds.site) extraNext.consoleSite = creds.site;
+  providers[rec.id] = { ...p, extra: extraNext };
+  upstreamQuotaApi().save({ ...now, providers });
+  rec.status = "saved";
 }
 
 function upstreamQuotaApi() {
@@ -4278,6 +4290,55 @@ const server = http.createServer((req, res) => {
     installApiGzip(req, res);
   }
 
+  // 阿里云百炼控制台授权回调：控制台的 /console-login 页把 access_token POST 回
+  // 「一键获取令牌」给出的那个地址 —— 也就是本面板自己（与官方 CLI 的本地回调同款契约）。
+  // 安全性靠一次性随机 state：**故意不校验登录态**（控制台页面没有本平台的 cookie），
+  // 且按 state 认领请求（官方 CLI 的监听器同样不挑路径，回调路径也可能是 `/`）。
+  if (req.method === "POST" || req.method === "OPTIONS") {
+    let cbState = "";
+    try { cbState = new URL(req.url || "/", "http://localhost").searchParams.get("state") || ""; } catch { cbState = ""; }
+    const cbRec = cbState ? bailianConsoleLogins.get(cbState) : null;
+    if (cbState && !cbRec) {
+      // 带 state 但不是我们发出去的活会话（伪造 / 已过期 / 重启前发的）：照官方 CLI 的监听器回 400。
+      res.writeHead(400, { ...BAILIAN_CALLBACK_CORS, "Content-Type": "text/plain; charset=utf-8" });
+      res.end("bad state\n");
+      return;
+    }
+    if (cbRec) {
+      const text = (status, body) => {
+        res.writeHead(status, { ...BAILIAN_CALLBACK_CORS, "Content-Type": "text/plain; charset=utf-8" });
+        res.end(body);
+      };
+      if (req.method === "OPTIONS") {
+        res.writeHead(204, BAILIAN_CALLBACK_CORS);
+        res.end();
+        return;
+      }
+      readBody(req, 64 * 1024).then((buf) => {
+        let creds = {};
+        try {
+          creds = extractBailianConsoleCredentials({
+            url: req.url, contentType: req.headers["content-type"] || "", body: buf.toString("utf8"),
+          });
+        } catch { creds = {}; }
+        if (!creds.token) { text(400, "missing access_token\n"); return; }
+        try {
+          applyBailianConsoleToken(cbRec, creds);
+          recordAdminAudit(req, "upstreamQuota.consoleLogin", "上游额度",
+            `${(cbRec.def && cbRec.def.name) || cbRec.id}：通过浏览器授权更新了控制台令牌`);
+          // 顺手拉一次，用户切回「上游额度」就能看到新数据（失败也无所谓，界面会自己再刷）。
+          upstreamQuotaApi().providerSnapshot(cbRec.id, { force: true }).catch(() => {});
+          text(200, "OK\n");
+        } catch (err) {
+          cbRec.status = "error";
+          cbRec.error = err.message;
+          text(500, "Failed to save credentials\n");
+        }
+      }).catch(() => { text(400, "bad request\n"); });
+      return;
+    }
+  }
+
   // 静态页面资源（settings.js 等纯浏览器代码，不含密钥或按请求数据，无需鉴权）。
   // CSP 的 script-src/style-src 'self' 已覆盖；?v= 是内容哈希，改文件后引用 URL 随
   // 重启变化，故可放心强缓存一周。
@@ -4500,39 +4561,18 @@ const server = http.createServer((req, res) => {
         const cfg = upstreamQuotaApi().cfg();
         const extra = (cfg.providers[id] && cfg.providers[id].extra) || {};
         const site = String(extra.consoleSite || "domestic").trim() || "domestic";
-        const session = await startBailianConsoleLogin({ site, timeoutMs: 5 * 60 * 1000 });
-        const rec = {
-          id, def, marker: field.consoleLogin, session,
-          status: "pending", error: null, createdAt: Date.now(),
-        };
-        bailianConsoleLogins.set(session.state, rec);
-        session.done.then((creds) => {
-          const cur = bailianConsoleLogins.get(session.state);
-          if (!cur) return;
-          try {
-            const now = upstreamQuotaApi().cfg();
-            const providers = { ...now.providers };
-            const p = providers[id] || {};
-            const extraNext = { ...(p.extra || {}), [cur.marker.field]: creds.token };
-            if (creds.region && cur.marker.regionField) extraNext[cur.marker.regionField] = creds.region;
-            if (creds.site) extraNext.consoleSite = creds.site;
-            providers[id] = { ...p, extra: extraNext };
-            upstreamQuotaApi().save({ ...now, providers });
-            cur.status = "saved";
-            recordAdminAudit(req, "upstreamQuota.consoleLogin", "上游额度", `${def.name}：通过浏览器授权更新了控制台令牌`);
-            // 顺手拉一次，用户切回「上游额度」就能看到新卡片数据（失败也无所谓，界面会自己再刷）。
-            upstreamQuotaApi().providerSnapshot(id, { force: true }).catch(() => {});
-          } catch (err) {
-            cur.status = "error";
-            cur.error = err.message;
-          }
-        }).catch((err) => {
-          const cur = bailianConsoleLogins.get(session.state);
-          if (cur && cur.status === "pending") { cur.status = "error"; cur.error = err.message; }
+        // 回调地址就用浏览器正在访问的这个地址（Host 头）：本机、SSH 隧道都自动适配，
+        // 回调由上面那个 /console-callback 分支按 state 认领。
+        const hostHeader = String(req.headers.host || "").trim() || `127.0.0.1:${req.socket.localPort}`;
+        const state = crypto.randomBytes(16).toString("hex");
+        const url = bailianConsoleLoginUrl({ origin: bailianConsoleOrigin(site), notice: hostHeader, state });
+        bailianConsoleLogins.set(state, {
+          id, def, marker: field.consoleLogin, status: "pending", error: null,
+          createdAt: Date.now(), notice: hostHeader, site,
         });
         sendJson(res, {
-          ok: true, state: session.state, url: session.url, port: session.port,
-          expiresInMs: 5 * 60 * 1000, field: field.key,
+          ok: true, state, url, notice: hostHeader,
+          expiresInMs: BAILIAN_LOGIN_TTL_MS, field: field.key,
         }, req);
       } catch (err) {
         res.writeHead(500, { "Content-Type": "application/json" });

@@ -1064,9 +1064,11 @@
   }
 
   // 一键获取控制台令牌（阿里云百炼）：
-  //   服务端在本机 127.0.0.1 起一次性回调端口 → 打开百炼控制台的授权页 → 控制台把
-  //   access_token POST 回来 → 服务端写进本平台的「控制台令牌」→ 这里轮询到 saved 后
-  //   把输入框填上并立刻查一次。等价于官方 CLI 的 auth login --console，但不用装 CLI。
+  //   服务端生成一次性 state，把「授权回调地址」写成浏览器正在访问的这个地址（Host 头）→
+  //   打开百炼控制台的授权页 → 控制台把 access_token POST 回本面板 → 服务端写进
+  //   本平台的「控制台令牌」→ 这里轮询到 saved 后把输入框填上并立刻查一次。
+  //   等价于官方 CLI 的 auth login --console，但不用装 CLI；本机访问、SSH 隧道都直接可用
+  //   （面板是 http 的局域网 IP 时，浏览器会拦下 https 控制台页面发来的回调，改用 AK/SK 自动换取或手动粘贴）。
   async function consoleLogin(id, fieldKey, btn) {
     const card = document.querySelector('#uqCfgBody .uq-cfg[data-id="' + id + '"]');
     const msg = card && card.querySelector("[data-console-msg]");
@@ -1099,7 +1101,8 @@
         if (p.status === "error") throw new Error(p.error || "授权失败");
         if (p.status === "expired") throw new Error(p.error || "授权会话已过期，请重新点「一键获取令牌」");
       }
-      throw new Error("等待授权超时，请重新点「一键获取令牌」");
+      throw new Error("等待授权超时。请确认浏览器能打开本面板这个地址（本机 127.0.0.1，或 SSH 隧道转发到 127.0.0.1）；"
+        + "服务器上没有浏览器时，可给 AccessKey 加 modelstudio:GenerateCLIAccessToken 权限让平台自动换取，或手动粘贴令牌");
     } catch (err) {
       say(err.message || String(err), "alarm");
       setStatus("获取令牌失败：" + clip(err.message || String(err), 60), "err");

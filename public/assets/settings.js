@@ -1516,10 +1516,17 @@ function schedGroupCardHtml(proto,gi,name,members){
   const rows=members.length?members.map(function(m,mi){
     const p=schedProfileByName(m);
     const nav=function(label,d,dis){return '<button type="button" class="btn btn-outline btn-sm" onclick="scheduleMoveMember(\''+proto+'\','+gi+','+mi+','+d+')"'+(dis?' disabled':'')+'>'+label+'</button>'};
-    return '<div class="group-item" data-name="'+h(m)+'" style="display:flex;align-items:center;gap:8px;padding:5px 8px;border:1px solid var(--border);border-radius:6px;margin-bottom:5px">'
+    // 每一行都可以按住拖动排序；不想拖的用「置顶」一键挪到组头（+↑/↓ 微调）。
+    return '<div class="group-item sched-row" draggable="true" data-mi="'+mi+'"'
+      +' ondragstart="schedDragStart(event,'+mi+')" ondragover="schedDragOver(event,'+mi+')"'
+      +' ondrop="schedDrop(event,'+mi+')" ondragend="schedDragEnd()"'
+      +' title="按住这一行拖动可调整顺序（也可以点「置顶」直接挪到第一位）"'
+      +' style="display:flex;align-items:center;gap:8px;padding:5px 8px;border:1px solid var(--border);border-radius:6px;margin-bottom:5px">'
+      +'<span class="sched-grip" aria-hidden="true">⋮⋮</span>'
       +'<span style="color:var(--blue);font-weight:600;min-width:20px">'+(mi+1)+'</span>'
       +'<span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+h(m)+' <span style="color:var(--dim);font-size:11px">'+h(schedBillingLabel(p))+'</span></span>'
       +nav('↑',-1,mi===0)+nav('↓',1,mi===members.length-1)
+      +'<button type="button" class="btn btn-outline btn-sm" onclick="scheduleMoveMemberTo(\''+proto+'\','+gi+','+mi+',0)"'+(mi===0?' disabled':'')+' title="移到第一位（组头）">置顶</button>'
       +'<button type="button" class="btn btn-outline btn-sm" onclick="scheduleRemoveMember(\''+proto+'\','+gi+','+mi+')">移出</button></div>';
   }).join(''):'<div class="note" style="margin:0 0 6px;color:var(--orange)">此组没有有效成员 —— 命中它的规则会被跳过（继续往下找），侧栏基础组不受影响。</div>';
   const addable=schedProfilesOf(proto).map(function(p){return p.name}).filter(function(n){return members.indexOf(n)<0});
@@ -1530,7 +1537,7 @@ function schedGroupCardHtml(proto,gi,name,members){
     ?'<select data-sadd style="'+SCHED_SEL_STYLE+'">'+schedOpts(addable,'')+'</select>'
       +'<button type="button" class="btn btn-outline btn-sm" onclick="scheduleAddMember(\''+proto+'\','+gi+')">加入</button>'
     :'<span class="note" style="margin:0">'+noneLeft+'</span>';
-  return '<div data-sgi="'+gi+'" style="border:1px solid var(--border);border-radius:6px;padding:10px 12px;margin-bottom:10px;background:var(--surface)">'
+  return '<div data-sgi="'+gi+'" data-proto="'+h(proto)+'" style="border:1px solid var(--border);border-radius:6px;padding:10px 12px;margin-bottom:10px;background:var(--surface)">'
     +'<div style="display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap;margin-bottom:8px">'
     +'<div style="min-width:0"><b style="font-size:13px">'+h(name)+'</b> <span class="note" style="margin:0">'+members.length+' 个方案'+(members.length?' · 组头 '+h(members[0]):'')+'</span></div>'
     +'<div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap">'+addRow
@@ -1644,12 +1651,67 @@ function scheduleMoveMember(proto,gi,mi,d){
   const members=name?(schedGroups[proto][name]||[]):[];
   const j=mi+d;
   if(!name||j<0||j>=members.length)return;
-  const next=schedCopyGroups(proto);
-  const arr=next[name];
-  const x=arr.splice(mi,1)[0];
-  arr.splice(j,0,x);
-  schedSaveGroups(proto,next,'方案组「'+name+'」顺序已更新');
+  scheduleMoveMemberTo(proto,gi,mi,j);
 }
+// 把第 from 项挪到第 to 项（0 = 组头）。「置顶」按钮与拖动排序都走这里，保证两种操作同一条保存路径。
+function schedReorderList(arr,from,to){
+  const a=arr.slice();
+  const x=a.splice(from,1)[0];
+  a.splice(to,0,x);
+  return a;
+}
+// 拖动落点的目标下标：over 是鼠标所在行，after 表示落在该行下半部分（= 插到它后面）。
+function schedDropTargetIndex(from,over,after){
+  const to=after?over+1:over;
+  // 往后拖时目标下标要 -1：源项先被摘掉，后面的项整体前移一位。
+  return to>from?to-1:to;
+}
+function scheduleMoveMemberTo(proto,gi,from,to){
+  const name=Object.keys(schedGroups[proto]||{})[gi];
+  const members=name?(schedGroups[proto][name]||[]):[];
+  if(!name||from<0||from>=members.length)return;
+  const j=Math.max(0,Math.min(members.length-1,to));
+  if(j===from)return;
+  const next=schedCopyGroups(proto);
+  const arr=schedReorderList(next[name],from,j);
+  next[name]=arr;
+  schedSaveGroups(proto,next,'方案组「'+name+'」顺序已更新（'+members[from]+' → 第 '+(j+1)+' 位）');
+}
+// ── 拖动排序（HTML5 drag & drop；不用拖也能用「置顶」+↑/↓）──
+var schedDrag=null;
+function schedClearDropMarks(){
+  Array.prototype.forEach.call(document.querySelectorAll('.sched-row'),function(el){
+    el.classList.remove('dragging','drop-before','drop-after');
+  });
+}
+function schedDragStart(ev,mi){
+  const row=ev.currentTarget;
+  const card=row&&row.closest?row.closest('[data-sgi]'):null;
+  if(!card)return;
+  schedDrag={proto:card.getAttribute('data-proto'),gi:Number(card.getAttribute('data-sgi')),from:mi};
+  row.classList.add('dragging');
+  try{ev.dataTransfer.effectAllowed='move';ev.dataTransfer.setData('text/plain',String(mi))}catch(e){}
+}
+function schedDragOver(ev,mi){
+  if(!schedDrag)return;
+  ev.preventDefault();
+  try{ev.dataTransfer.dropEffect='move'}catch(e){}
+  const row=ev.currentTarget,box=row.getBoundingClientRect();
+  const after=(ev.clientY-box.top)>box.height/2;
+  schedClearDropMarks();
+  row.classList.add(after?'drop-after':'drop-before');
+}
+function schedDrop(ev,mi){
+  if(!schedDrag)return;
+  ev.preventDefault();
+  const row=ev.currentTarget,box=row.getBoundingClientRect();
+  const after=(ev.clientY-box.top)>box.height/2;
+  const st=schedDrag;
+  schedDrag=null;
+  schedClearDropMarks();
+  scheduleMoveMemberTo(st.proto,st.gi,st.from,schedDropTargetIndex(st.from,mi,after));
+}
+function schedDragEnd(){schedDrag=null;schedClearDropMarks()}
 // ── 时间规则 ──
 function renderScheduleRules(proto,rules){
   const box=document.getElementById('schedRules-'+proto);

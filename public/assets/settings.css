@@ -130,3 +130,11 @@ td{padding:8px;border-bottom:1px solid #ecece8;font-size:12px}
 .notify-user-check{display:flex;align-items:center;gap:7px;font-size:12px;cursor:pointer;margin:0;white-space:nowrap;overflow:hidden}
 .notify-user-check input{width:auto;accent-color:var(--accent);margin:0;flex:none;cursor:pointer}
 .notify-user-check code{font-size:10px;color:var(--dim);overflow:hidden;text-overflow:ellipsis}
+
+/* 方案组调度:成员行拖动排序(拖动只是快捷方式,「置顶」+↑/↓ 按钮是等效的兜底) */
+.sched-row{cursor:grab}
+.sched-row:active{cursor:grabbing}
+.sched-row.dragging{opacity:.45}
+.sched-row.drop-before{box-shadow:0 -2px 0 0 var(--blue)}
+.sched-row.drop-after{box-shadow:0 2px 0 0 var(--blue)}
+.sched-grip{color:var(--dim2);letter-spacing:-2px;user-select:none;flex:none}

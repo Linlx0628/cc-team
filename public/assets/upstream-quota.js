@@ -63,6 +63,9 @@
       ".uq-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(236px,1fr));gap:10px;align-items:start;align-content:start;grid-auto-flow:dense}",
       // 条目多的卡（>=5 项）横着占满整行，内部再按列自动分栏：一张长卡不会把整段的行高撑歪。
       ".uq-card.wide{grid-column:1/-1}",
+      // 宽卡（多列）内部再按列自动分栏；wide-tail 让它在同段里排到最后 —— 单列卡优先在上面/前面，
+      // 多列卡一律在下面（用户 2026-10-14 明确要求）。告警/失败的宽卡不挪位，免得要紧的红卡被压到底部。
+      ".uq-card.wide-tail{order:1}",
       ".uq-card.wide .uq-body{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:0 18px;align-content:start}",
       // 套餐信息行（规格 · 生效中 · 到期 …）
       ".uq-plan{margin:4px 0 0;font-size:10.5px;color:var(--dim2);font-variant-numeric:tabular-nums}",
@@ -414,7 +417,9 @@
     // 条目多的卡（比如阿里云百炼：月额度 + 7 项 Harness 权益）横着铺开占满一整行，
     // 内部再按列自动分栏 —— 否则一张卡会拉得特别长，把整段的行高都撑歪。
     const wide = items.length >= 5;
+    const alarming = st.key === "alert" || st.key === "failed" || !!p.alert;
     const cls = "uq-card" + (wide ? " wide" : "")
+      + (wide && !alarming ? " wide-tail" : "")
       + (st.key === "alert" || st.key === "failed" ? " alarm" : (p.alert ? " warn" : ""));
     return '<div class="' + cls + '" data-id="' + attr(p.id) + '">'
       + '<div class="uq-card-hd">'

@@ -314,14 +314,16 @@ function showProfileSettings(){
   const cr=document.getElementById('codeReviewView');
   const um=document.getElementById('userManageView');
   const nm=document.getElementById('notifyManageView');
+  // 上游额度也是二级视图。任何「切回主设置表单」的路径都要把它一起藏掉,否则两个视图叠着。
+  const uq=document.getElementById('upstreamQuotaView');
   form.hidden=false;
-  [view,audit,pool,qr,sched,cr,um,nm].forEach(function(el){if(el){el.hidden=true;el.setAttribute('aria-hidden','true')}});
-  ['dataManagementNav','auditLogNav','quotaPoolNav','quotaRequestNav','planScheduleNav','codeReviewNav','userManageNav','notifyManageNav'].forEach(function(id){
+  [view,audit,pool,qr,sched,cr,um,nm,uq].forEach(function(el){if(el){el.hidden=true;el.setAttribute('aria-hidden','true')}});
+  ['dataManagementNav','auditLogNav','quotaPoolNav','quotaRequestNav','planScheduleNav','codeReviewNav','userManageNav','notifyManageNav','upstreamQuotaNav'].forEach(function(id){
     const el=document.getElementById(id);if(el)el.classList.remove('active');
   });
 }
 function hideAllSecondaryViews(){
-  const cr=document.getElementById('codeReviewView'),dm=document.getElementById('dataManagementView'),audit=document.getElementById('auditLogView'),pool=document.getElementById('quotaPoolView'),qr=document.getElementById('quotaRequestView'),sched=document.getElementById('planScheduleView'),um=document.getElementById('userManageView'),nm=document.getElementById('notifyManageView');
+  const cr=document.getElementById('codeReviewView'),dm=document.getElementById('dataManagementView'),audit=document.getElementById('auditLogView'),pool=document.getElementById('quotaPoolView'),qr=document.getElementById('quotaRequestView'),sched=document.getElementById('planScheduleView'),um=document.getElementById('userManageView'),nm=document.getElementById('notifyManageView'),uq=document.getElementById('upstreamQuotaView');
   dm.hidden=true;dm.setAttribute('aria-hidden','true');
   audit.hidden=true;audit.setAttribute('aria-hidden','true');
   if(pool){pool.hidden=true;pool.setAttribute('aria-hidden','true')}
@@ -330,9 +332,10 @@ function hideAllSecondaryViews(){
   if(cr){cr.hidden=true;cr.setAttribute('aria-hidden','true')}
   if(um){um.hidden=true;um.setAttribute('aria-hidden','true')}
   if(nm){nm.hidden=true;nm.setAttribute('aria-hidden','true')}
+  if(uq){uq.hidden=true;uq.setAttribute('aria-hidden','true')}
   document.querySelectorAll('.pl-item').forEach(function(el){el.classList.remove('active')});
   // Nav buttons live outside .pl-item now, so clear their highlight explicitly.
-  ['quotaPoolNav','dataManagementNav','auditLogNav','quotaRequestNav','planScheduleNav','codeReviewNav','userManageNav','notifyManageNav'].forEach(function(id){
+  ['quotaPoolNav','dataManagementNav','auditLogNav','quotaRequestNav','planScheduleNav','codeReviewNav','userManageNav','notifyManageNav','upstreamQuotaNav'].forEach(function(id){
     const el=document.getElementById(id);
     if(el)el.classList.remove('active');
   });

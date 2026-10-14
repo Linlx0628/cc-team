@@ -13,7 +13,7 @@ const todayBJ=()=>new Date(Date.now()+8*36e5).toISOString().slice(0,10);
 let activeWorkspaceTab="overview";
 // 菜单顺序,与侧栏按钮一一对应;id 由 setWorkspaceTab 按 'workspace-tab-'+s 硬拼 ——
 // 增删菜单必须与 lib/pages.mjs 的按钮和面板同时改,否则切换会静默失效。
-const SECTIONS=['overview','users','clients','detail','profiles','rates','errors','production','sessions','costs','review'];
+const SECTIONS=['overview','upstream','users','clients','detail','profiles','rates','errors','production','sessions','costs','review'];
 
 // ── 按菜单懒加载 ─────────────────────────────────────────────────────────────
 // 点哪个菜单才查哪个菜单的数据:别为了一张错误表去跑 dailyModels/dailyClients 那几张
@@ -23,6 +23,7 @@ const SECTION_SOURCE={
   overview:"overview", users:"users", clients:"clients", detail:"detail",
   profiles:"profiles", rates:"rates", errors:"errors",
   production:null, sessions:null, costs:null, review:null,
+  upstream:null,     // 上游额度:独立端点(/api/upstream-quota),不搭 /api/stats 的车
 };
 const sectionLoaded={};        // 菜单 → 是否已把它的数据拉进来过
 
@@ -44,6 +45,9 @@ async function ensureSection(name,{force=false}={}){
   if(src===undefined)return;
   if(src===null){                       // 产出/会话/成本/评审:各自的加载器/标志
     if(name==="review"){window.crEnsureLoaded&&window.crEnsureLoaded();return}
+    // 上游额度:**刻意忽略 force**。自动刷新每轮都强制打上游 = 对平台的定时骚扰,
+    // 刷新节奏交给服务端(缓存秒数 + 「自动刷新」分钟数,见设置页左下角「上游额度」)。
+    if(name==="upstream"){window.UQ&&window.UQ.load();return}
     if(force||!sectionLoaded[name]){
       sectionLoaded[name]=true;
       if(name==="production")loadProduction();

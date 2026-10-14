@@ -41,6 +41,7 @@ import { createLeaderboardReader } from "./lib/leaderboard.mjs";
 import { createSessionsReader } from "./lib/sessions.mjs";
 import { createNotifier } from "./lib/notifier.mjs";
 import { createPersistence } from "./lib/persistence.mjs";
+import { createUpstreamQuotaService, providerDef } from "./lib/upstream-quota.mjs";
 import { createMemberRewards } from "./lib/member-rewards.mjs";
 import { getApiKey, makeClientAbortError, isClientAbortError, createClientAbortState, markClientAborted, addClientAbortListener, setActiveUpstreamRequest, throwIfClientAborted, sleepWithClientAbort, jitter, buildUpstreamPath, extractClientSignal, noteUploadBudget, uploadBudgetExceeded } from "./lib/proxy-helpers.mjs";
 import { createVisionBridge } from "./lib/vision-bridge.mjs";
@@ -1029,6 +1030,53 @@ const removedOpenAIUserKeys = new Set();
   if (!Number.isInteger(config.quotaRequest.weeklyLimit) || config.quotaRequest.weeklyLimit < 0) { config.quotaRequest.weeklyLimit = 3; migrated = true; }
   if (migrated) { saveConfig(config); console.log("[MIGRATE] Added check-in / quota-request defaults"); }
 })();
+
+// Auto-migrate: 上游额度 / 余额面板。只保证对象存在 —— 逐平台默认值由
+// lib/upstream-quota.mjs 的 normalizeUpstreamQuotaConfig() 在每次读取时补齐
+// （未知平台丢弃、数字夹紧、缺省平台自动带上默认值），所以 config.json 里只留
+// 管理员真正改过的东西；在这里种一份 15 个平台的默认表等于给每个装机塞垃圾。
+(function migrateUpstreamQuotaConfig() {
+  if (!config.upstreamQuota || typeof config.upstreamQuota !== "object" || Array.isArray(config.upstreamQuota)) {
+    config.upstreamQuota = {};
+    saveConfig(config);
+    console.log("[MIGRATE] Added upstream quota defaults");
+  }
+})();
+
+// ─── 上游额度 / 余额 ─────────────────────────────────────────────────────────
+// 与「本地用量」互为正反面：本地记的是本网关给成员算的配额，这里读的是**上游
+// 官方**的余额 / 套餐窗口（DeepSeek 余额、GLM 5 小时窗口、阿里云账户余额…）。
+// 服务惰性构造：它依赖 db/kv_meta（走 getMeta/setMeta）与 config，而这些的初始化
+// 顺序在模块顶层是分散的，等到第一次请求再建就不会踩顺序坑。
+const UPSTREAM_QUOTA_META_KEY = "upstreamQuotaCache";
+let upstreamQuotaApiSvc = null;
+
+function upstreamQuotaApi() {
+  if (upstreamQuotaApiSvc) return upstreamQuotaApiSvc;
+  upstreamQuotaApiSvc = createUpstreamQuotaService({
+    getConfig: () => config,
+    saveConfig: () => saveConfig(config),
+    listProfiles: () => listProfiles(),
+    getUsers: () => config.users || {},
+    // 快照缓存落 kv_meta：进程重启后面板先显示上次的值（标注是旧的），而不是空白
+    // 加一串刚打出去的请求。setMeta 内部 String()，所以这里自己 JSON 化。
+    loadCache: () => {
+      const raw = getMeta(UPSTREAM_QUOTA_META_KEY, "");
+      if (!raw) return null;
+      try { return JSON.parse(raw); } catch { return null; }
+    },
+    saveCache: (obj) => setMeta(UPSTREAM_QUOTA_META_KEY, JSON.stringify(obj)),
+    log: console,
+  });
+  return upstreamQuotaApiSvc;
+}
+
+// 自动刷新：只有配置里给了分钟数才真去打上游（默认 0 = 仅在打开面板 / 手动刷新时查）。
+// 周期可用 UPSTREAM_QUOTA_TICK_MS 覆盖（测试用）。
+const UPSTREAM_QUOTA_TICK_MS = Math.max(50, Number(process.env.UPSTREAM_QUOTA_TICK_MS) || 60_000);
+setInterval(() => {
+  Promise.resolve(upstreamQuotaApi().tick()).catch((err) => console.log(`[UpstreamQuota] 定时刷新异常: ${err?.message}`));
+}, UPSTREAM_QUOTA_TICK_MS).unref();
 
 // ─── Quota Pools ─────────────────────────────────────────────────────────────
 // A quota pool is the billing boundary: the profiles inside it draw from ONE
@@ -4325,6 +4373,87 @@ const server = http.createServer((req, res) => {
     if (!checkAuth(req)) { res.writeHead(401); res.end("Unauthorized"); return; }
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify(getPublicSettings()));
+    return;
+  }
+
+  // ── 上游额度 / 余额 ────────────────────────────────────────────────────────
+  // 读接口只回快照 + 平台目录（**不含凭据**），面板够用；回显凭据只走 /config，
+  // 那条只在设置页打开时拉。
+  if (req.method === "GET" && req.url.split("?")[0] === "/api/upstream-quota") {
+    if (!checkAuth(req)) { res.writeHead(401); res.end("Unauthorized"); return; }
+    const qs = new URL(req.url, "http://localhost").searchParams;
+    const ids = String(qs.get("ids") || "").split(",").map((s) => s.trim()).filter(Boolean);
+    upstreamQuotaApi().snapshot({ ids: ids.length ? ids : null })
+      .then((snap) => sendJson(res, { ...snap, catalog: upstreamQuotaApi().catalog() }, req))
+      .catch((err) => { res.writeHead(500, { "Content-Type": "application/json" }); res.end(JSON.stringify({ error: err.message })); });
+    return;
+  }
+
+  if (req.method === "GET" && req.url === "/api/upstream-quota/config") {
+    if (!checkAuth(req)) { res.writeHead(401); res.end("Unauthorized"); return; }
+    sendJson(res, { config: upstreamQuotaApi().cfg(), catalog: upstreamQuotaApi().catalog() }, req);
+    return;
+  }
+
+  if (req.method === "POST" && req.url === "/api/upstream-quota/save") {
+    if (!checkAuth(req)) { res.writeHead(401); res.end("Unauthorized"); return; }
+    if (!checkCsrf(req)) { res.writeHead(403); res.end("CSRF validation failed"); return; }
+    readBody(req).then((buf) => {
+      try {
+        const body = JSON.parse(buf.toString());
+        const prev = upstreamQuotaApi().cfg();
+        const next = upstreamQuotaApi().save(body);
+        // 审计只记「谁改了什么」，密钥一律只写「更新了密钥」——不落明文也不落掩码。
+        const parts = [];
+        if (prev.enabled !== next.enabled) parts.push(`总开关 ${prev.enabled ? "开" : "关"} → ${next.enabled ? "开" : "关"}`);
+        if (prev.cacheSeconds !== next.cacheSeconds) parts.push(`缓存 ${prev.cacheSeconds}s → ${next.cacheSeconds}s`);
+        if (prev.autoRefreshMinutes !== next.autoRefreshMinutes) parts.push(`自动刷新 ${prev.autoRefreshMinutes ? `${prev.autoRefreshMinutes} 分钟` : "关"} → ${next.autoRefreshMinutes ? `${next.autoRefreshMinutes} 分钟` : "关"}`);
+        if (prev.alertPercent !== next.alertPercent) parts.push(`告警阈值 ${prev.alertPercent}% → ${next.alertPercent}%`);
+        const touched = [];
+        for (const [id, p] of Object.entries(next.providers)) {
+          const before = prev.providers[id] || {};
+          if (JSON.stringify(before) === JSON.stringify(p)) continue;
+          const def = providerDef(id);
+          const bits = [];
+          if (before.enabled !== p.enabled) bits.push(p.enabled ? "开启" : "关闭");
+          if (before.keySource !== p.keySource) bits.push(`凭据来源 ${before.keySource} → ${p.keySource}`);
+          if (before.apiKey !== p.apiKey) bits.push(p.apiKey ? "更新了密钥" : "清空了密钥");
+          if (JSON.stringify(before.extra || {}) !== JSON.stringify(p.extra || {})) bits.push("更新了接入凭据");
+          if (before.profileSuffix !== p.profileSuffix || before.memberKey !== p.memberKey) bits.push("改了指派成员");
+          if (before.baseUrl !== p.baseUrl) bits.push("改了接入点");
+          if (before.label !== p.label) bits.push("改了显示名");
+          touched.push(`${def ? def.name : id}（${bits.join("、") || "有改动"}）`);
+        }
+        if (touched.length) parts.push(touched.slice(0, 8).join("；") + (touched.length > 8 ? ` 等 ${touched.length} 项` : ""));
+        recordAdminAudit(req, "upstreamQuota.save", "上游额度", `保存上游额度设置${parts.length ? "：" + parts.join("；") : "（无变化）"}`);
+
+        sendJson(res, { ok: true, config: next, catalog: upstreamQuotaApi().catalog() }, req);
+      } catch (err) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: err.message }));
+      }
+    });
+    return;
+  }
+
+  if (req.method === "POST" && req.url === "/api/upstream-quota/refresh") {
+    if (!checkAuth(req)) { res.writeHead(401); res.end("Unauthorized"); return; }
+    if (!checkCsrf(req)) { res.writeHead(403); res.end("CSRF validation failed"); return; }
+    readBody(req).then(async (buf) => {
+      try {
+        const body = buf.length ? JSON.parse(buf.toString()) : {};
+        if (body.id) {
+          const provider = await upstreamQuotaApi().providerSnapshot(String(body.id), { force: true });
+          sendJson(res, { ok: true, provider }, req);
+        } else {
+          const snap = await upstreamQuotaApi().snapshot({ force: true });
+          sendJson(res, { ok: true, ...snap }, req);
+        }
+      } catch (err) {
+        res.writeHead(500, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: err.message }));
+      }
+    });
     return;
   }
 

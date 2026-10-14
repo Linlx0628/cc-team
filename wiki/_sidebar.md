@@ -4,7 +4,8 @@
 
 - **管理员指南**
   - [管理面板：顶栏与图表](dashboard.md)
-  - [管理面板：十个工作区](dashboard-workspaces.md)
+  - [管理面板：工作区](dashboard-workspaces.md)
+  - [上游额度 / 账户余额](upstream-quota.md)
   - [设置页：方案与全局配置](settings.md)
   - [方案组调度](schedule.md)
   - [用户与配额管理](users.md)

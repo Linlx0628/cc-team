@@ -727,7 +727,16 @@
         + '<span class="uq-probe" data-console-msg></span>'
         + '<span class="uq-probe" data-probe>' + (live && live.credLabel ? '<span style="color:var(--dim2)">凭据：' + esc(live.credLabel) + '</span>' : "") + '</span>'
         + (site ? '<button type="button" class="btn btn-outline btn-sm uq-del" onclick="UQ.delSite(this)">删除这个站点</button>' : "")
-        + '</div>';
+        + '</div>'
+        + (loginField && !consoleLoginReachable()
+          // 百炼控制台授权页的回调是硬编码 http 的，浏览器只对回环地址豁免 mixed-content：
+          // 用域名 / 局域网 IP 打开面板时，那个 POST 会被拦在本地，面板永远等不到令牌。
+          ? '<p class="uq-p-note uq-alarm">当前面板地址（' + esc(location.hostname) + '）不在回环地址上，浏览器会拦下授权回调'
+            + '（控制台授权页固定向 <b>http://' + esc(location.hostname) + '</b> 发令牌，https 页面发这种请求会被按混合内容拦掉）。'
+            + '可改用 <b>ssh -L 6789:127.0.0.1:6789</b> 隧道后访问 <b>http://127.0.0.1:6789</b> 再点这个按钮；'
+            + '或在你自己电脑上跑 <b>node tools/bailian-console-login.mjs</b>，把打印出来的令牌粘到上面的「控制台令牌」里；'
+            + '最省事的是给这把 AccessKey 加 <b>modelstudio:GenerateCLIAccessToken</b> 权限，面板会自动换取 / 自动续期。</p>'
+          : "");
     }
 
     // data-ksdef：这张卡没有「凭据来源」下拉时，collect() 用它当默认来源
@@ -1063,6 +1072,14 @@
       + (p.credLabel ? '<span style="color:var(--dim2)"> · 凭据：' + esc(p.credLabel) + '</span>' : "") + '</span>';
   }
 
+  // 浏览器只对回环地址豁免 mixed-content，而百炼控制台授权页的回调是硬编码 http 的
+  // （其 bundle 里就是 fetch("http://".concat(notice))），所以只有从 127.0.0.1 / localhost
+  // 打开面板时「一键获取令牌」才可能成功。
+  function consoleLoginReachable() {
+    const h = String(location.hostname || "").toLowerCase();
+    return h === "127.0.0.1" || h === "localhost" || h === "::1" || h === "[::1]";
+  }
+
   // 一键获取控制台令牌（阿里云百炼）：
   //   服务端生成一次性 state，把「授权回调地址」写成浏览器正在访问的这个地址（Host 头）→
   //   打开百炼控制台的授权页 → 控制台把 access_token POST 回本面板 → 服务端写进
@@ -1083,9 +1100,19 @@
       const start = await api("/api/upstream-quota/console-login/start", { method: "POST", body: { id: id } });
       if (!start || !start.ok || !start.url) throw new Error((start && start.error) || "启动授权失败");
       const win = window.open(start.url, "_blank", "noopener");
-      say("已打开授权页：在浏览器里登录并点「授权」，完成后这里会自动填好（最多等 5 分钟）", "dim");
+      const blocked = start.loopback === false;
+      if (blocked) {
+        // 回调地址不是回环地址：浏览器的混合内容拦截一定会把授权页发来的 POST 挡在本地。
+        say("当前面板地址不在回环地址上，浏览器会拦下授权回调（控制台授权页固定向 http://"
+          + (start.notice || location.hostname) + " 发令牌）。请改用 SSH 隧道后访问 http://127.0.0.1:6789 再点，"
+          + "或在电脑上跑 node tools/bailian-console-login.mjs 拿令牌粘进来；加 modelstudio:GenerateCLIAccessToken 权限可自动续期。", "alarm");
+      } else {
+        say("已打开授权页：在浏览器里登录并点「授权」，完成后这里会自动填好（最多等 5 分钟）", "dim");
+      }
       if (!win) say("浏览器可能拦截了弹窗：请允许弹窗，或手动打开 " + start.url, "alarm");
-      const deadline = Date.now() + 5 * 60 * 1000;
+      // 回调一定收不到时别让用户干等 5 分钟，45 秒就给结论。
+      const waitMs = blocked ? 45 * 1000 : 5 * 60 * 1000;
+      const deadline = Date.now() + waitMs;
       while (Date.now() < deadline) {
         await new Promise((res) => setTimeout(res, 1500));
         const p = await api("/api/upstream-quota/console-login/poll", { method: "POST", body: { state: start.state } });

@@ -44,6 +44,7 @@ import { createPersistence } from "./lib/persistence.mjs";
 import { createUpstreamQuotaService, providerDef } from "./lib/upstream-quota.mjs";
 import {
   bailianConsoleLoginUrl, bailianConsoleOrigin, extractBailianConsoleCredentials, BAILIAN_CALLBACK_CORS,
+  resolveCallbackNotice,
 } from "./lib/bailian-console-login.mjs";
 import { createMemberRewards } from "./lib/member-rewards.mjs";
 import { getApiKey, makeClientAbortError, isClientAbortError, createClientAbortState, markClientAborted, addClientAbortListener, setActiveUpstreamRequest, throwIfClientAborted, sleepWithClientAbort, jitter, buildUpstreamPath, extractClientSignal, noteUploadBudget, uploadBudgetExceeded } from "./lib/proxy-helpers.mjs";
@@ -4561,17 +4562,22 @@ const server = http.createServer((req, res) => {
         const cfg = upstreamQuotaApi().cfg();
         const extra = (cfg.providers[id] && cfg.providers[id].extra) || {};
         const site = String(extra.consoleSite || "domestic").trim() || "domestic";
-        // 回调地址就用浏览器正在访问的这个地址（Host 头）：本机、SSH 隧道都自动适配，
-        // 回调由上面那个 /console-callback 分支按 state 认领。
-        const hostHeader = String(req.headers.host || "").trim() || `127.0.0.1:${req.socket.localPort}`;
+        // 回调地址：优先设置页的「令牌回调地址」覆盖，否则用浏览器正在访问的这个地址（Host 头）。
+        // 百炼控制台授权页的回调是硬编码 http 的，浏览器只对回环地址豁免 mixed-content，
+        // 所以 loopback=false 时前端会提前说明"回调会被浏览器拦下"（别让用户白等 5 分钟）。
+        const callback = resolveCallbackNotice({
+          override: extra.consoleCallback,
+          hostHeader: req.headers.host,
+          localPort: req.socket.localPort,
+        });
         const state = crypto.randomBytes(16).toString("hex");
-        const url = bailianConsoleLoginUrl({ origin: bailianConsoleOrigin(site), notice: hostHeader, state });
+        const url = bailianConsoleLoginUrl({ origin: bailianConsoleOrigin(site), notice: callback.notice, state });
         bailianConsoleLogins.set(state, {
           id, def, marker: field.consoleLogin, status: "pending", error: null,
-          createdAt: Date.now(), notice: hostHeader, site,
+          createdAt: Date.now(), notice: callback.notice, site,
         });
         sendJson(res, {
-          ok: true, state, url, notice: hostHeader,
+          ok: true, state, url, notice: callback.notice, loopback: callback.loopback, noticeSource: callback.source,
           expiresInMs: BAILIAN_LOGIN_TTL_MS, field: field.key,
         }, req);
       } catch (err) {

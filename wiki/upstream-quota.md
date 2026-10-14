@@ -156,6 +156,16 @@
 
 **OpenCode Go** 是唯一会读本机文件的平台：没填 Key 时自动读 `$XDG_DATA_HOME/opencode/auth.json`（默认 `~/.local/share/opencode/auth.json`）里 `opencode-go` 段的 key —— 机器上已经在用 opencode，就不用再手抄一遍；读到就用，读不到才算「未配置」。
 
+每行平台卡片展开后的「**高级：接入点覆盖 / 显示名**」里还有一格「**接入点覆盖**」，默认**留空 = 官方地址**。它替换的是**域名部分**，路径仍按官方接口拼（`你填的地址` + 官方路径，自动去掉结尾多余的 `/`）。「显示名」用来把卡片标题改成你自己认得的名字（留空 = 平台原名）：
+
+| 场景 | 怎么填 |
+|---|---|
+| GLM 国际站（`z.ai`）等与国内站不同域名的账号 | 填 `https://api.z.ai` |
+| 自建反向代理 / 内网网关 | 填网关地址，例如 `https://gw.internal/deepseek` |
+| 站点型平台（Sub2API / NewAPI） | 留空 = 用所选方案的地址；也可以在这里直接填站点根地址，例如 `https://gw.example` |
+
+⚠️ 地址写错（多一层路径、少 `/v1`）会直接体现成卡片上的失败原因；改回留空即恢复官方地址。
+
 ### 阿里云百炼 Token Plan：两张脸（个人版 / 席位制团队版）
 
 百炼的 Token Plan 用量分在**两套完全不同的接口**里，本平台两套都会试，按你账号是哪一种自动选：
@@ -192,16 +202,6 @@ percent = round(per1MonthPercentage × 10000) / 100      # per1MonthPercentage �
 > ⚠️ 自己看这个数字的位置：控制台 → **Token Plan → 我的订阅**（国内站 `bailian.console.aliyun.com/cn-beijing/subscription/token-plan`，国际站 `modelstudio.console.alibabacloud.com/ap-southeast-1/subscription/token-plan`）。
 > ⚠️ 控制台令牌按**个人账号**签发，看到的月额度就是这个账号的；它是控制台登录态，**权限比 AccessKey 大**，别再填到别处或分享出去。
 > ⚠️ 令牌过期会显示 `NotLogined`，重新跑一次第 1 步即可。官方还有一条「用 AK/SK 换令牌」的路（RAM 权限点 `modelstudio:GenerateCLIAccessToken`），本平台暂未实现 —— 当前默认的那把 AccessKey 是 RAM 子账号，缺这个权限点（实测 403 `AccessDenied`）。
-
-每行平台卡片展开后的「**高级：接入点覆盖 / 显示名**」里还有一格「**接入点覆盖**」，默认**留空 = 官方地址**。它替换的是**域名部分**，路径仍按官方接口拼（`你填的地址` + 官方路径，自动去掉结尾多余的 `/`）。「显示名」用来把卡片标题改成你自己认得的名字（留空 = 平台原名）：
-
-| 场景 | 怎么填 |
-|---|---|
-| GLM 国际站（`z.ai`）等与国内站不同域名的账号 | 填 `https://api.z.ai` |
-| 自建反向代理 / 内网网关 | 填网关地址，例如 `https://gw.internal/deepseek` |
-| 站点型平台（Sub2API / NewAPI） | 留空 = 用所选方案的地址；也可以在这里直接填站点根地址，例如 `https://gw.example` |
-
-⚠️ 地址写错（多一层路径、少 `/v1`）会直接体现成卡片上的失败原因；改回留空即恢复官方地址。
 
 > ⚠️ 凭据以**明文**存在 `config.json` 的 `upstreamQuota` 里（与 SMTP 密码、webhook 密钥同一套处理方式），靠设置页的密码门保护；查询结果的快照接口不回传密钥，页脚只显示**末 4 位**。给云平台配 Key 时，建议单开一个只带下述只读权限的 RAM/子账号：
 > - 阿里云账户余额：`QueryAccountBalance`，RAM 权限点写作 `bss:DescribeAcccount`（注意是**双 c**）

@@ -79,6 +79,7 @@
       ".uq-bal-v{font-size:25px;font-weight:700;line-height:1.1;letter-spacing:-.02em;font-variant-numeric:tabular-nums;white-space:nowrap}",
       ".uq-bal-v small{font-size:12.5px;font-weight:600;color:var(--dim);margin-left:3px}",
       ".uq-bal-v.alarm{color:var(--red)}",
+      ".uq-bal-v.muted{color:var(--dim2)}",
       ".uq-bal-l{font-size:11.5px;color:var(--dim);margin-top:2px}",
       ".uq-bal-m{font-size:11px;color:var(--dim2);margin-top:5px;font-variant-numeric:tabular-nums}",
       // 套餐窗口
@@ -326,11 +327,15 @@
   // ── 卡片（dashboard） ─────────────────────────────────────────────────────
   // 余额：金额是主角（大号），标签与明细往下压。
   function balanceHTML(it) {
-    const alarm = it.remaining !== null && it.remaining !== undefined && Number(it.remaining) <= 0;
+    const depleted = it.remaining !== null && it.remaining !== undefined && Number(it.remaining) <= 0;
+    // 套餐内使用：套餐窗口还有余量时的 0 余额只是「这平台不按余额计费」，不标红也不参与告警。
+    // 判定在服务端（shapeProvider 给 item 打 coveredByPlan），这里只负责别把它画成红字。
+    const alarm = depleted && !it.coveredByPlan;
+    const note = [it.note, it.coveredByPlan ? "套餐内使用，余额不参与告警" : ""].filter(Boolean).join(" · ");
     return '<div class="uq-bal">'
-      + '<div class="uq-bal-v' + (alarm ? " alarm" : "") + '">' + esc(fmtMoney(it.remaining, it.unit)) + '</div>'
+      + '<div class="uq-bal-v' + (alarm ? " alarm" : (it.coveredByPlan ? " muted" : "")) + '">' + esc(fmtMoney(it.remaining, it.unit)) + '</div>'
       + '<div class="uq-bal-l">' + esc(it.label || "可用余额") + '</div>'
-      + (it.note ? '<div class="uq-bal-m">' + esc(it.note) + '</div>' : "")
+      + (note ? '<div class="uq-bal-m">' + esc(note) + '</div>' : "")
       + '</div>';
   }
   // 套餐窗口：百分比是主角，进度条给相对感，剩多少/何时重置压在下面一行。

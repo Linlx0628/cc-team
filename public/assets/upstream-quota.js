@@ -242,7 +242,9 @@
     if (v === null || v === undefined || v === "") return "—";
     if (unit === "%") return fmtNum(v) + "%";
     if (CURRENCY_SIGN[unit]) return fmtMoney(v, unit);
-    if (unit && !/[A-Za-z0-9]/.test(String(unit))) return fmtMoney(v, unit); // 上游给的就是符号
+    // 上游直接给货币符号（$ / ¥ / €）时按金额渲染；中文量纲（张 / 次 / 字符 / 秒）是计数单位，
+    // 不是货币符号 —— 否则会渲染成「剩 张20.00」这种既像钱又拖小数的样子。
+    if (unit && !/[A-Za-z0-9]/.test(String(unit)) && !/[\u4e00-\u9fff]/.test(String(unit))) return fmtMoney(v, unit);
     if (unit === "tokens") return fmtNum(v) + " tokens";
     return fmtNum(v) + (unit ? " " + unit : "");
   }

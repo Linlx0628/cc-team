@@ -195,13 +195,20 @@ percent = round(per1MonthPercentage × 10000) / 100      # per1MonthPercentage �
    npx -y bailian-cli auth login --console
    ```
 
-   它会打开浏览器让你登录阿里云百炼控制台，登录成功后令牌落到 `~/.bailian/config.json` 的 `access_token`。**之后不用再管**：平台的「控制台令牌」留空时会自动读这个文件（每隔一段时间重查一次，令牌长期有效）。
-2. 不想装 CLI 也行：从已经登录的 `bl` 环境里把 `access_token` 复制出来，粘到设置页 → 上游额度 → 阿里云百炼 Token Plan 的「**控制台令牌**」格里（密码型输入框，只存在本机 `config.json`，快照接口不回传）。
+   它会打开浏览器让你登录阿里云百炼控制台，登录成功后令牌落到 `~/.bailian/config.json` 的 `access_token`。**之后不用再管**：平台的「控制台令牌」留空时会自动读这个文件。
+2. **不装 CLI 也行**：CLI 这一步其实只做两件事 —— 在本机 `127.0.0.1` 上开一个随机端口、把控制台的 `/console-login` 页面在浏览器里打开。等价复刻（几十行 Node 脚本即可）：
+
+   - 本机监听 `127.0.0.1:<端口>`，生成一个随机 `state`；
+   - 打开 `https://bailian.console.aliyun.com/console-login?notice=127.0.0.1:<端口>?state=<state>`；
+   - 已登录的控制台页面会把 `access_token` POST 回那个本机端口（JSON / 表单 / multipart 都认；回调要校验 `state`，并回 `Access-Control-Allow-Origin: *`）；
+   - 拿到的那串（36 位左右）粘到设置页 → 上游额度 → 阿里云百炼 Token Plan 的「**控制台令牌**」格里（密码型输入框，只存在本机 `config.json`，快照接口不回传）。
+
+   实测：浏览器里点一下授权就拿到令牌，接口随即返回真实数字（`per1MonthPercentage` 驱动「套餐月额度」）。
 3. 想换账号 / 换区域：`BAILIAN_CONFIG_DIR` 可以指定另一个配置目录；设置页的「控制台区域」默认 `cn-beijing`，海外站填 `ap-southeast-1`。
 
 > ⚠️ 自己看这个数字的位置：控制台 → **Token Plan → 我的订阅**（国内站 `bailian.console.aliyun.com/cn-beijing/subscription/token-plan`，国际站 `modelstudio.console.alibabacloud.com/ap-southeast-1/subscription/token-plan`）。
 > ⚠️ 控制台令牌按**个人账号**签发，看到的月额度就是这个账号的；它是控制台登录态，**权限比 AccessKey 大**，别再填到别处或分享出去。
-> ⚠️ 令牌过期会显示 `NotLogined`，重新跑一次第 1 步即可。官方还有一条「用 AK/SK 换令牌」的路（RAM 权限点 `modelstudio:GenerateCLIAccessToken`），本平台暂未实现 —— 当前默认的那把 AccessKey 是 RAM 子账号，缺这个权限点（实测 403 `AccessDenied`）。
+> ⚠️ 令牌**是控制台登录态，会过期**（不是永久凭据，本地也不存过期时间）：失效后网关回 `NotLogined`，界面提示「控制台令牌已失效或被拒绝」，按上面第 1 / 2 步重取一次即可。官方另有一条「用 AK/SK 换令牌」的路（OpenAPI `GenerateCLIAccessToken`，RAM 权限点 `modelstudio:GenerateCLIAccessToken`）可以用来自动续期，本平台暂未实现 —— 当前默认那把 AccessKey 是 RAM 子账号，缺这个权限点（实测 403 `AccessDenied`）。
 
 > ⚠️ 凭据以**明文**存在 `config.json` 的 `upstreamQuota` 里（与 SMTP 密码、webhook 密钥同一套处理方式），靠设置页的密码门保护；查询结果的快照接口不回传密钥，页脚只显示**末 4 位**。给云平台配 Key 时，建议单开一个只带下述只读权限的 RAM/子账号：
 > - 阿里云账户余额：`QueryAccountBalance`，RAM 权限点写作 `bss:DescribeAcccount`（注意是**双 c**）
@@ -245,8 +252,8 @@ percent = round(per1MonthPercentage × 10000) / 100      # per1MonthPercentage �
 | 火山三个接口都 `HTTP 401` + `SignatureDoesNotMatch` | AK/SK 抄错或不成对（AK 应是 `AKLT` 开头，SK 一长串以 `=` 结尾），换成火山控制台「访问密钥」里的值 |
 | 阿里云 `Code: NotAuthorized / This API is not authorized for caller` | AK/SK 本身有效，但该 RAM 用户**没有 BSS 权限**：给它加 `AliyunBSSReadOnlyAccess` 或权限点 `bss:DescribeAcccount`（注意双 c） |
 | 百炼 Token Plan `HTTP 403` + `AccessDeniedDetail.AuthAction: modelstudio:GetSubscriptionStats` | 签名没问题，是 RAM 子账号缺这个权限点。官方口径（[Token Plan 个人版常见问题](https://help.aliyun.com/zh/model-studio/token-plan-personal-faq)）是给 RAM 用户挂 `AliyunTokenPlanReadOnlyAccess`（只读）或 `AliyunTokenPlanFullAccess`，**再挂 `AliyunBSSReadOnlyAccess`**，然后到控制台「账号管理」里给它分配管理员 / 订阅套餐权限。**但个人版套餐本来就没有席位**，加了权限也只会拿到空数据 —— 个人版请按下面一行配控制台令牌 |
-| 百炼 Token Plan 红字「读不到数据：…只能靠控制台令牌读取…」 | 这是**个人版套餐**（控制台「订阅」页有「套餐额度 / 月额度已用 x%」那种）。AccessKey 查的是席位制团队版接口，个人版拿不到。本机跑一次 `npx -y bailian-cli auth login --console`（浏览器点一下，令牌自动落到 `~/.bailian/config.json`），或把 `access_token` 粘到设置页的「控制台令牌」格里 |
-| 百炼 Token Plan 提示 `NotLogined` / 「控制台令牌已失效或被拒绝」 | 控制台令牌过期或被撤销：重新跑 `npx -y bailian-cli auth login --console`，把新 `access_token` 更新到「控制台令牌」格（留空时会重读 `~/.bailian/config.json`），再点「刷新全部」 |
+| 百炼 Token Plan 红字「读不到数据：…只能靠控制台令牌读取…」 | 这是**个人版套餐**（控制台「订阅」页有「套餐额度 / 月额度已用 x%」那种）。AccessKey 查的是席位制团队版接口，个人版拿不到。跑一次 `npx -y bailian-cli auth login --console`（浏览器点一下，令牌自动落到 `~/.bailian/config.json`），或按上面「两张脸」小节第 2 步用本机回调拿到 `access_token`、粘到设置页的「控制台令牌」格里 |
+| 百炼 Token Plan 提示 `NotLogined` / 「控制台令牌已失效或被拒绝」 | 控制台令牌过期或被撤销：重取一次（`npx -y bailian-cli auth login --console`，或上面第 2 步的本机回调），把新 `access_token` 更新到「控制台令牌」格（留空时会重读 `~/.bailian/config.json`），再点「刷新全部」 |
 | 百炼 Token Plan 只有 Harness 权益、没有「套餐月额度」 | 该账号没有月额度上限（或额度还没发放，官方说发放比购买晚几分钟）：卡片会给一条说明而不是显示成 0% |
 | 腾讯云 `未配置 AccessKey ID / Secret` | 云平台必须手填 SecretId / SecretKey，不能靠「自动复用方案密钥」（方案里的 Key 是推理 Key） |
 | 硅基流动在设置页只有「控制台」、不给查询 | 官方 `/v1/user/info` 已下线（410 + code 20092），替代接口未公布，所以本工具只给控制台入口；余额请去 [控制台「余额充值」](https://cloud.siliconflow.cn/account/charge) 看。官方公布新接口后会恢复 |

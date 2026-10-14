@@ -42,6 +42,7 @@ import { createSessionsReader } from "./lib/sessions.mjs";
 import { createNotifier } from "./lib/notifier.mjs";
 import { createPersistence } from "./lib/persistence.mjs";
 import { createUpstreamQuotaService, providerDef } from "./lib/upstream-quota.mjs";
+import { startBailianConsoleLogin } from "./lib/bailian-console-login.mjs";
 import { createMemberRewards } from "./lib/member-rewards.mjs";
 import { getApiKey, makeClientAbortError, isClientAbortError, createClientAbortState, markClientAborted, addClientAbortListener, setActiveUpstreamRequest, throwIfClientAborted, sleepWithClientAbort, jitter, buildUpstreamPath, extractClientSignal, noteUploadBudget, uploadBudgetExceeded } from "./lib/proxy-helpers.mjs";
 import { createVisionBridge } from "./lib/vision-bridge.mjs";
@@ -1051,6 +1052,28 @@ const removedOpenAIUserKeys = new Set();
 // 顺序在模块顶层是分散的，等到第一次请求再建就不会踩顺序坑。
 const UPSTREAM_QUOTA_META_KEY = "upstreamQuotaCache";
 let upstreamQuotaApiSvc = null;
+
+// 阿里云百炼「一键获取控制台令牌」的授权会话：state → { id, marker, session, status, error }
+// 一次性、内存里存（重启即失效），start 时顺手清掉 10 分钟前的陈货。
+const bailianConsoleLogins = new Map();
+const BAILIAN_LOGIN_TTL_MS = 10 * 60 * 1000;
+
+function sweepBailianConsoleLogins(now = Date.now()) {
+  for (const [state, rec] of bailianConsoleLogins) {
+    if (now - rec.createdAt > BAILIAN_LOGIN_TTL_MS) {
+      try { rec.session.close(); } catch { /* 已关闭 */ }
+      bailianConsoleLogins.delete(state);
+    }
+  }
+}
+
+// 找 provider def 里带 consoleLogin 标记的字段（当前只有阿里云百炼的控制台令牌）。
+function consoleLoginMarker(def) {
+  const marker = def && Array.isArray(def.extraFields)
+    ? def.extraFields.find((f) => f && f.consoleLogin)
+    : null;
+  return marker && marker.consoleLogin && marker.consoleLogin.kind === "bailian" ? marker : null;
+}
 
 function upstreamQuotaApi() {
   if (upstreamQuotaApiSvc) return upstreamQuotaApiSvc;
@@ -4452,6 +4475,99 @@ const server = http.createServer((req, res) => {
         }
       } catch (err) {
         res.writeHead(500, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: err.message }));
+      }
+    });
+    return;
+  }
+
+  if (req.method === "POST" && req.url === "/api/upstream-quota/console-login/start") {
+    if (!checkAuth(req)) { res.writeHead(401); res.end("Unauthorized"); return; }
+    if (!checkCsrf(req)) { res.writeHead(403); res.end("CSRF validation failed"); return; }
+    readBody(req).then(async (buf) => {
+      try {
+        const body = buf.length ? JSON.parse(buf.toString()) : {};
+        const id = String(body.id || "").trim();
+        const def = providerDef(id);
+        const field = consoleLoginMarker(def);
+        if (!def || !field) {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "该接入点不支持一键获取令牌" }));
+          return;
+        }
+        sweepBailianConsoleLogins();
+        // 站点跟着已保存的配置走（国际站走 modelstudio.console.alibabacloud.com）。
+        const cfg = upstreamQuotaApi().cfg();
+        const extra = (cfg.providers[id] && cfg.providers[id].extra) || {};
+        const site = String(extra.consoleSite || "domestic").trim() || "domestic";
+        const session = await startBailianConsoleLogin({ site, timeoutMs: 5 * 60 * 1000 });
+        const rec = {
+          id, def, marker: field.consoleLogin, session,
+          status: "pending", error: null, createdAt: Date.now(),
+        };
+        bailianConsoleLogins.set(session.state, rec);
+        session.done.then((creds) => {
+          const cur = bailianConsoleLogins.get(session.state);
+          if (!cur) return;
+          try {
+            const now = upstreamQuotaApi().cfg();
+            const providers = { ...now.providers };
+            const p = providers[id] || {};
+            const extraNext = { ...(p.extra || {}), [cur.marker.field]: creds.token };
+            if (creds.region && cur.marker.regionField) extraNext[cur.marker.regionField] = creds.region;
+            if (creds.site) extraNext.consoleSite = creds.site;
+            providers[id] = { ...p, extra: extraNext };
+            upstreamQuotaApi().save({ ...now, providers });
+            cur.status = "saved";
+            recordAdminAudit(req, "upstreamQuota.consoleLogin", "上游额度", `${def.name}：通过浏览器授权更新了控制台令牌`);
+            // 顺手拉一次，用户切回「上游额度」就能看到新卡片数据（失败也无所谓，界面会自己再刷）。
+            upstreamQuotaApi().providerSnapshot(id, { force: true }).catch(() => {});
+          } catch (err) {
+            cur.status = "error";
+            cur.error = err.message;
+          }
+        }).catch((err) => {
+          const cur = bailianConsoleLogins.get(session.state);
+          if (cur && cur.status === "pending") { cur.status = "error"; cur.error = err.message; }
+        });
+        sendJson(res, {
+          ok: true, state: session.state, url: session.url, port: session.port,
+          expiresInMs: 5 * 60 * 1000, field: field.key,
+        }, req);
+      } catch (err) {
+        res.writeHead(500, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: err.message }));
+      }
+    });
+    return;
+  }
+
+  if (req.method === "POST" && req.url === "/api/upstream-quota/console-login/poll") {
+    if (!checkAuth(req)) { res.writeHead(401); res.end("Unauthorized"); return; }
+    if (!checkCsrf(req)) { res.writeHead(403); res.end("CSRF validation failed"); return; }
+    readBody(req).then((buf) => {
+      try {
+        const body = buf.length ? JSON.parse(buf.toString()) : {};
+        const state = String(body.state || "").trim();
+        const rec = bailianConsoleLogins.get(state);
+        if (!rec) {
+          sendJson(res, { ok: false, status: "expired", error: "授权会话不存在或已过期，请重新点「获取令牌」" }, req);
+          return;
+        }
+        if (rec.status === "saved") {
+          sendJson(res, { ok: true, status: "saved", field: rec.marker.field }, req);
+          // 让前端有一次机会读到 saved，再回收（令牌已在配置里落盘）。
+          setTimeout(() => bailianConsoleLogins.delete(state), 60 * 1000).unref?.();
+          return;
+        }
+        if (rec.status === "error") {
+          bailianConsoleLogins.delete(state);
+          sendJson(res, { ok: false, status: "error", error: rec.error || "授权失败" }, req);
+          return;
+        }
+        sendJson(res, { ok: true, status: "pending" }, req);
+      } catch (err) {
+        res.writeHead(400, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ error: err.message }));
       }
     });

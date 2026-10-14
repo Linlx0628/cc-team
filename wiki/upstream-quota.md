@@ -20,7 +20,7 @@
 | Plan | 智谱 GLM / GLM Coding Plan | 5 小时窗口、周窗口、MCP 每月额度、账户余额 | API Key（国内站裸 Key / 国际站 Bearer，可选组织、项目 ID） | 私有（experimental） |
 | Plan | MiniMax | Token Plan 用量 | API Key | 私有（experimental） |
 | Plan | Claude 订阅（Claude Code） | 5 小时 / 7 天窗口用量 | OAuth Token（`sk-ant-oat…`，不是普通 API Key） | 私有（experimental） |
-| Plan | 阿里云百炼 Token Plan | **个人版**：套餐月额度已用 %、重置时间、Harness 权益用量；**席位制团队版**：席位数量、每类席位的 Credits 总量 / 剩余、逐席位（成员）剩余 | 控制台令牌（个人版，留空自动读本机 `~/.bailian/config.json`）+ AccessKey ID / Secret（团队版席位，可复用「阿里云账户余额」那份） | 个人版走控制台网关；团队版走官方 OpenAPI（Model Studio 2026-02-10，ACS3-HMAC-SHA256） |
+| Plan | 阿里云百炼 Token Plan | **个人版**：套餐月额度已用 %、重置时间、Harness 权益用量；**席位制团队版**：席位数量、每类席位的 Credits 总量 / 剩余、逐席位（成员）剩余 | 控制台令牌（个人版，卡片页脚「一键获取令牌」；留空时自动读本机 `~/.bailian/config.json`）+ AccessKey ID / Secret（团队版席位，可复用「阿里云账户余额」那份） | 个人版走控制台网关；团队版走官方 OpenAPI（Model Studio 2026-02-10，ACS3-HMAC-SHA256） |
 | Plan | OpenCode Go / Go Plus | 5 小时（rolling）/ 每周 / 每月三个窗口的已用百分比与重置时间 | Go 套餐 API Key；**留空则自动读本机** `~/.local/share/opencode/auth.json` 的登录态 | 官方 `GET /zen/go/v1/usage`（2026-08-11 起） |
 | 余额 | DeepSeek | 总余额（赠金 + 充值） | API Key | 官方 `GET /user/balance` |
 | 余额 | 阶跃星辰 StepFun | 预付费账户可用余额 | API Key | 官方 `GET /v1/accounts`（Step Plan 套餐额度只在控制台） |
@@ -172,7 +172,7 @@
 
 | 你的套餐 | 数据在哪 | 要什么凭据 | 卡片上看到 |
 |---|---|---|---|
-| **个人版**（控制台「Token Plan → 我的订阅」显示的 Lite / Essential / Standard / Pro，一个月限额） | 百炼**控制台网关**（控制台页面自己调的接口，`zeldaHttp.apikeyMgr./tokenplan/personal/api/v2/usage`） | **控制台令牌** —— 见下面的获取办法 | 「套餐月额度 0.27%」+「重置 11-15」；如果套餐带 Harness 权益，还会多出几行权益用量（已用 / 总量） |
+| **个人版**（控制台「Token Plan → 我的订阅」显示的 Lite / Essential / Standard / Pro，一个月限额） | 百炼**控制台网关**（控制台页面自己调的接口，`zeldaHttp.apikeyMgr./tokenplan/personal/api/v2/usage`） | **控制台令牌** —— 卡片页脚「一键获取令牌」，见下面的获取办法 | 「套餐月额度 0.27%」+「重置 11-15」；如果套餐带 Harness 权益，还会多出几行权益用量（剩 x / 共 y）。令牌在卡片页脚点「一键获取令牌」即可 |
 | **席位制团队版**（控制台「组织与成员 → 席位管理」里给成员分配席位） | 官方 OpenAPI（`GetSubscriptionStats` / `GetSubscriptionSeatDetails`） | **AccessKey ID / Secret**（可复用「阿里云账户余额」那份） | 「标准席位 Credits」等：总量 / 剩余 / 席位占用 / 订阅到期 |
 
 个人版各档的月限额（官方表，单位 Credits）：Lite `11,500` / Essential `25,500` / **Standard `45,000`** / Pro `180,000`。**控制台接口只给百分比**，所以我们照原样显示百分比：
@@ -189,22 +189,20 @@ percent = round(per1MonthPercentage × 10000) / 100      # per1MonthPercentage �
 
 **怎么拿控制台令牌**（只需一次，浏览器里点一下）：
 
-1. 本机装过 Node 的话直接跑（首次会先下载 CLI）：
+1. **面板里点一下就行**（推荐，不用装任何东西）：设置页 → 上游额度 → **阿里云百炼 Token Plan** 卡片页脚点「**一键获取令牌**」→ 浏览器弹出百炼控制台的授权页（已登录就点一下授权）→ 令牌自动回填到「控制台令牌」格里，卡片随即开始读数。
+
+   原理与官方 CLI 完全一样：面板在本机 `127.0.0.1` 上开一个**一次性**回调端口（只用 5 分钟，拿到令牌就关），把控制台的 `/console-login` 授权页打开，页面把 `access_token` POST 回来，面板直接写进自己的配置（**不依赖 `~/.bailian`，也不读你的浏览器数据**）。回调只认本次随机生成的 `state`，`state` 不对一律 400。
+2. **CLI 路线**：本机装过 Node 的话也可以直接跑（首次会先下载 CLI）：
 
    ```bash
    npx -y bailian-cli auth login --console
    ```
 
-   它会打开浏览器让你登录阿里云百炼控制台，登录成功后令牌落到 `~/.bailian/config.json` 的 `access_token`。**之后不用再管**：平台的「控制台令牌」留空时会自动读这个文件。
-2. **不装 CLI 也行**：CLI 这一步其实只做两件事 —— 在本机 `127.0.0.1` 上开一个随机端口、把控制台的 `/console-login` 页面在浏览器里打开。等价复刻（几十行 Node 脚本即可）：
+   它会打开同一个授权页，令牌落到 `~/.bailian/config.json` 的 `access_token`。**之后不用再管**：平台的「控制台令牌」留空时会自动读这个文件。
+3. **纯手工路线**（不想让面板开端口时）：自己复刻上面那条回调（本机监听 `127.0.0.1:<端口>` + 打开 `https://bailian.console.aliyun.com/console-login?notice=127.0.0.1:<端口>?state=<state>`），把拿到的那串（36 位左右）粘到「**控制台令牌**」格里（密码型输入框，只存在本机 `config.json`，快照接口不回传）。
+4. 想换账号 / 换区域：`BAILIAN_CONFIG_DIR` 可以指定另一个配置目录；设置页的「控制台区域」默认 `cn-beijing`，海外站填 `ap-southeast-1`。
 
-   - 本机监听 `127.0.0.1:<端口>`，生成一个随机 `state`；
-   - 打开 `https://bailian.console.aliyun.com/console-login?notice=127.0.0.1:<端口>?state=<state>`；
-   - 已登录的控制台页面会把 `access_token` POST 回那个本机端口（JSON / 表单 / multipart 都认；回调要校验 `state`，并回 `Access-Control-Allow-Origin: *`）；
-   - 拿到的那串（36 位左右）粘到设置页 → 上游额度 → 阿里云百炼 Token Plan 的「**控制台令牌**」格里（密码型输入框，只存在本机 `config.json`，快照接口不回传）。
-
-   实测：浏览器里点一下授权就拿到令牌，接口随即返回真实数字（`per1MonthPercentage` 驱动「套餐月额度」）。
-3. 想换账号 / 换区域：`BAILIAN_CONFIG_DIR` 可以指定另一个配置目录；设置页的「控制台区域」默认 `cn-beijing`，海外站填 `ap-southeast-1`。
+实测：浏览器里点一下授权就拿到令牌，接口随即返回真实数字（`per1MonthPercentage` 驱动「套餐月额度」）。
 
 > ⚠️ 自己看这个数字的位置：控制台 → **Token Plan → 我的订阅**（国内站 `bailian.console.aliyun.com/cn-beijing/subscription/token-plan`，国际站 `modelstudio.console.alibabacloud.com/ap-southeast-1/subscription/token-plan`）。
 > ⚠️ 控制台令牌按**个人账号**签发，看到的月额度就是这个账号的；它是控制台登录态，**权限比 AccessKey 大**，别再填到别处或分享出去。
@@ -238,7 +236,7 @@ percent = round(per1MonthPercentage × 10000) / 100      # per1MonthPercentage �
 | OpenCode Go `usage.rolling.percent: 12.5` | 窗口行大号 `12.5%` + 进度条；`status: "rate-limited"` 的那一行标注「已达本窗口上限」 |
 | 百炼 Token Plan 个人版 `per1MonthPercentage: 0.0027` | 窗口行大号 **`0.27%`**（上游给的是 **0–1 的比例**，换算成百分数；控制台页面同一个数字）+「重置 11-15 00:00」 |
 | 百炼 Token Plan 个人版 `{per1MonthPercentage: null}`（不限量） | **不出百分比行**，只留一条「控制台没有给出月额度上限（可能不限量）」，不会显示成 0% |
-| 百炼 Harness 权益 `totalQuota: 1000, availableQuota: 250` | 一行「权益名（planCode）75% · 剩 250 / 共 1000 次」+「权益至 <日期>」；权益还在发放（没配对到）时只出标题与一条「发放中」说明 |
+| 百炼 Harness 权益 `totalQuota: 1000, availableQuota: 250` | 一行「权益名（如「网页解析 MCP」）75% · 剩 250 / 共 1000 次」+「权益至 <日期>」；**标签只显示用户看得懂的名字**，接口里的权益 code（`tokenplan_harness…`）不摆到卡片上；权益还在发放（没配对到）时只出标题与一条「发放中」说明 |
 
 > ⚠️ **百分比一律按上游的刻度读**：智谱的 `percentage`、火山的 `Percent` 都是 **0–100 的百分数**（火山另有 `Cap` 表示刻度上限），`1` 就是 **1%**，不是 100%。（早期版本把 `1` 当小数 ×100，显示过假的 100%。）
 
@@ -252,8 +250,8 @@ percent = round(per1MonthPercentage × 10000) / 100      # per1MonthPercentage �
 | 火山三个接口都 `HTTP 401` + `SignatureDoesNotMatch` | AK/SK 抄错或不成对（AK 应是 `AKLT` 开头，SK 一长串以 `=` 结尾），换成火山控制台「访问密钥」里的值 |
 | 阿里云 `Code: NotAuthorized / This API is not authorized for caller` | AK/SK 本身有效，但该 RAM 用户**没有 BSS 权限**：给它加 `AliyunBSSReadOnlyAccess` 或权限点 `bss:DescribeAcccount`（注意双 c） |
 | 百炼 Token Plan `HTTP 403` + `AccessDeniedDetail.AuthAction: modelstudio:GetSubscriptionStats` | 签名没问题，是 RAM 子账号缺这个权限点。官方口径（[Token Plan 个人版常见问题](https://help.aliyun.com/zh/model-studio/token-plan-personal-faq)）是给 RAM 用户挂 `AliyunTokenPlanReadOnlyAccess`（只读）或 `AliyunTokenPlanFullAccess`，**再挂 `AliyunBSSReadOnlyAccess`**，然后到控制台「账号管理」里给它分配管理员 / 订阅套餐权限。**但个人版套餐本来就没有席位**，加了权限也只会拿到空数据 —— 个人版请按下面一行配控制台令牌 |
-| 百炼 Token Plan 红字「读不到数据：…只能靠控制台令牌读取…」 | 这是**个人版套餐**（控制台「订阅」页有「套餐额度 / 月额度已用 x%」那种）。AccessKey 查的是席位制团队版接口，个人版拿不到。跑一次 `npx -y bailian-cli auth login --console`（浏览器点一下，令牌自动落到 `~/.bailian/config.json`），或按上面「两张脸」小节第 2 步用本机回调拿到 `access_token`、粘到设置页的「控制台令牌」格里 |
-| 百炼 Token Plan 提示 `NotLogined` / 「控制台令牌已失效或被拒绝」 | 控制台令牌过期或被撤销：重取一次（`npx -y bailian-cli auth login --console`，或上面第 2 步的本机回调），把新 `access_token` 更新到「控制台令牌」格（留空时会重读 `~/.bailian/config.json`），再点「刷新全部」 |
+| 百炼 Token Plan 红字「读不到数据：…只能靠控制台令牌读取…」 | 这是**个人版套餐**（控制台「订阅」页有「套餐额度 / 月额度已用 x%」那种）。AccessKey 查的是席位制团队版接口，个人版拿不到。在卡片页脚点「一键获取令牌」（浏览器里点一下授权，令牌自动回填）；也可以跑一次 `npx -y bailian-cli auth login --console`，或自己拿 `access_token` 粘到「控制台令牌」格里 |
+| 百炼 Token Plan 提示 `NotLogined` / 「控制台令牌已失效或被拒绝」 | 控制台令牌过期或被撤销：在卡片页脚再点一次「一键获取令牌」即可（或 `npx -y bailian-cli auth login --console`），新令牌会覆盖「控制台令牌」格（留空时平台会重读 `~/.bailian/config.json`），然后点「刷新全部」 |
 | 百炼 Token Plan 只有 Harness 权益、没有「套餐月额度」 | 该账号没有月额度上限（或额度还没发放，官方说发放比购买晚几分钟）：卡片会给一条说明而不是显示成 0% |
 | 腾讯云 `未配置 AccessKey ID / Secret` | 云平台必须手填 SecretId / SecretKey，不能靠「自动复用方案密钥」（方案里的 Key 是推理 Key） |
 | 硅基流动在设置页只有「控制台」、不给查询 | 官方 `/v1/user/info` 已下线（410 + code 20092），替代接口未公布，所以本工具只给控制台入口；余额请去 [控制台「余额充值」](https://cloud.siliconflow.cn/account/charge) 看。官方公布新接口后会恢复 |

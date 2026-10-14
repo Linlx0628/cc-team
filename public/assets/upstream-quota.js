@@ -658,6 +658,8 @@
     const profOnly = !!def.profileOnly;   // Sub2API：地址 + Key 都只能从方案来
     const keySource = pc.keySource || "auto";
     const extra = pc.extra || {};
+    // 支持「一键获取控制台令牌」的字段（def 上用 consoleLogin 标记；目前只有阿里云百炼）。
+    const loginField = fieldsOf(def).find((f) => f && f.consoleLogin && f.consoleLogin.kind === "bailian") || null;
     const live = (lastSnap && (lastSnap.providers || []).find((p) => p.id === id)) || null;
     // 站点在自己这一行上就能改名（多个中转站要分得清哪个是哪个），普通平台的显示名在「高级」里。
     // profileOnly 型没有显示名：卡片名就跟着所选方案走。
@@ -718,6 +720,11 @@
         + (def.localKey ? '<p class="uq-p-note">没填 Key 时会自动读本机 <b>' + esc(def.localKey.label || "登录凭据") + '</b>（只读；读不到才算未配置）。</p>' : "")
         + (def.note ? '<p class="uq-p-note">官方口径：' + esc(def.note) + '</p>' : "")
         + '<div class="uq-p-foot"><button type="button" class="btn btn-outline btn-sm" onclick="UQ.testProvider(\'' + attr(id) + '\',this)">查询一次</button>'
+        + (loginField
+          // 控制台令牌型（阿里云百炼）：不用装 CLI，点一下就在浏览器里完成授权回调。
+          ? '<button type="button" class="btn btn-outline btn-sm" onclick="UQ.consoleLogin(\'' + attr(id) + '\',\'' + attr(loginField.key) + '\',this)">一键获取令牌</button>'
+          : "")
+        + '<span class="uq-probe" data-console-msg></span>'
         + '<span class="uq-probe" data-probe>' + (live && live.credLabel ? '<span style="color:var(--dim2)">凭据：' + esc(live.credLabel) + '</span>' : "") + '</span>'
         + (site ? '<button type="button" class="btn btn-outline btn-sm uq-del" onclick="UQ.delSite(this)">删除这个站点</button>' : "")
         + '</div>';
@@ -1056,6 +1063,67 @@
       + (p.credLabel ? '<span style="color:var(--dim2)"> · 凭据：' + esc(p.credLabel) + '</span>' : "") + '</span>';
   }
 
+  // 一键获取控制台令牌（阿里云百炼）：
+  //   服务端在本机 127.0.0.1 起一次性回调端口 → 打开百炼控制台的授权页 → 控制台把
+  //   access_token POST 回来 → 服务端写进本平台的「控制台令牌」→ 这里轮询到 saved 后
+  //   把输入框填上并立刻查一次。等价于官方 CLI 的 auth login --console，但不用装 CLI。
+  async function consoleLogin(id, fieldKey, btn) {
+    const card = document.querySelector('#uqCfgBody .uq-cfg[data-id="' + id + '"]');
+    const msg = card && card.querySelector("[data-console-msg]");
+    const say = (text, cls) => {
+      if (!msg) return;
+      msg.innerHTML = text ? '<span class="' + (cls || "") + '">' + esc(text) + '</span>' : "";
+    };
+    const old = btn ? btn.textContent : "";
+    if (btn) { btn.disabled = true; btn.textContent = "等待授权…"; }
+    try {
+      say("正在打开百炼控制台授权页…", "dim");
+      const start = await api("/api/upstream-quota/console-login/start", { method: "POST", body: { id: id } });
+      if (!start || !start.ok || !start.url) throw new Error((start && start.error) || "启动授权失败");
+      const win = window.open(start.url, "_blank", "noopener");
+      say("已打开授权页：在浏览器里登录并点「授权」，完成后这里会自动填好（最多等 5 分钟）", "dim");
+      if (!win) say("浏览器可能拦截了弹窗：请允许弹窗，或手动打开 " + start.url, "alarm");
+      const deadline = Date.now() + 5 * 60 * 1000;
+      while (Date.now() < deadline) {
+        await new Promise((res) => setTimeout(res, 1500));
+        const p = await api("/api/upstream-quota/console-login/poll", { method: "POST", body: { state: start.state } });
+        if (!p) throw new Error("查询授权状态失败");
+        if (p.status === "saved") {
+          await fillConsoleToken(id, p.field || fieldKey);
+          say("令牌已保存，正在查询上游…", "dim");
+          if (typeof toast === "function") toast("控制台令牌已获取并保存");
+          try { await testProvider(id); } catch (e) { /* 查询失败只影响读数，令牌已存好 */ }
+          say("令牌已保存");
+          return;
+        }
+        if (p.status === "error") throw new Error(p.error || "授权失败");
+        if (p.status === "expired") throw new Error(p.error || "授权会话已过期，请重新点「一键获取令牌」");
+      }
+      throw new Error("等待授权超时，请重新点「一键获取令牌」");
+    } catch (err) {
+      say(err.message || String(err), "alarm");
+      setStatus("获取令牌失败：" + clip(err.message || String(err), 60), "err");
+    } finally {
+      if (btn) { btn.disabled = false; btn.textContent = old || "一键获取令牌"; }
+    }
+  }
+
+  // 令牌由服务端写进配置后，把它读回来填进输入框（顺带同步本地 CFG，避免下次保存把它覆盖掉）。
+  async function fillConsoleToken(id, fieldKey) {
+    const r = await api("/api/upstream-quota/config");
+    const cfg = (r && r.config) || null;
+    if (!cfg) return;
+    CFG = cfg;
+    const p = (cfg.providers || {})[id] || {};
+    const ex = p.extra || {};
+    const card = document.querySelector('#uqCfgBody .uq-cfg[data-id="' + id + '"]');
+    if (!card) return;
+    const inp = card.querySelector('input[data-extra="' + fieldKey + '"]');
+    if (inp) inp.value = ex[fieldKey] || "";
+    const region = card.querySelector('input[data-extra="consoleRegion"]');
+    if (region && ex.consoleRegion) region.value = ex.consoleRegion;
+  }
+
   // 凭据来源 / 方案切换：显隐相关输入框并刷新成员下拉。
   function syncRow(el) {
     const card = el && el.closest ? el.closest(".uq-cfg") : null;
@@ -1100,6 +1168,7 @@
     loadSettings: loadSettings,
     saveSettings: saveSettings,
     testProvider: testProvider,
+    consoleLogin: consoleLogin,
     syncRow: syncRow,
     collect: collect,
     addSite: addSite,

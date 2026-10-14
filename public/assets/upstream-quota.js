@@ -13,12 +13,12 @@
 (function () {
   "use strict";
 
-  const GROUP_ORDER = ["套餐额度", "官方余额", "云平台账户", "自定义", "仅控制台"];
+  const GROUP_ORDER = ["套餐额度", "官方余额", "云平台账户", "中转站", "仅控制台"];
   const GROUP_HINT = {
     "套餐额度": "订阅制套餐的 5 小时 / 每周 / 每月窗口",
     "官方余额": "充值余额或开发者账户余额",
     "云平台账户": "云账号余额，需要 AccessKey / SecretKey",
-    "自定义": "中转网关（Sub2API / NewAPI）与任何能返回 JSON 的额度接口",
+    "中转站": "中转网关（Sub2API / NewAPI），一种类型可以加多个站点",
     "仅控制台": "官方没有可编程接口，只能点进控制台看",
   };
   const CURRENCY_SIGN = { CNY: "¥", USD: "$", EUR: "€", JPY: "¥", HKD: "HK$" };
@@ -133,6 +133,14 @@
       ".uq-p-state.alarm{color:var(--red);border-color:#e7b4ae;background:#fdf0ee}",
       ".uq-p-state.warn{color:var(--orange);border-color:#e6d7ac;background:#fdf8ec}",
       ".uq-p-body{padding:4px 13px 13px;border-top:1px solid var(--border)}",
+      // 中转站：一个类型一段，段里每个站点一张卡（左边缩进，视觉上从属于这个类型）
+      ".uq-sites{margin:2px 0 14px;padding-left:11px;border-left:2px solid var(--border)}",
+      ".uq-sites-hd{display:flex;align-items:center;gap:8px;padding:2px 0 7px}",
+      ".uq-sites-name{font-size:12.5px;font-weight:650}",
+      ".uq-sites-hd em{font-style:normal;font-size:11px;color:var(--dim2)}",
+      ".uq-sites-hd .btn{margin-left:auto}",
+      ".uq-sites .uq-p{margin-bottom:7px}",
+      ".uq-del{margin-left:auto}",
       ".uq-p-note{margin:10px 0 0;font-size:11px;color:var(--dim2);line-height:1.65}",
       ".uq-p-foot{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-top:11px}",
       ".uq-probe{font-size:11.5px;line-height:1.6;min-width:0}",
@@ -594,12 +602,23 @@
     return '<span class="uq-p-state ok" data-state>正常</span>';
   }
 
-  function cfgCardHTML(def, pc) {
+  // 设置页一卡：
+  //   · 普通平台 —— 一个平台一卡（def + config.providers[id]）
+  //   · 中转站型平台（multiInstance）—— 一个**站点**一卡（def + config.sites[] 里的一条），
+  //     卡片 id 是「类型:站点key」（如 sub2api:lemon），多带一个「显示名」与「删除」。
+  function cfgCardHTML(def, pc, opt) {
+    const site = (opt && opt.site) || null;
+    const id = site ? def.id + ":" + site.key : def.id;
     const manual = !!def.manualOnly;
     const credential = def.credential || "apiKey";
     const keySource = pc.keySource || "auto";
     const extra = pc.extra || {};
-    const live = (lastSnap && (lastSnap.providers || []).find((p) => p.id === def.id)) || null;
+    const live = (lastSnap && (lastSnap.providers || []).find((p) => p.id === id)) || null;
+    // 站点在自己这一行上就能改名（多个中转站要分得清哪个是哪个），普通平台的显示名在「高级」里。
+    const nameField = site
+      ? '<div><label>显示名<span style="color:var(--dim2)">（例如「XX 中转」）</span></label>'
+        + '<input type="text" data-f="label" autocomplete="off" value="' + attr(pc.label || "") + '" placeholder="' + attr(def.name) + '"></div>'
+      : "";
 
     let body = "";
     if (manual) {
@@ -609,25 +628,26 @@
         + '</div>'
         + (def.note ? '<p class="uq-p-note">' + esc(def.note) + '</p>' : "");
     } else {
-      const site = !!def.siteFromProfile;
+      const fromProfile = !!def.siteFromProfile;
       const token = !!def.tokenCredential;
-      // 「方案」下拉：站点型平台（Sub2API / NewAPI / 自定义）用它带出站点地址与成员 Key。
+      // 「方案」下拉：站点型平台（Sub2API / NewAPI）用它带出站点地址与成员 Key。
       // 管理面令牌型（NewAPI 的系统访问令牌）没有 keySource 下拉，所以这一格不挂 data-when。
       const profileField = (when) => '<div' + (when
         ? ' data-when="profile"' + (keySource === "profile" ? "" : ' style="display:none"') : "") + '>'
-        + '<label>方案' + (site ? '<span style="color:var(--dim2)">（带出站点地址）</span>' : "") + '</label>'
+        + '<label>方案' + (fromProfile ? '<span style="color:var(--dim2)">（带出站点地址）</span>' : "") + '</label>'
         + '<select data-f="profileSuffix" onchange="UQ.syncRow(this)">' + profileOptions(pc.profileSuffix || "") + '</select></div>';
       let cred;
       if (credential === "accessKey") {
         // 云平台凭据就是 AK/SK，没有「从方案里自动取」这条路，所以不给 keySource 下拉。
-        cred = fieldsOf(def).map((f) => inputHTML(f, extra)).join("");
+        cred = nameField + fieldsOf(def).map((f) => inputHTML(f, extra)).join("");
       } else if (token) {
         // 管理面令牌（NewAPI 的系统访问令牌）不是 sk- 中继 Key，方案只用来带出站点地址。
-        cred = (site ? profileField(false) : "")
+        cred = nameField + (fromProfile ? profileField(false) : "")
           + '<div><label>系统访问令牌</label><input type="text" data-f="apiKey" autocomplete="off" value="' + attr(pc.apiKey || "") + '" placeholder="控制台「个人设置 → 生成系统访问令牌」"></div>'
           + fieldsOf(def).map((f) => inputHTML(f, extra)).join("");
       } else {
-        cred = '<div><label>凭据来源</label><select data-f="keySource" onchange="UQ.syncRow(this)">' + keySourceOptions(keySource) + '</select></div>'
+        cred = nameField
+          + '<div><label>凭据来源</label><select data-f="keySource" onchange="UQ.syncRow(this)">' + keySourceOptions(keySource) + '</select></div>'
           + profileField(true)
           + '<div data-when="profile"' + (keySource === "profile" ? "" : ' style="display:none"') + '><label>成员</label>'
           + '<select data-f="memberKey">' + memberOptions(pc.profileSuffix || "", pc.memberKey || "") + '</select></div>'
@@ -635,27 +655,32 @@
           + '<input type="text" data-f="apiKey" autocomplete="off" value="' + attr(pc.apiKey || "") + '" placeholder="sk-…"></div>';
       }
       body = '<div class="uq-cfg-grid">' + cred + '</div>'
-        + '<details class="uq-adv"><summary>高级：接入点覆盖 / 显示名</summary>'
+        + '<details class="uq-adv"><summary>高级：接入点覆盖' + (site ? "" : " / 显示名") + '</summary>'
         + '<div class="uq-cfg-grid">'
-        + '<div><label>接入点覆盖<span style="color:var(--dim2)">（留空=官方地址/方案地址）</span></label><input type="text" data-f="baseUrl" autocomplete="off" value="' + attr(pc.baseUrl || "") + '" placeholder="仅换域名，例如 https://api.z.ai"></div>'
-        + '<div><label>显示名<span style="color:var(--dim2)">（留空=平台名）</span></label><input type="text" data-f="label" autocomplete="off" value="' + attr(pc.label || "") + '"></div>'
+        + '<div><label>接入点覆盖<span style="color:var(--dim2)">（留空=' + (fromProfile ? "方案地址" : "官方地址") + '）</span></label><input type="text" data-f="baseUrl" autocomplete="off" value="' + attr(pc.baseUrl || "") + '" placeholder="' + attr(fromProfile ? "站点根地址，例如 https://api.example.com" : "仅换域名，例如 https://api.z.ai") + '"></div>'
+        + (site ? "" : '<div><label>显示名<span style="color:var(--dim2)">（留空=平台名）</span></label><input type="text" data-f="label" autocomplete="off" value="' + attr(pc.label || "") + '"></div>')
         + '</div></details>'
         + (def.localKey ? '<p class="uq-p-note">没填 Key 时会自动读本机 <b>' + esc(def.localKey.label || "登录凭据") + '</b>（只读；读不到才算未配置）。</p>' : "")
         + (def.note ? '<p class="uq-p-note">官方口径：' + esc(def.note) + '</p>' : "")
-        + '<div class="uq-p-foot"><button type="button" class="btn btn-outline btn-sm" onclick="UQ.testProvider(\'' + attr(def.id) + '\',this)">查询一次</button>'
-        + '<span class="uq-probe" data-probe>' + (live && live.credLabel ? '<span style="color:var(--dim2)">凭据：' + esc(live.credLabel) + '</span>' : "") + '</span></div>';
+        + '<div class="uq-p-foot"><button type="button" class="btn btn-outline btn-sm" onclick="UQ.testProvider(\'' + attr(id) + '\',this)">查询一次</button>'
+        + '<span class="uq-probe" data-probe>' + (live && live.credLabel ? '<span style="color:var(--dim2)">凭据：' + esc(live.credLabel) + '</span>' : "") + '</span>'
+        + (site ? '<button type="button" class="btn btn-outline btn-sm uq-del" onclick="UQ.delSite(this)">删除这个站点</button>' : "")
+        + '</div>';
     }
 
     // data-ksdef：这张卡没有「凭据来源」下拉时，collect() 用它当默认来源
     // （NewAPI 是手动令牌 = inline；Sub2API 走方案 = profile）。
+    // data-site-type / data-site-key：站点卡，collect() 按这两个属性收进 config.sites[]。
     const ksDef = def.defaultKeySource || (credential === "none" ? "inline" : "auto");
-    return '<details class="uq-cfg uq-p" data-id="' + attr(def.id) + '" data-credential="' + attr(credential) + '" data-ksdef="' + attr(ksDef) + '">'
+    return '<details class="uq-cfg uq-p" data-id="' + attr(id) + '" data-credential="' + attr(credential) + '" data-ksdef="' + attr(ksDef) + '"'
+      + (site ? ' data-site-type="' + attr(def.id) + '" data-site-key="' + attr(site.key) + '"' : "") + '>'
       + '<summary>'
       + (manual ? "" : '<input type="checkbox" class="uq-en" data-f="enabled"' + (pc.enabled === false ? "" : " checked") + ' onclick="event.stopPropagation()" title="启用 / 停用这个平台">')
       + (manual ? '<span class="led"></span>' : '<span class="led' + (live && live.ok && live.enabled !== false ? " on" : "") + '"></span>')
-      + '<span class="uq-p-name">' + esc(def.name) + '</span>'
+      + '<span class="uq-p-name">' + esc(site ? (pc.label || def.name) : def.name) + '</span>'
+      + (site ? '<span class="uq-p-tag" title="' + attr(def.name) + '">' + esc(def.name) + '</span>' : "")
       + (def.experimental ? '<span class="uq-p-tag exp" title="接口未文档化，上游随时可能改">实验</span>' : "")
-      + liveHTML(def.id)
+      + liveHTML(id)
       + stateChipHTML(live)
       + '</summary>'
       + '<div class="uq-p-body">' + body + '</div>'
@@ -682,15 +707,31 @@
       + '</div></details>';
   }
 
+  // 中转站型平台：一段标题 + 「＋ 添加站点」按钮 + 每个站点一张卡（各自的名字 / 方案 / 令牌）。
+  function sitesBlockHTML(def, list) {
+    return '<div class="uq-sites" data-sites="' + attr(def.id) + '">'
+      + '<div class="uq-sites-hd"><span class="uq-sites-name">' + esc(def.name) + '</span>'
+      + '<em>' + esc(def.id === "newapi" ? "一个站点一张卡：站点地址 + 系统访问令牌（可以加多个）" : "一个站点一张卡：选方案带出地址与成员 Key（可以加多个）") + '</em>'
+      + '<button type="button" class="btn btn-outline btn-sm" onclick="UQ.addSite(\'' + attr(def.id) + '\')">＋ 添加站点</button></div>'
+      + list.map((s) => cfgCardHTML(def, s, { site: s })).join("")
+      + '<p class="uq-p-note uq-sites-empty"' + (list.length ? ' style="display:none"' : "") + '>还没有站点：点右上角「＋ 添加站点」，填个显示名（例如「XX 中转」）；地址可以选一个中转方案带出来，也可以在「高级：接入点覆盖」里直接填站点根地址。</p>'
+      + '</div>';
+  }
+
   function settingsFormHTML(cfg, catalog) {
     const known = new Set(catalog.map((d) => d.id));
     let html = globalsHTML(cfg);
-    html += '<p class="uq-lead">点平台行展开改凭据，<b>「查询一次」当场验证</b>；凭据默认<b>自动</b>＝复用方案里已有的成员密钥。数字来自上游官方接口，与本地配额是两套口径。</p>';
+    html += '<p class="uq-lead">点平台行展开改凭据，<b>「查询一次」当场验证</b>；凭据默认<b>自动</b>＝复用方案里已有的成员密钥。数字来自上游官方接口，与本地配额是两套口径。中转站可以加多个站点。</p>';
+    const sites = Array.isArray(cfg.sites) ? cfg.sites : [];
     for (const group of GROUP_ORDER) {
       const list = catalog.filter((d) => d.group === group);
       if (!list.length) continue;
-      html += '<div class="uq-sec"><div class="uq-sec-hd">' + esc(group) + '<em>' + esc(GROUP_HINT[group] || "") + '</em><em style="margin-left:auto">' + list.length + ' 个</em></div>';
-      html += list.map((def) => cfgCardHTML(def, cfg.providers[def.id] || {})).join("");
+      const singles = list.filter((d) => !d.multiInstance);
+      const multis = list.filter((d) => d.multiInstance);
+      const count = singles.length + multis.reduce((n, d) => n + sites.filter((s) => s.type === d.id).length, 0);
+      html += '<div class="uq-sec"><div class="uq-sec-hd">' + esc(group) + '<em>' + esc(GROUP_HINT[group] || "") + '</em><em style="margin-left:auto">' + count + ' 个</em></div>';
+      html += singles.map((def) => cfgCardHTML(def, cfg.providers[def.id] || {})).join("");
+      for (const def of multis) html += sitesBlockHTML(def, sites.filter((s) => s.type === def.id));
       html += '</div>';
     }
     const unknown = Object.keys(cfg.providers || {}).filter((id) => !known.has(id));
@@ -802,8 +843,10 @@
   }
 
   // 表单 → 保存体。数字字段 Number() 后交给服务端归一化（那边还会夹紧）。
+  // 普通平台收进 providers{}；中转站站点收进 sites[]（同一类型可以有多条）。
   function collect() {
     const providers = Object.assign({}, CARRY);
+    const sites = [];
     document.querySelectorAll("#uqCfgBody .uq-cfg[data-id]").forEach((card) => {
       const id = card.getAttribute("data-id");
       const pick = (f) => card.querySelector('[data-f="' + f + '"]');
@@ -812,7 +855,7 @@
       card.querySelectorAll("[data-extra]").forEach((el) => { extra[el.getAttribute("data-extra")] = el.value; });
       const en = pick("enabled");
       const credential = card.getAttribute("data-credential") || "apiKey";
-      providers[id] = {
+      const entry = {
         enabled: en ? !!en.checked : true,
         // 没有「凭据来源」下拉的卡（NewAPI 的系统访问令牌）用它自带的默认来源，别回落成 auto。
         keySource: val("keySource") || card.getAttribute("data-ksdef") || "auto",
@@ -823,6 +866,12 @@
         label: val("label").trim(),
         extra: extra,
       };
+      const siteType = card.getAttribute("data-site-type");
+      if (siteType) {
+        sites.push(Object.assign({ type: siteType, key: card.getAttribute("data-site-key") || "" }, entry));
+      } else {
+        providers[id] = entry;
+      }
     });
     const g = (k, dflt) => { const el = document.querySelector('#uqCfgBody [data-g="' + k + '"]'); return el ? el.value : dflt; };
     return {
@@ -832,7 +881,50 @@
       timeoutMs: Number(g("timeoutMs", 10000)),
       alertPercent: Number(g("alertPercent", 90)),
       providers: providers,
+      sites: sites,
     };
+  }
+
+  // 分组标题右边的「N 个」：加/删站点后要跟着变，否则会出现「删掉一张卡，标题还写着 4 个」。
+  function refreshSecCount(sec) {
+    if (!sec) return;
+    const em = sec.querySelector(".uq-sec-hd em:last-of-type");
+    if (em) em.textContent = sec.querySelectorAll(".uq-cfg[data-id]").length + " 个";
+  }
+
+  // 「＋ 添加站点」：先在页面上插一张空卡（key 由前端生成，只做内部标识），
+  // 填完点「保存全部」才落盘 —— 与其它改动一致，不点保存就什么都不改。
+  function addSite(type) {
+    const def = (CATALOG || []).find((d) => d.id === type);
+    const block = document.querySelector('#uqCfgBody [data-sites="' + type + '"]');
+    if (!def || !block) return;
+    const used = new Set([].map.call(block.querySelectorAll(".uq-cfg[data-site-key]"), (el) => el.getAttribute("data-site-key")));
+    let key = "s1", n = 1;
+    while (used.has(key)) key = "s" + (++n);
+    const tmp = document.createElement("div");
+    tmp.innerHTML = cfgCardHTML(def, { key: key, type: type, label: "", enabled: true, keySource: def.defaultKeySource || "auto", extra: {} }, { site: { key: key, type: type } });
+    const card = tmp.firstChild;
+    const empty = block.querySelector(".uq-sites-empty");
+    if (empty) block.insertBefore(card, empty); else block.appendChild(card);
+    card.open = true;
+    if (empty) empty.style.display = "none";
+    refreshSecCount(card.closest(".uq-sec"));
+    const name = card.querySelector('[data-f="label"]');
+    if (name) name.focus();
+  }
+
+  // 删除站点：只从页面上拿掉，点「保存全部」后服务端配置里那条才会消失。
+  function delSite(btn) {
+    const card = btn && btn.closest ? btn.closest(".uq-cfg") : null;
+    if (!card) return;
+    const block = card.closest("[data-sites]");
+    const name = card.querySelector(".uq-p-name");
+    card.remove();
+    const left = block ? block.querySelectorAll(".uq-cfg[data-site-key]").length : 0;
+    const empty = block && block.querySelector(".uq-sites-empty");
+    if (empty) empty.style.display = left ? "none" : "";
+    refreshSecCount(block && block.closest(".uq-sec"));
+    setStatus("已移除「" + clip((name && name.textContent) || "站点", 20) + "」——点「保存全部」后生效");
   }
 
   async function saveSettings() {
@@ -890,7 +982,7 @@
       const label = esc(it.label || "额度");
       if (it.kind === "balance") return label + ' <b>' + esc(fmtMoney(it.remaining, it.unit)) + '</b>';
       const pct = usedPercent(it);
-      return label + ' <b>' + (pct === null ? esc(fmtValue(it.used, it.unit)) : (pct < 10 ? pct.toFixed(1) : Math.round(pct)) + "%") + '</b>';
+      return label + ' <b>' + (pct === null ? esc(fmtValue(it.used, it.unit)) : pctStr(pct) + "%") + '</b>';
     }).join('<span style="color:var(--dim2)"> · </span>');
     return '<span class="uq-p-state ok">读到 ' + items.length + ' 项</span> <span class="uq-probe">' + (nums || "上游返回成功，但没有可识别的额度字段")
       + (p.credLabel ? '<span style="color:var(--dim2)"> · 凭据：' + esc(p.credLabel) + '</span>' : "") + '</span>';
@@ -936,6 +1028,8 @@
     testProvider: testProvider,
     syncRow: syncRow,
     collect: collect,
+    addSite: addSite,
+    delSite: delSite,
   };
 
   ensureStyle();

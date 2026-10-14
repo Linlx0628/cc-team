@@ -50,6 +50,21 @@ function crCoverWhy(cov) {
   const es = Object.entries(by).filter(([, n]) => Number(n) > 0);
   return es.length ? es.map(([k, n]) => `${n} 个${CR_CLASS_ZH[k] || k}`).join(" / ") : "";
 }
+// 撞预算后网关自动续评的停止原因(与服务端 RESUME_STOP_ZH 同一套说法,别各写各的)
+const CR_RESUME_STOP_ZH = {
+  cap: "已达续评轮数上限", dailybudget: "当日 token 预算已用尽", noprogress: "续评没有带来新增进展",
+  nosession: "引擎未提供会话标识", unreadable: "续评输出不可用,已保留上一轮结果", regressed: "续评结果反而更少,已保留上一轮结果",
+};
+// 「部分完成」时最该回答的问题:网关到底有没有自己补?补了几轮?为什么停?
+// 注意:老记录没有这份轨迹(run.autoResume 为 null)时**整行不显示**,不编造「没续评」。
+function crResumeText(ar) {
+  const plan = Number(ar.configured) || 0;
+  if (plan <= 0) return "已关闭（轮数 0），未评项不会自动补";
+  const rounds = Number(ar.rounds) || 0;
+  if (!rounds) return `未触发（已配置上限 ${plan} 轮）`;
+  const why = ar.stopped ? (CR_RESUME_STOP_ZH[ar.stopped] || String(ar.stopped)) : "";
+  return `已续评 ${rounds} 轮（复用 ${Number(ar.reused) || 0} 项已评结果）${why ? `，${why}` : ""}`;
+}
 // 覆盖率:新记录由服务端落库后透出(run.coverage),老记录由详情接口按需读原始报告补上。
 // 拿不到就是 null —— **不编造**「评全了」。
 function crCoverage(run) {
@@ -415,6 +430,8 @@ async function openReviewRun(id) {
     const covWhy = crCoverWhy(cov);
     const incomplete = cov ? covFailed > 0 : !!run.coverageIncomplete;
     const notReviewed = cov && Array.isArray(cov.sample) ? cov.sample : [];
+    // 续评计划/轨迹:撞预算后网关自己用 --resume 补了几轮、为什么停下(老记录没有这份轨迹)
+    const ar = run.autoResume && typeof run.autoResume === "object" ? run.autoResume : null;
     let html = '<div class="cr-detail"><div class="cr-facts">'
       + crFact("结论", run.note || "—")
       + crFact("评审范围", escH(crRangeText(run)))
@@ -424,6 +441,8 @@ async function openReviewRun(id) {
           ? `${covDone}/${covSel || Number(run.files_reviewed) || 0} 个文件${covWhy ? `（${escH(covWhy)}）` : ""}`
           : "覆盖不全（详情缺失，原始报告可能已被清理）")
         : "")
+      // 与覆盖率同一段:没评全时紧接着回答「网关自己补过没有、为什么停下」
+      + (incomplete && ar ? crFact("自动续评", escH(crResumeText(ar))) : "")
       // 为什么是这一段 —— 与结论(note)分开显示:「回退为最近 N 个提交」这类原因不该被结论盖掉
       + (run.range_note ? crFact("范围来源", escH(run.range_note)) : "")
       + (commitsTotal > 0 ? crFact("覆盖提交", `${commitsTotal} 个`) : "")

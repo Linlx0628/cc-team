@@ -33,13 +33,13 @@
 | 余额 | 腾讯云账户余额 | 账户余额（已换算成元） | SecretId / SecretKey（TC3-HMAC-SHA256） | 官方 `DescribeAccountBalance` |
 | 余额 | Sub2API（**可加多个站点**） | 钱包/订阅剩余额度；或 5 小时 / 1 天 / 7 天三个 Key 级窗口 | 站点发的 API Key（**必须选方案**，地址与密钥都由方案带出） | 站点自带 `GET /v1/usage`（开源网关） |
 | 余额 | NewAPI（**可加多个站点**） | 剩余额度（`quota ÷ quota_per_unit`）、累计请求 | 控制台生成的**系统访问令牌** + 数字用户 ID | 站点管理面 `GET /api/user/self`（开源网关，one-api 衍生） |
-| 余额 | 硅基流动 SiliconFlow | 总余额 / 赠费 / 充值（CNY） | — | 官方 `GET /v1/user/info` **已于 2026 年初下线**（实测 HTTP 410 + code 20092），替代接口未公布 |
+| 余额 | 硅基流动 SiliconFlow | **可用余额**（现金 + 代金券合计）+ 每张代金券的剩余 / 面额 / 有效期（CNY） | 控制台会话令牌（`__SF_auth.session-token`）+ 账号 ID（`x-subject-id`） | 控制台 walletd 接口（`/api/v1/subject/profile` + `/api/v1/subject/wallets?stage=3`，私有 experimental）。官方 `GET /v1/user/info` **已于 2026 年初下线**（410 + code 20092），见下节 |
 | Plan | 腾讯云 TokenHub Coding Plan | 5 小时 / 每周 / 每订阅月用量 | — | 官方只在控制台展示，无 API |
 | Plan | 阿里云百炼 Coding Plan | 套餐用量 | — | 官方只在控制台展示；`bl` CLI 需控制台登录态（**Token Plan 走的是同一套控制台网关**，见上表） |
 | Plan | 腾讯 CodeBuddy | 套餐与用量 | — | 官方只在网页展示 |
 
 - 面板上只有两个分区：**Plan**（订阅套餐 / 套餐窗口 / 只能在控制台看的套餐）与**余额**（充值余额 / 账户余额 / 中转站钱包）。分区归属是一张显式的表（代码里的 `BUCKET_OF`），**每个平台都必须写明**——漏写会默认落到「余额」，所以测试里有一条「每个平台都要显式归属」的断言。
-- **只能去控制台看的四个平台**（腾讯云 TokenHub Coding Plan、阿里云百炼 Coding Plan、腾讯 CodeBuddy、硅基流动）**不发任何请求**，只给一个「控制台」入口（点开在新标签里打开对方官网）。套餐额度只能人工看，或者等上游自己回 429（腾讯 TokenHub 的 `20097 hour|week|month allocated quota exceeded`、百炼的 `usage allocated quota exceeded`——这类报错会进管理面板的「错误记录」）。
+- **只能去控制台看的三个平台**（腾讯云 TokenHub Coding Plan、阿里云百炼 Coding Plan、腾讯 CodeBuddy）**不发任何请求**，只给一个「控制台」入口（点开在新标签里打开对方官网）。套餐额度只能人工看，或者等上游自己回 429（腾讯 TokenHub 的 `20097 hour|week|month allocated quota exceeded`、百炼的 `usage allocated quota exceeded`——这类报错会进管理面板的「错误记录」）。
 - ⚠️ 「账户余额」和「套餐额度」是两笔账：腾讯/阿里的 Token Plan 扣的是套餐额度，账户余额可能在很长一段时间里都是 0；反过来账户有余额也不代表套餐没到期。
 
 ## 一张卡片怎么读
@@ -314,6 +314,46 @@ Credit 套餐：优先按桶的绝对值加权 —— percent = (1 - Σcredit_re
 
 ⚠️ 令牌是**控制台登录态，权限比 API Key 大**（能操作你账号下的东西），只填在本机设置页里，别分享给别人。它和 API Key 一样以**明文**存在 `config.json` 的 `upstreamQuota` 里。
 
+### 硅基流动：官方余额接口下线了，改读控制台 walletd（现金 + 代金券）
+
+硅基流动的**官方 API Key 侧已经没有余额接口**：`GET /v1/user/info` 于 2026 年初下线（实测 HTTP 410 + code 20092），替代接口官方没公布。但控制台网页版自己走的是 `walletd` 服务（控制台的 Next.js 把 `walletd-server/*` 反代到 `https://walletd.siliconflow.cn/*`），两个接口都是活的：
+
+```text
+GET https://walletd.siliconflow.cn/api/v1/subject/profile                       → 现金余额
+GET https://walletd.siliconflow.cn/api/v1/subject/wallets?pageSize=50&stage=3   → 代金券（stage 3 = COUPON）
+
+cookie: __SF_auth.session-token=<控制台登录态>
+header: x-subject-id: <账号 ID>        # 缺了服务端回 400 validate error: invalid parameter: SubjectId
+```
+
+**为什么代金券也算余额**：硅基流动的赠送额度（认证奖励、邀请奖励、充值赠金）全部落在代金券里，而代金券能直接抵扣消费 —— 站内「可用余额」= 现金 + 代金券。所以卡片第一条是合计的「可用余额」，下面每张券一条：
+
+| 卡片上看到 | 来自 | 例 |
+|---|---|---|
+| **可用余额** | `financialInfo.balance` + 所有未过期代金券的 `balance` | 说明行「现金 ¥0.00 · 代金券 ¥35.85（2 张）」 |
+| 认证奖励券 / 赠金等额代金券 … | `wallets[].name`（多语言 JSON，取 `zh-cn`） | 每条带「有效期至 2027-01-31 · 面额 ¥16.00 · 已用 ¥5.91」 |
+
+**金额口径（易错）**：`profile` 里的金额**已经是元**（十进制字符串）；代金券的 `cap` / `used` / `balance` 是**12 位小数的定点整数** —— `16000000000000` 就是 ¥16（官方文案「16 元「认证奖励券」」可交叉验证）。面板换算时代金券除以 `1e12`：
+
+```text
+可用余额 = financialInfo.balance + Σ(未过期代金券.balance)
+代金券金额（元）= wallet.balance ÷ 1e12        例：10090655520000 ÷ 1e12 = 10.09065552
+已用完或已过期的券不计入（说明行写「N 张代金券已用完或过期，未计入」）
+余额告警只看第一条「可用余额」，所以「现金 0 + 只有代金券」不会被误判成余额耗尽
+```
+
+**怎么拿凭据**（浏览器里一次，30 秒）：
+
+1. 登录 [cloud.siliconflow.cn](https://cloud.siliconflow.cn/me/expensebill) → `F12` → **Application → Cookies → `https://cloud.siliconflow.cn`** → 复制 **`__SF_auth.session-token`** 的值；
+2. 同一个 `F12` 切到 **Network**，点任意一个请求，复制请求头 **`x-subject-id`**（形如 `rch2fz3g09`）；
+3. 设置页 → 上游额度 → **硅基流动 SiliconFlow** → 两格都填上 → 顶部「保存全部」→ 点卡片上的刷新。
+
+⚠️ **会话会过期**：`__SF_auth.session-token` 是控制台登录态，过期后服务端回 401，卡片提示「控制台令牌可能已过期：重新登录控制台，复制一份新的」。硅基流动**没有**阶跃星辰那种自动续期（它没有暴露 RefreshToken 接口给网页版）。
+
+⚠️ 控制台会话**权限比 API Key 大**（能操作账号下的东西），只填在本机设置页里即可；和 API Key 一样以**明文**存在 `config.json` 的 `upstreamQuota` 里。
+
+⚠️ 这两个接口是**控制台内部接口**（社区逆向，官方随时可能改），所以归为 experimental；接口一变就把这个平台的开关关掉。
+
 ## 数字示例：平台差异导致的显示差异
 
 | 平台返回 | 面板显示 |
@@ -353,7 +393,9 @@ Credit 套餐：优先按桶的绝对值加权 —— percent = (1 - Σcredit_re
 | 百炼 Token Plan 点「一键获取令牌」后一直「等待授权」 | 回调回不到面板：浏览器必须能访问**面板这个地址**（本机 `127.0.0.1` 或 SSH 隧道都行）。面板开在服务器上、浏览器用 `http://<服务器IP>:6789` 访问时，https 授权页发的回调会被浏览器按混合内容拦掉 —— 改用 `ssh -L 6789:127.0.0.1:6789` 隧道访问，或在自己电脑上跑 `node tools/bailian-console-login.mjs` 拿令牌 |
 | 百炼 Token Plan 只有 Harness 权益、没有「套餐月额度」 | 该账号没有月额度上限（或额度还没发放，官方说发放比购买晚几分钟）：卡片会给一条说明而不是显示成 0% |
 | 腾讯云 `未配置 AccessKey ID / Secret` | 云平台必须手填 SecretId / SecretKey，不能靠「自动复用方案密钥」（方案里的 Key 是推理 Key） |
-| 硅基流动在设置页只有「控制台」、不给查询 | 官方 `/v1/user/info` 已下线（410 + code 20092），替代接口未公布，所以本工具只给控制台入口；余额请去 [控制台「余额充值」](https://cloud.siliconflow.cn/account/charge) 看。官方公布新接口后会恢复 |
+| 硅基流动提示「未配置「控制台会话令牌」/「账号 ID」」 | 两格都要填：Cookie 里的 `__SF_auth.session-token` + 请求头 `x-subject-id`（见上节「怎么拿凭据」） |
+| 硅基流动 `HTTP 401` / 「控制台令牌可能已过期」 | 控制台会话过期了：重新登录控制台，复制一份新的 `__SF_auth.session-token` 粘回去 |
+| 硅基流动 `HTTP 400` + `invalid parameter: SubjectId` | `x-subject-id` 填错或没填（不是用户名，是控制台请求头里那串短 ID） |
 | Sub2API 报 `HTTP 404` / `HTTP 401` | 站点地址或 Key 不对：确认「方案」选的是这个中转站，或直接在「接入点覆盖」里填站点根地址（**不要带 `/v1`**） |
 | NewAPI 报 `无权进行此操作，未登录且未提供 access token` | 填的不是控制台生成的**系统访问令牌**（`sk-` 中转 Key 不行），或该站要求带 `New-Api-User` 数字用户 ID |
 | NewAPI 报 `没有 quota / used_quota` | 令牌有效但用户 ID 不对（读到的是空用户对象），核对控制台个人信息里的数字 ID |
@@ -363,7 +405,7 @@ Credit 套餐：优先按桶的绝对值加权 —— percent = (1 - Σcredit_re
 
 ## 加一个新平台
 
-- 上表里的 19 个内置平台**开箱即用**，选中就能查；中转站（Sub2API / NewAPI）可以按上面的办法加任意多个站点。
+- 上表里的 20 个内置平台**开箱即用**，选中就能查；中转站（Sub2API / NewAPI）可以按上面的办法加任意多个站点。
 - 上表之外、又只有 HTTP 接口的平台：目前面板里**没有**「自己填字段」的通用接口了（该功能已按需求下线）。要接只能改代码 —— 在 `lib/upstream-quota.mjs` 的 provider 定义里加一条（写请求、解析、字段、文档链接），重启后就会出现在设置页里。
 
 ## 相关页面

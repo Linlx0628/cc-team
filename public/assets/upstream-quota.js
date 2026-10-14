@@ -384,7 +384,10 @@
     if (spec) bits.push(spec.charAt(0).toUpperCase() + spec.slice(1));
     const status = String(plan.status || "").trim();
     if (status) bits.push(PLAN_STATUS_TEXT[status] || status);
-    const days = Number(plan.remainingDays);
+    // 注意：remainingDays 可能是 null（例如阶跃星辰的套餐名接口只给名字）——
+    // 不能直接 Number(null)（= 0，会画成「剩 0 天」这个假的到期提示）。
+    const rawDays = plan.remainingDays;
+    const days = (rawDays === null || rawDays === undefined || rawDays === "") ? NaN : Number(rawDays);
     const hasDays = Number.isFinite(days);
     if (Number(plan.endAt) > 0) {
       bits.push("到期 " + bjDate(plan.endAt) + (hasDays ? "（剩 " + Math.round(days) + " 天）" : ""));

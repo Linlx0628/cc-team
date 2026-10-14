@@ -35,7 +35,7 @@
 | 余额 | NewAPI（**可加多个站点**） | 剩余额度（`quota ÷ quota_per_unit`）、累计请求 | 控制台生成的**系统访问令牌** + 数字用户 ID | 站点管理面 `GET /api/user/self`（开源网关，one-api 衍生） |
 | 余额 | 硅基流动 SiliconFlow | **可用余额**（现金 + 代金券合计）+ 每张代金券的剩余 / 面额 / 有效期（CNY） | 控制台会话令牌（`__SF_auth.session-token`）+ 账号 ID（`x-subject-id`） | 控制台 walletd 接口（`/api/v1/subject/profile` + `/api/v1/subject/wallets?stage=3`，私有 experimental）。官方 `GET /v1/user/info` **已于 2026 年初下线**（410 + code 20092），见下节 |
 | Plan | 腾讯云 TokenHub Coding Plan | 5 小时 / 每周 / 每订阅月用量 | — | 官方只在控制台展示，无 API |
-| Plan | 阿里云百炼 Coding Plan | 5 小时 / 每周 / 计费月三个窗口的已用额度（**接口不给单位，数字原样显示**）；套餐名 / 状态 / 到期 / 剩余天数 | 控制台令牌（与「阿里云百炼 Token Plan」**共用同一份**，卡片页脚「一键获取令牌」；留空时自动读本机 `~/.bailian/config.json`） | 百炼控制台网关（`zeldaEasy.bailian-commerce.codingPlan.queryCodingPlanInstanceInfoV2`，私有 experimental，见[下节](#阿里云百炼-coding-plan同一个控制台令牌读三个窗口)） |
+| Plan | 阿里云百炼 Coding Plan | 5 小时 / 每周 / 计费月三个窗口的已用额度（**接口不给单位，数字原样显示**）；套餐名 / 状态 / 到期 / 剩余天数 | 控制台令牌（与「阿里云百炼 Token Plan」**共用同一份**，卡片页脚「一键获取令牌」；留空时自动读本机 `~/.bailian/config.json`）+ `AccessKey ID` / `Secret`（**可选**：留空也能查；填了就能在没有令牌 / 令牌过期时自动换取，可复用「阿里云账户余额」那份） | 百炼控制台网关（`zeldaEasy.bailian-commerce.codingPlan.queryCodingPlanInstanceInfoV2`，私有 experimental，见[下节](#阿里云百炼-coding-plan同一个控制台令牌读三个窗口)） |
 | Plan | 腾讯 CodeBuddy | 套餐与用量 | — | 官方只在网页展示 |
 
 - 面板上只有两个分区：**Plan**（订阅套餐 / 套餐窗口 / 只能在控制台看的套餐）与**余额**（充值余额 / 账户余额 / 中转站钱包）。分区归属是一张显式的表（代码里的 `BUCKET_OF`），**每个平台都必须写明**——漏写会默认落到「余额」，所以测试里有一条「每个平台都要显式归属」的断言。
@@ -272,6 +272,17 @@ GET/POST 控制台网关  api = zeldaHttp.apikeyMgr./tokenplan/personal/api/v2/s
 
 百炼的 **Coding Plan**（`sfm_codingplan_public_cn`，控制台「订阅 → Coding Plan」那一页）和 Token Plan 一样是**控制台登录态**才能读的接口，但**用的是同一份「控制台令牌」**——设置页 → 上游额度 → 阿里云百炼 Coding Plan 卡片页脚点「一键获取令牌」，或者直接把 Token Plan 那份令牌填进去（两处留空都会退到本机 `~/.bailian/config.json`）。
 
+**拿令牌的四条路**（与 [Token Plan 那节](#阿里云百炼-token-plan两张脸个人版--席位制团队版)完全一样，因为就是同一份令牌）：
+
+| 路子 | 怎么做 | 适合谁 |
+|---|---|---|
+| 浏览器一键授权 | 卡片页脚「一键获取令牌」→ 控制台点授权 → 令牌自动回填 | 面板在**本机**（或经 `ssh -L 6789:127.0.0.1:6789` 隧道）访问时；用域名 / 局域网 IP 打开面板时这个按钮会被浏览器的混合内容拦截挡掉（控制台回调硬编码 http） |
+| 自己机器上取 | 在能上网的电脑上跑 `node tools/bailian-console-login.mjs`，把打印的 `access_token` 粘进「控制台令牌」 | 面板部署在服务器上、本机没浏览器回调 |
+| **AccessKey 自动换取（服务器推荐）** | 填写可选的两格 `AccessKey ID` / `AccessKey Secret`（**可复用「阿里云账户余额」那份**），并给这个 RAM 用户加 `modelstudio:GenerateCLIAccessToken` 权限 | 无人值守的服务器：没有令牌时自动换一条；令牌过期（`NotLogined`）时自动换一条**再重试一次** |
+| 手工粘贴 | 从浏览器开发者工具里抄 `access_token` | 临时排障 |
+
+**AccessKey 是可选的**：这张卡的主要凭据是控制台令牌，AK/SK 只是「服务器上自动换取 / 续期令牌」的手段——所以只填令牌、一格 AK/SK 都不填也能查（不会像普通云平台那样报「未配置 AccessKey ID / Secret」）；反过来，只填 AK/SK、不填令牌，第一次查询会先拿 AK/SK 换令牌。换到的令牌会**在内存里缓存 30 分钟**，Token Plan 与 Coding Plan **共用**这一份，所以两张卡连着查只会换一次。卡片右下角那行「凭据：…」写的是**这次实际用的凭据**：`控制台令牌` / `控制台令牌（AccessKey 自动换取）`——不是「AK/SK 是从哪张卡复用的」。
+
 | 面板上看到 | 接口字段 | 说明 |
 |---|---|---|
 | 5 小时窗口 | `per5HourUsedQuota` / `per5HourTotalQuota` | **滚动窗口**：接口给的 `per5HourQuotaNextRefreshTime` 实测**就是查询时刻**（两次查询相隔 156 秒，字段值也跟着走 156 秒），所以**不画倒计时**，只留一行小字说明 |
@@ -286,8 +297,9 @@ GET/POST 控制台网关  api = zeldaHttp.apikeyMgr./tokenplan/personal/api/v2/s
 - 账号**没有** Coding Plan：接口正常返回但没有实例 → 卡片显示「这个账号没有百炼 Coding Plan 实例（接口没返回 codingPlanInstanceInfos）」，不报错。
 - 有实例但**没有用量字段**：显示「接口没返回 Coding Plan 的窗口额度（有实例但没有用量字段）」。
 - 接口名变了 / 服务下线：先试 V2（`…queryCodingPlanInstanceInfoV2`），被回「没有这个服务 / Not Found / 404」时**自动退回** V1 名（`…queryCodingPlanInstanceInfo`，返回同一份数据）；两个都不行才在卡片上报「查询失败」。
-- 令牌**没配**：卡片标「未配置」，提示去拿控制台令牌，**一个请求都不发**。
-- 令牌**过期**：网关回 `NotLogined` → 卡片提示「控制台令牌已失效或被拒绝」，按 Token Plan 那节的三条路线重取（服务器上推荐配 `modelstudio:GenerateCLIAccessToken` 权限点自动续期）。
+- 令牌**没配**（也没 AK/SK）：卡片标「未配置」并直接说清三条取令牌的路，**一个请求都不发**。
+- 令牌**过期**：网关回 `NotLogined` → 有 AK/SK 时**自动换一条新令牌重试一次**（成功后照常出数据）；没有 AK/SK 才在卡片上提示「控制台令牌已失效或被拒绝」，按上面四条路重取。
+- 有 AK/SK 但 RAM 用户缺 `modelstudio:GenerateCLIAccessToken` 权限：卡片红字写明缺哪个权限点（实测子账号默认 403 `AccessDenied`）。
 - 国际站（新加坡）账号：把「控制台区域」填 `ap-southeast-1`，请求会打到 `modelstudio-cs.console.aliyun.com`。
 
 > ⚠️ 这是一个**私有接口**（控制台页面自己调的 `zeldaEasy.bailian-commerce.codingPlan.*`，走 `/cli/api.json` 网关 + `Authorization: Bearer <控制台令牌>`），没进官方文档，所以带 `实验` 标；阿里云改了接口名就会失效，届时按上面「退回 V1 / 查询失败」的表现来认。

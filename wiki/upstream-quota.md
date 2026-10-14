@@ -35,11 +35,11 @@
 | 余额 | NewAPI（**可加多个站点**） | 剩余额度（`quota ÷ quota_per_unit`）、累计请求 | 控制台生成的**系统访问令牌** + 数字用户 ID | 站点管理面 `GET /api/user/self`（开源网关，one-api 衍生） |
 | 余额 | 硅基流动 SiliconFlow | **可用余额**（现金 + 代金券合计）+ 每张代金券的剩余 / 面额 / 有效期（CNY） | 控制台会话令牌（`__SF_auth.session-token`）+ 账号 ID（`x-subject-id`） | 控制台 walletd 接口（`/api/v1/subject/profile` + `/api/v1/subject/wallets?stage=3`，私有 experimental）。官方 `GET /v1/user/info` **已于 2026 年初下线**（410 + code 20092），见下节 |
 | Plan | 腾讯云 TokenHub Coding Plan | 5 小时 / 每周 / 每订阅月用量 | — | 官方只在控制台展示，无 API |
-| Plan | 阿里云百炼 Coding Plan | 套餐用量 | — | 官方只在控制台展示；`bl` CLI 需控制台登录态（**Token Plan 走的是同一套控制台网关**，见上表） |
+| Plan | 阿里云百炼 Coding Plan | 5 小时 / 每周 / 计费月三个窗口的已用额度（**接口不给单位，数字原样显示**）；套餐名 / 状态 / 到期 / 剩余天数 | 控制台令牌（与「阿里云百炼 Token Plan」**共用同一份**，卡片页脚「一键获取令牌」；留空时自动读本机 `~/.bailian/config.json`） | 百炼控制台网关（`zeldaEasy.bailian-commerce.codingPlan.queryCodingPlanInstanceInfoV2`，私有 experimental，见[下节](#阿里云百炼-coding-plan同一个控制台令牌读三个窗口)） |
 | Plan | 腾讯 CodeBuddy | 套餐与用量 | — | 官方只在网页展示 |
 
 - 面板上只有两个分区：**Plan**（订阅套餐 / 套餐窗口 / 只能在控制台看的套餐）与**余额**（充值余额 / 账户余额 / 中转站钱包）。分区归属是一张显式的表（代码里的 `BUCKET_OF`），**每个平台都必须写明**——漏写会默认落到「余额」，所以测试里有一条「每个平台都要显式归属」的断言。
-- **只能去控制台看的三个平台**（腾讯云 TokenHub Coding Plan、阿里云百炼 Coding Plan、腾讯 CodeBuddy）**不发任何请求**，只给一个「控制台」入口（点开在新标签里打开对方官网）。套餐额度只能人工看，或者等上游自己回 429（腾讯 TokenHub 的 `20097 hour|week|month allocated quota exceeded`、百炼的 `usage allocated quota exceeded`——这类报错会进管理面板的「错误记录」）。
+- **只能去控制台看的两个平台**（腾讯云 TokenHub Coding Plan、腾讯 CodeBuddy）**不发任何请求**，只给一个「控制台」入口（点开在新标签里打开对方官网）。套餐额度只能人工看，或者等上游自己回 429（腾讯 TokenHub 的 `20097 hour|week|month allocated quota exceeded`、百炼的 `usage allocated quota exceeded`——这类报错会进管理面板的「错误记录」）。阿里云百炼 Coding Plan 2026-10-15 起**已经能查**（走控制台网关，见下节），不在这一档里了。
 - ⚠️ 「账户余额」和「套餐额度」是两笔账：腾讯/阿里的 Token Plan 扣的是套餐额度，账户余额可能在很长一段时间里都是 0；反过来账户有余额也不代表套餐没到期。
 
 ## 一张卡片怎么读
@@ -55,7 +55,7 @@
   - 套餐类：一个窗口一行 —— 左边窗口名，右边**大号已用百分比**，下面是进度条与 `剩 6.00M / 300.00M tokens · 3 天后重置（10-17 11:45）`
   - 卡片右上角：状态徽章 + `↻`（只重查这一个平台）+ `ⓘ`（悬停显示该平台的官方口径说明，正文里不复述长文）
 - **没有数字的平台 → 压成一行小字**
-  - 还能查的（仅控制台那四个）直接摆出来，带「控制台」入口
+  - 还能查的（仅控制台那两个）直接摆出来，带「控制台」入口
   - 已关闭 / 未配置的收进分区末尾的折叠块「**其余 N 个（未配置 / 已关闭）**」，点开才占位置；展开状态记在浏览器本地，面板每 30 秒重绘也不会被弹回去
 
 细节：
@@ -267,6 +267,31 @@ GET/POST 控制台网关  api = zeldaHttp.apikeyMgr./tokenplan/personal/api/v2/s
 > - 火山引擎：方舟的 `GetCodingPlanUsage` / `GetAgentPlanAFPUsage` / `GetSeatInfoUsage` 与费用中心 `QueryBalanceAcct`
 
 ⚠️ 火山官方 CLI（ark-cli 0.1.16 起）暂停了 AK/SK 登录通道，那是 **CLI 自己**的限制；本页是直连公网 OpenAPI 签名，不受影响，但仍建议先点「查询一次」确认权限点够用。
+
+### 阿里云百炼 Coding Plan：同一个控制台令牌，读三个窗口
+
+百炼的 **Coding Plan**（`sfm_codingplan_public_cn`，控制台「订阅 → Coding Plan」那一页）和 Token Plan 一样是**控制台登录态**才能读的接口，但**用的是同一份「控制台令牌」**——设置页 → 上游额度 → 阿里云百炼 Coding Plan 卡片页脚点「一键获取令牌」，或者直接把 Token Plan 那份令牌填进去（两处留空都会退到本机 `~/.bailian/config.json`）。
+
+| 面板上看到 | 接口字段 | 说明 |
+|---|---|---|
+| 5 小时窗口 | `per5HourUsedQuota` / `per5HourTotalQuota` | **滚动窗口**：接口给的 `per5HourQuotaNextRefreshTime` 实测**就是查询时刻**（两次查询相隔 156 秒，字段值也跟着走 156 秒），所以**不画倒计时**，只留一行小字说明 |
+| 每周窗口 | `perWeekUsedQuota` / `perWeekTotalQuota` | 重置时间是真的：每周一 00:00（北京时间），照常显示「N 天后重置（10-19 00:00）」 |
+| 计费月窗口 | `perBillMonthUsedQuota` / `perBillMonthTotalQuota` | 重置时间 = 套餐到期时刻（`instanceEndTime`） |
+| 卡片标题下面那行 | `instanceName` / `status` / `instanceEndTime` / `remainingDays` / `autoRenewFlag` | 例：`Coding Plan Pro · 生效中 · 到期 2026-11-07（剩 22 天）`；`autoRenewFlag: true` 时才多一个「自动续费」 |
+
+已用百分比怎么算：`used ÷ total`，保留两位小数——例如 `358 ÷ 6000 = 5.97%`、`3687 ÷ 45000 = 8.19%`、`8203 ÷ 90000 = 9.11%`（这是 2026-10-15 一次真实读数的样子）。**接口不给单位**（不知道是「次」还是别的），所以面板照抄原始数字：`剩 5,642 / 6,000`。
+
+**边界情况**：
+
+- 账号**没有** Coding Plan：接口正常返回但没有实例 → 卡片显示「这个账号没有百炼 Coding Plan 实例（接口没返回 codingPlanInstanceInfos）」，不报错。
+- 有实例但**没有用量字段**：显示「接口没返回 Coding Plan 的窗口额度（有实例但没有用量字段）」。
+- 接口名变了 / 服务下线：先试 V2（`…queryCodingPlanInstanceInfoV2`），被回「没有这个服务 / Not Found / 404」时**自动退回** V1 名（`…queryCodingPlanInstanceInfo`，返回同一份数据）；两个都不行才在卡片上报「查询失败」。
+- 令牌**没配**：卡片标「未配置」，提示去拿控制台令牌，**一个请求都不发**。
+- 令牌**过期**：网关回 `NotLogined` → 卡片提示「控制台令牌已失效或被拒绝」，按 Token Plan 那节的三条路线重取（服务器上推荐配 `modelstudio:GenerateCLIAccessToken` 权限点自动续期）。
+- 国际站（新加坡）账号：把「控制台区域」填 `ap-southeast-1`，请求会打到 `modelstudio-cs.console.aliyun.com`。
+
+> ⚠️ 这是一个**私有接口**（控制台页面自己调的 `zeldaEasy.bailian-commerce.codingPlan.*`，走 `/cli/api.json` 网关 + `Authorization: Bearer <控制台令牌>`），没进官方文档，所以带 `实验` 标；阿里云改了接口名就会失效，届时按上面「退回 V1 / 查询失败」的表现来认。
+> ⚠️ 控制台令牌是**控制台登录态**、按个人账号签发（权限比 AccessKey 大），和 Token Plan 共用一份；别再填到别处或分享出去。
 
 ### 阶跃星辰 Step Plan：官方 API 看不到套餐，只能抄一份控制台令牌
 

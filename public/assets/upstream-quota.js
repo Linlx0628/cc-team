@@ -111,6 +111,8 @@
       ".uq-q .quota-progress{display:block;width:100%;height:5px;margin:4px 0 3px;border-radius:3px}",
       ".uq-q .quota-progress>i{transition:width .3s}",
       ".uq-q-sub{font-size:11px;color:var(--dim2);font-variant-numeric:tabular-nums}",
+      // 窗口额度的一句话说明（例：滚动窗口没有可用的重置时间；上游只给百分比之类）
+      ".uq-q-note{margin-top:2px;font-size:11px;line-height:1.6;color:var(--dim2)}",
       // 卡片内的异常/提示
       ".uq-alert{margin:8px 0 0;font-size:11.5px;line-height:1.5;color:var(--red);word-break:break-word}",
       ".uq-warnline{margin:6px 0 0;font-size:11px;line-height:1.5;color:var(--orange)}",
@@ -401,6 +403,7 @@
       + '<b class="' + sev + '">' + (pct === null ? esc(fmtValue(it.used, it.unit)) : pctStr(pct) + "%") + '</b></div>'
       + (pct === null ? "" : '<div class="quota-progress' + (sev === "alarm" ? " crit" : sev === "warn" ? " warn" : "") + '"><i style="width:' + pct.toFixed(1) + '%"></i></div>')
       + (sub.length ? '<div class="uq-q-sub">' + esc(sub.join(" · ")) + '</div>' : "")
+      + (it.note ? '<div class="uq-q-note">' + esc(it.note) + '</div>' : "")
       + '</div>';
   }
 

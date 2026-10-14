@@ -146,14 +146,20 @@
       ".uq-probe{font-size:11.5px;line-height:1.6;min-width:0}",
       ".uq-probe .uq-p-live{font-size:14px;margin-left:0}",
       ".uq-cfg-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(212px,1fr));gap:10px;margin-top:11px}",
-      ".uq-cfg-grid label{display:block;font-size:11px;color:var(--dim);margin-bottom:3px}",
+      // 每格是「标签在上、控件在下」的竖排，并整体贴底：某格标签折成两行时，控件仍然和
+      // 同行其它格的控件站在同一条线上（否则就会出现「方案」和「成员」两个下拉框错位）。
+      ".uq-cfg-grid>div{display:flex;flex-direction:column;justify-content:flex-end;min-width:0}",
+      // margin 归零是必须的：全局 label 样式带 12px 上边距，会让格子里的标签和控件整体下移。
+      ".uq-cfg-grid label{display:block;font-size:11px;color:var(--dim);margin:0 0 3px}",
       ".uq-cfg-grid input,.uq-cfg-grid select{width:100%}",
       ".uq-adv{margin-top:11px;font-size:11.5px}",
       ".uq-adv>summary{cursor:pointer;color:var(--dim2);list-style:none;display:inline-block}",
       ".uq-adv>summary::-webkit-details-marker{display:none}",
       ".uq-adv>summary:hover{color:var(--accent)}",
-      ".uq-sw{display:flex;align-items:center;gap:6px;font-size:11.5px;color:var(--dim)}",
-      ".uq-sw select{width:auto}",
+      // 总开关这格要和右边那排按钮同高、同中线：全局 label 的 12px/5px 上下边距会把整格压下去
+      // （实测比按钮低 3.5px），下拉框本身也比 .btn-sm 高，所以这里把边距归零、高度对齐 33px。
+      ".uq-sw{display:flex;align-items:center;gap:6px;font-size:11.5px;color:var(--dim);margin:0}",
+      ".uq-sw select{width:auto;height:33px;padding:0 8px}",
       ".uq-en{width:auto;margin:0}",
     ].join("");
     document.head.appendChild(st);
@@ -641,7 +647,10 @@
       // 第二个参数 = 必选（Sub2API profileOnly：地址与 Key 都只能从方案来，不选就查不了）。
       const profileField = (when, required) => '<div' + (when
         ? ' data-when="profile"' + (keySource === "profile" ? "" : ' style="display:none"') : "") + '>'
-        + '<label>方案' + (required ? '<span style="color:var(--dim2)">（必选 · 带出站点地址与成员 Key）</span>' : (fromProfile ? '<span style="color:var(--dim2)">（带出站点地址）</span>' : "")) + '</label>'
+        // 标签保持一行：写全「带出站点地址与成员 Key」会在窄列里折成两行，把下面的下拉框
+        // 顶下去、和「成员」那一格对不齐（详见 uq-cfg-grid 的底部对齐）。说明挂在 title 上。
+        + '<label' + (required ? ' title="一个方案 = 一个站点：站点地址与成员 Key 都从方案带出"' : "") + '>方案'
+        + (required ? '<span style="color:var(--dim2)">（必选）</span>' : (fromProfile ? '<span style="color:var(--dim2)">（带出站点地址）</span>' : "")) + '</label>'
         + '<select data-f="profileSuffix" onchange="UQ.syncRow(this)">' + profileOptions(pc.profileSuffix || "") + '</select></div>';
       let cred;
       if (credential === "accessKey") {

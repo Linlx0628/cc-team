@@ -223,6 +223,7 @@ newQuota ≤ userQuota → 放弃
 | `type: quota_exceeded`，正文含「今日配额已用尽」「额度池『xx』」 | **本站**额度池 | 加量 / 重置 / 等北京时间次日零点，与上游无关 |
 | 腾讯云 `20097 hour\|week\|month allocated quota exceeded` | **上游**套餐 | 等对应窗口重置（5 小时滑动 / 每周一 00:00 / 订阅月到期时刻）；本站按套餐耗尽处理 |
 | 阿里云百炼 `usage allocated quota exceeded`（含 hour / week / month） | **上游**套餐 | 同上 |
+| 阿里云百炼 Token Plan 个人版 `429 insufficient_quota: Your token-plan quota has been exhausted.` | **上游** Token Plan 月额度 | 等订阅月重置（重置时刻看「上游额度」页那张卡的「重置」），或让账号买用量包 / 升档；本站按套餐耗尽处理 |
 | 上游 `tpm rate limit exceeded`、智谱业务码 `1302` / `1305` | **上游**频率限流 | 瞬时突发，**不算**套餐耗尽，不触发方案暂停 |
 
 > ⚠️ 上游额度的查询结果**只用于展示与告警**，不参与路由决策——不会因为「某个上游余额为 0」就自动跳过某个候选方案。

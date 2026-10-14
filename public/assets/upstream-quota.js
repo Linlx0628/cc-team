@@ -58,14 +58,15 @@
       ".uq-buckets .uq-tail{margin-top:auto}",
       ".uq-sec-hd{display:flex;align-items:baseline;gap:8px;font-size:11.5px;font-weight:650;color:var(--dim);letter-spacing:.06em;margin:0 0 8px;padding-bottom:5px;border-bottom:1px solid var(--border)}",
       ".uq-sec-hd em{font-style:normal;font-weight:400;font-size:11px;color:var(--dim2);letter-spacing:0}",
-      // 236px 起排 → 常见 1000~1200px 的内容区一行 4 张卡，少滚动
-      // dense：让窄卡回填宽卡旁边留出的空位（宽卡必须整行起排，不然右边会空一格）
-      ".uq-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(236px,1fr));gap:10px;align-items:start;align-content:start;grid-auto-flow:dense}",
-      // 条目多的卡（>=5 项）横着占满整行，内部再按列自动分栏：一张长卡不会把整段的行高撑歪。
-      ".uq-card.wide{grid-column:1/-1}",
-      // 宽卡（多列）内部再按列自动分栏；wide-tail 让它在同段里排到最后 —— 单列卡优先在上面/前面，
-      // 多列卡一律在下面（用户 2026-10-14 明确要求）。告警/失败的宽卡不挪位，免得要紧的红卡被压到底部。
-      ".uq-card.wide-tail{order:1}",
+      // 卡片瀑布：各平台条目数不同、卡片高度差很大，grid 会按一行里最高的那张定行高（矮卡下面空
+      // 一块），CSS 多列（columns）的自动平衡在「一张很高的卡 + 一堆矮卡」时也很差（实测余额段
+      // 两列 756 / 431px）。所以列由 JS 分（layoutGrid：贪心放最矮的列 + 一轮局部改进），
+      // 这里只给骨架样式（用户 2026-10-14 反馈「卡片长短不同、有空白、排列不整齐」）。
+      ".uq-grid{display:flex;flex-wrap:wrap;align-items:flex-start;gap:10px}",
+      ".uq-grid>.uq-col{flex:1 1 236px;min-width:0;display:flex;flex-direction:column;gap:10px}",
+      ".uq-grid>.uq-card{flex:1 1 100%}",
+      // 条目多的卡（>=5 项）整行独占，内部再按列自动分栏：一张长卡不会把整段撑歪。
+      ".uq-card.wide{width:100%}",
       ".uq-card.wide .uq-body{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:0 18px;align-content:start}",
       // 套餐信息行（规格 · 生效中 · 到期 …）
       ".uq-plan{margin:4px 0 0;font-size:10.5px;color:var(--dim2);font-variant-numeric:tabular-nums}",
@@ -91,6 +92,15 @@
       ".uq-bal-v.muted{color:var(--dim2)}",
       ".uq-bal-l{font-size:11.5px;color:var(--dim);margin-top:2px}",
       ".uq-bal-m{font-size:11px;color:var(--dim2);margin-top:5px;font-variant-numeric:tabular-nums}",
+      // 代金券：和「余额」明显区分 —— 单独的虚线小卡片 + 「代金券」标签 + 琥珀色底（用户 2026-10-14 要求）。
+      ".uq-vch-wrap{margin-top:10px;padding-top:8px;border-top:1px dashed var(--border)}",
+      ".uq-vch-hd{display:flex;align-items:center;gap:6px;font-size:10.5px;color:var(--dim2);margin-bottom:6px}",
+      ".uq-vch-tag{display:inline-block;padding:1px 7px;border-radius:999px;border:1px solid #ecd9a8;background:#fdf6e3;color:#8a6a1f;font-weight:650;letter-spacing:.04em}",
+      ".uq-vchs{display:grid;gap:7px;grid-template-columns:repeat(auto-fill,minmax(148px,1fr))}",
+      ".uq-vch{border:1px dashed #e2cfa0;border-radius:9px;background:linear-gradient(180deg,#fffdf5,var(--surface) 72%);padding:7px 9px;min-width:0}",
+      ".uq-vch-name{font-size:11px;color:var(--dim);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}",
+      ".uq-vch-v{font-size:15.5px;font-weight:700;color:var(--text);margin-top:2px;font-variant-numeric:tabular-nums;white-space:nowrap}",
+      ".uq-vch-meta{font-size:10px;color:var(--dim2);margin-top:3px;line-height:1.45}",
       // 套餐窗口
       ".uq-q{margin:9px 0 0}",
       ".uq-q:first-of-type{margin-top:7px}",
@@ -353,6 +363,27 @@
       + (note ? '<div class="uq-bal-m">' + esc(note) + '</div>' : "")
       + '</div>';
   }
+  // 代金券：它不是余额，单独画成虚线小卡片，一眼能区分（用户 2026-10-14 要求）。
+  // 服务端在代金券条目上打 voucher:true 并带上 expiresAt；余额合计仍是卡片主数字（第一条 balance）。
+  function voucherHTML(it) {
+    const meta = [];
+    if (it.total !== null && it.total !== undefined && Number.isFinite(Number(it.total))) meta.push("面额 " + fmtMoney(it.total, it.unit));
+    if (it.used !== null && it.used !== undefined && Number.isFinite(Number(it.used))) meta.push("已用 " + fmtMoney(it.used, it.unit));
+    if (it.expiresAt) meta.push("有效期至 " + bjDate(it.expiresAt));
+    return '<div class="uq-vch">'
+      + '<div class="uq-vch-name" title="' + attr(it.label || "代金券") + '">' + esc(it.label || "代金券") + '</div>'
+      + '<div class="uq-vch-v">' + esc(fmtMoney(it.remaining, it.unit)) + '</div>'
+      + (meta.length ? '<div class="uq-vch-meta">' + esc(meta.join(" · ")) + '</div>' : "")
+      + '</div>';
+  }
+  function voucherWrapHTML(list) {
+    return '<div class="uq-vch-wrap">'
+      + '<div class="uq-vch-hd"><span class="uq-vch-tag">代金券</span>'
+      + '<span>' + list.length + ' 张 · 可直接抵扣消费</span></div>'
+      + '<div class="uq-vchs">' + list.map(voucherHTML).join("") + '</div>'
+      + '</div>';
+  }
+
   // 套餐窗口：百分比是主角，进度条给相对感，剩多少/何时重置压在下面一行。
   function quotaHTML(it, alertPercent) {
     const pct = usedPercent(it);
@@ -413,16 +444,19 @@
       if (!it.unit || it.unit === "%") return l + "（额度）";
       return l + "（" + it.unit + "）";
     };
-    const body = items.map((raw) => {
-      const it = Object.assign({}, raw, { label: labelOf(raw) });
+    const labelIt = (raw) => Object.assign({}, raw, { label: labelOf(raw) });
+    const vouchers = items.filter((it) => it.voucher === true).map(labelIt);
+    const body = items.filter((it) => it.voucher !== true).map((raw) => {
+      const it = labelIt(raw);
       return it.kind === "balance" ? balanceHTML(it) : quotaHTML(it, alertPercent);
     }).join("");
+    // 代金券单独一块（跟在余额/窗口下面），不混在 .uq-body 里
+    const voucherBlock = vouchers.length ? voucherWrapHTML(vouchers) : "";
     // 条目多的卡（比如阿里云百炼：月额度 + 7 项 Harness 权益）横着铺开占满一整行，
     // 内部再按列自动分栏 —— 否则一张卡会拉得特别长，把整段的行高都撑歪。
     const wide = items.length >= 5;
     const alarming = st.key === "alert" || st.key === "failed" || !!p.alert;
     const cls = "uq-card" + (wide ? " wide" : "")
-      + (wide && !alarming ? " wide-tail" : "")
       + (st.key === "alert" || st.key === "failed" ? " alarm" : (p.alert ? " warn" : ""));
     return '<div class="' + cls + '" data-id="' + attr(p.id) + '">'
       + '<div class="uq-card-hd">'
@@ -437,6 +471,7 @@
       // 查询失败时不要再说「没有可识别的额度字段」—— 下一行的错误原文才是原因。
       + (body ? '<div class="uq-body">' + body + '</div>'
         : (p.error ? "" : '<div class="uq-q-sub" style="margin-top:8px">上游没有返回可识别的额度字段</div>'))
+      + voucherBlock
       + (p.error ? '<div class="uq-alert" title="' + attr(p.error) + '">' + esc(clip(p.error, 180)) + '</div>' : "")
       + ((p.warnings && p.warnings.length) ? '<div class="uq-warnline" title="' + attr(p.warnings.join("；")) + '">' + esc(clip(p.warnings.join("；"), 140)) + '</div>' : "")
       + '<div class="uq-card-ft">'
@@ -503,6 +538,7 @@
       // 已关闭 / 未配置：一批人，默认折起来——展开状态记在 localStorage，30 秒自动刷新不会把它弹回去。
       const idleRows = rest.filter((p) => !p.manualOnly);
       body += '<div class="uq-sec"><div class="uq-sec-hd">' + esc(BUCKET_LABEL[b] || b) + '<em>' + esc(BUCKET_HINT[b] || "") + '</em><em style="margin-left:auto">' + list.length + ' 个</em></div>';
+      // 宽卡（条目 >=5）由 layoutGrid 独占整行放在列后面（告警的放最上面），这里不用排序。
       if (withData.length) body += '<div class="uq-grid">' + withData.map((p) => cardHTML(p, alertPercent)).join("") + '</div>';
       // 尾部（仅控制台行 + 其余 N 个）用 .uq-tail 包起来钉在段底：两列并排时两段的尾部对齐。
       let tail = "";
@@ -556,11 +592,107 @@
     }
     return null;
   }
+  // ── 卡片瀑布分列 ─────────────────────────────────────────────────────────
+  // 目标：卡片按各自自然高度往下排，列与列之间尽量齐平 —— 不出现「矮卡下面一大块空白」。
+  // 做法：贪心（下一张卡进当前最矮的列，保持优先级顺序在列内自上而下）+ 一轮局部改进
+  // （把某张卡挪到别的列，只要最高的列能变矮就保留）。宽度不够时自动退回单列。
+  const CARD_MIN_W = 236;
+  const CARD_GAP = 10;
+  // 纯函数：按每张卡的高度把它们分到 n 列。贪心（下一张进当前最矮的列，保持原顺序），
+  // 再补一轮「把某张卡挪到别的列、只要最高的列能变矮就保留」的局部改进。
+  // 返回 picks[i] = 第 i 张卡该进第几列。
+  function packColumns(heights, n) {
+    const cols = [];
+    for (let i = 0; i < n; i += 1) cols.push([]);
+    const colH = (k) => cols[k].reduce((s, i) => s + heights[i] + CARD_GAP, 0);
+    const tallest = () => { let m = 0; for (let k = 0; k < n; k += 1) m = Math.max(m, colH(k)); return m; };
+    heights.forEach((h, i) => {
+      let t = 0;
+      for (let k = 1; k < n; k += 1) if (colH(k) < colH(t)) t = k;
+      cols[t].push(i);
+    });
+    for (let from = 0; from < n; from += 1) {
+      for (const i of cols[from].slice()) {
+        const before = tallest();
+        let to = -1;
+        for (let k = 0; k < n; k += 1) if (k !== from && (to < 0 || colH(k) < colH(to))) to = k;
+        if (to < 0) continue;
+        cols[from].splice(cols[from].indexOf(i), 1);
+        cols[to].push(i);
+        if (tallest() < before) continue;        // 最高列变矮了 → 保留这次搬动
+        cols[to].splice(cols[to].indexOf(i), 1); // 没改善 → 放回原列
+        cols[from].push(i);
+      }
+    }
+    const picks = new Array(heights.length).fill(0);
+    cols.forEach((list, k) => list.forEach((i) => { picks[i] = k; }));
+    return picks;
+  }
+  function layoutGrid(grid) {
+    if (!grid) return;
+    const cards = [].slice.call(grid.querySelectorAll(".uq-card"));
+    if (!cards.length) return;
+    // 先拆掉上一次的列容器（卡片放回 grid 平铺），窗口缩放时会重新走一遍
+    [].slice.call(grid.querySelectorAll(":scope > .uq-col")).forEach((col) => {
+      while (col.firstChild) grid.appendChild(col.firstChild);
+      col.remove();
+    });
+    const wide = cards.filter((c) => c.classList.contains("wide"));
+    const narrow = cards.filter((c) => !c.classList.contains("wide"));
+    const width = grid.clientWidth || 0;
+    // 面板还藏在别的 tab 里（宽度 0）：先保持平铺，等 ResizeObserver 报出真宽度再分列。
+    if (!width && gridObserver) return;
+    const n = Math.max(1, Math.min(narrow.length || 1, Math.floor((width + CARD_GAP) / (CARD_MIN_W + CARD_GAP))));
+    const cols = [];
+    for (let i = 0; i < n; i += 1) {
+      const col = document.createElement("div");
+      col.className = "uq-col";
+      // 先挂到文档上：脱离文档的节点 offsetHeight 恒为 0，量不出高度就没法分列。
+      grid.appendChild(col);
+      cols.push(col);
+    }
+    // 先全塞第一列量高度：卡片进入列里宽度才是最终宽度（分列后的高度不随列高变化）。
+    narrow.forEach((card) => cols[0].appendChild(card));
+    const picks = packColumns(narrow.map((card) => card.offsetHeight), n);
+    narrow.forEach((card, i) => { if (picks[i] !== 0) cols[picks[i]].appendChild(card); });
+    // 宽卡（>=5 项）独占整行：告警/警告的钉在最上面（最要紧），其它排在所有列之后。
+    const alarmWide = wide.filter((c) => c.classList.contains("alarm") || c.classList.contains("warn"));
+    alarmWide.forEach((c) => grid.insertBefore(c, cols[0]));
+    wide.filter((c) => alarmWide.indexOf(c) < 0).forEach((c) => grid.appendChild(c));
+  }
+  function layoutGrids(root) {
+    const scope = (root && root.querySelectorAll) ? root : document;
+    [].slice.call(scope.querySelectorAll(".uq-grid")).forEach(layoutGrid);
+  }
+  // 页面藏在别的 tab 里时量不到宽度（clientWidth=0，只能排成一列）；用 ResizeObserver
+  // 在它真正有宽度那一刻补一次重排，切回来就是分好列的。
+  const gridObserver = (typeof ResizeObserver === "function") ? new ResizeObserver((entries) => {
+    entries.forEach((entry) => {
+      const grid = entry.target;
+      const w = Math.round(entry.contentRect.width);
+      if (!w || grid.dataset.uqW === String(w)) return;
+      grid.dataset.uqW = String(w);
+      layoutGrid(grid);
+    });
+  }) : null;
+  function watchGrids(root) {
+    if (!gridObserver) return;
+    const scope = (root && root.querySelectorAll) ? root : document;
+    [].slice.call(scope.querySelectorAll(".uq-grid")).forEach((g) => gridObserver.observe(g));
+  }
+  let layoutTimer = null;
+  window.addEventListener("resize", () => {
+    clearTimeout(layoutTimer);
+    layoutTimer = setTimeout(() => layoutGrids(document), 150);
+  });
+
   // 内容变了才重排 DOM；重排时把滚动位置按原样放回去（否则每次后台刷新都跳回顶部）。
   function renderInto(body, html) {
     const sc = scrollParentOf(body);
     const top = sc ? sc.scrollTop : 0;
     body.innerHTML = html;
+    layoutGrids(body);          // 卡片瀑布要按真实高度分列，插完 DOM 立刻分
+    watchGrids(body);
     if (sc) sc.scrollTop = top;
   }
   function snapSig(snap) {

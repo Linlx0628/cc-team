@@ -18,7 +18,7 @@
     "套餐额度": "订阅制套餐的 5 小时 / 每周 / 每月窗口",
     "官方余额": "充值余额或开发者账户余额",
     "云平台账户": "云账号余额，需要 AccessKey / SecretKey",
-    "自定义": "任何能返回 JSON 的额度接口",
+    "自定义": "中转网关（Sub2API / NewAPI）与任何能返回 JSON 的额度接口",
     "仅控制台": "官方没有可编程接口，只能点进控制台看",
   };
   const CURRENCY_SIGN = { CNY: "¥", USD: "$", EUR: "€", JPY: "¥", HKD: "HK$" };
@@ -202,7 +202,9 @@
   function fmtMoney(v, unit) {
     const n = Number(v);
     if (!Number.isFinite(n)) return "—";
-    const sign = CURRENCY_SIGN[unit] || (unit ? unit + " " : "");
+    // 上游直接给货币符号（NewAPI 的 custom_currency_symbol 就是 "$"）时紧贴数字，不要空格。
+    const sym = String(unit || "");
+    const sign = CURRENCY_SIGN[unit] || (sym && !/[A-Za-z0-9]/.test(sym) ? sym : (unit ? unit + " " : ""));
     const s = Math.abs(n) >= 1000
       ? n.toLocaleString("zh-CN", { minimumFractionDigits: 2, maximumFractionDigits: 2 })
       : n.toFixed(2);
@@ -212,6 +214,7 @@
     if (v === null || v === undefined || v === "") return "—";
     if (unit === "%") return fmtNum(v) + "%";
     if (CURRENCY_SIGN[unit]) return fmtMoney(v, unit);
+    if (unit && !/[A-Za-z0-9]/.test(String(unit))) return fmtMoney(v, unit); // 上游给的就是符号
     if (unit === "tokens") return fmtNum(v) + " tokens";
     return fmtNum(v) + (unit ? " " + unit : "");
   }
@@ -255,6 +258,13 @@
     const used = Number(it.used), total = Number(it.total);
     if (Number.isFinite(used) && Number.isFinite(total) && total > 0) return Math.max(0, Math.min(100, (used / total) * 100));
     return null;
+  }
+  // 百分比的显示：整数就照原样（65%），小数保留有效位（12.5% / 1.62%）——不要 12.5 变成 13。
+  function pctStr(p) {
+    const n = Number(p);
+    if (!Number.isFinite(n)) return "—";
+    if (Number.isInteger(n)) return String(n);
+    return n < 1 ? n.toFixed(2) : n.toFixed(1);
   }
   function severity(pct, alertPercent) {
     if (pct === null) return "";
@@ -307,7 +317,7 @@
     if (it.resetAt) sub.push(untilText(it.resetAt) + "（" + bjTime(it.resetAt) + "）");
     return '<div class="uq-q">'
       + '<div class="uq-q-hd"><span>' + esc(it.label || "额度窗口") + '</span>'
-      + '<b class="' + sev + '">' + (pct === null ? esc(fmtValue(it.used, it.unit)) : (pct < 10 ? pct.toFixed(1) : Math.round(pct)) + "%") + '</b></div>'
+      + '<b class="' + sev + '">' + (pct === null ? esc(fmtValue(it.used, it.unit)) : pctStr(pct) + "%") + '</b></div>'
       + (pct === null ? "" : '<div class="quota-progress' + (sev === "alarm" ? " crit" : sev === "warn" ? " warn" : "") + '"><i style="width:' + pct.toFixed(1) + '%"></i></div>')
       + (sub.length ? '<div class="uq-q-sub">' + esc(sub.join(" · ")) + '</div>' : "")
       + '</div>';
@@ -599,28 +609,47 @@
         + '</div>'
         + (def.note ? '<p class="uq-p-note">' + esc(def.note) + '</p>' : "");
     } else {
-      const cred = credential === "accessKey"
+      const site = !!def.siteFromProfile;
+      const token = !!def.tokenCredential;
+      // 「方案」下拉：站点型平台（Sub2API / NewAPI / 自定义）用它带出站点地址与成员 Key。
+      // 管理面令牌型（NewAPI 的系统访问令牌）没有 keySource 下拉，所以这一格不挂 data-when。
+      const profileField = (when) => '<div' + (when
+        ? ' data-when="profile"' + (keySource === "profile" ? "" : ' style="display:none"') : "") + '>'
+        + '<label>方案' + (site ? '<span style="color:var(--dim2)">（带出站点地址）</span>' : "") + '</label>'
+        + '<select data-f="profileSuffix" onchange="UQ.syncRow(this)">' + profileOptions(pc.profileSuffix || "") + '</select></div>';
+      let cred;
+      if (credential === "accessKey") {
         // 云平台凭据就是 AK/SK，没有「从方案里自动取」这条路，所以不给 keySource 下拉。
-        ? fieldsOf(def).map((f) => inputHTML(f, extra)).join("")
-        : '<div><label>凭据来源</label><select data-f="keySource" onchange="UQ.syncRow(this)">' + keySourceOptions(keySource) + '</select></div>'
-          + '<div data-when="profile"' + (keySource === "profile" ? "" : ' style="display:none"') + '><label>方案</label>'
-          + '<select data-f="profileSuffix" onchange="UQ.syncRow(this)">' + profileOptions(pc.profileSuffix || "") + '</select></div>'
+        cred = fieldsOf(def).map((f) => inputHTML(f, extra)).join("");
+      } else if (token) {
+        // 管理面令牌（NewAPI 的系统访问令牌）不是 sk- 中继 Key，方案只用来带出站点地址。
+        cred = (site ? profileField(false) : "")
+          + '<div><label>系统访问令牌</label><input type="text" data-f="apiKey" autocomplete="off" value="' + attr(pc.apiKey || "") + '" placeholder="控制台「个人设置 → 生成系统访问令牌」"></div>'
+          + fieldsOf(def).map((f) => inputHTML(f, extra)).join("");
+      } else {
+        cred = '<div><label>凭据来源</label><select data-f="keySource" onchange="UQ.syncRow(this)">' + keySourceOptions(keySource) + '</select></div>'
+          + profileField(true)
           + '<div data-when="profile"' + (keySource === "profile" ? "" : ' style="display:none"') + '><label>成员</label>'
           + '<select data-f="memberKey">' + memberOptions(pc.profileSuffix || "", pc.memberKey || "") + '</select></div>'
           + '<div data-when="inline"' + (keySource === "inline" ? "" : ' style="display:none"') + '><label>API Key</label>'
           + '<input type="text" data-f="apiKey" autocomplete="off" value="' + attr(pc.apiKey || "") + '" placeholder="sk-…"></div>';
+      }
       body = '<div class="uq-cfg-grid">' + cred + '</div>'
         + '<details class="uq-adv"><summary>高级：接入点覆盖 / 显示名</summary>'
         + '<div class="uq-cfg-grid">'
-        + '<div><label>接入点覆盖<span style="color:var(--dim2)">（留空=官方地址）</span></label><input type="text" data-f="baseUrl" autocomplete="off" value="' + attr(pc.baseUrl || "") + '" placeholder="仅换域名，例如 https://api.z.ai"></div>'
+        + '<div><label>接入点覆盖<span style="color:var(--dim2)">（留空=官方地址/方案地址）</span></label><input type="text" data-f="baseUrl" autocomplete="off" value="' + attr(pc.baseUrl || "") + '" placeholder="仅换域名，例如 https://api.z.ai"></div>'
         + '<div><label>显示名<span style="color:var(--dim2)">（留空=平台名）</span></label><input type="text" data-f="label" autocomplete="off" value="' + attr(pc.label || "") + '"></div>'
         + '</div></details>'
+        + (def.localKey ? '<p class="uq-p-note">没填 Key 时会自动读本机 <b>' + esc(def.localKey.label || "登录凭据") + '</b>（只读；读不到才算未配置）。</p>' : "")
         + (def.note ? '<p class="uq-p-note">官方口径：' + esc(def.note) + '</p>' : "")
         + '<div class="uq-p-foot"><button type="button" class="btn btn-outline btn-sm" onclick="UQ.testProvider(\'' + attr(def.id) + '\',this)">查询一次</button>'
         + '<span class="uq-probe" data-probe>' + (live && live.credLabel ? '<span style="color:var(--dim2)">凭据：' + esc(live.credLabel) + '</span>' : "") + '</span></div>';
     }
 
-    return '<details class="uq-cfg uq-p" data-id="' + attr(def.id) + '" data-credential="' + attr(credential) + '">'
+    // data-ksdef：这张卡没有「凭据来源」下拉时，collect() 用它当默认来源
+    // （NewAPI 是手动令牌 = inline；Sub2API 走方案 = profile）。
+    const ksDef = def.defaultKeySource || (credential === "none" ? "inline" : "auto");
+    return '<details class="uq-cfg uq-p" data-id="' + attr(def.id) + '" data-credential="' + attr(credential) + '" data-ksdef="' + attr(ksDef) + '">'
       + '<summary>'
       + (manual ? "" : '<input type="checkbox" class="uq-en" data-f="enabled"' + (pc.enabled === false ? "" : " checked") + ' onclick="event.stopPropagation()" title="启用 / 停用这个平台">')
       + (manual ? '<span class="led"></span>' : '<span class="led' + (live && live.ok && live.enabled !== false ? " on" : "") + '"></span>')
@@ -688,8 +717,8 @@
       let worst = null, worstPct = -1;
       for (const q of quotas) { const pct = usedPercent(q); if (pct !== null && pct > worstPct) { worstPct = pct; worst = q; } }
       const worstSev = worstPct < 0 ? "" : severity(worstPct, alertPercent);
-      const pctText = (q, pct) => compact(q.label) + " " + (pct === null ? "已用 " + fmtValue(q.used, q.unit) : (pct < 10 ? pct.toFixed(1) : Math.round(pct)) + "%");
-      const windowsTitle = quotas.map((q) => (q.label || "窗口") + "：" + (usedPercent(q) === null ? fmtValue(q.used, q.unit) : Math.round(usedPercent(q)) + "%")).join("；");
+      const pctText = (q, pct) => compact(q.label) + " " + (pct === null ? "已用 " + fmtValue(q.used, q.unit) : pctStr(pct) + "%");
+      const windowsTitle = quotas.map((q) => (q.label || "窗口") + "：" + (usedPercent(q) === null ? fmtValue(q.used, q.unit) : pctStr(usedPercent(q)) + "%")).join("；");
       if (bal) {
         const money = fmtMoney(bal.remaining, bal.unit);
         const zero = Number(bal.remaining) <= 0;
@@ -785,7 +814,8 @@
       const credential = card.getAttribute("data-credential") || "apiKey";
       providers[id] = {
         enabled: en ? !!en.checked : true,
-        keySource: val("keySource") || "auto",
+        // 没有「凭据来源」下拉的卡（NewAPI 的系统访问令牌）用它自带的默认来源，别回落成 auto。
+        keySource: val("keySource") || card.getAttribute("data-ksdef") || "auto",
         apiKey: val("apiKey"),
         profileSuffix: val("profileSuffix"),
         memberKey: val("memberKey"),

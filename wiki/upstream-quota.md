@@ -21,6 +21,7 @@
 | 套餐额度 | MiniMax | Token Plan 用量 | API Key | 私有（experimental） |
 | 套餐额度 | Claude 订阅（Claude Code） | 5 小时 / 7 天窗口用量 | OAuth Token（`sk-ant-oat…`，不是普通 API Key） | 私有（experimental） |
 | 套餐额度 | 阿里云百炼 Token Plan | 席位数量、每类席位的 Credits 总量 / 剩余、逐席位（成员）剩余 | AccessKey ID / Secret（可复用「阿里云账户余额」那份） | 官方 OpenAPI（Model Studio 2026-02-10，ACS3-HMAC-SHA256） |
+| 套餐额度 | OpenCode Go / Go Plus | 5 小时（rolling）/ 每周 / 每月三个窗口的已用百分比与重置时间 | Go 套餐 API Key；**留空则自动读本机** `~/.local/share/opencode/auth.json` 的登录态 | 官方 `GET /zen/go/v1/usage`（2026-08-11 起） |
 | 官方余额 | DeepSeek | 总余额（赠金 + 充值） | API Key | 官方 `GET /user/balance` |
 | 官方余额 | 阶跃星辰 StepFun | 预付费账户可用余额 | API Key | 官方 `GET /v1/accounts`（Step Plan 套餐额度只在控制台） |
 | 官方余额 | 月之暗面 Kimi | 可用 / 代金券 / 现金余额 | API Key | 官方 `GET /v1/users/me/balance` |
@@ -29,6 +30,8 @@
 | 云平台账户 | 火山引擎方舟 | Coding Plan / Agent Plan 的 5 小时、每周、每月窗口 + 账户余额 | AK / SK（Signature V4） | 官方 OpenAPI |
 | 云平台账户 | 阿里云账户余额 | 现金/可用余额（含信控额度） | AK / SK（RPC HMAC-SHA1） | 官方 `QueryAccountBalance` |
 | 云平台账户 | 腾讯云账户余额 | 账户余额（已换算成元） | SecretId / SecretKey（TC3-HMAC-SHA256） | 官方 `DescribeAccountBalance` |
+| 自定义 | Sub2API 中转站 | 钱包/订阅剩余额度；或 5 小时 / 1 天 / 7 天三个 Key 级窗口 | 站点发的 API Key（选「方案」即可带出地址与密钥） | 站点自带 `GET /v1/usage`（开源网关） |
+| 自定义 | NewAPI 中转站 | 剩余额度（`quota ÷ quota_per_unit`）、累计请求 | 控制台生成的**系统访问令牌** + 数字用户 ID | 站点管理面 `GET /api/user/self`（开源网关，one-api 衍生） |
 | 自定义 | 自定义 HTTP 接口 | 你自己填字段的任意额度接口 | 自定义鉴权头 | 自建 |
 | 仅控制台 | 硅基流动 SiliconFlow | 总余额 / 赠费 / 充值（CNY） | — | 官方 `GET /v1/user/info` **已于 2026 年初下线**（实测 HTTP 410 + code 20092），替代接口未公布 |
 | 仅控制台 | 腾讯云 TokenHub Coding Plan | 5 小时 / 每周 / 每订阅月用量 | — | 官方只在控制台展示，无 API |
@@ -57,7 +60,7 @@
 - **排在上面的都是要紧的**：同一分组内按「额度告警 → 查询失败 → 正常」排序，需要处理的排前面
 - **同名窗口自动区分**：智谱的周窗口有 tokens 与额度两条，会显示成「每周窗口（tokens）」与「每周窗口（额度）」，不会出现两个同名标题配两个不同百分比
 - **页脚**：`更新于 / 缓存于 N 分钟前`（缓存时说明数字来自上次的好数据）、凭据来源（如「自动 · DeepSeek / 张三」，只说方式**不显示密钥**）、控制台与文档链接
-- 面板标题栏右侧摘要：`⚠ 1 个需要关注 · 共 17 个平台 · 更新于 11:45`
+- 面板标题栏右侧摘要：`1 个需要关注 · 共 20 个平台 · 更新于 11:45`（有需要关注的平台时，文字前面会点一颗红点）
 - 单张卡片的 `↻` 只重查这一个平台并就地替换那张卡（整面板不重排、滚动位置不跳）；标题栏「**刷新全部**」强制重查所有已开平台
 
 ## 参数（设置页 → 上游额度 → 顶部「高级」折叠）
@@ -130,13 +133,23 @@
 
 同一个云账号下的多个平台**共用同一组 AK/SK**（例如「阿里云账户余额」与「阿里云百炼 Token Plan」）：只要有一处填过，另一处**留空即自动复用**，卡片页脚会显示「复用「阿里云账户余额」的 AccessKey」。想用不同的子账号，把那行自己的 AK/SK 填上就会覆盖。
 
+**中转网关（Sub2API / NewAPI）是「站点型」平台**，凭据规则与上面不同：
+
+- 展开后第一格是「**方案**（带出站点地址）」：选中你已接进本站的中转站方案，站点地址就从它的上游地址推出来（`https://gw.example/v1` → 站点根 `https://gw.example`；`/v1`、`/anthropic`、`/apps/anthropic`、`/api/coding/v3` 这类协议尾段会被剥掉，域名后面的子路径保留）。
+- **Sub2API**：接着选「成员」，就用该成员的站点 Key 请求 `GET {站点}/v1/usage` —— 站点 Key 就是方案里那把 Key，不用另外抄。
+- **NewAPI**：它**没有「凭据来源」三态**，要填的是「**系统访问令牌**」（控制台「个人设置 → 生成系统访问令牌」），另外填数字**用户 ID**（会作为 `New-Api-User` 头发过去）。`sk-` 开头的中转 Key 在这里**不管用**，那是模型调用用的。
+- 两个网关都能只填「接入点覆盖」手写站点地址（此时不必选方案）。
+
+**OpenCode Go** 是唯一会读本机文件的平台：没填 Key 时自动读 `$XDG_DATA_HOME/opencode/auth.json`（默认 `~/.local/share/opencode/auth.json`）里 `opencode-go` 段的 key —— 机器上已经在用 opencode，就不用再手抄一遍；读到就用，读不到才算「未配置」。
+
 每行平台卡片展开后的「**高级：接入点覆盖 / 显示名**」里还有一格「**接入点覆盖**」，默认**留空 = 官方地址**。它替换的是**域名部分**，路径仍按官方接口拼（`你填的地址` + 官方路径，自动去掉结尾多余的 `/`）。「显示名」用来把卡片标题改成你自己认得的名字（留空 = 平台原名）：
 
 | 场景 | 怎么填 |
 |---|---|
 | GLM 国际站（`z.ai`）等与国内站不同域名的账号 | 填 `https://api.z.ai` |
 | 自建反向代理 / 内网网关 | 填网关地址，例如 `https://gw.internal/deepseek` |
-| 「自定义」平台 | 这格就是**完整 URL**（自定义平台没有官方路径可拼），必填 |
+| 站点型平台（Sub2API / NewAPI） | 留空 = 用所选方案的地址；也可以在这里直接填站点根地址，例如 `https://gw.example` |
+| 「自定义 HTTP 接口」 | 这格就是**完整 URL**（自定义平台没有官方路径可拼），必填 |
 
 ⚠️ 地址写错（多一层路径、少 `/v1`）会直接体现成卡片上的失败原因；改回留空即恢复官方地址。
 
@@ -160,6 +173,11 @@
 | OpenRouter `total_credits − total_usage` | 大号金额 `$X`（差额即剩余） |
 | 智谱同时返回 tokens 周窗口与额度周窗口 | 两行分别标成「每周窗口（tokens）」「每周窗口（额度）」 |
 | 一个平台既有余额又有窗口（智谱、火山） | 窗口逐行列在大号百分比，余额在卡片下半部显示大号金额；设置页那一行则显示 `每周 98% · ¥380.00`（**最紧的窗口在前、余额在后**——窗口才是会卡住你的数字） |
+| Sub2API `mode: "unrestricted", remaining: 12.5, unit: "USD"` | 大号金额 `$12.50`，下面一行「剩余额度」 |
+| Sub2API `rate_limits: [{window:"5h", limit:100, used:25, remaining:75}]` | 每个窗口**各占一行**：「5 小时窗口 25% · 剩 75 / 共 100」；1 天 / 7 天窗口同理，**不会合并成一个余额** |
+| NewAPI `quota: 250000`（`quota_per_unit: 500000`） | 大号金额 `$0.50`（额度 ÷ 每单位额度）；note 里给用户、用户组、累计请求与折算基准 |
+| NewAPI `/api/status` 读不到 | 按配置里的「每单位额度」折算，仍没有就按上游默认 `500000 = 1 美元`，并挂一条提示 |
+| OpenCode Go `usage.rolling.percent: 12.5` | 窗口行大号 `12.5%` + 进度条；`status: "rate-limited"` 的那一行标注「已达本窗口上限」 |
 
 > ⚠️ **百分比一律按上游的刻度读**：智谱的 `percentage`、火山的 `Percent` 都是 **0–100 的百分数**（火山另有 `Cap` 表示刻度上限），`1` 就是 **1%**，不是 100%。（早期版本把 `1` 当小数 ×100，显示过假的 100%。）
 
@@ -175,6 +193,10 @@
 | 百炼 Token Plan `HTTP 403` + `AccessDeniedDetail.AuthAction: modelstudio:GetSubscriptionStats` | 签名没问题，是 RAM 子账号缺这个权限点：加上 `modelstudio:GetSubscriptionStats` 与 `modelstudio:GetSubscriptionSeatDetails`（或挂一个百炼只读策略）后点「刷新全部」即可 |
 | 腾讯云 `未配置 AccessKey ID / Secret` | 云平台必须手填 SecretId / SecretKey，不能靠「自动复用方案密钥」（方案里的 Key 是推理 Key） |
 | 硅基流动在设置页只有「控制台」、不给查询 | 官方 `/v1/user/info` 已下线（410 + code 20092），替代接口未公布，所以本工具只给控制台入口；余额请去 [控制台「余额充值」](https://cloud.siliconflow.cn/account/charge) 看。官方公布新接口后会恢复 |
+| Sub2API 报 `HTTP 404` / `HTTP 401` | 站点地址或 Key 不对：确认「方案」选的是这个中转站，或直接在「接入点覆盖」里填站点根地址（**不要带 `/v1`**） |
+| NewAPI 报 `无权进行此操作，未登录且未提供 access token` | 填的不是控制台生成的**系统访问令牌**（`sk-` 中转 Key 不行），或该站要求带 `New-Api-User` 数字用户 ID |
+| NewAPI 报 `没有 quota / used_quota` | 令牌有效但用户 ID 不对（读到的是空用户对象），核对控制台个人信息里的数字 ID |
+| OpenCode Go 报 `HTTP 401` | Key 不是 Go 套餐的，或本机没有 `~/.local/share/opencode/auth.json` 且没手填 Key（先用 opencode 登录一次即可） |
 | 任何平台 `请求超时` | 上游慢或被墙；把设置页「高级」里的请求超时调大，或填「接入点覆盖」 |
 | 卡片挂着「旧数据」黄标 | 这次查询失败，显示的是上一次成功的数据；点卡片右上角刷新重试 |
 

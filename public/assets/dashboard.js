@@ -3,7 +3,7 @@ Chart.defaults.color='#686863';Chart.defaults.font.family='-apple-system,BlinkMa
 // 页面内联引导脚本先注入 toast() 及 UI_HELPERS 提供的辅助函数再加载本文件；
 // 全部数据经 /api/* 运行时拉取，文件不含任何密钥，可长期强缓存（?v= 内容版本号）。
 let D=null,P="day",C={t:null,p:null,m:null,h:null,hm:null,pr:null},errPage=1,autoRefresh=true,refreshTimer=null,currentProfile="all",PROTO="";
-let MDL="all",USR="all",MT="tokens",PIEDIM="user",MDLDIM="model";
+let USR="all",MT="tokens",PIEDIM="user",MDLDIM="model";
 let DS="",DE="";
 // 北京时间的「今天」(YYYY-MM-DD)。原先 render / renderCharts / renderTables 各抄一份
 // 这个表达式,上一轮把用户表搬进 renderTables 时漏了一份 —— 运行期直接 ReferenceError
@@ -142,33 +142,18 @@ function onDateRangeChange(){
 }
 // ── 宽表(dailyModels/dailyClients)按需取数(P3 出网优化)──
 // 服务端只下发这个起点之后的宽表行;daily(趋势图)/profileDaily(方案图)恒为全史不受影响。
-// 「模型筛选生效且未设日期范围」时趋势图经 filteredDaily() 用 dailyModels 重建**全史**,
-// 这种情形传 0000-01-01 放开;其余场景宽表消费方(模型/客户端分布图)都按 effBounds 窗口
-// 过滤,传窗口起点即可 —— 默认按日视图只需今天,30s 轮询的载荷大幅缩小。
+// 宽表消费方(模型/客户端分布图、24 小时模型图)都按 effBounds 窗口过滤,传窗口起点即可 ——
+// 默认按日视图只需今天,30s 轮询的载荷大幅缩小。
 let FLOOR="";
 function statsFloor(){
-  const eb=effBounds();
-  return (MDL!=="all"&&!eb.ranged)?"0000-01-01":eb.start;
+  return effBounds().start;
 }
 // 筛选变化时:需要的起点比已取的更早就重拉,否则纯前端过滤就够(切 Tab 不再无条件打服务端)。
 function rerenderOrReload(){
   if(statsFloor()<FLOOR)load();else render();
 }
-// 图表数据源：模型筛选生效时由 dailyModels（已按掩码 key 对齐）重建不含缓存的日粒度数据；
-// 仅用户筛选时过滤 daily；无筛选直接用 daily。与 grp()/totalTokens() 的字段约定兼容。
+// 图表数据源：只按用户筛选过滤 daily；无筛选直接用 daily。与 grp()/totalTokens() 的字段约定兼容。
 function filteredDaily(){
-  if(MDL!=="all"){
-    const out={};
-    for(const[date,users]of Object.entries(D.dailyModels||{})){
-      for(const[u,models]of Object.entries(users)){
-        const v=models[MDL];if(!v)continue;
-        if(!out[date])out[date]={};
-        out[date][u]={inputTokens:v.inputTokens||0,outputTokens:v.outputTokens||0,requests:v.requests||0,cacheCreationTokens:0,cacheReadTokens:0};
-      }
-    }
-    if(USR==="all")return out;
-    const f={};for(const[date,ud]of Object.entries(out)){if(ud[USR])f[date]={[USR]:ud[USR]}}return f;
-  }
   if(USR==="all")return D.daily||{};
   const f={};for(const[date,ud]of Object.entries(D.daily||{})){if(ud[USR])f[date]={[USR]:ud[USR]}}return f;
 }
@@ -261,7 +246,7 @@ function handleWorkspaceTabKeydown(event){
 // dailyClients(与 dailyModels 同形),随 render() 一起刷新 —— 不走懒加载,所以 tab 上的
 // 计数在这里自己写,不能放进 renderWorkspaceSummaries()(那个函数每 30 秒跑一次,
 // 对懒加载 tab 会把数字擦掉;这张表虽然不受影响,但归属写在一处更好维护)。
-// 客户端与协议正交,所以这里不套用 protoSeg;但窗口与 USR/MDL 筛选沿用全局那套。
+// 客户端与协议正交,所以这里不套用 protoSeg;但窗口与 USR 筛选沿用全局那套。
 function renderClientBoard(){
   const body=document.getElementById("clientBoardBody");
   if(!D||!body)return;
@@ -285,7 +270,7 @@ function renderClientBoard(){
   const order=Object.keys(agg).sort((a,b)=>(agg[b].input+agg[b].output)-(agg[a].input+agg[a].output));
   const userName=k=>{const u=(D.users||{})[k];return(u&&u.name)||k};
   if(!order.length){
-    body.innerHTML='<tr><td colspan="7" class="empty">'+(MDL!=="all"?"客户端维度不含模型信息，请先清除模型筛选":"暂无数据")+'</td></tr>';
+    body.innerHTML='<tr><td colspan="7" class="empty">暂无数据</td></tr>';
   }else{
     const rows=[];
     for(const c of order){
@@ -690,6 +675,7 @@ function render(){
   }
   // Rebuild chart filter dropdowns on every render (30s refresh), keeping the
   // current selection; fall back to "all" if the value disappeared from the data.
+  // 方案下拉(#profileSel)不在这里重建 —— 它的选项来自 D.profiles,由上面那段代码一次性填好。
   const rebuildFilterSel=(id,entries,allLabel)=>{
     const el=document.getElementById(id);
     const keep=el.value||"all";
@@ -699,9 +685,6 @@ function render(){
     el.value=next;
     return next;
   };
-  const modelEntries=Object.entries(D.models||{}).map(([m,v])=>[m,m+" ("+fmtTk(v.requests||0)+"次)"]).sort((a,b)=>(D.models[b[0]].requests||0)-(D.models[a[0]].requests||0));
-  for(const dh of Object.values(D.hourlyModels||{}))for(const hm of Object.values(dh))for(const m of Object.keys(hm))if(!D.models||!D.models[m])modelEntries.push([m,m]);
-  MDL=rebuildFilterSel("modelSel",modelEntries,"全部模型");
   USR=rebuildFilterSel("userSel",Object.keys(D.users||{}).map(k=>[k,D.users[k].name]),"全部用户");
   const us=Object.values(D.users),allTokens=us.reduce((s,u)=>s+totalTokens(u),0),tr=us.reduce((s,u)=>s+u.totalRequests,0);
   const tday=todayBJ(),tdd=(D.daily||{})[tday]||{};
@@ -713,9 +696,14 @@ function render(){
   renderMeta();
 }
 function renderCharts(){
-  // Charts —— 六图共用全局筛选：P 周期 / MT 指标 / MDL 模型 / USR 用户 / DS+DE 日期范围。
+  // Charts —— 六图共用全局筛选：P 周期 / MT 指标 / 方案(#profileSel) / USR 用户 / DS+DE 日期范围。
   // 窗口规则:分布类图(用户/客户端分布、模型、两张 24 小时)用 effBounds() —— 日期范围
   // 生效时优先,否则周期窗口;趋势与方案两张全史分桶图只在日期范围生效时收窄。
+  // 方案筛选：/api/stats?profile= 已把「按用户/按模型/按周期/24 小时」几路口粮收窄到该方案,
+  // 只有 profileDaily / profileDailyModels 是**跨方案** feed(服务端刻意不收窄,供「全部方案」
+  // 视图用),所以选了具体方案时,那两张图的方案维度要在这里自己跳过其它方案 —— 否则
+  // 「方案请求情况」和「模型请求分布·按方案」会无视方案筛选,六图口径就不一致了。
+  const profOnly=currentProfile!=="all"?currentProfile:null;
   const fd0=filteredDaily();
   const eb=effBounds();
   let fd=fd0;
@@ -724,9 +712,9 @@ function renderCharts(){
   const val=s=>MT==="requests"?(s.requests||0):totalTokens(s);
   const trendCut=recentBuckets(Object.keys(g).sort(),eb.ranged);
   const keys=trendCut.keys;
-  // 图头 note 恒标口径:无模型筛选是总Token(含缓存),有筛选时数据源换成不含缓存的
-  // dailyModels —— 口径跟着变,note 也跟着变;指标切到请求数时 Token 口径无从谈起,不标
-  document.getElementById("trendNote").textContent=chartNote(trendCut.tip,MT==="requests"?"":(MDL!=="all"?"模型筛选：不含缓存 Token":"总Token(含缓存)"));
+  // 图头 note 恒标口径:趋势图数据源固定是日汇总表,Token 口径恒为总Token(含缓存);
+  // 指标切到请求数时 Token 口径无从谈起,不标。
+  document.getElementById("trendNote").textContent=chartNote(trendCut.tip,MT==="requests"?"":"总Token(含缓存)");
   if(C.t)C.t.destroy();if(C.p)C.p.destroy();if(C.m)C.m.destroy();if(C.h)C.h.destroy();if(C.hm)C.hm.destroy();if(C.pr)C.pr.destroy();
   C.t=new Chart(document.getElementById("trend"),{type:"bar",data:{labels:keys.map(k=>lbl(P,k)),datasets:uks.map((u,i)=>({label:D.users[u].name,data:keys.map(k=>val(g[k][u]||{})),backgroundColor:COL[i%COL.length]+"cc",borderRadius:3,borderSkipped:false}))},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:trendLegend(),tooltip:{callbacks:{label:ctx=>ctx.dataset.label+": "+fmtT(ctx.raw)}}},scales:{x:{stacked:true,ticks:{color:"#686863",font:{size:10}},grid:{color:"rgba(24,24,22,.08)"}},y:{stacked:true,ticks:{color:"#686863",callback:v=>fmtTk(v)},grid:{color:"rgba(24,24,22,.08)"}}}}});
   // 用户分布 / 客户端分布:共用 #pie 这张横向柱状图,顶部 seg 切维度。
@@ -735,8 +723,8 @@ function renderCharts(){
   // Y 轴标签都取完整可读的名字(用户名 / 客户端友好名)。
   let pieLabels,pieVals;
   if(PIEDIM==="client"){
-    // 客户端维度自带 user_key 一层,所以 USR 筛选在这里自己应用;MDL(模型)筛选对它不适用
-    // —— usage_daily_client 没有模型列,按模型筛出来的客户端分布无从计算,只能整段忽略。
+    // 客户端维度自带 user_key 一层,所以 USR 筛选在这里自己应用;方案筛选由 /api/stats?profile=
+    // 在服务端收窄(客户端日表按方案隔离),这里不用再过滤。
     const cAgg={};
     for(const[date,users]of Object.entries(D.dailyClients||{})){
       if(date<eb.start||date>eb.end)continue;
@@ -760,19 +748,18 @@ function renderCharts(){
     pieLabels=uIdx.map(i=>D.users[uks[i]].name);pieVals=uIdx.map(i=>tot[i]);
     document.getElementById("pieTitle").textContent="用户分布";
   }
-  // 这张图的 Token 口径随维度与筛选变化,标签必须跟着实际口径走,不能一律写 "tokens":
-  //   用户维度 + 无模型筛选 → totalTokens(输入+输出+缓存读写,含缓存);
-  //   客户端维度(usage_daily_client 没有缓存列)、或模型筛选生效(filteredDaily 由
-  //   dailyModels 重建,同样没有缓存列) → 只有 输入+输出(不含缓存)。
+  // 这张图的 Token 口径随维度变化,标签必须跟着实际口径走,不能一律写 "tokens":
+  //   用户维度 → totalTokens(输入+输出+缓存读写,含缓存);
+  //   客户端维度(usage_daily_client 没有缓存列) → 只有 输入+输出(不含缓存)。
   // 相邻的「模型请求分布」恒为不含缓存 —— 两图并排数字差出一个缓存量,不标口径必被当成对不上。
-  const pieBasis=(PIEDIM==="client"||MDL!=="all")?"Token(输入+输出)":"总Token(含缓存)";
+  const pieBasis=PIEDIM==="client"?"Token(输入+输出)":"总Token(含缓存)";
   C.p=new Chart(document.getElementById("pie"),{type:"bar",data:{labels:pieLabels,datasets:[{label:MT==="requests"?"请求数":pieBasis,data:pieVals,backgroundColor:pieVals.map((_,i)=>COL[i%COL.length]+"cc"),borderWidth:0,borderRadius:3,borderSkipped:false}]},options:{indexAxis:"y",responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false},tooltip:{callbacks:{label:ctx=>MT==="requests"?fmtT(ctx.raw)+" 次请求":fmtT(ctx.raw)+" "+pieBasis}}},scales:{x:{ticks:{color:"#686863",callback:v=>fmtTk(v)},grid:{color:"rgba(24,24,22,.08)"}},y:{ticks:{color:"#686863",font:{size:11},autoSkip:false},grid:{display:false}}}}});
 
   // 模型请求分布：按有效窗口(日期范围优先,否则周期窗口,北京时间)求和，可按指标筛选。
   // seg 切三个维度:
   //   按模型      usage_daily_model[日期][用户][模型],可响应 USR 筛选;
   //   按方案      profileDailyModels[方案][日期][模型],无 user 维度所以不响应 USR
-  //               —— 与「方案请求情况」图口径一致;
+  //               —— 与「方案请求情况」图口径一致;选了具体方案时只留那一根(profOnly);
   //   按模型×方案 同吃 profileDailyModels,把「同模型不同方案」拆成独立柱子,
   //               标签写「模型(方案)」而不是合并成一根(见下面分支内的说明)。
   // 三源都不含缓存 Token。横向柱状图便于读取名称。
@@ -781,6 +768,7 @@ function renderCharts(){
     const sfxName={};for(const p of (Array.isArray(D.profiles)?D.profiles:[]))sfxName[p.suffix]=p.name;
     const pAgg={};
     for(const [sfx,days] of Object.entries(D.profileDailyModels||{})){
+      if(profOnly&&sfx!==profOnly)continue;
       for(const [date,models] of Object.entries(days)){
         if(date<eb.start||date>eb.end)continue;
         if(!pAgg[sfx])pAgg[sfx]={requests:0,tokens:0};
@@ -803,6 +791,7 @@ function renderCharts(){
     const sfxName={};for(const p of (Array.isArray(D.profiles)?D.profiles:[]))sfxName[p.suffix]=p.name;
     const agg={};
     for(const [sfx,days] of Object.entries(D.profileDailyModels||{})){
+      if(profOnly&&sfx!==profOnly)continue;
       for(const [date,models] of Object.entries(days)){
         if(date<eb.start||date>eb.end)continue;
         for(const [m,v] of Object.entries(models||{})){
@@ -890,36 +879,32 @@ function renderCharts(){
   if(hasOther)hmSeries.push({label:"其他",data:hmAgg.map(a=>{let t=0;for(const [m,v] of Object.entries(a))if(!topModels.includes(m))t+=MT==="requests"?v.requests:v.tokens;return t})});
   C.hm=new Chart(document.getElementById("hourModelChart"),{type:"line",data:{labels:hrs,datasets:hmSeries.map((s,i)=>({label:s.label,data:s.data,borderColor:COL[i%COL.length],backgroundColor:COL[i%COL.length]+"22",fill:i===0,tension:.28,pointRadius:0,pointHitRadius:10,pointBackgroundColor:COL[i%COL.length],pointHoverRadius:4,borderWidth:2}))},options:{responsive:true,maintainAspectRatio:false,interaction:{mode:"index",intersect:false},plugins:{legend:trendLegend(),tooltip:{callbacks:{label:ctx=>ctx.dataset.label+": "+fmtT(ctx.raw)+(MT==="requests"?" 次请求":" Token(输入+输出)")}}},scales:{x:{ticks:{color:"#686863",font:{size:9},maxRotation:0,autoSkip:true,maxTicksLimit:12},grid:{display:false}},y:{ticks:{color:"#686863",callback:v=>fmtTk(v)},grid:{color:"rgba(24,24,22,.08)"}}}}});
 
-  // 方案请求情况：跨方案维度（恒为全部方案，不随方案下拉收窄），按周期分桶的堆叠柱。
+  // 方案请求情况：跨方案维度,按周期分桶的堆叠柱。
   // 统计逻辑与 Token 用量趋势完全一致:共用 recentBuckets 那条「最近 30 个桶」的默认窗口,
   // 日期范围生效时才以范围为准(提示文案在上面 pSorted 算出来之后写,那时才知道有没有裁)。
-  // 模型筛选生效时切换到 profileDailyModels 数据源（不含缓存 Token）。
-  const pdBase=MDL==="all"?(D.profileDaily||{}):(D.profileDailyModels||{});
+  // 数据源 profileDaily 是**跨方案** feed(服务端不收窄),所以「选了具体方案」这件事在这里
+  // 自己落地:profOnly 一过滤,这张图就只剩那一根柱子,与其余五图同一个方案口径。
+  const pdBase=D.profileDaily||{};
   const suffixName={};for(const p of (Array.isArray(D.profiles)?D.profiles:[]))suffixName[p.suffix]=p.name;
   const pBuckets={};
   for(const [sfx,days] of Object.entries(pdBase)){
+    if(profOnly&&sfx!==profOnly)continue;
     for(const [date,entry] of Object.entries(days)){
       if(eb.ranged&&(date<eb.start||date>eb.end))continue;
       const k=P==="week"?wk(date):P==="month"?date.slice(0,7):P==="year"?date.slice(0,4):date;
       if(!pBuckets[k])pBuckets[k]={};
       if(!pBuckets[k][sfx])pBuckets[k][sfx]={requests:0,tokens:0};
-      if(MDL==="all"){
-        pBuckets[k][sfx].requests+=(entry.requests||0);pBuckets[k][sfx].tokens+=totalTokens(entry);
-      }else{
-        const v=entry[MDL]||{};
-        pBuckets[k][sfx].requests+=(v.requests||0);pBuckets[k][sfx].tokens+=((v.inputTokens||0)+(v.outputTokens||0));
-      }
+      pBuckets[k][sfx].requests+=(entry.requests||0);pBuckets[k][sfx].tokens+=totalTokens(entry);
     }
   }
-  const pSfx=Object.keys(pdBase).sort();
+  const pSfx=Object.keys(pdBase).filter(s=>!profOnly||s===profOnly).sort();
   const pCut=recentBuckets(Object.keys(pBuckets).sort(),eb.ranged),pSorted=pCut.keys;
-  // 注意 pSfx(图例/系列的来源)仍取自全量 pdBase:某个方案在窗口内没有用量时,它会是一条
-  // 全 0 的系列 —— 与趋势图「所有用户都在图例里」的既有口径一致,不额外隐藏(「掉下去了」
-  // 本身是信息)。只有「画几个桶」被裁,系列的集合不变。
-  // 同趋势图:note 恒标口径,tooltip 后缀也跟着实际口径走(MDL 筛选时 s.tokens 来自
-  // profileDailyModels,只有输入+输出;无筛选时来自 totalTokens,含缓存)
-  document.getElementById("profileNote").textContent=chartNote(pCut.tip,MT==="requests"?"":(MDL!=="all"?"模型筛选：不含缓存 Token":"总Token(含缓存)"));
-  C.pr=new Chart(document.getElementById("profileChart"),{type:"bar",data:{labels:pSorted.map(k=>lbl(P,k)),datasets:pSfx.map((sfx,i)=>({label:suffixName[sfx]||sfx,data:pSorted.map(k=>{const s=(pBuckets[k]||{})[sfx];return s?(MT==="requests"?s.requests:s.tokens):0}),backgroundColor:COL[i%COL.length]+"cc",borderRadius:3,borderSkipped:false}))},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:trendLegend(),tooltip:{callbacks:{label:ctx=>ctx.dataset.label+": "+fmtT(ctx.raw)+(MT==="requests"?" 次请求":(MDL!=="all"?" Token(输入+输出)":" 总Token(含缓存)"))}}},scales:{x:{stacked:true,ticks:{color:"#686863",font:{size:10}},grid:{color:"rgba(24,24,22,.08)"}},y:{stacked:true,ticks:{color:"#686863",callback:v=>fmtTk(v)},grid:{color:"rgba(24,24,22,.08)"}}}}});
+  // 注意 pSfx(图例/系列的来源)仍取自 pdBase(按 profOnly 过滤后):某个方案在窗口内没有用量时,
+  // 它会是一条全 0 的系列 —— 与趋势图「所有用户都在图例里」的既有口径一致,不额外隐藏
+  // (「掉下去了」本身是信息)。只有「画几个桶」被裁,系列的集合不变。
+  // 同趋势图:数据源恒为 profileDaily(日汇总表),Token 口径恒为总Token(含缓存)
+  document.getElementById("profileNote").textContent=chartNote(pCut.tip,MT==="requests"?"":"总Token(含缓存)");
+  C.pr=new Chart(document.getElementById("profileChart"),{type:"bar",data:{labels:pSorted.map(k=>lbl(P,k)),datasets:pSfx.map((sfx,i)=>({label:suffixName[sfx]||sfx,data:pSorted.map(k=>{const s=(pBuckets[k]||{})[sfx];return s?(MT==="requests"?s.requests:s.tokens):0}),backgroundColor:COL[i%COL.length]+"cc",borderRadius:3,borderSkipped:false}))},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:trendLegend(),tooltip:{callbacks:{label:ctx=>ctx.dataset.label+": "+fmtT(ctx.raw)+(MT==="requests"?" 次请求":" 总Token(含缓存)")}}},scales:{x:{stacked:true,ticks:{color:"#686863",font:{size:10}},grid:{color:"rgba(24,24,22,.08)"}},y:{stacked:true,ticks:{color:"#686863",callback:v=>fmtTk(v)},grid:{color:"rgba(24,24,22,.08)"}}}}});
 }
 
 // ── 用户用量(独立菜单 /api/stats?section=users)──
@@ -985,9 +970,10 @@ function load(){refreshCurrent()}
 function toggleSec(id){const body=document.getElementById(id+"Body");const icon=document.getElementById(id+"Icon");const open=body.classList.toggle("open");icon.classList.toggle("open",open)}
 document.querySelectorAll(".tab").forEach(b=>b.addEventListener("click",()=>{document.querySelectorAll(".tab").forEach(x=>x.classList.remove("on"));b.classList.add("on");P=b.dataset.p;resetDetailGrouping();rerenderOrReload()}));
 document.getElementById("metricSel").addEventListener("change",e=>{MT=e.target.value;render()});
-document.getElementById("modelSel").addEventListener("change",e=>{MDL=e.target.value;resetDetailGrouping();rerenderOrReload()});
+// 方案下拉(#profileSel)走 HTML 上的 onchange="switchProfileView(this.value)" —— 它的切换要
+// 换数据源(clearSectionCache + load),不是纯前端重画,所以不在这里再挂一个监听。
 document.getElementById("userSel").addEventListener("change",e=>{USR=e.target.value;render()});
-function resetChartFilters(){P="day";MT="tokens";MDL="all";USR="all";DS="";DE="";PROTO="";setPieDim("user");setModelDim("model");setProtoSeg("");document.querySelectorAll("#globalTabs .tab").forEach(x=>x.classList.toggle("on",x.dataset.p==="day"));document.getElementById("metricSel").value="tokens";document.getElementById("modelSel").value="all";document.getElementById("userSel").value="all";document.getElementById("dateStart").value="";document.getElementById("dateEnd").value="";if(currentProfile!=="all"){currentProfile="all";document.getElementById("profileSel").value="all"}resetDetailGrouping();load()}
+function resetChartFilters(){P="day";MT="tokens";USR="all";DS="";DE="";PROTO="";setPieDim("user");setModelDim("model");setProtoSeg("");document.querySelectorAll("#globalTabs .tab").forEach(x=>x.classList.toggle("on",x.dataset.p==="day"));document.getElementById("metricSel").value="tokens";document.getElementById("userSel").value="all";document.getElementById("dateStart").value="";document.getElementById("dateEnd").value="";if(currentProfile!=="all"){currentProfile="all";document.getElementById("profileSel").value="all"}resetDetailGrouping();load()}
 (function bindDashNav(){
   const nav=document.getElementById("dashNav");
   if(!nav)return;

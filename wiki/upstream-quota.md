@@ -24,17 +24,17 @@
 | 官方余额 | 阶跃星辰 StepFun | 预付费账户可用余额 | API Key | 官方 `GET /v1/accounts`（Step Plan 套餐额度只在控制台） |
 | 官方余额 | 月之暗面 Kimi | 可用 / 代金券 / 现金余额 | API Key | 官方 `GET /v1/users/me/balance` |
 | 官方余额 | OpenRouter | 总额度与累计消耗，差额 = 剩余 | API Key | 官方 `GET /api/v1/credits` |
-| 官方余额 | 硅基流动 SiliconFlow | 总余额 / 赠费 / 充值（CNY） | API Key | 官方 `GET /v1/user/info` |
 | 官方余额 | OpenAI（组织用量） | 组织维度用量/成本（**不是剩余额度**） | Admin Key（`sk-admin-…`） | 官方 usage 接口（experimental） |
 | 云平台账户 | 火山引擎方舟 | Coding Plan / Agent Plan 的 5 小时、每周、每月窗口 + 账户余额 | AK / SK（Signature V4） | 官方 OpenAPI |
 | 云平台账户 | 阿里云账户余额 | 现金/可用余额（含信控额度） | AK / SK（RPC HMAC-SHA1） | 官方 `QueryAccountBalance` |
 | 云平台账户 | 腾讯云账户余额 | 账户余额（已换算成元） | SecretId / SecretKey（TC3-HMAC-SHA256） | 官方 `DescribeAccountBalance` |
 | 自定义 | 自定义 HTTP 接口 | 你自己填字段的任意额度接口 | 自定义鉴权头 | 自建 |
+| 仅控制台 | 硅基流动 SiliconFlow | 总余额 / 赠费 / 充值（CNY） | — | 官方 `GET /v1/user/info` **已于 2026 年初下线**（实测 HTTP 410 + code 20092），替代接口未公布 |
 | 仅控制台 | 腾讯云 TokenHub Coding Plan | 5 小时 / 每周 / 每订阅月用量 | — | 官方只在控制台展示，无 API |
 | 仅控制台 | 阿里云百炼 Coding / Token Plan | 套餐用量 | — | 官方口径「暂无法通过 API 查看」；`bl` CLI 需控制台登录态 |
 | 仅控制台 | 腾讯 CodeBuddy | 套餐与用量 | — | 官方只在网页展示 |
 
-- 「仅控制台」的三个平台**不发任何请求**，卡片只给一个「去控制台」链接。它们的套餐额度只能人工看，或者等上游自己回 429（腾讯 TokenHub 的 `20097 hour|week|month allocated quota exceeded`、百炼的 `usage allocated quota exceeded`——这类报错会进管理面板的「错误记录」）。
+- 「仅控制台」的四个平台**不发任何请求**，卡片只给一个「去控制台」链接。套餐额度只能人工看，或者等上游自己回 429（腾讯 TokenHub 的 `20097 hour|week|month allocated quota exceeded`、百炼的 `usage allocated quota exceeded`——这类报错会进管理面板的「错误记录」）。
 - ⚠️ 「账户余额」和「套餐额度」是两笔账：腾讯/阿里的 Token Plan 扣的是套餐额度，账户余额可能在很长一段时间里都是 0；反过来账户有余额也不代表套餐没到期。
 
 ## 一张卡片怎么读
@@ -169,6 +169,7 @@
 | 火山三个接口都 `HTTP 401` + `SignatureDoesNotMatch` | AK/SK 抄错或不成对（AK 应是 `AKLT` 开头，SK 一长串以 `=` 结尾），换成火山控制台「访问密钥」里的值 |
 | 阿里云 `Code: NotAuthorized / This API is not authorized for caller` | AK/SK 本身有效，但该 RAM 用户**没有 BSS 权限**：给它加 `AliyunBSSReadOnlyAccess` 或权限点 `bss:DescribeAcccount`（注意双 c） |
 | 腾讯云 `未配置 AccessKey ID / Secret` | 云平台必须手填 SecretId / SecretKey，不能靠「自动复用方案密钥」（方案里的 Key 是推理 Key） |
+| 硅基流动在设置页只有「控制台」、不给查询 | 官方 `/v1/user/info` 已下线（410 + code 20092），替代接口未公布，所以本工具只给控制台入口；余额请去 [控制台「余额充值」](https://cloud.siliconflow.cn/account/charge) 看。官方公布新接口后会恢复 |
 | 任何平台 `请求超时` | 上游慢或被墙；把设置页「高级」里的请求超时调大，或填「接入点覆盖」 |
 | 卡片挂着「旧数据」黄标 | 这次查询失败，显示的是上一次成功的数据；点卡片右上角刷新重试 |
 

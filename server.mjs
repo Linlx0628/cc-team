@@ -165,20 +165,40 @@ function serveWiki(wikiPath, req, res) {
   res.end(body);
 }
 
-// ─── 页面 HTML 的条件请求(ETag/304)─────────────────────────────────────────────
-// 页面是登录态渲染,不能给 max-age 浏览器缓存;但同一版本的 HTML(如 settings 页 ~96KB)
-// 在常规刷新/重开标签时完全可以走 304 空体。ETag 取渲染结果 sha1 前 16 位 —— 模板或
-// 数据变了哈希就变,不会命中错版本。Cache-Control 维持 no-cache(每次重验证)。
+// ─── 页面 HTML 的条件请求(ETag/304) + gzip ────────────────────────────────────
+// 页面是登录态渲染,不能给 max-age 浏览器缓存;但同一版本的 HTML 在常规刷新/重开标签时
+// 完全可以走 304 空体。ETag 取渲染结果 sha1 前 16 位 —— 模板或数据变了哈希就变,不会
+// 命中错版本。Cache-Control 维持 no-cache(每次重验证)。
+// gzip:页面全是文本,设置页体积又随成员数线性膨胀(1000 用户 ~4.8MB,其中大头是两张用户
+// 表格 + 内联的 SETTINGS JSON),不压缩时限速链路上光下载就要 2 秒、3G 下更久。压缩结果
+// 按 ETag 记忆化 —— 内容没变时走 304(既不重算也不发体),内容变了才压一次(CPU 一次性)。
+const htmlGzCache = new Map(); // etag → gzip Buffer;页面共 7 个,留 8 份足够
+const HTML_GZ_CACHE_MAX = 8;
 function serveHtml(res, req, html) {
   const body = Buffer.from(html);
   const etag = `"h-${crypto.createHash("sha1").update(body).digest("hex").slice(0, 16)}"`;
+  // 同一 URL 会按 Accept-Encoding 回不同字节,必须声明 Vary 否则中间层可能缓存错版本
+  const base = { "Cache-Control": "no-cache", ETag: etag, Vary: "Accept-Encoding" };
   if (req.headers["if-none-match"] === etag) {
-    res.writeHead(304, { ETag: etag, "Cache-Control": "no-cache" });
+    res.writeHead(304, base);
     res.end();
     return;
   }
-  res.writeHead(200, { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-cache", ETag: etag });
-  res.end(body);
+  const head = { ...base, "Content-Type": "text/html; charset=utf-8" };
+  let out = body;
+  if (body.length >= 1024 && String(req.headers["accept-encoding"] || "").includes("gzip")) {
+    out = htmlGzCache.get(etag);
+    if (!out) {
+      out = zlib.gzipSync(body, { level: 6 });
+      if (htmlGzCache.size >= HTML_GZ_CACHE_MAX) htmlGzCache.delete(htmlGzCache.keys().next().value);
+      htmlGzCache.set(etag, out);
+    }
+    head["Content-Encoding"] = "gzip";
+  }
+  // HTML 路由只认 GET(req.method==="GET"),HEAD 不会走到这里;gzip 分支已把响应体整体定长,
+  // 不存在半路改头的问题
+  res.writeHead(200, head);
+  res.end(out);
 }
 
 // ─── MCP 端点（/mcp，成员级工具 + wiki 资源）────────────────────────────────

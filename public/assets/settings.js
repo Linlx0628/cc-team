@@ -363,6 +363,23 @@ function openCodeReviewView(){
 function rememberPoolViewForReload(){
   try{sessionStorage.setItem('tm_return_pool_view','1')}catch(e){}
 }
+// ─── 保存后就地生效，不整页重载 ────────────────────────────────────────────────
+// 这些视图都是服务端一次渲染出来的（卡片/表格都是 HTML）。保存成功后若 location.reload()，
+// 浏览器要重新下载＋解析整页 HTML —— 设置页体积随成员数线性膨胀（1000 用户 ~4.8MB），
+// 用户看到的就是「先切回方案详情 → 等一会 → 才提示成功再跳回来」。而这几处编辑本身以
+// 当前 DOM 为真值（saveUsers/savePoolQuota 都是从 DOM 读的），服务端落库后只需把结果同步
+// 进内存态 SETTINGS（临时额度弹窗、方案下拉等派生视图要读它），再就地提示即可。
+// 结构性变更（新建/删除额度池、方案增删改、组、调度、清空数据）仍走重载 —— 那些会改动
+// 服务端渲染的整块结构，reload 才是唯一不会漂移的做法（加上服务器 gzip 后也已便宜很多）。
+function poolIndexByName(name){return (SETTINGS.quotaPools||[]).findIndex(p=>p.name===name)}
+// /api/quota-pool/save 直接回传 listQuotaPools() 里的那一项，形状与页面内联
+// SETTINGS.quotaPools 完全一致，原样采纳即可（不用再请求一次 /api/settings）。
+function adoptPool(name,pool){
+  if(!pool)return;
+  if(!Array.isArray(SETTINGS.quotaPools))SETTINGS.quotaPools=[];
+  const i=poolIndexByName(name);
+  if(i>=0)SETTINGS.quotaPools[i]=pool;else SETTINGS.quotaPools.push(pool);
+}
 // Collect a pool card's pool-level limit + per-user limits and POST to the single
 // write path. The temporary-quota modal (bonus/reset) is separate and reaches the
 // same pool via its representative profile suffix.
@@ -381,8 +398,9 @@ async function savePoolQuota(poolName){
     data=await r.json();
   }catch(err){alert('保存失败: '+err.message);return}
   if(!r.ok){alert('保存失败: '+(data&&data.error?data.error:r.status));return}
+  adoptPool(poolName,data&&data.pool);
   rememberPoolViewForReload();
-  toastThen('额度池「'+(data.pool?data.pool.label:poolName)+'」已保存',()=>location.reload());
+  toast('额度池「'+((data&&data.pool&&data.pool.label)||poolName)+'」已保存');
 }
 // Rename a pool's display label only — the pool key (name) never changes, so
 // member profile bindings and per-user limits are untouched (body omits them).
@@ -398,8 +416,16 @@ async function renamePoolLabel(poolName,currentLabel){
     data=await r.json();
   }catch(err){alert('重命名失败: '+err.message);return}
   if(!r.ok){alert('重命名失败: '+(data&&data.error?data.error:r.status));return}
+  const newLabel=(data&&data.pool&&data.pool.label)||label;
+  adoptPool(poolName,data&&data.pool);
+  // 卡片上只有标题 <b> 与保存按钮文案带 label，就地改掉即可（池 key 不变）
+  const card=document.querySelector('[data-poolcard="'+poolName+'"]');
+  if(card){
+    const b=card.querySelector('b');if(b)b.textContent=newLabel;
+    const save=card.querySelector('button.btn-primary');if(save)save.textContent='保存「'+newLabel+'」';
+  }
   rememberPoolViewForReload();
-  toastThen('额度池已重命名为「'+(data.pool?data.pool.label:label)+'」',()=>location.reload());
+  toast('额度池已重命名为「'+newLabel+'」');
 }
 // Open the temporary-quota modal for a user from the pool view, using the pool's
 // representative profile suffix so /api/quota/daily-op resolves the same pool.
@@ -953,7 +979,24 @@ document.addEventListener('click',function(e){
 async function deleteGlobalUser(k){
   if(!confirm('确定删除用户？该用户将从所有方案中移除。'))return;
   const r=await fetch('/api/global-user/delete',{method:'POST',headers:csrfHeaders({'Content-Type':'application/json'}),body:JSON.stringify({key:k})});
-  if(r.ok){try{sessionStorage.setItem('tm_return_user_view','1')}catch(e){}toastThen('用户已删除',()=>location.reload())}else{const e=await r.json();alert('删除失败: '+e.error)}
+  if(!r.ok){const e=await r.json().catch(()=>({}));alert('删除失败: '+(e.error||r.status));return}
+  // 就地删除：全局表那一行、额度池卡片里的每人配额行、内存态与方案分配表一起更新。
+  // 服务端会把该用户从所有方案的 users 里删掉、并清掉他的用量历史，所以这里也要把
+  // 每个方案的「N位用户」计数重算一遍，而不是只动当前这个方案。
+  document.querySelectorAll('#globalUsersTable tbody tr').forEach(tr=>{
+    if(rowUserKey(tr)===k)tr.remove();
+  });
+  document.querySelectorAll('#quotaPoolSection input[data-user]').forEach(inp=>{
+    if(inp.dataset.user===k){const row=inp.closest('tr');if(row)row.remove()}
+  });
+  if(SETTINGS.globalUsers)delete SETTINGS.globalUsers[k];
+  const pa=SETTINGS.profileAssignments||{};
+  Object.keys(pa).forEach(s=>{if(pa[s])delete pa[s][k]});
+  const sel=document.getElementById('userProfileSel');
+  if(sel)renderProfileUsers(sel.value);
+  refreshProfileUserCounts();
+  try{sessionStorage.setItem('tm_return_user_view','1')}catch(e){}
+  toast('用户已删除');
 }
 function renderProfileUsers(suffix){
   const assignments=SETTINGS.profileAssignments[suffix]||{};
@@ -973,6 +1016,45 @@ function renderProfileUsers(suffix){
   }).join('');
 }
 function switchUserProfile(suffix){renderProfileUsers(suffix)}
+// 一行全局用户对应的虚拟 Key：服务端渲染的行放在第一个 <code> 里，页面上「添加用户」新加的
+// 行用 hidden input 带 key。读法与 saveUsers() 完全一致 —— 两处口径必须相同，否则就地更新
+// 会认错行（把 A 的用户名写到 B 上）。
+function rowUserKey(tr){
+  const hid=tr.querySelector('input[type=hidden]');
+  if(hid)return hid.value;
+  const code=tr.querySelector('code');
+  return code?code.textContent.trim():'';
+}
+// 保存成功后：内存态 + 派生视图就地更新（不再整页重载）。形状与 server.mjs 的
+// /api/global-user/save 落库口径一致：用户名留空 → key 前 8 位；方案分配 = {key,disabled}。
+function applySavedUsers(users,profileUsers,profileSuffix){
+  const gu=SETTINGS.globalUsers||(SETTINGS.globalUsers={});
+  Object.keys(gu).forEach(k=>{delete gu[k]});
+  users.forEach(u=>{gu[u.key]={username:u.username||u.key.slice(0,8),expiresAt:u.expiresAt||'',disabled:!!u.disabled,superUser:!!u.superUser}});
+  // 留空用户名的那一行，服务端存的是 key 前 8 位：写回输入框，免得下次保存又读到空串
+  document.querySelectorAll('#globalUsersTable tbody tr').forEach(tr=>{
+    const k=rowUserKey(tr);if(!k)return;
+    const u=users.find(x=>x.key===k);if(!u)return;
+    const un=tr.querySelector('input[name^="gu_un_"]');
+    if(un&&!un.value.trim())un.value=gu[k].username;
+  });
+  const pa=SETTINGS.profileAssignments||(SETTINGS.profileAssignments={});
+  const next={};
+  profileUsers.forEach(pu=>{next[pu.key]={key:pu.realKey||'',disabled:!!pu.disabled}});
+  pa[profileSuffix]=next;
+  refreshProfileUserCounts();
+}
+// 侧栏方案卡上的「N位用户」= 该方案里配了真实 Key 的用户数（server.mjs 里 userCount 同口径）。
+function refreshProfileUserCounts(){
+  const pa=SETTINGS.profileAssignments||{};
+  (SETTINGS.profiles||[]).forEach(prof=>{
+    const n=Object.values(pa[prof.suffix]||{}).filter(v=>v&&v.key).length;
+    prof.userCount=n;
+    const el=document.getElementById('pl-'+prof.name);
+    const t=el&&el.querySelector('.pl-users');
+    if(t)t.textContent=n+'位用户';
+  });
+}
 async function saveUsers(){
   const tbody=document.querySelector("#globalUsersTable tbody");
   const rows=tbody.querySelectorAll("tr");
@@ -1000,7 +1082,8 @@ async function saveUsers(){
   const profileSuffix=document.getElementById('userProfileSel').value;
   try{sessionStorage.setItem('tm_return_user_view','1')}catch(e){}
   const r=await fetch('/api/global-user/save',{method:'POST',headers:csrfHeaders({'Content-Type':'application/json'}),body:JSON.stringify({users,profileUsers,profileSuffix})});
-  if(r.ok){toastThen('用户配置已保存',()=>location.reload())}else{const e=await r.json();alert('保存失败: '+e.error)}
+  if(r.ok){applySavedUsers(users,profileUsers,profileSuffix);toast('用户配置已保存')}
+  else{const e=await r.json().catch(()=>({}));alert('保存失败: '+(e.error||r.status))}
 }
 // ── 今日临时额度（bonus / reset）弹窗 ──────────────────────────────────────
 function qFmt(n){n=Number(n)||0;if(n>=1e6)return(n/1e6).toFixed(1)+'M';if(n>=1e3)return(n/1e3).toFixed(1)+'k';return String(n)}

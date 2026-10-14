@@ -1457,7 +1457,17 @@ function schedLoadDraft(){
     schedDirty[proto]=false;
   });
 }
-function rememberScheduleViewForReload(){try{sessionStorage.setItem('tm_return_schedule_view','1')}catch(e){}}
+// 保存成功后**就地生效**，不再整页重载：/api/schedule 的五个写接口回的都是
+// `{ok:true, ...buildScheduleState()}`（与 GET /api/schedule 同源），采纳服务端状态后只重画
+// 刚刚保存过的那一个协议块即可。此前每存一次都要 location.reload()：设置页是服务端一次
+// 渲染的整页 HTML（成员多时有几百 KB），而且会把页面上**其它没保存的编辑一起冲掉**。
+// 只重画 proto 这一块：另一个协议的规则表 / 组卡片（可能正在编辑）原样留着。
+function schedAdoptSaved(data,proto){
+  if(data&&data.protocols)schedState=data.protocols;
+  schedLoadDraft();
+  renderScheduleProto(proto);
+  applyScheduleDockState();   // 侧栏「方案组调度生效中」提示跟着更新
+}
 function openPlanScheduleView(){
   const form=document.getElementById('settingsForm');
   hideAllSecondaryViews();
@@ -1549,8 +1559,8 @@ async function schedSaveGroups(proto,next,okMsg){
     schedLoadDraft();renderScheduleProto(proto);
     return;
   }
-  rememberScheduleViewForReload();
-  toastThen(okMsg,function(){location.reload()});
+  schedAdoptSaved(data,proto);
+  toast(okMsg);
 }
 function scheduleToggleAddGroup(proto){
   const box=document.getElementById('schedGroupCreate-'+proto);
@@ -1593,8 +1603,8 @@ function scheduleRenameGroup(proto,gi){
     .then(function(d){
       data=d;
       if(!r2.ok){alert('重命名失败: '+(data&&data.error?data.error:r2.status));return}
-      rememberScheduleViewForReload();
-      toastThen('方案组已重命名为「'+nn+'」',function(){location.reload()});
+      schedAdoptSaved(data,proto);
+      toast('方案组已重命名为「'+nn+'」');
     })
     .catch(function(err){alert('重命名失败: '+err.message)});
 }
@@ -1605,8 +1615,8 @@ function scheduleDeleteGroup(proto,gi){
   fetch('/api/schedule/groups/delete',{method:'POST',headers:csrfHeaders({'Content-Type':'application/json'}),body:JSON.stringify({protocol:proto,name:name})})
     .then(function(r){return r.json().catch(function(){return {}}).then(function(d){
       if(!r.ok){alert('删除失败: '+(d&&d.error?d.error:r.status));return}
-      rememberScheduleViewForReload();
-      toastThen('方案组「'+name+'」已删除',function(){location.reload()});
+      schedAdoptSaved(d,proto);
+      toast('方案组「'+name+'」已删除');
     })})
     .catch(function(err){alert('删除失败: '+err.message)});
 }
@@ -1736,8 +1746,8 @@ async function scheduleSaveRules(proto){
     data=await r.json().catch(function(){return {}});
   }catch(err){alert('保存失败: '+err.message);return}
   if(!r.ok){alert('保存失败: '+(data&&data.error?data.error:r.status));return}
-  rememberScheduleViewForReload();
-  toastThen(SCHED_PROTO_LABEL[proto]+'时间规则已保存（'+rules.length+' 条，自上而下首条命中胜）',function(){location.reload()});
+  schedAdoptSaved(data,proto);
+  toast(SCHED_PROTO_LABEL[proto]+'时间规则已保存（'+rules.length+' 条，自上而下首条命中胜）');
 }
 async function scheduleSetOverride(proto){
   const sel=document.getElementById('schedOverrideSel-'+proto);
@@ -1757,8 +1767,8 @@ async function schedPostOverride(proto,group,okMsg){
     data=await r.json().catch(function(){return {}});
   }catch(err){alert('操作失败: '+err.message);return}
   if(!r.ok){alert('操作失败: '+(data&&data.error?data.error:r.status));return}
-  rememberScheduleViewForReload();
-  toastThen(okMsg,function(){location.reload()});
+  schedAdoptSaved(data,proto);
+  toast(okMsg);
 }
 // ── 状态回显（30s 轮询 + 打开视图时立即一次）──
 // **只改横幅、告警与「命中」徽章，绝不重建输入控件** —— 重建会把用户正在编辑的规则表抹掉。
@@ -1847,10 +1857,8 @@ else{renderAliasRows(SETTINGS.profiles.find(p=>p.suffix===SETTINGS.selectedProfi
 // the 额度池 view instead of the profile form. sessionStorage = once only, this
 // session; a fresh open of the settings page starts on profiles as usual.
 try{if(sessionStorage.getItem('tm_return_pool_view')==='1'){sessionStorage.removeItem('tm_return_pool_view');openQuotaPoolView()}}catch(e){}
-// Same one-shot for the 方案组调度 view: an admin adjusting several groups/rules in a
-// row shouldn't be kicked back to the profile form after each save.
-try{if(sessionStorage.getItem('tm_return_schedule_view')==='1'){sessionStorage.removeItem('tm_return_schedule_view');openPlanScheduleView()}}catch(e){}
-// 用户管理视图同款(保存/删除用户会整页刷新)。
+// 方案组调度视图不再有 reload 一说：五个写接口都在 schedAdoptSaved() 里就地生效，
+// 所以 sessionStorage 那个「保存后要落回哪个视图」的一次性标记也随之删掉了。
 try{if(sessionStorage.getItem('tm_return_user_view')==='1'){sessionStorage.removeItem('tm_return_user_view');openUserManageView()}}catch(e){}
 // 侧栏 dock 的调度提示切换。与服务端渲染的 hidden 属性幂等（同一判定函数），
 // 放在 init 末尾是因为它只读 schedState，不依赖别的前置状态。
@@ -1886,7 +1894,8 @@ function saveProdSettings(){
   msg.textContent='保存中...';
   fetch('/api/production/settings',{method:'POST',headers:csrfHeaders({'Content-Type':'application/json'}),
     body:JSON.stringify({productionTracking:{enabled:document.getElementById('prodTrackingToggle').checked,storeFilePaths:document.getElementById('prodPathToggle').checked},costRates:costRates})})
-    .then(r=>r.json()).then(()=>{msg.textContent='已保存';setTimeout(()=>location.reload(),600)})
+    .then(r=>r.json().then(d=>{if(!r.ok)throw new Error((d&&d.error)||String(r.status));return d}))
+    .then(()=>{msg.textContent='已保存';toast('产出与成本设置已保存')})
     .catch(e=>{msg.textContent='保存失败: '+e.message});
 }
 (function(){

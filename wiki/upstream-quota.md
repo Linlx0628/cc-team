@@ -21,9 +21,10 @@
 | Plan | MiniMax | Token Plan 用量 | API Key | 私有（experimental） |
 | Plan | Claude 订阅（Claude Code） | 5 小时 / 7 天窗口用量 | OAuth Token（`sk-ant-oat…`，不是普通 API Key） | 私有（experimental） |
 | Plan | 阿里云百炼 Token Plan | **个人版**：套餐月额度已用 %、重置时间、Harness 权益用量；**席位制团队版**：席位数量、每类席位的 Credits 总量 / 剩余、逐席位（成员）剩余 | 控制台令牌（个人版，卡片页脚「一键获取令牌」；留空时自动读本机 `~/.bailian/config.json`，或给 AccessKey 加 `modelstudio:GenerateCLIAccessToken` 权限由平台自动换取 / 自动续期）+ AccessKey ID / Secret（团队版席位，可复用「阿里云账户余额」那份） | 个人版走控制台网关；团队版走官方 OpenAPI（Model Studio 2026-02-10，ACS3-HMAC-SHA256） |
+| Plan | 阶跃星辰 Step Plan | **Coding Plan**：5 小时 / 每周窗口；**Token Plan（Credit）**：月度 Credit 剩余 / 总量、加油包、Credits 到期日；套餐名（Plus / Mini） | 控制台令牌（Oasis-Token，从浏览器 Cookie 复制一次） | 私有（控制台内部接口，experimental，默认关闭） |
 | Plan | OpenCode Go / Go Plus | 5 小时（rolling）/ 每周 / 每月三个窗口的已用百分比与重置时间 | Go 套餐 API Key；**留空则自动读本机** `~/.local/share/opencode/auth.json` 的登录态 | 官方 `GET /zen/go/v1/usage`（2026-08-11 起） |
 | 余额 | DeepSeek | 总余额（赠金 + 充值） | API Key | 官方 `GET /user/balance` |
-| 余额 | 阶跃星辰 StepFun | 预付费账户可用余额 | API Key | 官方 `GET /v1/accounts`（Step Plan 套餐额度只在控制台） |
+| 余额 | 阶跃星辰 StepFun | 预付费账户可用余额 | API Key | 官方 `GET /v1/accounts`（Step Plan 套餐额度只在控制台，见上表「阶跃星辰 Step Plan」） |
 | 余额 | 月之暗面 Kimi | 可用 / 代金券 / 现金余额 | API Key | 官方 `GET /v1/users/me/balance` |
 | 余额 | OpenRouter | 总额度与累计消耗，差额 = 剩余 | API Key | 官方 `GET /api/v1/credits` |
 | 余额 | OpenAI（组织用量） | 组织维度用量/成本（**不是剩余额度**） | Admin Key（`sk-admin-…`） | 官方 usage 接口（experimental） |
@@ -266,6 +267,52 @@ GET/POST 控制台网关  api = zeldaHttp.apikeyMgr./tokenplan/personal/api/v2/s
 > - 火山引擎：方舟的 `GetCodingPlanUsage` / `GetAgentPlanAFPUsage` / `GetSeatInfoUsage` 与费用中心 `QueryBalanceAcct`
 
 ⚠️ 火山官方 CLI（ark-cli 0.1.16 起）暂停了 AK/SK 登录通道，那是 **CLI 自己**的限制；本页是直连公网 OpenAPI 签名，不受影响，但仍建议先点「查询一次」确认权限点够用。
+
+### 阶跃星辰 Step Plan：官方 API 看不到套餐，只能抄一份控制台令牌
+
+阶跃星辰的**官方 API Key 侧没有套餐接口** —— 只有 [`GET /v1/accounts`](https://platform.stepfun.com/docs/zh/api-reference/accounts/get)（现金 / 赠金余额，就是「阶跃星辰 StepFun」那张卡的 ¥15）。实测把 Step Key 打到 `/v1/usage`、`/v1/credits`、`/v1/subscription`、`/v1/dashboard/billing/{subscription,usage}`、`/step_plan/v1/{accounts,usage,credits,subscription}` 等 10 条候选路径**全是 404**。
+
+Step Plan 的套餐额度只在控制台，卡片读的是**网页版自己调的内部接口**（无令牌访问回 `401 auth failed: token is missing`，说明路径是活的）：
+
+```text
+POST https://platform.stepfun.com/api/step.openapi.devcenter.Dashboard/QueryStepPlanRateLimit   body {}
+POST https://platform.stepfun.com/api/step.openapi.devcenter.Dashboard/GetStepPlanStatus         body {}
+
+header: oasis-appid: 10300 / oasis-platform: web / oasis-webid: <device_id> / content-type: application/json
+cookie: Oasis-Token=<令牌>; Oasis-Webid=<device_id>
+```
+
+**为什么需要 `Oasis-Webid`**：它必须等于令牌里 `device_id` 声明（`access` 段 `...` `refresh` 段，取 refresh 段的 JWT 载荷），否则服务端回 `auth failed: oasis-token is embezzled`。粘贴整段令牌后面板会自己解出来，不用手填；「Oasis-Webid」那格只在特殊情况下（令牌里没有 `device_id`）才需要手动覆盖。
+
+**怎么拿令牌**（浏览器里一次，30 秒）：
+
+1. 浏览器登录 [platform.stepfun.com](https://platform.stepfun.com) → `F12` → **Application → Cookies → `https://platform.stepfun.com`**；
+2. 找到 **`Oasis-Token`**，复制它的值（形如 `eyJhbGci…...eyJhbGci…`，中间是 `...`，**整段复制**，不要只复制前半段）；
+3. 设置页 → 上游额度 → **阶跃星辰 Step Plan** → 「控制台令牌（Oasis-Token）」粘进去 → 顶部「保存全部」→ 点卡片上的刷新。
+
+两种计费模型（2026-06-18 升级后并存）都会自动识别，**按响应载荷的形状判断**，不只看 `plan_family`：
+
+| 你的套餐 | 响应特征 | 卡片上看到 |
+|---|---|---|
+| **Coding Plan**（滚动窗口） | `five_hour_usage_left_rate` / `weekly_usage_left_rate` 有值、`*_reset_time` 是真实时间戳 | 「5 小时窗口 0.2%」「每周窗口 38%」，各自带重置时间 |
+| **Token Plan**（月度 Credit 池） | 窗口字段恒为 `0` + `plan_credit_rate_limit`（`plan_family: 2`） | 「套餐 Credit 3.6%」，说明行里带 `剩 385,643,853 / 400,000,000 Credits · 订阅 Credit 剩 96.4% · Credit 至 YYYY-MM-DD`；加油包非 0 时追加「加油包剩 x%」 |
+
+```text
+窗口套餐：percent = (1 - five_hour_usage_left_rate) × 100      # 接口给的是「剩余比例」
+例：left_rate = 0.998 → 0.2%（剩 99.8%），重置看 *_reset_time（秒级时间戳，按北京时间显示）
+
+Credit 套餐：优先按桶的绝对值加权 —— percent = (1 - Σcredit_residual / Σcredit_total) × 100
+例：385,643,853 / 400,000,000 → 3.59%（剩 96.4%）
+没有可用桶时退回 subscription_credit_left_rate，最后才用 topup_credit_left_rate
+```
+
+套餐名（`Plus` / `Mini` 之类）来自 `GetStepPlanStatus` 的 `subscription.name`，会出现在卡片标题下方那一行；**这条接口失败只是少一行字，不影响额度数字**。
+
+⚠️ **令牌会过期**：服务端回 `401` 时平台会自动用令牌里的 refresh 段续期一次并重试（续期走 `POST /passport/proto.api.passport.v1.PassportService/RefreshToken`，body `{}`）；续期也失败就重新从浏览器复制一份。浏览器 Cookie 里的 refresh 段有效期很长，所以正常用很少需要再粘。
+
+⚠️ 这两个接口是**控制台内部接口**（社区逆向，官方随时可能改），所以这个平台在设置页里默认**关闭**、归类为 experimental：接口变了就先把开关关掉。
+
+⚠️ 令牌是**控制台登录态，权限比 API Key 大**（能操作你账号下的东西），只填在本机设置页里，别分享给别人。它和 API Key 一样以**明文**存在 `config.json` 的 `upstreamQuota` 里。
 
 ## 数字示例：平台差异导致的显示差异
 

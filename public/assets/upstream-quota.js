@@ -748,6 +748,10 @@
         cred = nameField + (fromProfile ? profileField(false) : "")
           + '<div><label>系统访问令牌</label><input type="text" data-f="apiKey" autocomplete="off" value="' + attr(pc.apiKey || "") + '" placeholder="控制台「个人设置 → 生成系统访问令牌」"></div>'
           + fieldsOf(def).map((f) => inputHTML(f, extra)).join("");
+      } else if (credential === "none") {
+        // 不需要「凭据来源」的平台（阶跃星辰 Step Plan）：凭据只有 extraFields 里那几格
+        // （控制台令牌 / Oasis-Webid），没有 API Key、也不从方案里带 Key，所以只渲染额外字段。
+        cred = nameField + fieldsOf(def).map((f) => inputHTML(f, extra)).join("");
       } else if (profOnly) {
         // Sub2API：一个方案 = 一个站点，地址与 Key 都从方案里来（方案是必选项），
         // 所以不给「凭据来源」也不给「显示名」——卡片名就是方案名。

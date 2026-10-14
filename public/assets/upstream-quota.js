@@ -341,7 +341,8 @@
       + '<button type="button" class="uq-icon" title="只刷新这个平台" onclick="UQ.refreshOne(\'' + attr(p.id) + '\')">↻</button>'
       + (p.note ? '<span class="uq-icon" title="' + attr(p.note) + '" style="cursor:help">ⓘ</span>' : "")
       + '</div>'
-      + (body || '<div class="uq-q-sub" style="margin-top:8px">上游没有返回可识别的额度字段</div>')
+      // 查询失败时不要再说「没有可识别的额度字段」—— 下一行的错误原文才是原因。
+      + (body || (p.error ? "" : '<div class="uq-q-sub" style="margin-top:8px">上游没有返回可识别的额度字段</div>'))
       + (p.error ? '<div class="uq-alert" title="' + attr(p.error) + '">' + esc(clip(p.error, 180)) + '</div>' : "")
       + ((p.warnings && p.warnings.length) ? '<div class="uq-warnline" title="' + attr(p.warnings.join("；")) + '">' + esc(clip(p.warnings.join("；"), 140)) + '</div>' : "")
       + '<div class="uq-card-ft">'

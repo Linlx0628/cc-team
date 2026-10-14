@@ -20,6 +20,7 @@
 | 套餐额度 | 智谱 GLM / GLM Coding Plan | 5 小时窗口、周窗口、账户余额 | API Key（国内站裸 Key / 国际站 Bearer，可选组织、项目 ID） | 私有（experimental） |
 | 套餐额度 | MiniMax | Token Plan 用量 | API Key | 私有（experimental） |
 | 套餐额度 | Claude 订阅（Claude Code） | 5 小时 / 7 天窗口用量 | OAuth Token（`sk-ant-oat…`，不是普通 API Key） | 私有（experimental） |
+| 套餐额度 | 阿里云百炼 Token Plan | 席位数量、每类席位的 Credits 总量 / 剩余、逐席位（成员）剩余 | AccessKey ID / Secret（可复用「阿里云账户余额」那份） | 官方 OpenAPI（Model Studio 2026-02-10，ACS3-HMAC-SHA256） |
 | 官方余额 | DeepSeek | 总余额（赠金 + 充值） | API Key | 官方 `GET /user/balance` |
 | 官方余额 | 阶跃星辰 StepFun | 预付费账户可用余额 | API Key | 官方 `GET /v1/accounts`（Step Plan 套餐额度只在控制台） |
 | 官方余额 | 月之暗面 Kimi | 可用 / 代金券 / 现金余额 | API Key | 官方 `GET /v1/users/me/balance` |
@@ -31,7 +32,7 @@
 | 自定义 | 自定义 HTTP 接口 | 你自己填字段的任意额度接口 | 自定义鉴权头 | 自建 |
 | 仅控制台 | 硅基流动 SiliconFlow | 总余额 / 赠费 / 充值（CNY） | — | 官方 `GET /v1/user/info` **已于 2026 年初下线**（实测 HTTP 410 + code 20092），替代接口未公布 |
 | 仅控制台 | 腾讯云 TokenHub Coding Plan | 5 小时 / 每周 / 每订阅月用量 | — | 官方只在控制台展示，无 API |
-| 仅控制台 | 阿里云百炼 Coding / Token Plan | 套餐用量 | — | 官方口径「暂无法通过 API 查看」；`bl` CLI 需控制台登录态 |
+| 仅控制台 | 阿里云百炼 Coding Plan | 套餐用量 | — | 官方只在控制台展示；`bl` CLI 需控制台登录态（**Token Plan 已单独有官方 OpenAPI**，见上表） |
 | 仅控制台 | 腾讯 CodeBuddy | 套餐与用量 | — | 官方只在网页展示 |
 
 - 「仅控制台」的四个平台**不发任何请求**，卡片只给一个「去控制台」链接。套餐额度只能人工看，或者等上游自己回 429（腾讯 TokenHub 的 `20097 hour|week|month allocated quota exceeded`、百炼的 `usage allocated quota exceeded`——这类报错会进管理面板的「错误记录」）。
@@ -56,7 +57,7 @@
 - **排在上面的都是要紧的**：同一分组内按「额度告警 → 查询失败 → 正常」排序，需要处理的排前面
 - **同名窗口自动区分**：智谱的周窗口有 tokens 与额度两条，会显示成「每周窗口（tokens）」与「每周窗口（额度）」，不会出现两个同名标题配两个不同百分比
 - **页脚**：`更新于 / 缓存于 N 分钟前`（缓存时说明数字来自上次的好数据）、凭据来源（如「自动 · DeepSeek / 张三」，只说方式**不显示密钥**）、控制台与文档链接
-- 面板标题栏右侧摘要：`⚠ 1 个需要关注 · 共 16 个平台 · 更新于 11:45`
+- 面板标题栏右侧摘要：`⚠ 1 个需要关注 · 共 17 个平台 · 更新于 11:45`
 - 单张卡片的 `↻` 只重查这一个平台并就地替换那张卡（整面板不重排、滚动位置不跳）；标题栏「**刷新全部**」强制重查所有已开平台
 
 ## 参数（设置页 → 上游额度 → 顶部「高级」折叠）
@@ -127,6 +128,8 @@
 
 云平台（火山 / 阿里云 / 腾讯云）的凭据不是 API Key，而是 **AccessKey ID / Secret**（腾讯云叫 SecretId / SecretKey）；火山还可选区域，默认 `cn-beijing`。
 
+同一个云账号下的多个平台**共用同一组 AK/SK**（例如「阿里云账户余额」与「阿里云百炼 Token Plan」）：只要有一处填过，另一处**留空即自动复用**，卡片页脚会显示「复用「阿里云账户余额」的 AccessKey」。想用不同的子账号，把那行自己的 AK/SK 填上就会覆盖。
+
 每行平台卡片展开后的「**高级：接入点覆盖 / 显示名**」里还有一格「**接入点覆盖**」，默认**留空 = 官方地址**。它替换的是**域名部分**，路径仍按官方接口拼（`你填的地址` + 官方路径，自动去掉结尾多余的 `/`）。「显示名」用来把卡片标题改成你自己认得的名字（留空 = 平台原名）：
 
 | 场景 | 怎么填 |
@@ -138,7 +141,8 @@
 ⚠️ 地址写错（多一层路径、少 `/v1`）会直接体现成卡片上的失败原因；改回留空即恢复官方地址。
 
 > ⚠️ 凭据以**明文**存在 `config.json` 的 `upstreamQuota` 里（与 SMTP 密码、webhook 密钥同一套处理方式），靠设置页的密码门保护；查询结果的快照接口不回传密钥，页脚只显示**末 4 位**。给云平台配 Key 时，建议单开一个只带下述只读权限的 RAM/子账号：
-> - 阿里云：`QueryAccountBalance`，RAM 权限点写作 `bss:DescribeAcccount`（注意是**双 c**）
+> - 阿里云账户余额：`QueryAccountBalance`，RAM 权限点写作 `bss:DescribeAcccount`（注意是**双 c**）
+> - 阿里云百炼 Token Plan：`modelstudio:GetSubscriptionStats`（席位与 Credits）与 `modelstudio:GetSubscriptionSeatDetails`（逐席位明细），两条就够
 > - 腾讯云：`DescribeAccountBalance`（费用中心只读）
 > - 火山引擎：方舟的 `GetCodingPlanUsage` / `GetAgentPlanAFPUsage` / `GetSeatInfoUsage` 与费用中心 `QueryBalanceAcct`
 
@@ -168,6 +172,7 @@
 | 智谱只有账户余额、没有 5 小时/周窗口 | 该 Key 不属于套餐账号（本工具会自动依次尝试个人版与团队版两种查询参数），或需要填组织 / 项目 ID |
 | 火山三个接口都 `HTTP 401` + `SignatureDoesNotMatch` | AK/SK 抄错或不成对（AK 应是 `AKLT` 开头，SK 一长串以 `=` 结尾），换成火山控制台「访问密钥」里的值 |
 | 阿里云 `Code: NotAuthorized / This API is not authorized for caller` | AK/SK 本身有效，但该 RAM 用户**没有 BSS 权限**：给它加 `AliyunBSSReadOnlyAccess` 或权限点 `bss:DescribeAcccount`（注意双 c） |
+| 百炼 Token Plan `HTTP 403` + `AccessDeniedDetail.AuthAction: modelstudio:GetSubscriptionStats` | 签名没问题，是 RAM 子账号缺这个权限点：加上 `modelstudio:GetSubscriptionStats` 与 `modelstudio:GetSubscriptionSeatDetails`（或挂一个百炼只读策略）后点「刷新全部」即可 |
 | 腾讯云 `未配置 AccessKey ID / Secret` | 云平台必须手填 SecretId / SecretKey，不能靠「自动复用方案密钥」（方案里的 Key 是推理 Key） |
 | 硅基流动在设置页只有「控制台」、不给查询 | 官方 `/v1/user/info` 已下线（410 + code 20092），替代接口未公布，所以本工具只给控制台入口；余额请去 [控制台「余额充值」](https://cloud.siliconflow.cn/account/charge) 看。官方公布新接口后会恢复 |
 | 任何平台 `请求超时` | 上游慢或被墙；把设置页「高级」里的请求超时调大，或填「接入点覆盖」 |

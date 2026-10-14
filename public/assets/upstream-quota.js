@@ -49,13 +49,17 @@
       ".uq-kpi-t.time b{font-size:15px;font-weight:600}",
       // 分段（面板只分 Plan / 余额两段；设置页沿用同一套）
       // 两桶并排：宽屏时 Plan 与余额 各占一列（一屏能看完），窄屏自动退回上下堆叠。
-      ".uq-buckets{display:grid;gap:0 18px;grid-template-columns:repeat(auto-fit,minmax(430px,1fr));align-items:start}",
+      // 两列等高（stretch）+ 段内把「仅控制台行 / 其余 N 个」这块用 margin-top:auto 钉到段底：
+      // 两段的尾部就都落在同一条水平线上，不会一个高一个低（用户反馈的「没有对齐」就是这个）。
+      // 注意两段的 margin-bottom 必须一致，否则 stretch 出来的高度会差一个 margin。
+      ".uq-buckets{display:grid;gap:0 18px;grid-template-columns:repeat(auto-fit,minmax(430px,1fr));align-items:stretch}",
       ".uq-sec{margin:0 0 16px}",
-      ".uq-sec:last-child{margin-bottom:4px}",
+      ".uq-buckets .uq-sec{display:flex;flex-direction:column}",
+      ".uq-buckets .uq-tail{margin-top:auto}",
       ".uq-sec-hd{display:flex;align-items:baseline;gap:8px;font-size:11.5px;font-weight:650;color:var(--dim);letter-spacing:.06em;margin:0 0 8px;padding-bottom:5px;border-bottom:1px solid var(--border)}",
       ".uq-sec-hd em{font-style:normal;font-weight:400;font-size:11px;color:var(--dim2);letter-spacing:0}",
       // 236px 起排 → 常见 1000~1200px 的内容区一行 4 张卡，少滚动
-      ".uq-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(236px,1fr));gap:10px;align-items:start}",
+      ".uq-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(236px,1fr));gap:10px;align-items:start;align-content:start}",
       // 卡片
       ".uq-card{display:flex;flex-direction:column;border:1px solid var(--border);border-radius:10px;background:var(--surface);padding:10px 12px}",
       ".uq-card.alarm{border-color:#e7b4ae;background:linear-gradient(180deg,#fff7f6,var(--surface) 58%)}",
@@ -116,23 +120,6 @@
       ".uq-fail b{display:block;font-size:13px;color:var(--red);margin-bottom:5px}",
       ".uq-fail p{font-size:11.5px;color:var(--dim);line-height:1.6;word-break:break-word}",
       ".uq-fail code{font-family:var(--font-mono);font-size:11px;background:var(--surface);border:1px solid var(--border);border-radius:4px;padding:1px 5px}",
-      // ── 控制台抽屉：点「控制台」从右边滑出，里面嵌官方控制台 ──────────────────
-      ".uq-drawer-on{overflow:hidden}",
-      ".uq-drawer-bd{position:fixed;inset:0;background:rgba(18,20,17,.34);z-index:70}",
-      ".uq-drawer{position:fixed;top:0;right:0;height:100vh;width:min(1080px,94vw);z-index:71;display:flex;flex-direction:column;background:var(--surface);border-left:1px solid var(--border);box-shadow:-18px 0 44px rgba(0,0,0,.2);animation:uqDrawerIn .18s ease-out}",
-      "@keyframes uqDrawerIn{from{transform:translateX(26px);opacity:.5}to{transform:none;opacity:1}}",
-      ".uq-drawer-hd{display:flex;align-items:center;gap:9px;padding:10px 13px;border-bottom:1px solid var(--border)}",
-      ".uq-drawer-hd b{font-size:13px;font-weight:650}",
-      ".uq-drawer-host{margin-right:auto;font-family:var(--font-mono);font-size:11px;color:var(--dim2)}",
-      ".uq-drawer-x{border:0;background:transparent;color:var(--dim);cursor:pointer;font-size:15px;line-height:1;padding:3px 7px;border-radius:6px}",
-      ".uq-drawer-x:hover{background:var(--surface-subtle);color:var(--text)}",
-      ".uq-drawer-main{flex:1;min-height:0;display:flex;flex-direction:column;background:var(--surface-subtle)}",
-      ".uq-drawer-frame{flex:1;width:100%;border:0;background:#fff}",
-      ".uq-drawer-tip{margin:0;padding:6px 12px;border-top:1px solid var(--border);background:var(--surface);font-size:10.5px;color:var(--dim2);line-height:1.6}",
-      ".uq-embed-no{margin:auto;max-width:540px;padding:24px;text-align:center;font-size:12.5px;line-height:1.8;color:var(--dim)}",
-      ".uq-embed-no b{display:block;margin-bottom:7px;font-size:14px;color:var(--text)}",
-      ".uq-embed-no code{font-family:var(--font-mono);font-size:11px;background:var(--surface);border:1px solid var(--border);border-radius:4px;padding:1px 5px}",
-      ".uq-embed-no a{color:var(--accent)}",
       // ── 设置页 ────────────────────────────────────────────────────────────
       ".uq-bar{position:sticky;top:0;z-index:6;display:flex;align-items:center;gap:9px;flex-wrap:wrap;padding:9px 13px;margin-bottom:14px;border:1px solid var(--border);border-radius:10px;background:var(--surface)}",
       ".uq-bar-t{font-size:13px;font-weight:650}",
@@ -399,7 +386,7 @@
       + '<div class="uq-card-ft">'
       + '<span>' + (p.fromCache ? "缓存于 " : "更新于 ") + esc(ago(p.fetchedAt) || "—") + '</span>'
       + (p.credLabel ? '<span class="uq-src" title="这个数字用的是哪份凭据">' + esc(p.credLabel) + '</span>' : "")
-      + (p.consoleUrl ? '<a href="' + attr(p.consoleUrl) + '" target="_blank" rel="noopener" data-name="' + attr(p.name) + '" onclick="return UQ.consoleClick(event,this)">控制台</a>' : "")
+      + (p.consoleUrl ? '<a href="' + attr(p.consoleUrl) + '" target="_blank" rel="noopener">控制台</a>' : "")
       + (p.docsUrl ? '<a href="' + attr(p.docsUrl) + '" target="_blank" rel="noopener">文档</a>' : "")
       + '</div>'
       + '</div>';
@@ -411,7 +398,7 @@
   // 没数字可看的平台压成一排小字行：把版面留给真有数据的那几张卡。
   function rowItem(p, kind) {
     const name = '<b>' + esc(p.name) + '</b>';
-    if (kind === "manual") return '<span class="uq-row">' + name + '<a href="' + attr(p.consoleUrl || "#") + '" target="_blank" rel="noopener" data-name="' + attr(p.name) + '" onclick="return UQ.consoleClick(event,this)">控制台</a></span>';
+    if (kind === "manual") return '<span class="uq-row">' + name + '<a href="' + attr(p.consoleUrl || "#") + '" target="_blank" rel="noopener">控制台</a></span>';
     if (kind === "off") return '<span class="uq-row"><span class="led"></span>' + name + '<em>已关闭</em><a href="/settings">启用</a></span>';
     if (kind === "unset") return '<span class="uq-row"><span class="led"></span>' + name + '<em>未配置凭据</em><a href="/settings">配置</a></span>';
     return '<span class="uq-row">' + name + (p.error ? '<em title="' + attr(p.error) + '">' + esc(clip(p.error, 60)) + '</em>' : "") + '</span>';
@@ -461,15 +448,18 @@
       const idleRows = rest.filter((p) => !p.manualOnly);
       body += '<div class="uq-sec"><div class="uq-sec-hd">' + esc(BUCKET_LABEL[b] || b) + '<em>' + esc(BUCKET_HINT[b] || "") + '</em><em style="margin-left:auto">' + list.length + ' 个</em></div>';
       if (withData.length) body += '<div class="uq-grid">' + withData.map((p) => cardHTML(p, alertPercent)).join("") + '</div>';
-      if (manualRows.length) body += '<div class="uq-rows">' + manualRows.map((p) => rowItem(p, "manual")).join("") + '</div>';
+      // 尾部（仅控制台行 + 其余 N 个）用 .uq-tail 包起来钉在段底：两列并排时两段的尾部对齐。
+      let tail = "";
+      if (manualRows.length) tail += '<div class="uq-rows">' + manualRows.map((p) => rowItem(p, "manual")).join("") + '</div>';
       if (idleRows.length) {
-        body += '<details class="uq-more"' + (moreOpen(b) ? " open" : "") + ' ontoggle="UQ.moreToggle(event,\'' + attr(b) + '\')">'
+        tail += '<details class="uq-more"' + (moreOpen(b) ? " open" : "") + ' ontoggle="UQ.moreToggle(event,\'' + attr(b) + '\')">'
           + '<summary>其余 ' + idleRows.length + ' 个（未配置 / 已关闭）</summary>'
           + '<div class="uq-rows">' + idleRows.map((p) => {
             const k = providerState(p, alertPercent).key;
             return rowItem(p, k === "off" ? "off" : "unset");
           }).join("") + '</div></details>';
       }
+      if (tail) body += '<div class="uq-tail">' + tail + '</div>';
       body += '</div>';
     }
     return kpiHTML(providers, snap) + '<div class="uq-buckets">' + body + '</div>';
@@ -482,96 +472,6 @@
   function moreToggle(ev, bucket) {
     try { localStorage.setItem("uq.more." + bucket, ev.target.open ? "1" : "0"); } catch (e) { /* 隐私模式：记不住也不影响用 */ }
   }
-
-  // ── 控制台抽屉 ────────────────────────────────────────────────────────────
-  // 点卡片/行里的「控制台」不再直接跳走，而是从右边滑出一个抽屉，里面用 iframe 嵌官方控制台，
-  // 这样切平台不用来回丢上下文。两个硬事实决定了实现方式：
-  //   1. 有几家（下表）在响应头里明确拒绝被嵌套，iframe 一定是空白 —— 对它们直接说实话 +
-  //      一键新标签，不浪费一次点击；
-  //   2. 就算能被嵌，浏览器也不共享第三方 Cookie —— 抽屉里可能要求重新登录一次，所以
-  //      顶部常驻「新标签打开」兜底。
-  // 表格用 2026-10-14 「curl -I」逐个验过的响应头整理：DENY / SAMEORIGIN / frame-ancestors 不在白名单。
-  const NO_EMBED_HOSTS = [
-    "platform.deepseek.com",       // CSP frame-ancestors 'none'
-    "openrouter.ai",               // X-Frame-Options: SAMEORIGIN
-    "www.bigmodel.cn",             // X-Frame-Options: SAMEORIGIN
-    "claude.ai",                   // X-Frame-Options: SAMEORIGIN
-    "opencode.ai",                 // X-Frame-Options: DENY
-    "platform.openai.com",         // X-Frame-Options: SAMEORIGIN
-    "cloud.siliconflow.cn",        // X-Frame-Options: DENY
-    "bailian.console.aliyun.com",  // CSP frame-ancestors *.aliyun.com
-  ];
-  function embedBlocked(url) {
-    try {
-      const h = new URL(url).hostname.toLowerCase();
-      return NO_EMBED_HOSTS.some((d) => h === d || h.endsWith("." + d));
-    } catch (e) { return false; }
-  }
-  function hostOf(url) {
-    try { return new URL(url).hostname; } catch (e) { return String(url || ""); }
-  }
-
-  let consoleState = { url: "", name: "", forced: false };
-
-  // 链接统一走这里：中键 / ⌘ / Ctrl / Shift 点击照旧交给浏览器开新标签（不抢用户习惯）。
-  function consoleClick(ev, el) {
-    const href = el.getAttribute("href") || "";
-    if (!/^https?:/i.test(href)) return true;   // 没有真地址（老配置 #）：照旧让浏览器处理
-    if (ev && (ev.metaKey || ev.ctrlKey || ev.shiftKey || ev.altKey || ev.button !== 0)) return true;
-    if (ev) ev.preventDefault();
-    return openConsole(href, el.getAttribute("data-name") || "");
-  }
-  function openConsole(url, name) {
-    if (!url) return false;
-    consoleState = { url: String(url), name: name || "控制台", forced: false };
-    renderConsole();
-    return false;
-  }
-  function renderConsole() {
-    let wrap = $("uqConsole");
-    if (!wrap) {
-      wrap = document.createElement("div");
-      wrap.id = "uqConsole";
-      document.body.appendChild(wrap);
-    }
-    const blocked = embedBlocked(consoleState.url) && !consoleState.forced;
-    wrap.innerHTML = '<div class="uq-drawer-bd" onclick="UQ.closeConsole()"></div>'
-      + '<aside class="uq-drawer" role="dialog" aria-modal="true" aria-label="' + attr(consoleState.name) + ' 控制台">'
-      + '<div class="uq-drawer-hd"><b>' + esc(consoleState.name) + '</b>'
-      + '<span class="uq-drawer-host" title="' + attr(consoleState.url) + '">' + esc(hostOf(consoleState.url)) + '</span>'
-      + '<a class="btn btn-outline btn-sm" href="' + attr(consoleState.url) + '" target="_blank" rel="noopener">新标签打开 →</a>'
-      + '<button type="button" class="btn btn-outline btn-sm" onclick="UQ.copyConsole(this)">复制地址</button>'
-      + '<button type="button" class="uq-drawer-x" title="关闭（Esc）" onclick="UQ.closeConsole()">✕</button></div>'
-      + '<div class="uq-drawer-main">'
-      + (blocked
-        ? '<div class="uq-embed-no"><b>这个控制台不允许被嵌进别的页面</b>'
-          + '<p>对方站点在响应头里写了 <code>X-Frame-Options</code> 或 <code>frame-ancestors</code>，浏览器会直接拒绝渲染，'
-          + '嵌进来只会是空白。<br>点右上角「<b>新标签打开 →</b>」在浏览器里看；'
-          + '<a href="#" onclick="return UQ.forceEmbed()">仍然尝试嵌入</a>（有些站点只是没配好，值得一试）。</p></div>'
-        : '<iframe class="uq-drawer-frame" src="' + attr(consoleState.url) + '" referrerpolicy="no-referrer-when-downgrade" allow="clipboard-read; clipboard-write; fullscreen"></iframe>'
-          + '<p class="uq-drawer-tip">抽屉里用的是浏览器自己的会话：部分平台会要求在这里重新登录一次（第三方 Cookie 不共享）。'
-          + '显示不出来就点右上角「新标签打开 →」。</p>')
-      + '</div></aside>';
-    document.body.classList.add("uq-drawer-on");
-  }
-  function forceEmbed() { consoleState.forced = true; renderConsole(); return false; }
-  function closeConsole() {
-    const wrap = $("uqConsole");
-    if (wrap) wrap.remove();
-    document.body.classList.remove("uq-drawer-on");
-    consoleState = { url: "", name: "", forced: false };
-  }
-  function copyConsole(btn) {
-    const url = consoleState.url;
-    const done = () => { if (!btn) return; const t = btn.textContent; btn.textContent = "已复制"; setTimeout(() => { btn.textContent = t; }, 1200); };
-    try {
-      if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(url).then(done, done);
-      else { const ta = document.createElement("textarea"); ta.value = url; document.body.appendChild(ta); ta.select(); document.execCommand("copy"); ta.remove(); done(); }
-    } catch (e) { done(); }
-  }
-  document.addEventListener("keydown", (e) => {
-    if (e.key === "Escape" && $("uqConsole")) closeConsole();
-  });
 
   // 摘要行：有需要关注的平台时前面点一颗红点（用 CSS 画，不用表情符号——项目约定
   // 源码与资产里不出现 emoji，tests/multi-profile-default-ux.test.mjs 会扫）。
@@ -767,7 +667,7 @@
     let body = "";
     if (manual) {
       body = '<div class="uq-p-foot">'
-        + (def.consoleUrl ? '<a class="btn btn-outline btn-sm" href="' + attr(def.consoleUrl) + '" target="_blank" rel="noopener" data-name="' + attr(def.name) + '" onclick="return UQ.consoleClick(event,this)">打开控制台</a>' : "")
+        + (def.consoleUrl ? '<a class="btn btn-outline btn-sm" href="' + attr(def.consoleUrl) + '" target="_blank" rel="noopener">打开控制台</a>' : "")
         + (def.docsUrl ? '<a class="btn btn-outline btn-sm" href="' + attr(def.docsUrl) + '" target="_blank" rel="noopener">文档</a>' : "")
         + '</div>'
         + (def.note ? '<p class="uq-p-note">' + esc(def.note) + '</p>' : "");
@@ -1203,10 +1103,6 @@
     addSite: addSite,
     delSite: delSite,
     moreToggle: moreToggle,
-    consoleClick: consoleClick,
-    closeConsole: closeConsole,
-    copyConsole: copyConsole,
-    forceEmbed: forceEmbed,
   };
 
   ensureStyle();

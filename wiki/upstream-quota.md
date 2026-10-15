@@ -230,6 +230,8 @@ GET/POST 控制台网关  api = zeldaHttp.apikeyMgr./tokenplan/personal/api/v2/s
         # 国际站换 modelstudio.ap-southeast-1.aliyuncs.com；ACS3-HMAC-SHA256 签名，无请求体
    → { "cliAccessToken": "<36 位左右的令牌>" }
    ```
+
+   > ⚠️ **换得到 ≠ 读得到**（2026-10-15 实测）：只加 `modelstudio:GenerateCLIAccessToken` 时，换取接口会 200 并真的返回令牌，但那个令牌打到控制台网关会被判 **`BailianGateway.Team.NotAuthorised`** —— 它代表的账号（实测那把 AK 是 RAM 子账号 `finance-staff`）**不在百炼的控制台团队 / 业务空间里**。这个报错说明「令牌被认了、但没有团队授权」，和过期（`NotLogined`）是两码事。要让第 3 条真的通，这个 RAM 用户还得有百炼控制台侧的权限：在百炼「业务空间 → 成员管理」里把它加成成员，或给主账号 / 有百炼控制台权限的 AK。只加权限点的话，请用第 2 条（自己电脑上跑脚本粘令牌）。
 4. **CLI 路线**：本机跑 `npx -y bailian-cli auth login --console`，令牌落到 `~/.bailian/config.json` 的 `access_token`。平台的「控制台令牌」留空时会自动读这个文件。
 5. **纯手工路线**：把拿到的 `access_token`（36 位左右）粘进「**控制台令牌**」格（密码型输入框，只存在本机 `config.json`，快照接口不回传）。
 6. 想换账号 / 换区域：`BAILIAN_CONFIG_DIR` 可以指定另一个配置目录；设置页的「控制台区域」默认 `cn-beijing`，海外站填 `ap-southeast-1`。
@@ -241,9 +243,9 @@ GET/POST 控制台网关  api = zeldaHttp.apikeyMgr./tokenplan/personal/api/v2/s
 |---|---|---|
 | 浏览器开 `http://127.0.0.1:6789`（面板就在本机） | ✅ 能 | 第 1 条 |
 | `ssh -L 6789:127.0.0.1:6789 user@服务器` 后浏览器开 `http://127.0.0.1:6789` | ✅ 能（回调经隧道回到你本机） | 第 1 条 |
-| 浏览器开 `http://<服务器IP>:6789`（局域网 IP / 裸 HTTP） | ❌ 不行（混合内容：https 授权页 → 非回环的 http 地址被拦） | 第 2 条（自己电脑上跑脚本）或第 3 条（加 RAM 权限，最省事） |
+| 浏览器开 `http://<服务器IP>:6789`（局域网 IP / 裸 HTTP） | ❌ 不行（混合内容：https 授权页 → 非回环的 http 地址被拦） | 第 2 条（自己电脑上跑脚本，最稳）或第 3 条（加 RAM 权限 + 把这个子账号加进百炼业务空间） |
 | 浏览器开 `https://<域名>`（反向代理 + 证书） | ❌ 也不行（原因同上：授权页固定发 http，浏览器只豁免回环地址） | 同上；或配隧道 + 「令牌回调地址」= `127.0.0.1:6789` |
-| 服务器上没浏览器 / 无人值守 | — | 第 3 条（配一次权限点，之后全自动） |
+| 服务器上没浏览器 / 无人值守 | — | 第 3 条（配权限点 **且** 把这个 RAM 用户加进百炼业务空间，之后全自动；只加权限点会换来令牌但被网关判 `Team.NotAuthorised`） |
 
 实测：浏览器里点一下授权就拿到令牌，接口随即返回真实数字（`per1MonthPercentage` 驱动「套餐月额度」）。
 
@@ -278,10 +280,12 @@ GET/POST 控制台网关  api = zeldaHttp.apikeyMgr./tokenplan/personal/api/v2/s
 |---|---|---|
 | 浏览器一键授权 | 卡片页脚「一键获取令牌」→ 控制台点授权 → 令牌自动回填 | 面板在**本机**（或经 `ssh -L 6789:127.0.0.1:6789` 隧道）访问时；用域名 / 局域网 IP 打开面板时这个按钮会被浏览器的混合内容拦截挡掉（控制台回调硬编码 http） |
 | 自己机器上取 | 在能上网的电脑上跑 `node tools/bailian-console-login.mjs`，把打印的 `access_token` 粘进「控制台令牌」 | 面板部署在服务器上、本机没浏览器回调 |
-| **AccessKey 自动换取（服务器推荐）** | 填写可选的两格 `AccessKey ID` / `AccessKey Secret`（**可复用「阿里云账户余额」那份**），并给这个 RAM 用户加 `modelstudio:GenerateCLIAccessToken` 权限 | 无人值守的服务器：没有令牌时自动换一条；令牌过期（`NotLogined`）时自动换一条**再重试一次** |
+| **AccessKey 自动换取** | 填写可选的两格 `AccessKey ID` / `AccessKey Secret`（**可复用「阿里云账户余额」那份**），给这个 RAM 用户加 `modelstudio:GenerateCLIAccessToken` 权限，**并且**让这个账号在百炼业务空间里有控制台权限（见下方 ⚠️） | 无人值守的服务器：没有令牌时自动换一条；令牌过期（`NotLogined`）时自动换一条**再重试一次**；只加了权限点但账号不在业务空间里时，换来也会被网关判 `Team.NotAuthorised` |
 | 手工粘贴 | 从浏览器开发者工具里抄 `access_token` | 临时排障 |
 
 **AccessKey 是可选的**：这张卡的主要凭据是控制台令牌，AK/SK 只是「服务器上自动换取 / 续期令牌」的手段——所以只填令牌、一格 AK/SK 都不填也能查（不会像普通云平台那样报「未配置 AccessKey ID / Secret」）；反过来，只填 AK/SK、不填令牌，第一次查询会先拿 AK/SK 换令牌。换到的令牌会**在内存里缓存 30 分钟**，Token Plan 与 Coding Plan **共用**这一份，所以两张卡连着查只会换一次。卡片右下角那行「凭据：…」写的是**这次实际用的凭据**：`控制台令牌` / `控制台令牌（AccessKey 自动换取）`——不是「AK/SK 是从哪张卡复用的」。
+
+> ⚠️ **自动换取的前提**（2026-10-15 实测）：`modelstudio:GenerateCLIAccessToken` 只决定「能不能换到令牌」，换来之后还要看这个账号**在不在百炼的控制台团队 / 业务空间里**。实测一把 RAM 子账号（`finance-staff`）只加了权限点时：换取接口 200 拿到令牌，但网关回 `BailianGateway.Team.NotAuthorised`（不是 `NotLogined`，说明令牌被认了、只是没有团队授权）。想让它通，就把这个 RAM 用户加进百炼「业务空间 → 成员管理」，或改用主账号 / 有百炼控制台权限的 AK；否则请用「本机跑 `tools/bailian-console-login.mjs` 粘令牌」这条。
 
 | 面板上看到 | 接口字段 | 说明 |
 |---|---|---|

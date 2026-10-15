@@ -108,7 +108,7 @@ body{padding:0;overflow:hidden;height:100vh}
 .q-focus-btn:hover{border-color:var(--border-strong);background:var(--surface-subtle)}
 .q-focus-btn.on{border-color:#bdd0c3;color:var(--green);background:var(--accent-soft)}
 .sec-toggle{display:none}.sec-hint{font-size:10px;color:var(--dim);font-weight:400}.sec-body{display:block;min-height:0}.sec-body.open{display:block}
-/* detail/errors 不走 -inner 外壳:这三个节点原用 height:100% 撑高,改 flex:1 接入新高度模型 */
+/* detail/errors 同样套 -inner 白底外壳；这两个节点原用 height:100% 撑高,改 flex:1 接入新高度模型 */
 #detailSec,#detailSecBody,#errorSec{flex:1;min-height:0;display:flex;flex-direction:column}#errorSecBody{overflow:auto}
 .clear-btn{font-size:11px;background:#fff5f3;color:var(--red);border:1px solid #f1c8c2;border-radius:4px;padding:4px 9px;cursor:pointer;margin-left:8px}
 .detail-tools{display:grid;grid-template-columns:minmax(220px,1.4fr) minmax(130px,.55fr) minmax(160px,.65fr) auto;gap:9px;align-items:end;padding:8px 12px}

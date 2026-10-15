@@ -52,7 +52,9 @@
       // 两列等高（stretch）+ 段内把「仅控制台行 / 其余 N 个」这块用 margin-top:auto 钉到段底：
       // 两段的尾部就都落在同一条水平线上，不会一个高一个低（用户反馈的「没有对齐」就是这个）。
       // 注意两段的 margin-bottom 必须一致，否则 stretch 出来的高度会差一个 margin。
-      ".uq-buckets{display:grid;gap:0 18px;grid-template-columns:repeat(auto-fit,minmax(430px,1fr));align-items:stretch}",
+      // 每张卡至少要 330px 才放得下「智谱 GLM / GLM Coding Plan」这种长名字，所以两个分区并排要求
+      // 每个分区 ≥720px；窗口不够宽时宁可把分区竖着叠起来，也不要压窄卡片把名字截掉。
+      ".uq-buckets{display:grid;gap:18px 18px;grid-template-columns:repeat(auto-fit,minmax(720px,1fr));align-items:stretch}",
       ".uq-sec{margin:0 0 16px}",
       ".uq-buckets .uq-sec{display:flex;flex-direction:column}",
       ".uq-buckets .uq-tail{margin-top:auto}",
@@ -76,7 +78,7 @@
       ".uq-card.warn{border-color:#e6d7ac}",
       ".uq-card.off{background:var(--surface-subtle)}",
       ".uq-card-hd{display:flex;align-items:center;gap:7px;min-width:0}",
-      ".uq-name{font-size:13px;font-weight:650;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}",
+      ".uq-name{font-size:13px;font-weight:650;line-height:1.3;overflow-wrap:break-word}",
       ".uq-state{margin-left:auto;font-size:10.5px;padding:1px 7px;border-radius:9px;border:1px solid var(--border);color:var(--dim);white-space:nowrap}",
       ".uq-state.ok{color:var(--green);border-color:#bcd6c6;background:var(--accent-soft)}",
       ".uq-state.alarm{color:var(--red);border-color:#e7b4ae;background:#fdf0ee}",
@@ -118,8 +120,8 @@
       // 健康度配色不走全局告警阈值，而是固定规则：低于 80% 蓝、达 80% 红，框/条/数字一起变。
       ".uq-planq{margin:2px 0;padding:7px 9px;border:1px dashed #a9c6f2;border-radius:9px;background:linear-gradient(180deg,#f7faff,var(--surface) 72%)}",
       ".uq-planq.hot{border-color:#e8b4b4;background:linear-gradient(180deg,#fff7f7,var(--surface) 72%)}",
-      ".uq-planq-hd{display:flex;align-items:center;gap:6px;font-size:10.5px;color:var(--dim2);margin-bottom:6px}",
-      ".uq-planq-tag{display:inline-block;padding:1px 7px;border-radius:999px;border:1px solid #bcd2f4;background:#eef5ff;color:#2b62b8;font-weight:650;letter-spacing:.04em}",
+      ".uq-planq-hd{display:flex;align-items:center;flex-wrap:wrap;gap:3px 6px;font-size:10.5px;color:var(--dim2);margin-bottom:6px}",
+      ".uq-planq-tag{display:inline-block;white-space:nowrap;padding:1px 7px;border-radius:999px;border:1px solid #bcd2f4;background:#eef5ff;color:#2b62b8;font-weight:650;letter-spacing:.04em}",
       ".uq-planq.hot .uq-planq-tag{border-color:#ecc0c0;background:#fdf0f0;color:#a8302f}",
       ".uq-planq .uq-q .quota-progress{background:#e7effc}",
       ".uq-planq .uq-q .quota-progress>i{background:#3b82f6}",
@@ -466,6 +468,14 @@
     return '<div class="uq-plan" title="套餐信息来自上游订阅接口">' + esc(bits.join(" · ")) + '</div>';
   }
 
+  // 这一条是不是「套餐额度」：带进度条的额度窗口默认都算（阶跃星辰的套餐 Credit、火山的三个窗口、
+  // 百炼 Coding Plan 的三个窗口…），显式标了 planQuota:false 的留在框外（智谱的 MCP 每月额度、
+  // 百炼的 Harness 权益），代金券是另一块。
+  function isPlanQuotaItem(it) {
+    if (!it || it.voucher === true) return false;
+    if (it.planQuota === false) return false;
+    return it.kind === "quota" || it.planQuota === true;
+  }
   function cardHTML(p, alertPercent) {
     const st = providerState(p, alertPercent);
     // 同一平台可能有多个同名窗口（智谱就有「每周窗口」的 tokens 与额度两条），
@@ -483,9 +493,9 @@
     const labelIt = (raw) => Object.assign({}, raw, { label: labelOf(raw) });
     const vouchers = items.filter((it) => it.voucher === true).map(labelIt);
     // 套餐额度（planQuota）单独一块画在最上面：与 MCP / 权益额度明显分开。
-    const planQuota = items.filter((it) => it.voucher !== true && it.planQuota === true).map(labelIt);
+    const planQuota = items.filter(isPlanQuotaItem).map(labelIt);
     const planBlock = planQuota.length ? planQuotaHTML(planQuota, alertPercent) : "";
-    const body = items.filter((it) => it.voucher !== true && it.planQuota !== true).map((raw) => {
+    const body = items.filter((it) => !isPlanQuotaItem(it)).map((raw) => {
       const it = labelIt(raw);
       return it.kind === "balance" ? balanceHTML(it) : quotaHTML(it, alertPercent);
     }).join("");
@@ -636,7 +646,7 @@
   // 目标：卡片按各自自然高度往下排，列与列之间尽量齐平 —— 不出现「矮卡下面一大块空白」。
   // 做法：贪心（下一张卡进当前最矮的列，保持优先级顺序在列内自上而下）+ 一轮局部改进
   // （把某张卡挪到别的列，只要最高的列能变矮就保留）。宽度不够时自动退回单列。
-  const CARD_MIN_W = 236;
+  const CARD_MIN_W = 330;
   const CARD_GAP = 10;
   // 纯函数：按每张卡的高度把它们分到 n 列。贪心（下一张进当前最矮的列，保持原顺序），
   // 再补一轮「把某张卡挪到别的列、只要最高的列能变矮就保留」的局部改进。

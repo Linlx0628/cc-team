@@ -113,6 +113,20 @@
       ".uq-q-sub{font-size:11px;color:var(--dim2);font-variant-numeric:tabular-nums}",
       // 窗口额度的一句话说明（例：滚动窗口没有可用的重置时间；上游只给百分比之类）
       ".uq-q-note{margin-top:2px;font-size:11px;line-height:1.6;color:var(--dim2)}",
+      // 套餐额度单独一块：虚线框圈起来，跟同一张卡里的 MCP / 权益额度分开
+      //（用户 2026-10-15：一眼要能认出这个百分比是套餐额度，不是 MCP 额度）。
+      // 健康度配色不走全局告警阈值，而是固定规则：低于 80% 蓝、达 80% 红，框/条/数字一起变。
+      ".uq-planq{margin:2px 0;padding:7px 9px;border:1px dashed #a9c6f2;border-radius:9px;background:linear-gradient(180deg,#f7faff,var(--surface) 72%)}",
+      ".uq-planq.hot{border-color:#e8b4b4;background:linear-gradient(180deg,#fff7f7,var(--surface) 72%)}",
+      ".uq-planq-hd{display:flex;align-items:center;gap:6px;font-size:10.5px;color:var(--dim2);margin-bottom:6px}",
+      ".uq-planq-tag{display:inline-block;padding:1px 7px;border-radius:999px;border:1px solid #bcd2f4;background:#eef5ff;color:#2b62b8;font-weight:650;letter-spacing:.04em}",
+      ".uq-planq.hot .uq-planq-tag{border-color:#ecc0c0;background:#fdf0f0;color:#a8302f}",
+      ".uq-planq .uq-q .quota-progress{background:#e7effc}",
+      ".uq-planq .uq-q .quota-progress>i{background:#3b82f6}",
+      ".uq-planq .uq-q .uq-q-hd b{color:#2b62b8}",
+      ".uq-planq.hot .uq-q .quota-progress{background:#f7e9e9}",
+      ".uq-planq.hot .uq-q .quota-progress>i{background:var(--red)}",
+      ".uq-planq.hot .uq-q .uq-q-hd b{color:var(--red)}",
       // 卡片内的异常/提示
       ".uq-alert{margin:8px 0 0;font-size:11.5px;line-height:1.5;color:var(--red);word-break:break-word}",
       ".uq-warnline{margin:6px 0 0;font-size:11px;line-height:1.5;color:var(--orange)}",
@@ -407,6 +421,25 @@
       + '</div>';
   }
 
+  // 套餐额度单独一块：虚线框圈起来，跟同一张卡里的 MCP / 权益额度分开
+  // （用户 2026-10-15：一眼要能认出哪个百分比是套餐额度，不是 MCP 额度）。
+  // 配色不用全局告警阈值，而是这条固定规则：**低于 80% 蓝、80% 及以上红** ——
+  // 虚线框、进度条、数字一起变（就是硅基流动代金券那种「一块自己的小框」）。
+  const PLAN_HOT_PERCENT = 80;
+  function planQuotaHTML(list, alertPercent) {
+    const items = list || [];
+    const worst = items.reduce((m, it) => {
+      const pct = usedPercent(it);
+      return pct === null ? m : Math.max(m, pct);
+    }, -1);
+    const hot = worst >= PLAN_HOT_PERCENT;
+    return '<div class="uq-planq' + (hot ? " hot" : "") + '">'
+      + '<div class="uq-planq-hd"><span class="uq-planq-tag">套餐额度</span>'
+      + '<span>' + (hot ? "用量已到 " + PLAN_HOT_PERCENT + "% 以上" : "订阅套餐自带的额度窗口") + '</span></div>'
+      + items.map((it) => quotaHTML(it, alertPercent)).join("")
+      + '</div>';
+  }
+
   // 套餐本身的信息：规格 / 是否生效中 / 到期时间（+ 剩余天数）。
   // 只有上游接口真的给了才渲染这一行（阿里云百炼个人版的控制台订阅接口给得出；多数平台
   // 只给窗口重置时间，没给套餐到期 —— 那就什么都不显示，不猜、不占版面）。
@@ -449,7 +482,10 @@
     };
     const labelIt = (raw) => Object.assign({}, raw, { label: labelOf(raw) });
     const vouchers = items.filter((it) => it.voucher === true).map(labelIt);
-    const body = items.filter((it) => it.voucher !== true).map((raw) => {
+    // 套餐额度（planQuota）单独一块画在最上面：与 MCP / 权益额度明显分开。
+    const planQuota = items.filter((it) => it.voucher !== true && it.planQuota === true).map(labelIt);
+    const planBlock = planQuota.length ? planQuotaHTML(planQuota, alertPercent) : "";
+    const body = items.filter((it) => it.voucher !== true && it.planQuota !== true).map((raw) => {
       const it = labelIt(raw);
       return it.kind === "balance" ? balanceHTML(it) : quotaHTML(it, alertPercent);
     }).join("");
@@ -471,9 +507,10 @@
       + (p.note ? '<span class="uq-icon" title="' + attr(p.note) + '" style="cursor:help">ⓘ</span>' : "")
       + '</div>'
       + planHTML(p.plan)
+      + planBlock
       // 查询失败时不要再说「没有可识别的额度字段」—— 下一行的错误原文才是原因。
       + (body ? '<div class="uq-body">' + body + '</div>'
-        : (p.error ? "" : '<div class="uq-q-sub" style="margin-top:8px">上游没有返回可识别的额度字段</div>'))
+        : (p.error || planBlock ? "" : '<div class="uq-q-sub" style="margin-top:8px">上游没有返回可识别的额度字段</div>'))
       + voucherBlock
       + (p.error ? '<div class="uq-alert" title="' + attr(p.error) + '">' + esc(clip(p.error, 180)) + '</div>' : "")
       + ((p.warnings && p.warnings.length) ? '<div class="uq-warnline" title="' + attr(p.warnings.join("；")) + '">' + esc(clip(p.warnings.join("；"), 140)) + '</div>' : "")

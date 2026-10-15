@@ -916,6 +916,11 @@
         + (loginField
           // 控制台令牌型（阿里云百炼）：不用装 CLI，点一下就在浏览器里完成授权回调。
           ? '<button type="button" class="btn btn-outline btn-sm" onclick="UQ.consoleLogin(\'' + attr(id) + '\',\'' + attr(loginField.key) + '\',this)">一键获取令牌</button>'
+            // 已经存着一份令牌时才给「清除」：只想用 AK/SK 自动换取的用户不用手动清空 + 保存，
+            // 也免得一份过期令牌让每次刷新都先失败一轮。
+            + (String(extra[loginField.key] || "").trim()
+              ? '<button type="button" class="btn btn-outline btn-sm" onclick="UQ.clearConsoleToken(\'' + attr(id) + '\',\'' + attr(loginField.key) + '\',this)">清除控制台令牌</button>'
+              : "")
           : "")
         + '<span class="uq-probe" data-console-msg></span>'
         + '<span class="uq-probe" data-probe>' + (live && live.credLabel ? '<span style="color:var(--dim2)">凭据：' + esc(live.credLabel) + '</span>' : "") + '</span>'
@@ -1347,6 +1352,35 @@
     if (region && ex.consoleRegion) region.value = ex.consoleRegion;
   }
 
+  // 清除已保存的控制台令牌（只想用 AccessKey 自动换取的场景）：删掉配置里那一格并重查一次，
+  // 之后这张卡直接换新令牌，不再「先拿旧令牌失败一轮」。
+  async function clearConsoleToken(id, fieldKey, btn) {
+    const card = document.querySelector('#uqCfgBody .uq-cfg[data-id="' + id + '"]');
+    const msg = card && card.querySelector("[data-console-msg]");
+    const say = (text, cls) => {
+      if (!msg) return;
+      msg.innerHTML = text ? '<span class="' + (cls || "") + '">' + esc(text) + '</span>' : "";
+    };
+    if (btn) btn.disabled = true;
+    try {
+      say("正在清除已保存的控制台令牌…", "dim");
+      const r = await api("/api/upstream-quota/clear-console-token", { method: "POST", body: { id: id } });
+      if (!r || !r.ok) throw new Error((r && r.error) || "清除失败");
+      // 读回服务端配置：顺带把输入框置空、CFG 同步掉（否则下次「保存全部」又把令牌写回去）。
+      await fillConsoleToken(id, fieldKey);
+      // 这个按钮只在「存着令牌」时渲染，清完就撤掉，免得用户以为还剩一份。
+      if (btn && btn.parentNode) btn.parentNode.removeChild(btn);
+      if (typeof toast === "function") toast(r.cleared ? "已清除控制台令牌" : "本来就没有保存的控制台令牌");
+      say("已清除。之后这张卡会用 AccessKey 自动换取 / 续期控制台令牌，不再需要手动填。", "dim");
+      try { await testProvider(id); } catch (e) { /* 查询失败不影响清除结果 */ }
+    } catch (err) {
+      say((err && err.message) || String(err), "alarm");
+      setStatus("清除令牌失败：" + clip((err && err.message) || String(err), 60), "err");
+    } finally {
+      if (btn) btn.disabled = false;
+    }
+  }
+
   // 凭据来源 / 方案切换：显隐相关输入框并刷新成员下拉。
   function syncRow(el) {
     const card = el && el.closest ? el.closest(".uq-cfg") : null;
@@ -1392,6 +1426,7 @@
     saveSettings: saveSettings,
     testProvider: testProvider,
     consoleLogin: consoleLogin,
+    clearConsoleToken: clearConsoleToken,
     syncRow: syncRow,
     collect: collect,
     addSite: addSite,

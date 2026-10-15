@@ -4620,6 +4620,43 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+  // 清除已保存的「控制台令牌」：只想让平台用 AccessKey 自动换取的用户，不必手动清空输入框再保存
+  // （留着一份过期令牌的话，每次刷新都会先拿它失败一轮、再换新的重试）。
+  if (req.method === "POST" && req.url === "/api/upstream-quota/clear-console-token") {
+    if (!checkAuth(req)) { res.writeHead(401); res.end("Unauthorized"); return; }
+    if (!checkCsrf(req)) { res.writeHead(403); res.end("CSRF validation failed"); return; }
+    readBody(req).then((buf) => {
+      try {
+        const body = buf.length ? JSON.parse(buf.toString()) : {};
+        const id = String(body.id || "").trim();
+        const def = providerDef(id);
+        const field = consoleLoginMarker(def);
+        if (!def || !field) {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "该接入点没有「控制台令牌」这个字段" }));
+          return;
+        }
+        const now = upstreamQuotaApi().cfg();
+        const providers = { ...now.providers };
+        const p = providers[id] || {};
+        const extraNext = { ...(p.extra || {}) };
+        const had = String(extraNext[field.key] || "").trim() !== "";
+        delete extraNext[field.key];
+        providers[id] = { ...p, extra: extraNext };
+        upstreamQuotaApi().save({ ...now, providers });
+        recordAdminAudit(req, "upstreamQuota.clearConsoleToken", "上游额度",
+          `${def.name}：清除了已保存的控制台令牌`);
+        // 立刻按新配置查一次：用户切回「上游额度」就能看到「凭据：控制台令牌（AccessKey 自动换取）」。
+        upstreamQuotaApi().providerSnapshot(id, { force: true }).catch(() => {});
+        sendJson(res, { ok: true, cleared: had, field: field.key }, req);
+      } catch (err) {
+        res.writeHead(500, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: err.message }));
+      }
+    });
+    return;
+  }
+
   if (req.method === "POST" && req.url === "/api/data-import/preview") {
     if (!checkAuth(req)) { res.writeHead(401); res.end("Unauthorized"); return; }
     if (!checkCsrf(req)) { res.writeHead(403); res.end("CSRF validation failed"); return; }

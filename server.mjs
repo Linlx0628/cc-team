@@ -5910,7 +5910,17 @@ const server = http.createServer((req, res) => {
       return;
     }
     if (req.method === "GET" && pePath === "/api/plan-export/jobs") {
-      sendJson(res, { ok: true, jobs: planExportApi.listJobs() }, req);
+      const q = u.searchParams;
+      sendJson(res, {
+        ok: true,
+        ...planExportApi.listJobs({
+          page: q.get("page"),
+          pageSize: q.get("pageSize"),
+          suffix: q.get("suffix"),
+          status: q.get("status"),
+          period: q.get("period"),
+        }),
+      }, req);
       return;
     }
     if (req.method === "GET" && pePath === "/api/plan-export/file") {

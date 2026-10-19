@@ -346,3 +346,9 @@ td{padding:8px 12px;font-size:11px;border-bottom:1px solid #ecece8;white-space:n
 .pe-job-meta{font-size:10.5px;color:var(--dim);margin-top:5px;overflow-wrap:break-word}
 .pe-job-files{display:flex;gap:7px;margin-top:7px;flex-wrap:wrap}
 .pe-job-err{margin-top:7px;font-size:11px;color:var(--red)}
+
+/* ── 文件管理:筛选栏 + 分页 ─────────────────────────────────────────── */
+.pe-filter-row{display:flex;gap:8px;margin-bottom:12px;flex-wrap:wrap}
+.pe-filter-row .pe-sel{width:auto;min-width:128px;flex:0 1 auto}
+.pe-pager{display:flex;align-items:center;justify-content:center;gap:10px;margin-top:12px}
+.pe-page-info{font-size:12px;color:var(--dim)}

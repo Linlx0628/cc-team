@@ -1142,13 +1142,32 @@ async function loadSessions(){
 // 弹窗选 月度/周度 二选一 → 拉 /api/plan-export/periods 填可选周期 → POST 入队后台
 // 任务;「文件管理」弹窗轮询 /api/plan-export/jobs 展示任务进度与下载入口,
 // 进行中任务在工具栏按钮上点亮小圆点,完成/失败时 toast 提醒一次。
-const peState={period:"month",suffix:"",name:"",periods:null,pollTimer:null,trackedJobs:new Set()};
+const peState={period:"month",suffix:"",name:"",periods:null,pollTimer:null,trackedJobs:new Set(),page:1,pages:1,total:0,filters:{suffix:"",status:"",period:""},plans:[]};
 const PE_STATUS={queued:["排队中","pill-warn"],running:["生成中","pill-warn"],done:["完成","pill-ok"],failed:["失败","pill-bad"]};
 function peCsrf(){return(document.cookie.match(/tm_csrf=([^;]+)/)||[])[1]||''}
 function peFmtTime(ts){if(!ts)return"-";const d=new Date(ts),p=n=>String(n).padStart(2,"0");return (d.getMonth()+1)+"-"+p(d.getDate())+" "+p(d.getHours())+":"+p(d.getMinutes())}
 function pePeriodLabel(j){return j.period==="month"?("月度 · "+j.from.slice(0,7)+"（"+j.from+" ~ "+j.to+"）"):("周度 · "+j.from+" ~ "+j.to)}
-async function peFetchJobs(){const r=await fetch("/api/plan-export/jobs");const d=await r.json();return Array.isArray(d.jobs)?d.jobs:[]}
-function peUpdateDot(jobs){const el=document.getElementById("planExportFilesDot");if(el)el.hidden=!jobs.some(j=>j.status==="queued"||j.status==="running")}
+// 分页 + 筛选拉任务列表;响应里除当前页 jobs 外还有全量 statuses/plans(见服务端 listJobs)
+async function peFetchJobs(){
+  const f=peState.filters,q=new URLSearchParams();
+  if(f.suffix)q.set("suffix",f.suffix);
+  if(f.status)q.set("status",f.status);
+  if(f.period)q.set("period",f.period);
+  q.set("page",String(peState.page));q.set("pageSize","10");
+  const r=await fetch("/api/plan-export/jobs?"+q.toString());
+  const d=await r.json();
+  return d&&d.jobs?d:{jobs:[],total:0,page:1,pageSize:10,pages:1,statuses:{},plans:[]};
+}
+function peUpdateDot(statuses){const el=document.getElementById("planExportFilesDot");if(el)el.hidden=!Object.values(statuses||{}).some(s=>s&&(s.status==="queued"||s.status==="running"))}
+function peHasFilter(){const f=peState.filters;return !!(f.suffix||f.status||f.period)}
+// 方案筛选下拉:每次渲染后重建选项(新方案出现时自动可筛),尽量保留当前选中值
+function peFillPlanFilter(plans){
+  peState.plans=plans||[];
+  const sel=document.getElementById("planFilesFilterPlan");if(!sel)return;
+  const cur=sel.value;
+  sel.innerHTML='<option value="">全部方案</option>'+peState.plans.map(p=>'<option value="'+escH(p.suffix)+'">'+escH(p.name)+'</option>').join("");
+  if(cur&&peState.plans.some(p=>p.suffix===cur))sel.value=cur;
+}
 
 function peFillPeriodOptions(){
   const sel=document.getElementById("planExportPeriodSel"),d=peState.periods||{};
@@ -1198,16 +1217,22 @@ document.getElementById("planExportSubmit").addEventListener("click",async()=>{
     dlgClose("planExportDlg");
     toast("已开始导出「"+peState.name+"」报告，完成后可在「文件管理」下载");
     peState.trackedJobs.add(d.job.id);
+    peState.page=1;peRefreshJobs(); // 新任务排在最前,若文件管理开着立即能看到
     peStartPolling();
   }catch(e){
     errEl.textContent="导出失败："+e.message;errEl.hidden=false;
   }finally{btn.disabled=false}
 });
 
-function peRenderJobs(jobs){
-  const body=document.getElementById("planFilesBody");
-  if(!jobs.length){body.innerHTML='<div class="lb-msg" style="padding:16px">还没有导出记录 —— 到「方案中心」每行右侧的「导出」按钮创建</div>';return}
-  body.innerHTML='<div class="pe-jobs">'+jobs.map(j=>{
+function peRenderJobs(d){
+  peState.page=d.page||1;peState.pages=d.pages||1;peState.total=d.total||0;
+  if(d.plans)peFillPlanFilter(d.plans);
+  const body=document.getElementById("planFilesBody"),pager=document.getElementById("planFilesPager");
+  if(!d.jobs.length){
+    body.innerHTML='<div class="lb-msg" style="padding:16px">'+(peHasFilter()?"没有符合条件的导出记录":"还没有导出记录 —— 到「方案中心」每行右侧的「导出」按钮创建")+'</div>';
+    pager.hidden=true;return;
+  }
+  body.innerHTML='<div class="pe-jobs">'+d.jobs.map(j=>{
     const st=PE_STATUS[j.status]||[j.status,""];
     const files=(j.files||[]).map(f=>{
       const url="/api/plan-export/file?job="+encodeURIComponent(j.id)+"&kind="+encodeURIComponent(f.kind);
@@ -1220,22 +1245,29 @@ function peRenderJobs(jobs){
       +'<div class="pe-job-meta">创建于 '+peFmtTime(j.createdAt)+(j.finishedAt?' · 完成 '+peFmtTime(j.finishedAt):"")+(size?" · "+size:"")+'</div>'
       +(files?'<div class="pe-job-files">'+files+'</div>':"")+err+'</div>';
   }).join("")+'</div>';
+  // 分页:信息常显;只有一页时隐藏翻页按钮(整条 pager 留着,免得列表高度跳动)
+  pager.hidden=false;
+  document.getElementById("planFilesPageInfo").textContent="第 "+peState.page+" / "+peState.pages+" 页 · 共 "+fmtT(peState.total)+" 条";
+  document.getElementById("planFilesPrev").disabled=peState.page<=1;
+  document.getElementById("planFilesNext").disabled=peState.page>=peState.pages;
 }
 function peRefreshJobs(){
-  peFetchJobs().then(jobs=>{peUpdateDot(jobs);peRenderJobs(jobs)}).catch(()=>{document.getElementById("planFilesBody").innerHTML='<div class="lb-msg" style="padding:16px">加载失败，请稍后重试</div>'});
+  peFetchJobs().then(d=>{peUpdateDot(d.statuses);peRenderJobs(d)}).catch(()=>{document.getElementById("planFilesBody").innerHTML='<div class="lb-msg" style="padding:16px">加载失败，请稍后重试</div>'});
 }
 function peStartPolling(){
   if(peState.pollTimer)return;
   peState.pollTimer=setInterval(()=>{
     if(document.hidden)return;
     const filesOpen=document.getElementById("planFilesDlg").classList.contains("open");
-    peFetchJobs().then(jobs=>{
-      peUpdateDot(jobs);
-      if(filesOpen)peRenderJobs(jobs);
-      for(const j of jobs){
-        if(peState.trackedJobs.has(j.id)&&(j.status==="done"||j.status==="failed")){
-          peState.trackedJobs.delete(j.id);
-          toast(j.status==="done"?("「"+j.profileName+"」报告导出完成，可在「文件管理」下载"):("「"+j.profileName+"」报告导出失败："+(j.error||"未知错误")));
+    peFetchJobs().then(d=>{
+      peUpdateDot(d.statuses);
+      if(filesOpen)peRenderJobs(d);
+      // toast 跟踪走全量 statuses(与筛选/分页无关,别的页完成的任务也能提醒到)
+      for(const id of [...peState.trackedJobs]){
+        const s=(d.statuses||{})[id];
+        if(s&&(s.status==="done"||s.status==="failed")){
+          peState.trackedJobs.delete(id);
+          toast(s.status==="done"?("「"+s.name+"」报告导出完成，可在「文件管理」下载"):("「"+s.name+"」报告导出失败："+(s.err||"未知错误")));
         }
       }
       if(!peState.trackedJobs.size&&!filesOpen)peStopPolling();
@@ -1244,11 +1276,22 @@ function peStartPolling(){
 }
 function peStopPolling(){if(peState.pollTimer){clearInterval(peState.pollTimer);peState.pollTimer=null}}
 document.getElementById("planExportFilesBtn").addEventListener("click",()=>{dlgOpen("planFilesDlg");peRefreshJobs();peStartPolling()});
+// 筛选:任一条件变化都回到第 1 页再拉
+for(const [fid,key] of [["planFilesFilterPlan","suffix"],["planFilesFilterStatus","status"],["planFilesFilterPeriod","period"]]){
+  document.getElementById(fid).addEventListener("change",()=>{
+    peState.filters[key]=document.getElementById(fid).value;
+    peState.page=1;peRefreshJobs();
+  });
+}
+document.getElementById("planFilesPrev").addEventListener("click",()=>{if(peState.page>1){peState.page--;peRefreshJobs()}});
+document.getElementById("planFilesNext").addEventListener("click",()=>{if(peState.page<peState.pages){peState.page++;peRefreshJobs()}});
 // 页面加载时同步一次历史任务:有进行中的就接管跟踪(页面刷新不丢完成提醒),顺带点亮小圆点
-peFetchJobs().then(jobs=>{
-  peUpdateDot(jobs);
-  const act=jobs.filter(j=>j.status==="queued"||j.status==="running");
-  if(act.length){act.forEach(j=>peState.trackedJobs.add(j.id));peStartPolling()}
+peFetchJobs().then(d=>{
+  peUpdateDot(d.statuses);
+  peFillPlanFilter(d.plans);
+  const st=d.statuses||{};
+  const act=Object.values(st).filter(s=>s.status==="queued"||s.status==="running");
+  if(act.length){Object.keys(st).forEach(id=>{if(st[id].status==="queued"||st[id].status==="running")peState.trackedJobs.add(id)});peStartPolling()}
 }).catch(()=>{});
 
 // 轮询治理:页面隐藏/最小化时暂停 30s 自动刷新(后台标签挂一天不再持续打满出网),

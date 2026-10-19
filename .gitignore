@@ -12,6 +12,9 @@ data.db-wal
 backups/
 logs/
 
+# 方案用量报告导出产物(HTML/XLSX + 任务索引,运行时数据)
+exportFile/
+
 # Worktree temporary directories
 .claude/*
 .spec-workflow/*

@@ -647,13 +647,13 @@ function renderProfilesPanel(){
   const fmtResume=function(iso){const d=new Date(new Date(iso).getTime()+8*3600000);const p=n=>String(n).padStart(2,'0');const now=new Date(Date.now()+8*3600000);const hm=p(d.getUTCHours())+':'+p(d.getUTCMinutes());if(d.getUTCFullYear()===now.getUTCFullYear()&&d.getUTCMonth()===now.getUTCMonth()&&d.getUTCDate()===now.getUTCDate())return hm;if(Date.UTC(d.getUTCFullYear(),d.getUTCMonth(),d.getUTCDate())-Date.UTC(now.getUTCFullYear(),now.getUTCMonth(),now.getUTCDate())===86400000)return '明天 '+hm;return (d.getUTCFullYear()===now.getUTCFullYear()?'':d.getUTCFullYear()+'-')+p(d.getUTCMonth()+1)+'-'+p(d.getUTCDate())+' '+hm};
   const rowOf=p=>{const st=p.breakerState||"UNKNOWN";const rl=p.rateLimit;let col,led,stateLabel;if(rl){col='var(--red)';led='err';stateLabel='限额中 '+fmtResume(rl.resumeAt)+'恢复';}else{col=st==="CLOSED"?"var(--green)":st==="HALF_OPEN"?"var(--orange)":"var(--red)";led=st==="CLOSED"?"on":st==="HALF_OPEN"?"warn":"err";stateLabel=st==="CLOSED"?"正常":st==="HALF_OPEN"?"探测中":"熔断"+(p.breakerCooldownRemaining>0?' '+Math.ceil(p.breakerCooldownRemaining/1000)+'s后探测':'');}const current=currentProfile!=="all"&&p.suffix===currentProfile;const gBadge=p.inDefaultGroup?' <span style="color:var(--blue);font-size:10px;font-weight:600">默认组·'+(p.groupOrder+1)+'</span>':'';const rBadge=p.inResponsesGroup?' <span style="color:var(--blue);font-size:10px;font-weight:600">Resp组·'+(p.responsesGroupOrder+1)+'</span>':'';const protoBadge=p.protocol==='responses'?' <span style="color:var(--blue);font-size:10px">OpenAI</span>':'';const bLabel=p.billingType==='coding_plan'?' <span style="color:var(--dim);font-size:10px">CP</span>':p.billingType==='token_plan'?' <span style="color:var(--dim);font-size:10px">TP</span>':'';const pk=(p.peakHours&&p.peakHours.length)?(function(rs){const now=new Date(),cur=((now.getTime()+8*3600000)%86400000)/60000;const tm=function(t){if(!t)return null;const a=t.split(':');return (+a[0])*60+(+a[1])};const inPk=rs.some(function(r){const s=tm(r.start),e=tm(r.end);return s!==null&&e!==null&&s!==e&&(s<e?(cur>=s&&cur<e):(cur>=s||cur<e))});return ' <span style="color:'+(inPk?'var(--orange)':'var(--dim)')+';font-size:10px" title="高峰时段(北京时间) '+rs.map(function(r){return r.start+'-'+r.end}).join(', ')+'">'+(inPk?'高峰中':rs.map(function(r){return r.start+'-'+r.end}).join(','))+'</span>'})(p.peakHours):'';const rt2=(function(){if(p.peakQuotaRate==null&&p.offPeakQuotaRate==null)return'';const pr=p.peakQuotaRate==null?1:p.peakQuotaRate,orr=p.offPeakQuotaRate==null?1:p.offPeakQuotaRate;const nCustom=Object.keys(p.modelQuotaRates||{}).length;if(pr===1&&orr===1&&nCustom===0)return'';var now=new Date(),cur=((now.getTime()+8*3600000)%86400000)/60000;var tm=function(t){if(!t)return null;var a=t.split(':');return (+a[0])*60+(+a[1])};var ip=(p.peakHours||[]).some(function(r){var s=tm(r.start),e=tm(r.end);return s!==null&&e!==null&&s!==e&&(s<e?(cur>=s&&cur<e):(cur>=s||cur<e))});return ' <span style="color:var(--accent);font-size:10px" title="默认配额倍率：高峰 ×'+pr+' / 低谷 ×'+orr+'（当前'+(ip?'高峰':'低谷')+'）'+(nCustom?'；另有 '+nCustom+' 个模型单独定价':'')+'">×'+(ip?pr:orr)+(nCustom?'+'+nCustom:'')+'</span>'})();const restricted=(p.inDefaultGroup&&profiles.filter(x=>x.inDefaultGroup).length>=2)||(p.inResponsesGroup&&profiles.filter(x=>x.inResponsesGroup).length>=2);const entryCode=p.protocol==='responses'?'/v1/responses':'/v1';const defBadge=(p.isDefault||p.isResponsesDefault)?' <span style="color:var(--green);font-size:11px;font-weight:600;vertical-align:middle">默认</span>':'';/* 「使用状态」列:active 由后端算好(进行中请求 或 最近5分钟内完成记账)。使用中且
      有并发时带数字(failover 排查能直接看到哪个方案被压着 N 个);休眠时悬停看最后活跃。 */
-const actCell='<td><span class="led '+(p.active?'on':'')+'"></span><span style="color:'+(p.active?'var(--green)':'var(--dim)')+';font-size:12px;white-space:nowrap"'+(p.active?'':' title="最后活跃：'+(p.lastActive?ago(p.lastActive):'从未')+'"')+'>'+(p.active?'使用中'+(p.inflight>0?' · '+p.inflight:''):'休眠中')+'</span></td>';return'<tr'+(current?' class="profile-current" aria-current="true"':'')+'><td>'+escH(p.name)+defBadge+gBadge+rBadge+protoBadge+bLabel+pk+rt2+(current?' <span class="current-mark">当前</span>':'')+'</td><td>'+(restricted?'<code>'+entryCode+'</code> <span style="color:var(--dim);font-size:10px">仅 '+entryCode+'</span>':'<code>/'+escH(p.suffix)+'</code>'+((p.isDefault||p.isResponsesDefault)?' <span style="color:var(--dim)">/ <code>'+entryCode+'</code></span>':''))+'</td><td style="font-size:12px;color:var(--dim);max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+escH((p.upstream||'').replace('https://','').replace('http://',''))+'</td><td class="n">'+fmtT(p.todayRequests||0)+'</td><td class="n hl">'+fmtT(p.todayTokens||0)+'</td>'+actCell+'<td><span class="led '+led+'"></span><span style="color:'+col+';font-size:12px">'+stateLabel+'</span></td></tr>'};
+const actCell='<td><span class="led '+(p.active?'on':'')+'"></span><span style="color:'+(p.active?'var(--green)':'var(--dim)')+';font-size:12px;white-space:nowrap"'+(p.active?'':' title="最后活跃：'+(p.lastActive?ago(p.lastActive):'从未')+'"')+'>'+(p.active?'使用中'+(p.inflight>0?' · '+p.inflight:''):'休眠中')+'</span></td>';const exportCell='<td class="n"><button type="button" class="detail-reset pe-export-btn" data-suffix="'+escH(p.suffix)+'" data-name="'+escH(p.name)+'" title="导出该方案的月度/周度用量报告（HTML + Excel）">导出</button></td>';return'<tr'+(current?' class="profile-current" aria-current="true"':'')+'><td>'+escH(p.name)+defBadge+gBadge+rBadge+protoBadge+bLabel+pk+rt2+(current?' <span class="current-mark">当前</span>':'')+'</td><td>'+(restricted?'<code>'+entryCode+'</code> <span style="color:var(--dim);font-size:10px">仅 '+entryCode+'</span>':'<code>/'+escH(p.suffix)+'</code>'+((p.isDefault||p.isResponsesDefault)?' <span style="color:var(--dim)">/ <code>'+entryCode+'</code></span>':''))+'</td><td style="font-size:12px;color:var(--dim);max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+escH((p.upstream||'').replace('https://','').replace('http://',''))+'</td><td class="n">'+fmtT(p.todayRequests||0)+'</td><td class="n hl">'+fmtT(p.todayTokens||0)+'</td>'+actCell+'<td><span class="led '+led+'"></span><span style="color:'+col+';font-size:12px">'+stateLabel+'</span></td>'+exportCell+'</tr>'};
   const anthProfiles=profiles.filter(p=>p.protocol!=="responses"),respProfiles=profiles.filter(p=>p.protocol==="responses");
-  const protoRow=(label,entry,count)=>'<tr class="proto-row"><td colspan="7">'+label+' · 入口 '+entry+' · '+count+' 个方案</td></tr>';
+  const protoRow=(label,entry,count)=>'<tr class="proto-row"><td colspan="8">'+label+' · 入口 '+entry+' · '+count+' 个方案</td></tr>';
   let psbHtml="";
   if(anthProfiles.length)psbHtml+=protoRow("Anthropic","/v1",anthProfiles.length)+anthProfiles.map(rowOf).join("");
   if(respProfiles.length)psbHtml+=protoRow("OpenAI","/v1/responses",respProfiles.length)+respProfiles.map(rowOf).join("");
-  psb.innerHTML=profiles.length?psbHtml:'<tr><td colspan="7" class="empty">暂无方案</td></tr>';
+  psb.innerHTML=profiles.length?psbHtml:'<tr><td colspan="8" class="empty">暂无方案</td></tr>';
   const profileLabel=D.profileView||(currentProfile==="all"?"全部方案":"默认方案");
   const curProtoProf=(D.profiles||[]).find(p=>p.suffix===currentProfile);
   setProtoSeg(currentProfile!=="all"?((curProtoProf&&curProtoProf.protocol)||""):PROTO);
@@ -1138,6 +1138,119 @@ async function loadSessions(){
     document.getElementById('sessSummary').textContent='加载失败: '+e.message;
   }
 }
+// ── 方案用量报告导出(方案中心「导出」)+ 文件管理 ─────────────────────────────
+// 弹窗选 月度/周度 二选一 → 拉 /api/plan-export/periods 填可选周期 → POST 入队后台
+// 任务;「文件管理」弹窗轮询 /api/plan-export/jobs 展示任务进度与下载入口,
+// 进行中任务在工具栏按钮上点亮小圆点,完成/失败时 toast 提醒一次。
+const peState={period:"month",suffix:"",name:"",periods:null,pollTimer:null,trackedJobs:new Set()};
+const PE_STATUS={queued:["排队中","pill-warn"],running:["生成中","pill-warn"],done:["完成","pill-ok"],failed:["失败","pill-bad"]};
+function peCsrf(){return(document.cookie.match(/tm_csrf=([^;]+)/)||[])[1]||''}
+function peFmtTime(ts){if(!ts)return"-";const d=new Date(ts),p=n=>String(n).padStart(2,"0");return (d.getMonth()+1)+"-"+p(d.getDate())+" "+p(d.getHours())+":"+p(d.getMinutes())}
+function pePeriodLabel(j){return j.period==="month"?("月度 · "+j.from.slice(0,7)+"（"+j.from+" ~ "+j.to+"）"):("周度 · "+j.from+" ~ "+j.to)}
+async function peFetchJobs(){const r=await fetch("/api/plan-export/jobs");const d=await r.json();return Array.isArray(d.jobs)?d.jobs:[]}
+function peUpdateDot(jobs){const el=document.getElementById("planExportFilesDot");if(el)el.hidden=!jobs.some(j=>j.status==="queued"||j.status==="running")}
+
+function peFillPeriodOptions(){
+  const sel=document.getElementById("planExportPeriodSel"),d=peState.periods||{};
+  if(peState.period==="month"){
+    document.getElementById("planExportPeriodLabel").textContent="选择月份";
+    const months=d.months||[];
+    sel.innerHTML=months.length?months.map(m=>'<option value="'+escH(m)+'">'+escH(m)+'</option>').join(""):'<option value="">暂无可导出的月份</option>';
+    if(d.current&&d.current.month&&months.includes(d.current.month))sel.value=d.current.month;
+  }else{
+    document.getElementById("planExportPeriodLabel").textContent="选择周（周一 ~ 周日）";
+    const weeks=d.weeks||[];
+    sel.innerHTML=weeks.length?weeks.map(w=>'<option value="'+escH(w.start)+'">'+escH(w.label)+'</option>').join(""):'<option value="">暂无可导出的周</option>';
+    if(d.current&&d.current.week)sel.value=d.current.week;
+  }
+}
+function openPlanExportModal(suffix,name){
+  peState.suffix=suffix;peState.name=name;peState.period="month";peState.periods=null;
+  document.getElementById("planExportProfile").textContent=name;
+  const errEl=document.getElementById("planExportError");
+  errEl.hidden=true;errEl.textContent="";
+  document.querySelectorAll("#planExportPeriodSeg button").forEach(b=>b.classList.toggle("on",b.dataset.period==="month"));
+  document.getElementById("planExportPeriodLabel").textContent="选择月份";
+  document.getElementById("planExportPeriodSel").innerHTML='<option value="">加载中…</option>';
+  dlgOpen("planExportDlg");
+  fetch("/api/plan-export/periods?profile="+encodeURIComponent(suffix)).then(r=>r.json()).then(d=>{
+    if(d.error)throw new Error(d.error);
+    peState.periods=d;peFillPeriodOptions();
+  }).catch(e=>{document.getElementById("planExportPeriodSel").innerHTML='<option value="">加载失败:'+escH(e.message)+'</option>'});
+}
+document.getElementById("profileSummaryBody").addEventListener("click",e=>{
+  const btn=e.target.closest(".pe-export-btn");
+  if(btn)openPlanExportModal(btn.dataset.suffix,btn.dataset.name);
+});
+document.querySelectorAll("#planExportPeriodSeg button").forEach(b=>b.addEventListener("click",()=>{
+  peState.period=b.dataset.period;
+  document.querySelectorAll("#planExportPeriodSeg button").forEach(x=>x.classList.toggle("on",x===b));
+  peFillPeriodOptions();
+}));
+document.getElementById("planExportSubmit").addEventListener("click",async()=>{
+  const sel=document.getElementById("planExportPeriodSel"),errEl=document.getElementById("planExportError"),btn=document.getElementById("planExportSubmit");
+  if(!sel.value){errEl.textContent="请先选择"+(peState.period==="month"?"月份":"要导出的周");errEl.hidden=false;return}
+  btn.disabled=true;errEl.hidden=true;
+  try{
+    const r=await fetch("/api/plan-export",{method:"POST",headers:{"Content-Type":"application/json","x-csrf-token":peCsrf()},body:JSON.stringify({profile:peState.suffix,period:peState.period,value:sel.value})});
+    const d=await r.json();
+    if(!r.ok||d.error)throw new Error(d.error||("HTTP "+r.status));
+    dlgClose("planExportDlg");
+    toast("已开始导出「"+peState.name+"」报告，完成后可在「文件管理」下载");
+    peState.trackedJobs.add(d.job.id);
+    peStartPolling();
+  }catch(e){
+    errEl.textContent="导出失败："+e.message;errEl.hidden=false;
+  }finally{btn.disabled=false}
+});
+
+function peRenderJobs(jobs){
+  const body=document.getElementById("planFilesBody");
+  if(!jobs.length){body.innerHTML='<div class="lb-msg" style="padding:16px">还没有导出记录 —— 到「方案中心」每行右侧的「导出」按钮创建</div>';return}
+  body.innerHTML='<div class="pe-jobs">'+jobs.map(j=>{
+    const st=PE_STATUS[j.status]||[j.status,""];
+    const files=(j.files||[]).map(f=>{
+      const url="/api/plan-export/file?job="+encodeURIComponent(j.id)+"&kind="+encodeURIComponent(f.kind);
+      const view=f.kind==="html"?'<a class="pager-btn" href="'+url+'&disposition=inline" target="_blank" rel="noopener">查看</a>':"";
+      return '<a class="pager-btn" href="'+url+'" download>下载 '+f.kind.toUpperCase()+'</a>'+view;
+    }).join("");
+    const err=j.status==="failed"?'<div class="pe-job-err">'+escH(j.error||"未知错误")+'</div>':"";
+    const size=(j.files&&j.files.length)?j.files.map(f=>escH(f.name)+"（"+fmtT(f.size)+" 字节）").join(" · "):"";
+    return '<div class="pe-job"><div class="pe-job-main"><span class="pill '+st[1]+'">'+st[0]+'</span><strong>'+escH(j.profileName)+'</strong><span class="pe-job-period">'+escH(pePeriodLabel(j))+'</span></div>'
+      +'<div class="pe-job-meta">创建于 '+peFmtTime(j.createdAt)+(j.finishedAt?' · 完成 '+peFmtTime(j.finishedAt):"")+(size?" · "+size:"")+'</div>'
+      +(files?'<div class="pe-job-files">'+files+'</div>':"")+err+'</div>';
+  }).join("")+'</div>';
+}
+function peRefreshJobs(){
+  peFetchJobs().then(jobs=>{peUpdateDot(jobs);peRenderJobs(jobs)}).catch(()=>{document.getElementById("planFilesBody").innerHTML='<div class="lb-msg" style="padding:16px">加载失败，请稍后重试</div>'});
+}
+function peStartPolling(){
+  if(peState.pollTimer)return;
+  peState.pollTimer=setInterval(()=>{
+    if(document.hidden)return;
+    const filesOpen=document.getElementById("planFilesDlg").classList.contains("open");
+    peFetchJobs().then(jobs=>{
+      peUpdateDot(jobs);
+      if(filesOpen)peRenderJobs(jobs);
+      for(const j of jobs){
+        if(peState.trackedJobs.has(j.id)&&(j.status==="done"||j.status==="failed")){
+          peState.trackedJobs.delete(j.id);
+          toast(j.status==="done"?("「"+j.profileName+"」报告导出完成，可在「文件管理」下载"):("「"+j.profileName+"」报告导出失败："+(j.error||"未知错误")));
+        }
+      }
+      if(!peState.trackedJobs.size&&!filesOpen)peStopPolling();
+    }).catch(()=>{});
+  },2500);
+}
+function peStopPolling(){if(peState.pollTimer){clearInterval(peState.pollTimer);peState.pollTimer=null}}
+document.getElementById("planExportFilesBtn").addEventListener("click",()=>{dlgOpen("planFilesDlg");peRefreshJobs();peStartPolling()});
+// 页面加载时同步一次历史任务:有进行中的就接管跟踪(页面刷新不丢完成提醒),顺带点亮小圆点
+peFetchJobs().then(jobs=>{
+  peUpdateDot(jobs);
+  const act=jobs.filter(j=>j.status==="queued"||j.status==="running");
+  if(act.length){act.forEach(j=>peState.trackedJobs.add(j.id));peStartPolling()}
+}).catch(()=>{});
+
 // 轮询治理:页面隐藏/最小化时暂停 30s 自动刷新(后台标签挂一天不再持续打满出网),
 // 切回可见时立即刷一次。
 function startAutoRefresh(){

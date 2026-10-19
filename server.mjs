@@ -41,6 +41,7 @@ import { createLeaderboardReader } from "./lib/leaderboard.mjs";
 import { createSessionsReader } from "./lib/sessions.mjs";
 import { createNotifier } from "./lib/notifier.mjs";
 import { createPersistence } from "./lib/persistence.mjs";
+import { createPlanExportManager } from "./lib/report-export.mjs";
 import { createUpstreamQuotaService, providerDef } from "./lib/upstream-quota.mjs";
 import {
   bailianConsoleLoginUrl, bailianConsoleOrigin, extractBailianConsoleCredentials, BAILIAN_CALLBACK_CORS,
@@ -2418,6 +2419,14 @@ initMemberNotifyDb(db); // 成员自助的通知渠道(成员用量页里配)
 const memberNotifyApi = createMemberNotify({ get db() { return db; } });
 initNotificationsDb(db); // 管理员系统通知(站内信,成员铃铛)
 const notificationsApi = createNotifications({ get db() { return db; } });
+// 方案用量报告导出(方案中心「导出」+ 数据总览「文件管理」):后台任务串行生成
+// HTML + Excel,文件落 exportFile/;db 在上方 initDb 已就绪,按值传入即可。
+const planExportApi = createPlanExportManager({
+  db,
+  dir: path.join(__dirname, "exportFile"),
+  listProfiles,
+  getProfileNameBySuffix,
+});
 function productionEnabled() { return (config.productionTracking || {}).enabled !== false; }
 const productionTracker = createProductionTracker({ db, getConfig: () => config.productionTracking || {}, log: console.log });
 
@@ -5876,6 +5885,72 @@ const server = http.createServer((req, res) => {
     // 不带 section 时 keys 为 null,一个键都不动(兼容护栏)。
     if (keys) for (const k of Object.keys(data)) if (!keys.has(k)) delete data[k];
     sendJson(res, data, req);
+    return;
+  }
+
+  // ── 方案用量报告导出(方案中心「导出」按钮 + 数据总览「文件管理」)─────────────
+  // GET  /api/plan-export/periods?profile=<suffix>   该方案可导出的月/周列表(弹窗选项)
+  // POST /api/plan-export      {profile,period:"month"|"week",value} 入队后台导出,立即返回
+  // GET  /api/plan-export/jobs                       导出任务列表(文件管理轮询)
+  // GET  /api/plan-export/file?job=<id>&kind=html|xlsx[&disposition=inline]  下载/预览
+  // 生成是异步后台任务,这里只负责入队与取结果;文件都在 exportFile/ 下,路径由
+  // 任务管理器白名单校验(planExportApi.filePath),不直接信任任何查询参数。
+  if (req.url.split("?")[0] === "/api/plan-export" || req.url.split("?")[0].startsWith("/api/plan-export/")) {
+    if (!checkAuth(req)) { res.writeHead(401); res.end("Unauthorized"); return; }
+    const u = new URL(req.url, `http://localhost`);
+    const pePath = u.pathname;
+    if (req.method === "GET" && pePath === "/api/plan-export/periods") {
+      const suffix = normalizeProfileSuffix(u.searchParams.get("profile") || "");
+      if (!suffix || !getProfileNameBySuffix(suffix)) {
+        res.writeHead(404, { "Content-Type": "application/json; charset=utf-8" });
+        res.end(JSON.stringify({ error: `Unknown profile "${suffix}"` }));
+        return;
+      }
+      sendJson(res, { ok: true, ...planExportApi.listPeriods(suffix) }, req);
+      return;
+    }
+    if (req.method === "GET" && pePath === "/api/plan-export/jobs") {
+      sendJson(res, { ok: true, jobs: planExportApi.listJobs() }, req);
+      return;
+    }
+    if (req.method === "GET" && pePath === "/api/plan-export/file") {
+      const job = planExportApi.getJob(u.searchParams.get("job") || "");
+      const kind = u.searchParams.get("kind") === "xlsx" ? "xlsx" : "html";
+      const file = job && job.files.find((f) => f.kind === kind);
+      const p = job && planExportApi.filePath(job, kind);
+      if (!job || !file || !p) {
+        res.writeHead(404, { "Content-Type": "application/json; charset=utf-8" });
+        res.end(JSON.stringify({ error: "文件不存在或已被删除" }));
+        return;
+      }
+      const inline = u.searchParams.get("disposition") === "inline" && kind === "html";
+      res.writeHead(200, {
+        "Content-Type": kind === "html" ? "text/html; charset=utf-8" : "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "Content-Disposition": `${inline ? "inline" : "attachment"}; filename="${file.name}"`,
+        "Content-Length": String(file.size),
+      });
+      res.end(fs.readFileSync(p));
+      return;
+    }
+    if (req.method === "POST" && pePath === "/api/plan-export") {
+      if (!checkCsrf(req)) { res.writeHead(403); res.end("CSRF validation failed"); return; }
+      readBody(req, 10_000).then((buf) => {
+        const body = JSON.parse(buf.toString() || "{}");
+        const job = planExportApi.startJob({ profile: body.profile, period: body.period, value: body.value });
+        recordAdminAudit(req, "plan-export.create", job.profileName,
+          `导出${job.period === "month" ? "月度" : "周度"}用量报告 ${job.from}~${job.to}（后台任务 ${job.id}）`);
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: true, job }));
+      }).catch((err) => {
+        if (!res.headersSent) {
+          res.writeHead(400, { "Content-Type": "application/json; charset=utf-8" });
+          res.end(JSON.stringify({ error: err && err.message ? err.message : "Bad request" }));
+        }
+      });
+      return;
+    }
+    res.writeHead(404, { "Content-Type": "application/json; charset=utf-8" });
+    res.end(JSON.stringify({ error: "Not found" }));
     return;
   }
 

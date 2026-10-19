@@ -319,3 +319,30 @@ td{padding:8px 12px;font-size:11px;border-bottom:1px solid #ecece8;white-space:n
 .detail-bd-track i{display:block;height:100%;background:var(--accent);border-radius:4px}
 .detail-bd-val{color:var(--dim);white-space:nowrap;font-variant-numeric:tabular-nums}
 .detail-bd-more,.detail-bd-empty{font-size:10.5px;color:var(--dim);margin-top:4px}
+
+/* ── 方案用量报告导出(方案中心「导出」)+ 文件管理 ─────────────────────────── */
+/* 工具栏「文件管理」按钮上的进行中小圆点 */
+.files-dot{display:inline-block;width:6px;height:6px;border-radius:50%;background:var(--orange);margin-left:5px;vertical-align:2px;box-shadow:0 0 0 3px var(--accent-soft)}
+/* 导出弹窗表单 */
+.pe-field{margin-bottom:13px}
+.pe-field>label{display:block;font-size:11px;font-weight:600;color:var(--dim);margin-bottom:5px}
+.pe-profile{font-size:13px;font-weight:650;color:var(--text);background:var(--surface-subtle);border:1px solid var(--border);border-radius:5px;padding:7px 10px}
+.pe-seg{display:inline-flex;border:1px solid var(--border);border-radius:6px;overflow:hidden;background:var(--surface)}
+.pe-seg button{font-size:12px;font-weight:600;padding:6px 18px;border:none;background:transparent;color:var(--dim);cursor:pointer}
+.pe-seg button+button{border-left:1px solid var(--border)}
+.pe-seg button.on{background:var(--accent-soft);color:var(--accent)}
+.pe-sel{width:100%;height:32px;border:1px solid var(--border);border-radius:5px;background:var(--surface);color:var(--text);font-size:12px;padding:0 9px;outline:none}
+.pe-sel:hover{border-color:var(--border-strong)}
+.pe-sel:focus{border-color:var(--accent)}
+.pe-actions{display:flex;align-items:center;gap:10px;margin-top:4px}
+.pe-hint{font-size:10.5px;color:var(--dim);line-height:1.5}
+.pe-error{margin-top:10px;font-size:11.5px;color:var(--red);background:rgba(220,80,80,.08);border:1px solid var(--red);border-radius:5px;padding:7px 10px}
+/* 文件管理弹窗的任务列表 */
+.pe-jobs{display:flex;flex-direction:column;gap:9px}
+.pe-job{background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:9px 12px}
+.pe-job-main{display:flex;align-items:center;gap:9px;flex-wrap:wrap}
+.pe-job-main strong{font-size:13px}
+.pe-job-period{font-size:11.5px;color:var(--dim)}
+.pe-job-meta{font-size:10.5px;color:var(--dim);margin-top:5px;overflow-wrap:break-word}
+.pe-job-files{display:flex;gap:7px;margin-top:7px;flex-wrap:wrap}
+.pe-job-err{margin-top:7px;font-size:11px;color:var(--red)}

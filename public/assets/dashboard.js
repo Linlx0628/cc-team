@@ -647,7 +647,7 @@ function renderProfilesPanel(){
   const fmtResume=function(iso){const d=new Date(new Date(iso).getTime()+8*3600000);const p=n=>String(n).padStart(2,'0');const now=new Date(Date.now()+8*3600000);const hm=p(d.getUTCHours())+':'+p(d.getUTCMinutes());if(d.getUTCFullYear()===now.getUTCFullYear()&&d.getUTCMonth()===now.getUTCMonth()&&d.getUTCDate()===now.getUTCDate())return hm;if(Date.UTC(d.getUTCFullYear(),d.getUTCMonth(),d.getUTCDate())-Date.UTC(now.getUTCFullYear(),now.getUTCMonth(),now.getUTCDate())===86400000)return '明天 '+hm;return (d.getUTCFullYear()===now.getUTCFullYear()?'':d.getUTCFullYear()+'-')+p(d.getUTCMonth()+1)+'-'+p(d.getUTCDate())+' '+hm};
   const rowOf=p=>{const st=p.breakerState||"UNKNOWN";const rl=p.rateLimit;let col,led,stateLabel;if(rl){col='var(--red)';led='err';stateLabel='限额中 '+fmtResume(rl.resumeAt)+'恢复';}else{col=st==="CLOSED"?"var(--green)":st==="HALF_OPEN"?"var(--orange)":"var(--red)";led=st==="CLOSED"?"on":st==="HALF_OPEN"?"warn":"err";stateLabel=st==="CLOSED"?"正常":st==="HALF_OPEN"?"探测中":"熔断"+(p.breakerCooldownRemaining>0?' '+Math.ceil(p.breakerCooldownRemaining/1000)+'s后探测':'');}const current=currentProfile!=="all"&&p.suffix===currentProfile;const gBadge=p.inDefaultGroup?' <span style="color:var(--blue);font-size:10px;font-weight:600">默认组·'+(p.groupOrder+1)+'</span>':'';const rBadge=p.inResponsesGroup?' <span style="color:var(--blue);font-size:10px;font-weight:600">Resp组·'+(p.responsesGroupOrder+1)+'</span>':'';const protoBadge=p.protocol==='responses'?' <span style="color:var(--blue);font-size:10px">OpenAI</span>':'';const bLabel=p.billingType==='coding_plan'?' <span style="color:var(--dim);font-size:10px">CP</span>':p.billingType==='token_plan'?' <span style="color:var(--dim);font-size:10px">TP</span>':'';const pk=(p.peakHours&&p.peakHours.length)?(function(rs){const now=new Date(),cur=((now.getTime()+8*3600000)%86400000)/60000;const tm=function(t){if(!t)return null;const a=t.split(':');return (+a[0])*60+(+a[1])};const inPk=rs.some(function(r){const s=tm(r.start),e=tm(r.end);return s!==null&&e!==null&&s!==e&&(s<e?(cur>=s&&cur<e):(cur>=s||cur<e))});return ' <span style="color:'+(inPk?'var(--orange)':'var(--dim)')+';font-size:10px" title="高峰时段(北京时间) '+rs.map(function(r){return r.start+'-'+r.end}).join(', ')+'">'+(inPk?'高峰中':rs.map(function(r){return r.start+'-'+r.end}).join(','))+'</span>'})(p.peakHours):'';const rt2=(function(){if(p.peakQuotaRate==null&&p.offPeakQuotaRate==null)return'';const pr=p.peakQuotaRate==null?1:p.peakQuotaRate,orr=p.offPeakQuotaRate==null?1:p.offPeakQuotaRate;const nCustom=Object.keys(p.modelQuotaRates||{}).length;if(pr===1&&orr===1&&nCustom===0)return'';var now=new Date(),cur=((now.getTime()+8*3600000)%86400000)/60000;var tm=function(t){if(!t)return null;var a=t.split(':');return (+a[0])*60+(+a[1])};var ip=(p.peakHours||[]).some(function(r){var s=tm(r.start),e=tm(r.end);return s!==null&&e!==null&&s!==e&&(s<e?(cur>=s&&cur<e):(cur>=s||cur<e))});return ' <span style="color:var(--accent);font-size:10px" title="默认配额倍率：高峰 ×'+pr+' / 低谷 ×'+orr+'（当前'+(ip?'高峰':'低谷')+'）'+(nCustom?'；另有 '+nCustom+' 个模型单独定价':'')+'">×'+(ip?pr:orr)+(nCustom?'+'+nCustom:'')+'</span>'})();const restricted=(p.inDefaultGroup&&profiles.filter(x=>x.inDefaultGroup).length>=2)||(p.inResponsesGroup&&profiles.filter(x=>x.inResponsesGroup).length>=2);const entryCode=p.protocol==='responses'?'/v1/responses':'/v1';const defBadge=(p.isDefault||p.isResponsesDefault)?' <span style="color:var(--green);font-size:11px;font-weight:600;vertical-align:middle">默认</span>':'';/* 「使用状态」列:active 由后端算好(进行中请求 或 最近5分钟内完成记账)。使用中且
      有并发时带数字(failover 排查能直接看到哪个方案被压着 N 个);休眠时悬停看最后活跃。 */
-const actCell='<td><span class="led '+(p.active?'on':'')+'"></span><span style="color:'+(p.active?'var(--green)':'var(--dim)')+';font-size:12px;white-space:nowrap"'+(p.active?'':' title="最后活跃：'+(p.lastActive?ago(p.lastActive):'从未')+'"')+'>'+(p.active?'使用中'+(p.inflight>0?' · '+p.inflight:''):'休眠中')+'</span></td>';const exportCell='<td class="n"><button type="button" class="detail-reset pe-export-btn" data-suffix="'+escH(p.suffix)+'" data-name="'+escH(p.name)+'" title="导出该方案的月度/周度用量报告（HTML + Excel）">导出</button></td>';return'<tr'+(current?' class="profile-current" aria-current="true"':'')+'><td>'+escH(p.name)+defBadge+gBadge+rBadge+protoBadge+bLabel+pk+rt2+(current?' <span class="current-mark">当前</span>':'')+'</td><td>'+(restricted?'<code>'+entryCode+'</code> <span style="color:var(--dim);font-size:10px">仅 '+entryCode+'</span>':'<code>/'+escH(p.suffix)+'</code>'+((p.isDefault||p.isResponsesDefault)?' <span style="color:var(--dim)">/ <code>'+entryCode+'</code></span>':''))+'</td><td style="font-size:12px;color:var(--dim);max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+escH((p.upstream||'').replace('https://','').replace('http://',''))+'</td><td class="n">'+fmtT(p.todayRequests||0)+'</td><td class="n hl">'+fmtT(p.todayTokens||0)+'</td>'+actCell+'<td><span class="led '+led+'"></span><span style="color:'+col+';font-size:12px">'+stateLabel+'</span></td>'+exportCell+'</tr>'};
+const actCell='<td><span class="led '+(p.active?'on':'')+'"></span><span style="color:'+(p.active?'var(--green)':'var(--dim)')+';font-size:12px;white-space:nowrap"'+(p.active?'':' title="最后活跃：'+(p.lastActive?ago(p.lastActive):'从未')+'"')+'>'+(p.active?'使用中'+(p.inflight>0?' · '+p.inflight:''):'休眠中')+'</span></td>';const exportCell='<td class="n" style="white-space:nowrap"><button type="button" class="detail-reset pe-export-btn" data-suffix="'+escH(p.suffix)+'" data-name="'+escH(p.name)+'" title="导出该方案的月度/周度用量报告（HTML + Excel）">导出</button> <button type="button" class="detail-reset pe-analyze-btn" data-suffix="'+escH(p.suffix)+'" data-name="'+escH(p.name)+'" title="看该方案各模型的计费占比与实际倍率（哪个模型消耗高）">分析</button></td>';return'<tr'+(current?' class="profile-current" aria-current="true"':'')+'><td>'+escH(p.name)+defBadge+gBadge+rBadge+protoBadge+bLabel+pk+rt2+(current?' <span class="current-mark">当前</span>':'')+'</td><td>'+(restricted?'<code>'+entryCode+'</code> <span style="color:var(--dim);font-size:10px">仅 '+entryCode+'</span>':'<code>/'+escH(p.suffix)+'</code>'+((p.isDefault||p.isResponsesDefault)?' <span style="color:var(--dim)">/ <code>'+entryCode+'</code></span>':''))+'</td><td style="font-size:12px;color:var(--dim);max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+escH((p.upstream||'').replace('https://','').replace('http://',''))+'</td><td class="n">'+fmtT(p.todayRequests||0)+'</td><td class="n hl">'+fmtT(p.todayTokens||0)+'</td>'+actCell+'<td><span class="led '+led+'"></span><span style="color:'+col+';font-size:12px">'+stateLabel+'</span></td>'+exportCell+'</tr>'};
   const anthProfiles=profiles.filter(p=>p.protocol!=="responses"),respProfiles=profiles.filter(p=>p.protocol==="responses");
   const protoRow=(label,entry,count)=>'<tr class="proto-row"><td colspan="8">'+label+' · 入口 '+entry+' · '+count+' 个方案</td></tr>';
   let psbHtml="";
@@ -1200,6 +1200,8 @@ function openPlanExportModal(suffix,name){
 document.getElementById("profileSummaryBody").addEventListener("click",e=>{
   const btn=e.target.closest(".pe-export-btn");
   if(btn)openPlanExportModal(btn.dataset.suffix,btn.dataset.name);
+  const ana=e.target.closest(".pe-analyze-btn");
+  if(ana)openPlanModelModal(ana.dataset.suffix,ana.dataset.name);
 });
 document.querySelectorAll("#planExportPeriodSeg button").forEach(b=>b.addEventListener("click",()=>{
   peState.period=b.dataset.period;
@@ -1293,6 +1295,86 @@ peFetchJobs().then(d=>{
   const act=Object.values(st).filter(s=>s.status==="queued"||s.status==="running");
   if(act.length){Object.keys(st).forEach(id=>{if(st[id].status==="queued"||st[id].status==="running")peState.trackedJobs.add(id)});peStartPolling()}
 }).catch(()=>{});
+
+// ── 方案模型计费归因分析(「分析」弹窗) ────────────────────────────────────────
+// 数据端点 /api/plan-model-analysis 只读同步;展示口径与导出报告的归因段一致:
+// 计费占比 = 模型计权 ÷ 方案总计权(落表时已折算倍率,改价不影响历史);
+// 实际倍率 = 计权 ÷ 原始 Token,跨高峰边界或期间调价会落在两档之间。
+const pmState={suffix:"",name:"",window:"30d"};
+const pmWindowLabel={ "7d":"近 7 天","30d":"近 30 天","month":"本月" };
+function pmFmtTk(n){
+  n=Number(n)||0;
+  if(Math.abs(n)>=1e9)return (n/1e9).toFixed(2)+" B";
+  if(Math.abs(n)>=1e6)return (n/1e6).toFixed(2)+" M";
+  if(Math.abs(n)>=1e4)return (n/1e3).toFixed(1)+" K";
+  return n.toLocaleString("zh-CN");
+}
+function pmPct(v){return (v*100).toFixed(1)+"%"}
+function pmRate(v){return v==null?"-":"×"+(Math.round(v*100)/100).toFixed(2)}
+function pmMaxShare(rows){return Math.max(0.0001,...rows.map(r=>r.billShare))}
+function pmRender(d){
+  const ma=d.modelAnalysis||{rows:[]};
+  const s=d.summary||{};
+  const rows=ma.rows||[];
+  const maxShare=pmMaxShare(rows);
+  let html="";
+  if(!rows.length){
+    html='<div class="lb-msg" style="padding:16px">'+escH(d.windowLabel||"")+"该方案没有模型明细可归因"+(s.weighted>0?"（有计权用量但明细已超出 400 天保留期）":"（该时段无用量）")+'</div>';
+  }else{
+    const top=ma.topModel||rows[0];
+    html='<div class="pm-summary">计费占比最高的是 <b>'+escH(top.model)+'</b>，占'+escH(d.windowLabel||"该时段")+'配额消耗的 <b>'+escH(pmPct(top.billShare))+'</b>'
+      +(top.effRate!=null?"（实际倍率 "+escH(pmRate(top.effRate))+"）":"")
+      +(rows.length>=2?" · 前两名合计 "+escH(pmPct(ma.top2Share)):"")
+      +(ma.attribution<0.999?' <span style="color:var(--orange)">注意：模型明细仅覆盖 '+escH(pmPct(ma.attribution))+' 的计权消耗（超出 400 天保留期部分无法归因）</span>':"")
+      +'</div>';
+    html+='<div class="pm-cards">'
+      +'<div class="pm-card"><div class="l">计权用量（配额口径）</div><div class="v" style="color:var(--accent)">'+pmFmtTk(s.weighted||0)+'</div></div>'
+      +'<div class="pm-card"><div class="l">实际 Token</div><div class="v">'+pmFmtTk(s.total||0)+'</div></div>'
+      +'<div class="pm-card"><div class="l">请求次数</div><div class="v">'+fmtT(s.requests||0)+'</div></div>'
+      +'<div class="pm-card"><div class="l">活跃用户</div><div class="v">'+fmtT(s.activeUsers||0)+'</div></div>'
+      +'</div>';
+    html+='<div class="tbl-scroll"><table class="pm-table"><thead><tr><th>模型</th><th class="n">计权Token</th><th class="n">计费占比</th><th style="min-width:110px">占比</th><th class="n">累计占比</th><th class="n">实际倍率</th><th class="n">请求</th><th class="n">实际Token</th></tr></thead><tbody>';
+    for(const r of rows){
+      const w=pmFmtTk(r.weighted);
+      html+='<tr><td style="color:var(--blue)">'+escH(r.model)+'</td>'
+        +'<td class="n" title="'+fmtT(r.weighted)+'">'+w+'</td>'
+        +'<td class="n hl">'+pmPct(r.billShare)+'</td>'
+        +'<td class="bar-cell"><div class="bar"><i style="width:'+Math.max(r.billShare>0?1.5:0,(r.billShare/maxShare)*100).toFixed(1)+'%"></i></div></td>'
+        +'<td class="n">'+pmPct(r.cumShare)+'</td>'
+        +'<td class="n">'+pmRate(r.effRate)+'</td>'
+        +'<td class="n">'+fmtT(r.requests)+'</td>'
+        +'<td class="n" title="'+fmtT(r.raw)+'">'+pmFmtTk(r.raw)+'</td>'
+        +'</tr>';
+    }
+    html+='</tbody></table></div>';
+    html+='<div class="pm-note">「计费占比」按计权 Token（配额口径）计算——落表时已按当时的时段与该模型倍率折算，之后调整倍率不影响历史归因；「实际倍率」= 计权 ÷ 原始 Token，跨高峰边界或期间调整过倍率时会落在两档之间。想看每天的明细或发给同事，用该方案行的「导出」按钮，报告里有同口径的归因表。</div>';
+  }
+  document.getElementById("planModelBody").innerHTML=html;
+}
+function pmLoad(){
+  const errEl=document.getElementById("planModelError");
+  errEl.hidden=true;
+  document.getElementById("planModelBody").innerHTML='<div class="lb-msg" style="padding:16px">加载中…</div>';
+  fetch("/api/plan-model-analysis?profile="+encodeURIComponent(pmState.suffix)+"&window="+encodeURIComponent(pmState.window))
+    .then(r=>r.json()).then(d=>{
+      if(d.error)throw new Error(d.error);
+      pmRender(d);
+    })
+    .catch(e=>{errEl.textContent="加载失败："+e.message;errEl.hidden=false;document.getElementById("planModelBody").innerHTML=""});
+}
+function openPlanModelModal(suffix,name){
+  pmState.suffix=suffix;pmState.name=name;pmState.window="30d";
+  document.getElementById("planModelProfile").textContent=name+(suffix?"（/"+suffix+"）":"");
+  document.querySelectorAll("#planModelWindowSeg button").forEach(x=>x.classList.toggle("on",x.dataset.window==="30d"));
+  document.getElementById("planModelError").hidden=true;
+  dlgOpen("planModelDlg");
+  pmLoad();
+}
+document.querySelectorAll("#planModelWindowSeg button").forEach(b=>b.addEventListener("click",()=>{
+  pmState.window=b.dataset.window;
+  document.querySelectorAll("#planModelWindowSeg button").forEach(x=>x.classList.toggle("on",x===b));
+  pmLoad();
+}));
 
 // 轮询治理:页面隐藏/最小化时暂停 30s 自动刷新(后台标签挂一天不再持续打满出网),
 // 切回可见时立即刷一次。

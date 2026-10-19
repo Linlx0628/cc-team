@@ -41,7 +41,7 @@ import { createLeaderboardReader } from "./lib/leaderboard.mjs";
 import { createSessionsReader } from "./lib/sessions.mjs";
 import { createNotifier } from "./lib/notifier.mjs";
 import { createPersistence } from "./lib/persistence.mjs";
-import { createPlanExportManager } from "./lib/report-export.mjs";
+import { createPlanExportManager, collectPlanReport, monthEndOf, addDays } from "./lib/report-export.mjs";
 import { createUpstreamQuotaService, providerDef } from "./lib/upstream-quota.mjs";
 import {
   bailianConsoleLoginUrl, bailianConsoleOrigin, extractBailianConsoleCredentials, BAILIAN_CALLBACK_CORS,
@@ -5961,6 +5961,54 @@ const server = http.createServer((req, res) => {
     }
     res.writeHead(404, { "Content-Type": "application/json; charset=utf-8" });
     res.end(JSON.stringify({ error: "Not found" }));
+    return;
+  }
+
+  // ── 方案模型计费归因(方案中心「分析」弹窗,只读即时查询) ─────────────────────
+  // GET /api/plan-model-analysis?profile=<suffix>&window=7d|30d|month[&value=YYYY-MM]
+  // 复用导出报告的 collectPlanReport 聚合 + analyzeModelConsumption 归因计算,
+  // 但不走后台任务 —— 数据量小(单方案区间聚合),同步返回。
+  // 权限与 periods 端点一致:管理员登录即可看任意方案。
+  if (req.method === "GET" && req.url.split("?")[0] === "/api/plan-model-analysis") {
+    if (!checkAuth(req)) { res.writeHead(401); res.end("Unauthorized"); return; }
+    const u = new URL(req.url, `http://localhost`);
+    const suffix = normalizeProfileSuffix(u.searchParams.get("profile") || "");
+    const profileName = suffix ? getProfileNameBySuffix(suffix) : null;
+    if (!profileName) {
+      res.writeHead(404, { "Content-Type": "application/json; charset=utf-8" });
+      res.end(JSON.stringify({ error: `Unknown profile "${suffix}"` }));
+      return;
+    }
+    const rt = runtimes[suffix];
+    const window = u.searchParams.get("window") || "30d";
+    const today = cnDate();
+    let from, to = today, windowLabel;
+    if (window === "7d") {
+      from = addDays(today, -6); windowLabel = "近 7 天";
+    } else if (window === "month") {
+      const value = /^\d{4}-\d{2}$/.test(u.searchParams.get("value") || "") ? u.searchParams.get("value") : today.slice(0, 7);
+      from = value + "-01";
+      to = value === today.slice(0, 7) ? today : monthEndOf(value);
+      windowLabel = value === today.slice(0, 7) ? `本月(${value})` : value;
+    } else {
+      from = addDays(today, -29); windowLabel = "近 30 天";
+    }
+    try {
+      const report = collectPlanReport(db, {
+        suffix, from, to, profileName,
+        protocol: rt?.protocol || "", upstream: rt?.upstream || "",
+      });
+      sendJson(res, {
+        ok: true,
+        profile: suffix, profileName, window, windowLabel, from, to,
+        generatedAt: report.generatedAt,
+        summary: report.summary,
+        modelAnalysis: report.modelAnalysis,
+      }, req);
+    } catch (err) {
+      res.writeHead(500, { "Content-Type": "application/json; charset=utf-8" });
+      res.end(JSON.stringify({ error: err && err.message ? err.message : "Analysis failed" }));
+    }
     return;
   }
 

@@ -352,3 +352,15 @@ td{padding:8px 12px;font-size:11px;border-bottom:1px solid #ecece8;white-space:n
 .pe-filter-row .pe-sel{width:auto;min-width:128px;flex:0 1 auto}
 .pe-pager{display:flex;align-items:center;justify-content:center;gap:10px;margin-top:12px}
 .pe-page-info{font-size:12px;color:var(--dim)}
+
+/* ── 方案模型计费归因分析弹窗 ───────────────────────────────────────── */
+.pm-summary{font-size:13px;background:var(--accent-soft);border-radius:8px;padding:9px 12px;margin-bottom:10px}
+.pm-cards{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-bottom:12px}
+.pm-card{border:1px solid var(--border);border-radius:8px;padding:8px 10px}
+.pm-card .l{font-size:11px;color:var(--dim)}
+.pm-card .v{font-size:16px;font-weight:600;margin-top:2px}
+.pm-table th,.pm-table td{white-space:nowrap}
+.pm-table .bar-cell{min-width:110px}
+.pm-table .bar{background:var(--accent-soft);border-radius:3px;height:8px;overflow:hidden}
+.pm-table .bar i{display:block;height:100%;background:linear-gradient(90deg,#4d8a6d,#2f6e50);border-radius:3px}
+.pm-note{font-size:12px;color:var(--dim);margin-top:10px;line-height:1.7}

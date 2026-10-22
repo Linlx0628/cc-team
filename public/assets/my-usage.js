@@ -963,7 +963,8 @@ function renderSessSummary(){
   const card=(l,v,sub)=>'<div class="card"><div class="l">'+l+'</div><div class="v">'+v+'</div>'
     +(sub?'<div style="margin-top:6px;font-size:10px;color:var(--dim)">'+sub+'</div>':'')+'</div>';
   el.innerHTML=
-    card('会话数',fmtT(s.sessions||0),'碎片 '+(s.fragments||0)+' 个'+(share==null?'':' · '+Math.round(share*100)+'%'))
+    card('会话数',fmtT(s.sessions||0),'碎片 '+(s.fragments||0)+' 个'+(share==null?'':' · '+Math.round(share*100)+'%')
+      +(s.automation_sessions>0?' · 其中自动化 '+fmtT(s.automation_sessions)+' 个':''))
     +card('总轮数',fmtT(s.requests||0),'平均每会话 '+(s.sessions?Math.round(s.requests/s.sessions*10)/10:0)+' 轮')
     +card('缓存率',ratioCell(s.cache_rate,sc.ths))
     +card('平均单轮新增上下文',perTurnCell(s.new_input_per_turn,sc.ths))
@@ -987,9 +988,9 @@ function renderSessBoard(){
   board.innerHTML='<div class="sess-list">'+rows.map(function(s){
     const g=GRADE_CLS[s.grade]||'none';
     // 会话名(本机 Claude Code 的 ai-title,后端现读)优先当主标题;没有才退回项目标签,
-    // 再没有才是「纯问答」占位。项目与标识都是辅助信息,降到下面那行小字。标识串任何时候都
-    // 保留:它是唯一能对上盘上文件的键。
-    const name=s.title?esc(s.title):(s.project?esc(s.project):'<span style="color:var(--dim)">纯问答 · 无代码产出</span>');
+    // 再没有就是「无代码产出」占位 —— 原来写的是「纯问答」,但这类会话常常有几十次工具调用
+    // (dig: 没会话头的客户端),叫「纯问答」是在替用户下错结论。
+    const name=s.title?esc(s.title):(s.project?esc(s.project):'<span style="color:var(--dim)" title="没有可归属的代码项目(无文件产出)；不等于没有工具调用，工具/文件/净产出那几格照实显示">无代码产出</span>');
     const idLine=(s.title&&s.project?esc(s.project)+' · ':'')+esc(sessShort(s.session))
       // 客户端与管理端流水同一套用词(clientLabel);迁移前旧行没采集过,省略比一个灰「—」干净。
       +(s.client?' · '+esc(clientLabel(s.client)):'');
@@ -1001,7 +1002,7 @@ function renderSessBoard(){
     const nit=s.new_input_per_turn==null?null:Math.round(s.new_input_per_turn);
     const nx=s.net_lines==null?null:(s.net_lines>0?'+':'')+fmtT(s.net_lines);
     // 跨项目:后端给的是 `p ? p.cross : 0`(lib/sessions.mjs),**没有项目归属时也是 0**,不是
-    // 「测到了 0」。必须先看 project 在不在,否则纯问答会话会被标成「跨 0 个项目」—— 假数据。
+    // 「测到了 0」。必须先看 project 在不在,否则无代码产出的会话会被标成「跨 0 个项目」—— 假数据。
     const cross=s.project==null?null:(s.cross_projects||0);
     const cells=
       (s.requests?cell('轮数',fmtT(s.requests),false,'轮数 '+fmtT(s.requests)+' 轮')
@@ -1030,7 +1031,9 @@ function renderSessBoard(){
     return '<div class="sess-row '+g+'">'
       +'<div class="sess-hd">'
         +'<span class="sess-grade">'+(s.gradeLabel?esc(s.gradeLabel):'—')+'</span>'
-        +'<div class="sess-id"><div class="sess-title">'+name+'</div>'
+        +'<div class="sess-id"><div class="sess-title">'+name
+          +(s.automation?' <span class="chip" title="自动化账号(代码评审机器人)产生的会话：一次评审一条，读法与其他会话不同">自动化</span>':'')
+          +'</div>'
           +'<div class="sess-meta">'+idLine+'</div>'
           +(when?'<div class="sess-meta">'+esc(when)+'</div>':'')
         +'</div>'

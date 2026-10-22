@@ -109,6 +109,9 @@ const CLIENT_LABELS={
   'codex_exec':'Codex Exec',
   'codex_sdk_ts':'Codex SDK',
   'codex-app-server':'Codex App',
+  // 代码评审引擎(OCR CLI)自己发起的请求。它不是人坐在终端里用的客户端 ——
+  // 「会话使用情况」里这些会话会另贴「自动化」标(判定见 lib/sessions.mjs)。
+  'open-code-review':'代码评审',
 };
 function clientLabel(client){
   const key=String(client==null?'':client);

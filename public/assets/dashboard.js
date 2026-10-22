@@ -1073,7 +1073,7 @@ async function loadCosts(){
 }
 // ── 会话使用情况 tab(懒加载:首次切到该 tab 才拉数据)──
 // 与成本/产出一致:会话视图比总览更细(时间戳、文件路径、会话标识),按需拉、不挂 30 秒轮询。
-let sessionsLoaded=false,sessDrillUser='';
+let sessionsLoaded=false,sessDrillUser='',sessAutoOpen=false;
 // 分档 → 药丸配色。档位一律服务端算好(方向不写死在前端),这里只做颜色映射。
 const SESS_GRADE_CLS={good:'pill-ok',warn:'pill-warn',bad:'pill-bad'};
 const SESS_THS_FALLBACK={cache_rate_good:.9,cache_rate_warn:.8,new_input_good:3000,new_input_bad:8000};
@@ -1085,6 +1085,14 @@ function sessFail(v){if(v==null)return DASH;const col=v<0.1?'var(--green)':v<0.3
 // 下钻键必须用原始 key(载荷里的 key 字段),掩码后的 user_key 查不到任何东西。
 function drillSess(key){sessDrillUser=sessDrillUser===key?'':key;loadSessions()}
 function clearSessDrill(){sessDrillUser='';loadSessions()}
+// 自动化账号的折叠只动 DOM、不重新拉数据:它只是一层显示开关,再 fetch 一次既慢又会
+// 让「切时间范围」的漂移掺进来。
+function toggleSessAuto(){
+  sessAutoOpen=!sessAutoOpen;
+  document.querySelectorAll('#sessUserTable tr.sess-auto-row').forEach(r=>{r.style.display=sessAutoOpen?'':'none'});
+  const lb=document.getElementById('sessAutoLabel');
+  if(lb&&lb.dataset.text)lb.textContent=(sessAutoOpen?'▾ ':'▸ ')+lb.dataset.text+' · 点击'+(sessAutoOpen?'收起':'展开');
+}
 async function loadSessions(){
   const range=document.getElementById('sessRangeSel').value;
   try{
@@ -1094,12 +1102,30 @@ async function loadSessions(){
     const drill=d.users.find(u=>u.key===sessDrillUser);
     document.getElementById('sessDrillClear').style.display=sessDrillUser?'':'none';
     document.getElementById('sessDrillHint').textContent=sessDrillUser?('当前只看 '+(drill?drill.user_name:'已选成员')):'全部成员 · 点上方某行可只看该成员';
-    document.getElementById('sessSummary').textContent=s.sessions
-      ?('合计 '+s.sessions+' 个会话 / '+fmtT(s.requests||0)+' 轮 · 缓存率 '+(s.cache_rate==null?'—':(s.cache_rate*100).toFixed(1)+'%')+' · 单轮新增 '+(s.new_input_per_turn==null?'—':fmtT(Math.round(s.new_input_per_turn)))+' token/轮 · 总档位：'+(s.gradeLabel||'—'))
-      :'该周期没有可归属到会话的请求';
-    document.querySelector('#sessUserTable tbody').innerHTML=d.users.map(u=>
-      '<tr style="cursor:pointer'+(u.key===sessDrillUser?';background:rgba(47,110,80,.06)':'')+'" onclick="drillSess('+escH(JSON.stringify(String(u.key)))+')" title="点击下钻到该成员的会话流水">'
-      +'<td>'+escH(u.user_name)+' <span style="color:var(--dim);font-size:10px">'+escH(u.user_key)+'</span></td>'
+    // 合计那句话必须把「自动化」与「碎片」摊开:线上一个团队 583 条会话里 266 条是代码
+    // 评审机器人打的(一次评审 = 一次请求 = 一条会话),334 条 ≤2 轮。只写「合计 N 个会话」
+    // 会被读成「N 次对话」—— 用户当场就是这么怀疑的。三个数相加能对回总数:真人 + 自动化。
+    const autoS=Number(s.automation_sessions||0), humanS=Number(s.human_sessions||0);
+    const fragS=Number(s.fragments||0), humanFrag=Number(s.human_fragments||0);
+    const sumEl=document.getElementById('sessSummary');
+    if(s.sessions){
+      sumEl.textContent='合计 '+s.sessions+' 个会话('
+        +(autoS>0?('真人 '+humanS+' + 自动化 '+autoS+',真人碎片 '+humanFrag):('其中碎片 '+fragS))
+        +') / '+fmtT(s.requests||0)+' 轮 · 缓存率 '+(s.cache_rate==null?'—':(s.cache_rate*100).toFixed(1)+'%')
+        +' · 单轮新增 '+(s.new_input_per_turn==null?'—':fmtT(Math.round(s.new_input_per_turn)))+' token/轮 · 总档位：'+(s.gradeLabel||'—');
+      sumEl.title='会话 = 按 (成员,会话标识) 折叠后的条数;'
+        +(autoS>0?'自动化 = 代码评审机器人账号(一次评审一条会话,共 '+Number(s.automation_requests||0)+' 轮),真人 = 其余;':'')
+        +'碎片 = 轮数 ≤ '+(ths.fragment_max_requests||2)+' 的会话'
+        +(autoS>0?'。自动化那批里另有 '+Number(s.automation_fragments||0)+' 条碎片,不计入「真人碎片」。':'')+'。';
+    }else{ sumEl.textContent='该周期没有可归属到会话的请求'; sumEl.title=''; }
+    // 自动化账号默认折叠:它们在会话数上排得很靠前(机器人比任何真人都"能开会话"),
+    // 摊在表里会把成员表读成"谁最闲不开会话"。合计里已分项披露,这里点开才看。
+    const allUsers=d.users||[];
+    const autoUsers=allUsers.filter(u=>u.automation), humanUsers=allUsers.filter(u=>!u.automation);
+    const urow=(u)=>'<tr class="'+(u.automation?'sess-auto-row':'')+'" style="cursor:pointer'+(u.key===sessDrillUser?';background:rgba(47,110,80,.06)':'')+'" onclick="drillSess('+escH(JSON.stringify(String(u.key)))+')" title="点击下钻到该成员的会话流水">'
+      +'<td>'+escH(u.user_name)
+        +(u.automation?' <span class="chip" title="自动化账号(代码评审机器人):一次评审一条会话,不是人开的对话">自动化</span>':'')
+        +' <span style="color:var(--dim);font-size:10px">'+escH(u.user_key)+'</span></td>'
       +'<td class="n">'+fmtT(u.sessions)+'</td>'
       +'<td class="n">'+fmtT(u.requests)+'</td>'
       +'<td class="n hl">'+fmtTk(u.tokens)+'</td>'
@@ -1107,15 +1133,24 @@ async function loadSessions(){
       +'<td class="n">'+sessPerTurn(u.new_input_per_turn,ths)+'</td>'
       +'<td class="n">'+sessFail(u.fail_rate)+'</td>'
       +'<td class="n">'+(u.fragments||0)+'</td>'
-      +'<td>'+sessGrade(u)+'</td></tr>').join('')
+      +'<td>'+sessGrade(u)+'</td></tr>';
+    const autoSessions=autoUsers.reduce((n,u)=>n+(u.sessions||0),0);
+    const autoBar=autoUsers.length
+      ?'<tr class="sess-auto-bar" style="cursor:pointer" onclick="toggleSessAuto()"><td colspan="9" style="font-size:11px;color:var(--dim)" title="这些账号是机器在跑:会话数不能当使用强度读">'
+        +'<span id="sessAutoLabel" data-text="自动化账号 '+autoUsers.length+' 个(代码评审机器人) · '+fmtT(autoSessions)+' 个会话">'
+        +(sessAutoOpen?'▾':'▸')+' 自动化账号 '+autoUsers.length+' 个(代码评审机器人) · '+fmtT(autoSessions)+' 个会话 · 点击'+(sessAutoOpen?'收起':'展开')
+        +'</span></td></tr>':'';
+    document.querySelector('#sessUserTable tbody').innerHTML=(humanUsers.map(urow).join('')+autoBar+autoUsers.map(urow).join(''))
       ||'<tr><td colspan="9" class="empty">该周期没有可归属到会话的请求</td></tr>';
+    // 折叠状态跨重绘保持(切时间范围、下钻都不该把它重新弹开)
+    document.querySelectorAll('#sessUserTable tr.sess-auto-row').forEach(r=>{r.style.display=sessAutoOpen?'':'none'});
     // 「会话」列:有会话名(后端从本机 Claude Code 的会话文件现读)就顶掉那串标识 ——
     // 列宽有限,两者同显会把表挤变形;完整标识挪进悬浮提示,别处对账仍以它为准。
     document.querySelector('#sessTable tbody').innerHTML=d.sessions.map(x=>
       '<tr>'
       +'<td>'+escH(x.user_name)+'</td>'
       +'<td>'+(x.client?escH(clientLabel(x.client)):'<span style="color:var(--dim)">—</span>')+'</td>'
-      +'<td>'+(x.project?escH(x.project)+(x.cross_projects>0?' <span class="chip chip-warn" title="该会话横跨多个项目，token 整段算在主项目名下">跨'+x.cross_projects+'</span>':''):'<span style="color:var(--dim)">纯问答</span>')+'</td>'
+      +'<td>'+(x.project?escH(x.project)+(x.cross_projects>0?' <span class="chip chip-warn" title="该会话横跨多个项目，token 整段算在主项目名下">跨'+x.cross_projects+'</span>':''):'<span style="color:var(--dim)" title="该会话没有可归属的代码项目(无文件产出)；不等于没有工具调用，工具数看后面两列">无代码产出</span>')+'</td>'
       +'<td style="font-size:10px;color:var(--dim)" title="'+escH(x.session)+'">'+escH(x.title||String(x.session).slice(0,18))+'</td>'
       +'<td style="font-size:11px;color:var(--dim);white-space:nowrap">'+bjClock(x.first_seen)+(x.last_seen!==x.first_seen?' → '+bjClock(x.last_seen).slice(6):'')+'</td>'
       +'<td class="n">'+(x.requests?fmtT(x.requests):'<span style="color:var(--dim)" title="只有工具数据，轮数未知">—</span>')+'</td>'
@@ -1126,7 +1161,7 @@ async function loadSessions(){
       +'<td class="n">'+(x.files||0)+'</td>'
       +'<td class="n">'+(x.net_lines==null?DASH:((x.net_lines>0?'+':'')+fmtT(x.net_lines)))+'</td>'
       +'<td class="n">'+sessFail(x.fail_rate)+'</td>'
-      +'<td>'+sessGrade(x)+(x.fragment?' <span class="chip chip-warn" title="轮数 ≤ '+(ths.fragment_max_requests||2)+'，会话偏碎">碎片</span>':'')+'</td></tr>').join('')
+      +'<td>'+sessGrade(x)+(x.automation?' <span class="chip" title="自动化账号(代码评审机器人)产生的会话：一次评审一条，读法与其他会话不同">自动化</span>':'')+(x.fragment?' <span class="chip chip-warn" title="轮数 ≤ '+(ths.fragment_max_requests||2)+'，会话偏碎">碎片</span>':'')+'</td></tr>').join('')
       ||'<tr><td colspan="14" class="empty">该周期没有可归属到会话的请求</td></tr>';
     // 无会话标识的部分必须如实披露 —— 否则「总量」和「会话表加起来」对不上时没人知道为什么
     const un=d.unattributed||{},tot=d.totals||{},at=d.attributed||{};

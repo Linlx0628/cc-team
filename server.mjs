@@ -4210,6 +4210,12 @@ const SESSIONS_DEPS = {
   sessionKey,
   knownUserKeys,
   nameOf: (key) => getUserName(key),
+  // 自动化(代码评审)账号判定:设置页当前配置的评审 Key 一改立刻生效 —— 只认前缀的话,
+  // 换了 Key 前缀却沿用了旧账号就会漏判。前缀判定在 lib/sessions.mjs 里兜底(历史行)。
+  isAutomationKey: (key) => {
+    const reviewKey = (config.codeReview || {}).providerKey || "";
+    return !!reviewKey && key === reviewKey;
+  },
   get db() { return db; },
   get stmts() { return stmts; },
 };

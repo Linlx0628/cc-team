@@ -316,15 +316,18 @@ function showProfileSettings(){
   const nm=document.getElementById('notifyManageView');
   // 上游额度也是二级视图。任何「切回主设置表单」的路径都要把它一起藏掉,否则两个视图叠着。
   const uq=document.getElementById('upstreamQuotaView');
+  // 点数预算同理:它是侧栏底部入口打开的独立二级视图。
+  const pb=document.getElementById('pointBudgetView');
   form.hidden=false;
-  [view,audit,pool,qr,sched,cr,um,nm,uq].forEach(function(el){if(el){el.hidden=true;el.setAttribute('aria-hidden','true')}});
-  ['dataManagementNav','auditLogNav','quotaPoolNav','quotaRequestNav','planScheduleNav','codeReviewNav','userManageNav','notifyManageNav','upstreamQuotaNav'].forEach(function(id){
+  [view,audit,pool,qr,sched,cr,um,nm,uq,pb].forEach(function(el){if(el){el.hidden=true;el.setAttribute('aria-hidden','true')}});
+  ['dataManagementNav','auditLogNav','quotaPoolNav','quotaRequestNav','planScheduleNav','codeReviewNav','userManageNav','notifyManageNav','upstreamQuotaNav','pointBudgetNav'].forEach(function(id){
     const el=document.getElementById(id);if(el)el.classList.remove('active');
   });
 }
 function hideAllSecondaryViews(){
-  const cr=document.getElementById('codeReviewView'),dm=document.getElementById('dataManagementView'),audit=document.getElementById('auditLogView'),pool=document.getElementById('quotaPoolView'),qr=document.getElementById('quotaRequestView'),sched=document.getElementById('planScheduleView'),um=document.getElementById('userManageView'),nm=document.getElementById('notifyManageView'),uq=document.getElementById('upstreamQuotaView');
+  const cr=document.getElementById('codeReviewView'),dm=document.getElementById('dataManagementView'),audit=document.getElementById('auditLogView'),pool=document.getElementById('quotaPoolView'),qr=document.getElementById('quotaRequestView'),sched=document.getElementById('planScheduleView'),um=document.getElementById('userManageView'),nm=document.getElementById('notifyManageView'),uq=document.getElementById('upstreamQuotaView'),pb=document.getElementById('pointBudgetView');
   dm.hidden=true;dm.setAttribute('aria-hidden','true');
+  if(pb){pb.hidden=true;pb.setAttribute('aria-hidden','true')}
   audit.hidden=true;audit.setAttribute('aria-hidden','true');
   if(pool){pool.hidden=true;pool.setAttribute('aria-hidden','true')}
   if(qr){qr.hidden=true;qr.setAttribute('aria-hidden','true')}
@@ -335,7 +338,7 @@ function hideAllSecondaryViews(){
   if(uq){uq.hidden=true;uq.setAttribute('aria-hidden','true')}
   document.querySelectorAll('.pl-item').forEach(function(el){el.classList.remove('active')});
   // Nav buttons live outside .pl-item now, so clear their highlight explicitly.
-  ['quotaPoolNav','dataManagementNav','auditLogNav','quotaRequestNav','planScheduleNav','codeReviewNav','userManageNav','notifyManageNav','upstreamQuotaNav'].forEach(function(id){
+  ['quotaPoolNav','dataManagementNav','auditLogNav','quotaRequestNav','planScheduleNav','codeReviewNav','userManageNav','notifyManageNav','upstreamQuotaNav','pointBudgetNav'].forEach(function(id){
     const el=document.getElementById(id);
     if(el)el.classList.remove('active');
   });
@@ -347,6 +350,9 @@ function openQuotaPoolView(){
   const view=document.getElementById('quotaPoolView');
   view.hidden=false;view.setAttribute('aria-hidden','false');
   document.getElementById('quotaPoolNav').classList.add('active');
+  // 点数模式下「每人每日配额」不再生效，这里把这批输入框禁用并挂徽标；
+  // 池级上限是护栏，保持可编辑。容器可能被就地刷新换掉，所以每次进入都重跑一遍。
+  enhancePointsModeInputs(view);
 }
 // 代码评审是二级视图(左栏菜单进入):每次进入重新读一份配置并探测引擎 ——
 // 仓库保存后走 refreshReviewFromServer(),两边状态一致。
@@ -420,6 +426,8 @@ async function refreshServerContainers(ids,opts){
     if(sel){sel.value=userSelBefore;if(typeof renderProfileUsers==='function')renderProfileUsers(userSelBefore)}
   }
   if(typeof opts.after==='function')opts.after();
+  // 额度池卡片被整块换掉后，点数模式的禁用与徽标要重新挂上（旧的 DOM 已经不在文档里）。
+  enhancePointsModeInputs(document);
   return true;
 }
 function poolIndexByName(name){return (SETTINGS.quotaPools||[]).findIndex(p=>p.name===name)}
@@ -519,6 +527,428 @@ async function deletePool(name){
   await refreshServerContainers(POOL_STRUCT_IDS);
   toast('额度池已删除');
 }
+// ─── 点数预算（管理端）────────────────────────────────────────────────────────
+// 一位成员一份「周期点数预算」：1 点 = 10,000 计权 token，模型/峰谷倍率写时冻结。
+// 契约里所有数字（本期起止、本期已用、剩余、建议预算）都随 GET /api/point-budgets 下发，
+// 服务端是唯一真值 —— 客户端不做重算，只负责渲染、收集一行输入、写回。
+// 与额度池的关系：点数模式成员的个人「每日配额」不再生效（服务端给这类输入框打
+// data-points-mode="1"），本文件负责把它们禁用并挂「点数模式」徽标；池级上限是护栏，仍可编辑。
+// 所有 DOM 访问都判空：视图与端点是并行的另一条改动，任一未就绪时本页要安静降级
+// （表格里显示「接口未就绪」），绝不抛异常炸掉整个设置页。
+let PB={unitTokens:10000,defaultPeriod:'month',allowSelfSelect:false,users:[],loaded:false,error:''};
+const PB_POINT_MAX=10000000;
+const PB_PERIODS=[['day','按日'],['week','按周'],['month','按月']];
+const PB_COLS=13;
+function pbPeriodLabel(p){
+  const m=PB_PERIODS.find(x=>x[0]===p);
+  return m?m[1]:(p||'—');
+}
+function pbNum(v){const n=Number(v);return Number.isFinite(n)?Math.round(n):0}
+function pbPoints(v){return pbNum(v).toLocaleString('zh-CN')}
+function pbUnitTokens(){return Number(PB.unitTokens)||10000}
+function pbUser(key){return (PB.users||[]).find(u=>u.key===key)||null}
+function pbSetStatus(text,isErr){
+  const el=document.getElementById('pbStatus');
+  if(!el)return;
+  el.textContent=text||'';
+  el.style.color=isErr?'var(--red)':'var(--dim)';
+  el.style.fontSize='12px';
+}
+function pbRow(key){
+  const rows=document.querySelectorAll('#pbTableBody tr[data-pbrow]');
+  for(let i=0;i<rows.length;i++){if(rows[i].dataset.pbrow===key)return rows[i]}
+  return null;
+}
+function pbField(row,name){return row?row.querySelector('[data-pb-f="'+name+'"]'):null}
+function pbPrefCell(u,protocol){
+  const pref=(u.preferred||{})[protocol];
+  const sfx=typeof pref==='string'?pref:((pref&&pref.suffix)||'');
+  if(!sfx)return '<span style="color:var(--dim)">自动</span>';
+  const meta=(u.profiles||[]).find(p=>p.suffix===sfx);
+  const label=(pref&&typeof pref==='object'&&pref.name)||(meta&&meta.name)||sfx;
+  return h(label);
+}
+// 表头由 pages.mjs 渲染（12 列）；万一模板只给了空表就补一份，保证列数与行数对得上。
+function pbEnsureHead(){
+  const body=document.getElementById('pbTableBody');
+  if(!body||!body.closest)return null;
+  const table=body.closest('table');
+  if(!table)return null;
+  const head=table.querySelector('thead');
+  if(head&&head.querySelector('th'))return table;
+  const cols=['<input type="checkbox" id="pbSelectAll" title="全选/取消" style="width:auto">',
+    '成员','虚拟 Key','启用','预算点数','用户系数','周期','本期已用','剩余','近 30 天用量','建议预算','首选方案','操作'];
+  const html='<thead><tr>'+cols.map(c=>'<th>'+c+'</th>').join('')+'</tr></thead>';
+  if(head)head.outerHTML=html;else table.insertAdjacentHTML('afterbegin',html);
+  return table;
+}
+function pbToggleAll(on){
+  document.querySelectorAll('#pbTableBody [data-pb-check]').forEach(c=>{c.checked=!!on});
+  pbSyncBulkBar();
+}
+function pbSyncBulkBar(){
+  let n=0;
+  document.querySelectorAll('#pbTableBody [data-pb-check]').forEach(c=>{if(c.checked)n++});
+  const all=document.getElementById('pbSelectAll');
+  if(all){
+    const total=document.querySelectorAll('#pbTableBody [data-pb-check]').length;
+    all.checked=n>0&&n===total;
+    all.indeterminate=n>0&&n<total;
+  }
+  const bar=document.getElementById('pbBulkBar');
+  if(bar)bar.style.opacity=n?'1':'.55';
+  return n;
+}
+function pbPending(row){
+  const msg=row?row.querySelector('[data-pb-msg]'):null;
+  if(!msg)return;
+  const en=pbField(row,'enabled');
+  const pts=pbNum(pbField(row,'budgetPoints').value);
+  if(en&&en.checked&&pts===0)msg.innerHTML='<span style="color:var(--red);font-size:11px">该成员所有请求将被拒绝</span>';
+  else msg.innerHTML='<span style="color:var(--dim);font-size:11px">未保存</span>';
+}
+function pbRowHtml(u){
+  const key=u.key||'';
+  const b=u.budget||{},usage=u.usage||{};
+  const enabled=!!b.enabled;
+  const points=pbNum(b.budgetPoints);
+  const period=b.period||PB.defaultPeriod;
+  const used=pbNum(usage.usedPoints);
+  const remaining=u.remainingPoints!=null?pbNum(u.remainingPoints):Math.max(0,points-used);
+  // 判定口径以服务端 allowed/exhausted 为准：展示点数是四舍五入的，
+  // 999,999/1,000,000 会显示成 100/100，但请求其实还放行。
+  const pct=enabled
+    ? Math.max(0,Math.min(100,u.pct!=null?pbNum(u.pct):(points>0?Math.round(used/points*100):0)))
+    : 0;
+  const exhausted=enabled&&(u.exhausted===true||u.allowed===false||(u.exhausted==null&&used>=points));
+  const zero=enabled&&points===0;
+  const range=(u.periodStart||'')+(u.periodEnd?' ~ '+u.periodEnd:'');
+  const flags=[]
+    .concat(u.disabled?['<span class="pill" style="font-size:10px;color:var(--dim)">已禁用</span>']:[])
+    .concat(u.superUser?['<span class="pill" style="font-size:10px;color:var(--accent)">超级</span>']:[]);
+  const periods=PB_PERIODS.map(p=>'<option value="'+p[0]+'"'+(p[0]===period?' selected':'')+'>'+p[1]+'</option>').join('');
+  return '<tr data-pbrow="'+h(key)+'">'
+    +'<td><input type="checkbox" data-pb-check="1" style="width:auto" onchange="pbSyncBulkBar()"></td>'
+    +'<td><div style="font-weight:600">'+h(u.username||'未命名')+'</div>'
+    +   (flags.length?'<div style="margin-top:2px">'+flags.join(' ')+'</div>':'')
+    +   (b.note?'<div style="font-size:11px;color:var(--dim)">'+h(b.note)+'</div>':'')
+    +'</td>'
+    +'<td><code style="font-size:11px;color:var(--dim)">'+h(key)+'</code></td>'
+    +'<td><input type="checkbox" data-pb-f="enabled"'+(enabled?' checked':'')+' style="width:auto" onchange="pbPending(this.closest(\'tr\'))"></td>'
+    +'<td><input type="number" data-pb-f="budgetPoints" min="0" max="'+PB_POINT_MAX+'" step="1" value="'+points+'"'
+    +   ' style="width:92px" oninput="pbPending(this.closest(\'tr\'))"></td>'
+    +'<td><input type="number" data-pb-f="billingFactor" min="0.1" max="10" step="0.05" value="'+(b.billingFactor==null?1:b.billingFactor)+'"'
+    +   ' style="width:72px" title="用户计费系数：只影响点数，0.1~10，默认 1.00；与方案系数相乘，封顶 100" oninput="pbPending(this.closest(\'tr\'))"></td>'
+    +'<td><select data-pb-f="period" style="width:78px">'+periods+'</select>'
+    +   (range?'<div style="font-size:10px;color:var(--dim);white-space:nowrap" title="本期起止（北京时间）">'+h(range)+'</div>':'')
+    +'</td>'
+    +'<td class="n" title="本期已用">'+pbPoints(used)+' 点'
+    +   '<div style="height:4px;background:var(--border);border-radius:2px;overflow:hidden;margin-top:3px;width:88px;margin-left:auto">'
+    +     '<div style="height:100%;width:'+pct+'%;background:'+(exhausted||zero?'var(--red)':'var(--accent)')+'"></div>'
+    +   '</div>'
+    +   (zero?'<div style="color:var(--red);font-size:11px">所有请求将被拒绝</div>':'')
+    +'</td>'
+    +'<td class="n" title="本期剩余"'+(exhausted?' style="color:var(--red)"':'')+'>'+pbPoints(remaining)+' 点'
+    +   (exhausted&&!zero?'<div style="font-size:11px">本期已用完</div>':'')+'</td>'
+    +'<td class="n" style="white-space:nowrap">'+pbPoints(usage.last30dPoints)+' 点/30天'
+    +   '<div style="font-size:10px;color:var(--dim)">'+pbPoints(usage.requests)+' 次</div></td>'
+    +'<td class="n" style="white-space:nowrap">'+pbPoints(usage.suggestedMonthlyPoints)+' 点/月'
+    +   ' <button type="button" class="btn btn-outline btn-sm" style="font-size:10px;padding:0 6px"'
+    +     ' onclick="pbAdoptSuggested(\''+h(key)+'\')">采用</button></td>'
+    +'<td style="font-size:11px;line-height:1.5">'
+    +   '<div title="Anthropic 协议首选方案">Claude：'+pbPrefCell(u,'anthropic')+'</div>'
+    +   '<div title="Responses 协议首选方案">Codex：'+pbPrefCell(u,'responses')+'</div>'
+    +'</td>'
+    +'<td style="white-space:nowrap">'
+    +   '<button type="button" class="btn btn-primary btn-sm" onclick="savePointBudget(\''+h(key)+'\')">保存</button>'
+    +   '<span data-pb-msg style="margin-left:6px"></span>'
+    +'</td>'
+    +'</tr>';
+}
+function pbRenderTable(){
+  const body=document.getElementById('pbTableBody');
+  if(!body)return;
+  pbEnsureHead();
+  if(PB.error){
+    body.innerHTML='<tr><td colspan="'+PB_COLS+'" class="note" style="padding:14px">'+h(PB.error)+'</td></tr>';
+    pbSetStatus(PB.error,true);
+    return;
+  }
+  if(!PB.users.length){
+    body.innerHTML='<tr><td colspan="'+PB_COLS+'" class="note" style="padding:14px">还没有成员。先在「用户管理」里添加成员。</td></tr>';
+    pbSyncBulkBar();
+    pbRenderSummary();
+    return;
+  }
+  body.innerHTML=PB.users.map(pbRowHtml).join('');
+  pbSyncBulkBar();
+  pbRenderSummary();
+}
+function pbRenderSummary(){
+  let on=0,total=0,usedTotal=0;
+  PB.users.forEach(u=>{
+    const b=u.budget||{};
+    if(b.enabled){on++;total+=pbNum(b.budgetPoints);usedTotal+=pbNum((u.usage||{}).usedPoints)}
+  });
+  pbSetStatus('成员 '+PB.users.length+' 人 · 已开启 '+on+' 人 · 预算合计 '+pbPoints(total)+' 点 · 本期已用 '+pbPoints(usedTotal)+' 点'
+    +' · 1 点 = '+pbPoints(pbUnitTokens())+' 计权 token');
+}
+function pbRenderGlobals(){
+  const sw=document.getElementById('pbGlobalSwitch');
+  if(sw&&sw.type==='checkbox')sw.checked=!!PB.allowSelfSelect;
+}
+function openPointBudgetView(){
+  const form=document.getElementById('settingsForm');
+  const view=document.getElementById('pointBudgetView');
+  if(!view){alert('点数预算视图尚未就绪（页面模板未更新）');return}
+  hideAllSecondaryViews();
+  if(form)form.hidden=true;
+  view.hidden=false;view.setAttribute('aria-hidden','false');
+  const nav=document.getElementById('pointBudgetNav');
+  if(nav)nav.classList.add('active');
+  pbRenderGlobals();
+  if(PB.loaded&&!PB.error)pbRenderTable();else loadPointBudgets();
+}
+async function loadPointBudgets(){
+  const body=document.getElementById('pbTableBody');
+  if(body)body.innerHTML='<tr><td colspan="'+PB_COLS+'" class="note" style="padding:14px">正在加载…</td></tr>';
+  pbSetStatus('正在加载点数预算…');
+  let r,data;
+  try{
+    r=await fetch('/api/point-budgets',{headers:{'x-requested-with':'fetch'},credentials:'same-origin'});
+    data=await r.json().catch(()=>({}));
+  }catch(err){
+    PB.users=[];PB.loaded=false;PB.error='读取点数预算失败：'+err.message;
+    pbRenderTable();return false;
+  }
+  if(!r.ok||!data||data.error){
+    PB.users=[];PB.loaded=false;
+    PB.error='点数预算接口未就绪'+(data&&data.error?'（'+data.error+'）':'（HTTP '+r.status+'）')+' —— 服务端上线后重新打开本页即可。';
+    pbRenderTable();return false;
+  }
+  PB.unitTokens=Number(data.unitTokens)||PB.unitTokens;
+  PB.defaultPeriod=data.defaultPeriod||PB.defaultPeriod;
+  PB.allowSelfSelect=!!data.allowSelfSelect;
+  PB.users=Array.isArray(data.users)?data.users:[];
+  PB.loaded=true;PB.error='';
+  pbRenderGlobals();
+  pbRenderTable();
+  return true;
+}
+// 单行写回的唯一出口：savePointBudget（带确认）与 saveAllPointBudgets（批量）共用。
+async function pbPostOne(key,enabled,points,period,extra){
+  const body={key:key,enabled:enabled,budgetPoints:points,period:period,_csrf:getCsrf()};
+  if(extra)Object.assign(body,extra);
+  let r,data;
+  try{
+    r=await fetch('/api/point-budget/save',{method:'POST',headers:csrfHeaders({'Content-Type':'application/json'}),
+      body:JSON.stringify(body)});
+    data=await r.json().catch(()=>({}));
+  }catch(err){return {ok:false,error:err.message}}
+  if(!r.ok||(data&&data.error))return {ok:false,error:(data&&data.error)||('HTTP '+r.status)};
+  return {ok:true};
+}
+async function savePointBudget(key){
+  const u=pbUser(key),row=pbRow(key);
+  if(!u||!row){alert('这一行已经失效，请重新打开本页');return}
+  const en=pbField(row,'enabled');
+  const enabled=!!(en&&en.checked);
+  const points=pbNum(pbField(row,'budgetPoints').value);
+  const ps=pbField(row,'period');
+  const period=(ps&&ps.value)||PB.defaultPeriod;
+  const used=pbNum((u.usage||{}).usedPoints);
+  const factor=pbNum(pbField(row,'billingFactor').value);
+  if(enabled&&points>PB_POINT_MAX){alert('预算点数不能超过 '+pbPoints(PB_POINT_MAX));return}
+  if(!(factor>=0.1&&factor<=10)){alert('用户计费系数必须在 0.1 ~ 10 之间');return}
+  const tip=['成员：'+(u.username||key),
+    '预算：'+(enabled?pbPoints(points)+' 点 / '+pbPeriodLabel(period):'不启用（不限点数）'),
+    '用户计费系数：×'+factor];
+  if(enabled)tip.push('本期已用 '+pbPoints(used)+' 点，设置 '+pbPoints(points)+' 点会立即生效。');
+  if(enabled&&points===0)tip.push('注意：预算为 0，该成员所有请求将被拒绝。');
+  tip.push('','是否保存？');
+  if(!confirm(tip.join('\n')))return;
+  const msg=row.querySelector('[data-pb-msg]');
+  if(msg)msg.innerHTML='<span style="color:var(--dim);font-size:11px">保存中…</span>';
+  const res=await pbPostOne(key,enabled,points,period,
+    {startsAt:(u.budget&&u.budget.startsAt)||null,note:(u.budget&&u.budget.note)||'',billingFactor:factor});
+  if(!res.ok){
+    if(msg)msg.innerHTML='<span style="color:var(--red);font-size:11px">保存失败</span>';
+    alert('保存失败: '+res.error);
+    pbSetStatus('保存失败：'+res.error,true);
+    return;
+  }
+  await refreshSettingsState();
+  await loadPointBudgets();                     // 本期已用/剩余是服务端算的，重拉一次保证一致
+  const ok='「'+(u.username||key)+'」的点数预算已保存';
+  pbSetStatus(ok);
+  toast(ok);
+}
+function pbDirtyRows(){
+  const out=[];
+  document.querySelectorAll('#pbTableBody tr[data-pbrow]').forEach(row=>{
+    const key=row.dataset.pbrow,u=pbUser(key);
+    if(!u)return;
+    const en=pbField(row,'enabled');
+    const enabled=!!(en&&en.checked);
+    const points=pbNum(pbField(row,'budgetPoints')?pbField(row,'budgetPoints').value:0);
+    const ps=pbField(row,'period');
+    const period=(ps&&ps.value)||PB.defaultPeriod;
+    const factor=pbNum(pbField(row,'billingFactor')?pbField(row,'billingFactor').value:1);
+    const b=u.budget||{};
+    const oldFactor=pbNum(b.billingFactor==null?1:b.billingFactor);
+    if(!!b.enabled!==enabled||pbNum(b.budgetPoints)!==points||(b.period||PB.defaultPeriod)!==period||oldFactor!==factor){
+      out.push({key:key,enabled:enabled,points:points,period:period,factor:factor,u:u,row:row});
+    }
+  });
+  return out;
+}
+// 「保存全部修改」：只提交与当前服务端状态不同的行，逐行走同一个写接口。
+async function saveAllPointBudgets(){
+  const dirty=pbDirtyRows();
+  if(!dirty.length){pbSetStatus('没有需要保存的修改。');toast('没有需要保存的修改');return}
+  const zero=dirty.filter(d=>d.enabled&&d.points===0).length;
+  if(!confirm('将保存 '+dirty.length+' 位成员的修改'+(zero?'（其中 '+zero+' 位预算为 0，会被拒绝所有请求）':'')+'，立即生效。继续？'))return;
+  pbSetStatus('正在保存 '+dirty.length+' 处修改…');
+  let ok=0,fail=0,lastErr='';
+  for(const d of dirty){
+    const res=await pbPostOne(d.key,d.enabled,d.points,d.period,
+      {startsAt:(d.u.budget&&d.u.budget.startsAt)||null,note:(d.u.budget&&d.u.budget.note)||'',billingFactor:d.factor});
+    if(res.ok)ok++;else{fail++;lastErr=res.error||''}
+  }
+  await refreshSettingsState();
+  await loadPointBudgets();
+  if(fail){
+    const msg='已保存 '+ok+' 位，失败 '+fail+' 位：'+lastErr;
+    pbSetStatus(msg,true);
+    alert(msg);
+  }else{
+    const msg='已保存 '+ok+' 位成员的点数预算';
+    pbSetStatus(msg);
+    toast(msg);
+  }
+}
+function pbBulkKeys(){
+  const keys=[];
+  document.querySelectorAll('#pbTableBody [data-pb-check]').forEach(c=>{
+    if(!c.checked)return;
+    const row=c.closest?c.closest('tr'):null;
+    if(row&&row.dataset&&row.dataset.pbrow)keys.push(row.dataset.pbrow);
+  });
+  return keys;
+}
+async function savePointBudgetBulk(){
+  const keys=pbBulkKeys();
+  if(!keys.length){alert('请先勾选要批量设置的成员');return}
+  const en=document.getElementById('pbBulkEnabled');
+  const pi=document.getElementById('pbBulkBudget');
+  const ps=document.getElementById('pbBulkPeriod');
+  const enabled=en?!!en.checked:false;
+  const raw=pi?String(pi.value).trim():'';
+  if(enabled&&raw===''){alert('请填写批量预算点数');return}
+  const points=pbNum(raw);
+  const period=(ps&&ps.value)||PB.defaultPeriod;
+  if(enabled&&points>PB_POINT_MAX){alert('预算点数不能超过 '+pbPoints(PB_POINT_MAX));return}
+  if(!confirm('将对 '+keys.length+' 位成员'+(enabled?'设置 '+pbPoints(points)+' 点 / '+pbPeriodLabel(period)+'，立即生效。':'关闭点数预算（不限点数）。')+'\n\n是否继续？'))return;
+  let r,data;
+  try{
+    r=await fetch('/api/point-budget/bulk',{method:'POST',headers:csrfHeaders({'Content-Type':'application/json'}),
+      body:JSON.stringify({keys:keys,enabled:enabled,budgetPoints:points,period:period,_csrf:getCsrf()})});
+    data=await r.json().catch(()=>({}));
+  }catch(err){
+    pbSetStatus('批量保存失败：'+err.message,true);
+    alert('批量保存失败: '+err.message);
+    return;
+  }
+  if(!r.ok){
+    const why=(data&&data.error)||('HTTP '+r.status);
+    pbSetStatus('批量保存失败：'+why,true);
+    alert('批量保存失败: '+why);
+    return;
+  }
+  await refreshSettingsState();
+  await loadPointBudgets();
+  const msg='已批量更新 '+keys.length+' 位成员';
+  pbSetStatus(msg);
+  toast(msg);
+}
+// 全局开关：成员能否在「我的用量」自己切换首选方案。优先专属端点，未上线时退回统一保存入口。
+async function savePointBudgetSettings(){
+  const sw=document.getElementById('pbGlobalSwitch');
+  const on=!!(sw&&sw.type==='checkbox'&&sw.checked);
+  let ok=false,why='';
+  try{
+    const r=await fetch('/api/point-budget/settings',{method:'POST',headers:csrfHeaders({'Content-Type':'application/json'}),
+      body:JSON.stringify({allowSelfSelect:on,_csrf:getCsrf()})});
+    const data=await r.json().catch(()=>({}));
+    ok=r.ok&&!(data&&data.error);
+    why=(data&&data.error)||('HTTP '+r.status);
+  }catch(err){ok=false;why=err.message}
+  if(!ok){
+    try{
+      const body=new URLSearchParams();
+      body.set('pointSettings.allowSelfSelect',on?'on':'');
+      const r2=await fetch('/api/settings-save',{method:'POST',
+        headers:csrfHeaders({'Content-Type':'application/x-www-form-urlencoded'}),
+        body:body.toString(),redirect:'manual'});
+      ok=r2.ok||r2.type==='opaqueredirect';
+      if(!ok)why='HTTP '+r2.status;
+    }catch(e2){ok=false;why=e2.message}
+  }
+  if(!ok){
+    const msg='保存失败：全局开关接口未就绪（'+why+'）';
+    pbSetStatus(msg,true);
+    alert(msg);
+    if(sw&&sw.type==='checkbox')sw.checked=!on;
+    return;
+  }
+  PB.allowSelfSelect=on;
+  const msg=on?'已允许成员在「我的用量」里自选首选方案':'已禁止成员自选首选方案';
+  pbSetStatus(msg);
+  toast(msg);
+}
+// 点数模式下个人「每日配额」不生效：禁用并挂徽标（点击进点数预算页）。池级上限不受影响。
+function enhancePointsModeInputs(root){
+  const scope=(root&&root.querySelectorAll)?root:document;
+  scope.querySelectorAll('[data-points-mode="1"]').forEach(el=>{
+    const isField=/^(INPUT|SELECT|TEXTAREA)$/.test(el.tagName);
+    const fields=isField?[el]:Array.prototype.slice.call(el.querySelectorAll('input,select,textarea'));
+    fields.forEach(inp=>{
+      inp.disabled=true;
+      inp.title='点数模式已开启：该成员的额度按「点数预算」计算，这里的每日配额不再生效';
+      inp.style.opacity='.45';
+      inp.style.textDecoration='line-through';
+    });
+    if(el.dataset.pbBadge==='1')return;
+    el.dataset.pbBadge='1';
+    const badge=document.createElement('span');
+    badge.textContent='点数模式';
+    badge.title='该成员使用点数预算，点击查看/调整';
+    badge.style.cssText='font-size:10px;background:var(--accent-soft);color:var(--accent);padding:1px 6px;border-radius:4px;margin-left:4px;cursor:pointer;white-space:nowrap';
+    badge.onclick=function(e){e.preventDefault();openPointBudgetView()};
+    if(el.parentNode)el.parentNode.insertBefore(badge,el.nextSibling);
+  });
+}
+function pbAdoptSuggested(key){
+  const u=pbUser(key),row=pbRow(key);
+  if(!u||!row)return;
+  const sug=pbNum((u.usage||{}).suggestedMonthlyPoints);
+  if(!sug){alert('近 30 天没有足够用量，暂时给不出建议');return}
+  if(!confirm('建议月预算 = 近 30 天总用量的 80%（'+pbPoints(sug)+' 点），将把周期切换为「按月」并填入该值（保存后才生效）。继续？'))return;
+  const pi=pbField(row,'budgetPoints');
+  const ps=pbField(row,'period');
+  if(pi)pi.value=sug;
+  if(ps)ps.value='month';
+  pbPending(row);
+}
+function pbBindControls(){
+  const sw=document.getElementById('pbGlobalSwitch');
+  if(sw)sw.onchange=savePointBudgetSettings;
+  const all=document.getElementById('pbSelectAll');
+  if(all)all.onchange=function(){pbToggleAll(this.checked)};
+  pbSyncBulkBar();
+}
+pbBindControls();
+enhancePointsModeInputs(document);
 // ─── 操作日志（audit_log）───
 let auditRows=[],auditOffset=0,auditCategory='',auditLoaded=false,auditTotal=0;
 const AUDIT_PAGE=100;
@@ -1288,7 +1718,7 @@ function addGlobalUser(){
 const CW_OPTIONS=[[32768,'32K（32,768）'],[65536,'64K（65,536）'],[128000,'128K（128,000）'],[200000,'200K（200,000）'],[262144,'256K（262,144）'],[400000,'400K（400,000）'],[1048576,'1M（1,048,576）']];
 function cwSelectHtml(name,val){return '<select name="'+name+'">'+CW_OPTIONS.map(o=>'<option value="'+o[0]+'"'+(String(o[0])===String(val||128000)?' selected':'')+'>'+o[1]+'</option>').join('')+'</select>'}
 function renumberRows(prefix){
-  const wrap=prefix==='ma'?document.getElementById('aliasRows'):prefix==='mr'?document.getElementById('rateRows'):document.getElementById('peakRows');
+  const wrap=prefix==='ma'?document.getElementById('aliasRows'):prefix==='mr'?document.getElementById('rateRows'):prefix==='pmr'?document.getElementById('pointRateRows'):document.getElementById('peakRows');
   const rows=[...wrap.querySelectorAll('.alias-row')];
   rows.forEach((row,i)=>{row.querySelectorAll('[name^="'+prefix+'_"]').forEach(el=>{
     const parts=el.name.split('_');el.name=prefix+'_'+parts[1]+'_'+i;});});
@@ -1371,7 +1801,9 @@ function refreshRateSelect(sel,want){
 }
 function refreshAllRateSelects(){
   document.querySelectorAll('#rateRows select[name^="mr_model_"]').forEach(sel=>refreshRateSelect(sel));
+  document.querySelectorAll('#pointRateRows select[name^="pmr_model_"]').forEach(sel=>refreshRateSelect(sel));
   updateRateRowsHint();
+  updatePointRateRowsHint();
 }
 function addRateRow(model,peak,off){
   document.getElementById('rateRows').appendChild(rateRowEl(model||'',peak,off));

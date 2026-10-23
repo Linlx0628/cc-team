@@ -416,14 +416,15 @@ function renderPointBalances(){
       +'<td style="'+stateCls+';font-weight:600">'+state+'</td>'
       +'<td>'+pointPeriodLabel(b.period)+'</td>'
       +'<td class="n">'+(on?fmtT(b.budgetPoints):'–')+'</td>'
-      +'<td class="n">'+(on?fmtT(usg.usedPoints):'–')+'</td>'
-      +'<td class="n hl">'+(on?fmtT(u.remainingPoints):'–')+'</td>'
+      +'<td class="n">'+(on?fmtPts(usg.usedPointsExact!=null?usg.usedPointsExact:usg.usedPoints):'–')+'</td>'
+      +'<td class="n hl">'+(on?fmtPts(u.remainingPointsExact!=null?u.remainingPointsExact:u.remainingPoints):'–')+'</td>'
       +'<td><div class="pb-track"><i style="width:'+pct+'%;background:'+barCol+'"></i></div><span class="pb-pct">'+(on?pct+'%':'–')+'</span></td>'
       +'<td class="pb-period">'+(on?escH((u.periodStart||'')+' ~ '+(u.periodEnd||'')):'–')+'</td>'
       +'<td class="pb-pref">'+escH(pref)+'</td>'
       +'</tr>';
   }).join('');
 }
+function fmtPts(n){const v=Math.round((Number(n)||0)*100)/100;return Number.isInteger(v)?String(v):v.toFixed(2)}
 function maskDetailKey(key){const value=String(key||"");return value.length<=12?value:value.slice(0,8)+"****"+value.slice(-4)}
 // ── All-profiles quota columns ───────────────────────────────────────────────
 // Swap the single 配额 header for one column per quota-bearing profile (or back).

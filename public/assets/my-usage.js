@@ -21,6 +21,7 @@ function pointsData(){return D&&D.points&&D.points.enabled?D.points:null}
 function pointsUnit(){const p=pointsData();return p&&p.unitTokens>0?p.unitTokens:POINT_UNIT}
 function isPointsMode(){return !!(pointsData()||(D&&D.quota&&D.quota.pointsMode))}
 function fmtP(n){const v=Math.round((Number(n)||0)*10)/10;return Number.isInteger(v)?fmtT(v):v.toFixed(1)}
+function fmtPts(n){const v=Math.round((Number(n)||0)*100)/100;return Number.isInteger(v)?fmtT(v):v.toFixed(2)}
 function fmtPeriod(p){
   if(!p)return'';
   const base=PERIOD_LABEL[p.period]||'本周期';
@@ -436,7 +437,7 @@ function renderPoints(){
   if(!p){card.style.display='none';return}
   card.style.display='';
   const remaining=document.getElementById('pointsRemaining');
-  if(remaining)remaining.textContent=fmtP(p.remainingPoints);
+  if(remaining)remaining.textContent=fmtPts(p.remainingPointsExact!=null?p.remainingPointsExact:p.remainingPoints);
   const meta=document.getElementById('pointsMeta');
   if(meta)meta.textContent=fmtPeriod(p);
   const pct=p.pct==null?(p.exhausted?100:0):Math.max(0,Math.min(100,p.pct));
@@ -447,15 +448,15 @@ function renderPoints(){
   }
   const detail=document.getElementById('pointsDetail');
   if(!detail)return;
-  let html='已用 <b>'+fmtP(p.usedPoints)+'</b> / '+fmtP(p.budgetPoints)+' 点'
+  let html='已用 <b>'+fmtPts(p.usedPointsExact!=null?p.usedPointsExact:p.usedPoints)+'</b> / '+fmtP(p.budgetPoints)+' 点'
     +(p.budgetPoints>0?'（'+p.pct+'%）':'')
     +(p.overPoints>0
-      ?' · <span style="color:var(--red);font-weight:600">已超出 '+fmtP(p.overPoints)+' 点</span>'
-      :' · 剩余 '+fmtP(p.remainingPoints)+' 点');
+      ?' · <span style="color:var(--red);font-weight:600">已超出 '+fmtPts(p.overPointsExact!=null?p.overPointsExact:p.overPoints)+' 点</span>'
+      :' · 剩余 '+fmtPts(p.remainingPointsExact!=null?p.remainingPointsExact:p.remainingPoints)+' 点');
   const lines=[];
   if(p.exhausted)lines.push('<span style="color:var(--red)">本期点数已用完，请求会被拦截</span>');
   else if(p.projectedExhaustDate)lines.push('按当前速度预计 <b>'+p.projectedExhaustDate+'</b> 用完');
-  if(p.avgDailyPoints>0)lines.push('日均 '+fmtP(p.avgDailyPoints)+' 点');
+  if(p.avgDailyPoints>0)lines.push('日均 '+fmtPts(p.avgDailyPoints)+' 点');
   if(lines.length)html+='<br>'+lines.join(' · ');
   if(!p.exhausted)html+='<br><span style="color:var(--dim)">点数模式下请联系管理员调整预算</span>';
   detail.innerHTML=html;

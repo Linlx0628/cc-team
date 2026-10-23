@@ -473,10 +473,10 @@ function renderPointCheckin(){
   if(!c||c.available===false||c.enabled===false){wrap.style.display='none';return}
   wrap.style.display='flex';
   if(c.checkedInToday){
-    hint.textContent='今日已签到 +'+fmtPts(c.todayPoints)+' 点'+(c.streak>1?' · 连续 '+c.streak+' 天':'');
+    hint.textContent='今日已签到 +'+fmtPts(c.todayPoints)+' 点';
     btn.disabled=true;btn.textContent='已签到';
   }else{
-    hint.textContent='签到领 '+fmtPts(c.minPoints)+'~'+fmtPts(c.maxPoints)+' 点'+(c.streak>0?' · 连续 '+c.streak+' 天':'');
+    hint.textContent='';
     btn.disabled=false;btn.textContent='签到';
   }
 }

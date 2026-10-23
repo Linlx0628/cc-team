@@ -15,6 +15,7 @@
         "jx-haiku": "glm-5.1"
       },
       "dailyTokenLimit": 2000000,
+      "pointsEligible": true,
       "peakHours": [
         {
           "start": "09:00",
@@ -28,6 +29,10 @@
       "peakQuotaRate": 1,
       "offPeakQuotaRate": 1,
       "modelQuotaRates": {},
+      "pointPeakRate": null,
+      "pointOffPeakRate": null,
+      "pointModelRates": {},
+      "pointsBillingFactor": 1,
       "users": {
         "jx-example-user": {
           "key": "replace-with-real-upstream-key",
@@ -59,6 +64,19 @@
     "rateLimitPerMinute": 60,
     "circuitBreakerFailures": 5,
     "circuitBreakerCooldown": 30000
+  },
+  "pointSettings": {
+    "defaultPeriod": "month",
+    "allowSelfSelect": true
+  },
+  "pointBudgets": {
+    "jx-example-user": {
+      "enabled": true,
+      "budgetPoints": 5000,
+      "period": "month",
+      "startsAt": "2026-10-01",
+      "note": "示例：1 点 = 1 万计权 token；月预算 5000 点 = 5000 万计权 token"
+    }
   },
   "codeReview": {
     "enabled": false,

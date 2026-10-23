@@ -499,3 +499,77 @@ table{width:100%;border-collapse:collapse;min-width:560px}th{text-align:left;pad
   background:var(--card);border:1px solid var(--border);border-radius:6px;padding:8px 10px}
 .mr-cmt-form-act{display:flex;gap:6px}
 .box.is-dismissed{opacity:.72}
+
+/* ── 点数模式：点数卡 / 首选方案选择器 / 点数表头（my-usage.js 的 renderPoints/
+   renderPreferred/syncPointsColumn 填充，容器由 lib/pages.mjs 提供） ── */
+#pointsCard{border-left:3px solid var(--accent)}
+#pointsCard h3{margin:0 0 10px}
+#pointsBar{transition:width .3s ease,background .3s ease}
+#prefPlanCard{border-left:3px solid var(--accent)}
+#prefPlanCard h3{margin:0 0 6px}
+.pref-proto{padding:12px 0;border-top:1px dashed var(--border)}
+.pref-proto:first-child{border-top:0;padding-top:2px}
+.pref-proto-hd{display:flex;align-items:baseline;justify-content:space-between;gap:10px;margin-bottom:8px;font-size:12px}
+.pref-proto-hd b{font-size:12.5px;color:var(--text)}
+.pref-proto-hd span{font-size:11px;color:var(--dim)}
+.pref-chips{display:grid;grid-template-columns:repeat(auto-fill,minmax(210px,1fr));gap:8px}
+.pref-chip{position:relative;display:flex;flex-direction:column;align-items:flex-start;gap:3px;width:100%;text-align:left;
+  padding:9px 11px;border:1px solid var(--border);border-radius:7px;background:var(--surface);
+  color:var(--text);font:inherit;cursor:pointer;transition:border-color .15s,background .15s}
+.pref-chip.has-peak{padding-right:58px}
+.pref-chip:hover{border-color:var(--border-strong);background:var(--surface-subtle)}
+.pref-chip.on{border-color:var(--accent);background:var(--accent-soft);box-shadow:inset 0 0 0 1px var(--accent)}
+.pref-chip.err{border-color:var(--red);background:var(--red-soft,#fff2f0);box-shadow:inset 0 0 0 1px var(--red);cursor:not-allowed}
+.pref-chip.err .pref-chip-meta{color:var(--red)}
+.pref-chip.err:hover{border-color:var(--red)}
+.pref-peak{position:absolute;top:7px;right:8px;font-size:9px;line-height:1.6;padding:0 5px;border-radius:3px;
+  font-weight:700;letter-spacing:.3px;white-space:nowrap;color:#b54708;background:#fef0c7;border:1px solid #fdb022}
+.tier-badge{font-size:9px;line-height:1.5;padding:0 4px;border-radius:3px;font-weight:700;white-space:nowrap;border:1px solid transparent}
+.tier-fable{color:#b42318;background:#fee4e2;border-color:#fda29b}
+.tier-opus{color:#b54708;background:#fef0c7;border-color:#fdb022}
+.tier-sonnet{color:#175cd3;background:#eff8ff;border-color:#84caff}
+.tier-haiku{color:#067647;background:#ecfdf3;border-color:#75e0a7}
+.pref-chip[disabled]{cursor:not-allowed;opacity:1}
+.pref-chip-name{font-size:12.5px;font-weight:650;line-height:1.3}
+.pref-chip-meta{font-size:10.5px;color:var(--dim);line-height:1.35;word-break:break-word}
+.pref-chip-map{display:flex;flex-direction:column;gap:2px;margin-top:4px;padding-top:5px;border-top:1px dashed var(--border);width:100%}
+.pref-map-row{display:flex;align-items:baseline;gap:4px;flex-wrap:wrap;font-size:10.5px;line-height:1.4;color:var(--dim)}
+.pref-map-row code{font-size:10.5px;color:var(--text);background:var(--surface-subtle);border-radius:3px;padding:0 3px}
+.pref-map-arrow{color:var(--dim)}
+.pref-map-peak{font-size:9.5px;color:var(--orange);white-space:nowrap}
+.pref-map-rate{font-size:9.5px;color:var(--dim);white-space:nowrap;border:1px solid var(--border);border-radius:3px;padding:0 3px}
+.pref-map-rate.hot{color:var(--orange);border-color:rgba(255,149,0,.35)}
+.pref-map-rate.cool{color:var(--green);border-color:rgba(46,164,79,.3)}
+#modelTable th[data-points-col]{color:var(--accent)}
+@media (max-width:760px){.pref-chips{grid-template-columns:1fr}}
+/* 请求方案：紧凑列表（替代卡片，信息密度更高） */
+.pref-table-wrap{overflow-x:auto;margin-top:2px}
+.pref-table{width:100%;border-collapse:collapse;table-layout:fixed;min-width:980px}
+.pref-table th,.pref-table td{padding:6px 7px;border-bottom:1px solid var(--border);font-size:11px;text-align:left;vertical-align:top;white-space:normal}
+.pref-table th{font-weight:600;color:var(--dim);background:var(--surface-subtle);line-height:1.45}
+.pref-table tbody tr:last-child td{border-bottom:0}
+.pref-row.on td{background:var(--accent-soft)}
+.pref-row.err td{background:var(--red-soft,#fff2f0)}
+.pref-name-main{font-size:12px;font-weight:650;line-height:1.3}
+.pref-name-sub{font-size:10px;color:var(--dim);margin-top:2px;word-break:break-all}
+.pref-table td.pref-model{overflow:hidden}.pref-model-name{font-size:10.5px;line-height:1.35;color:var(--text);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:100%}
+.pref-model-rate{font-size:10px;color:var(--dim);margin-top:2px;white-space:nowrap}
+.pref-model-rate.hot{color:var(--orange)}
+.pref-model-rate.cool{color:var(--green)}
+.pref-limit{font-size:10.5px;color:var(--dim);line-height:1.35;white-space:normal;overflow-wrap:anywhere;word-break:break-word}
+.pref-limit.err{color:var(--red)}.pref-limit-sub{font-size:9.5px;color:var(--red);margin-top:1px;overflow-wrap:anywhere}
+.pref-op{text-align:right;white-space:nowrap;vertical-align:middle}
+.pref-pick{border:1px solid var(--border);background:var(--surface);color:var(--text);border-radius:4px;padding:3px 8px;font-size:11px;cursor:pointer;white-space:nowrap}
+.pref-pick:hover{border-color:var(--accent);color:var(--accent)}
+.pref-pick[disabled]{cursor:not-allowed;opacity:.65;color:var(--dim);background:var(--surface-subtle)}
+.pref-auto-row td{background:var(--surface-subtle)}
+.pref-auto-row.on td{background:var(--accent-soft)}
+.pref-auto-meta{font-size:11px;color:var(--dim);line-height:1.45;word-break:break-word}
+.pref-peak-inline{display:inline-block;font-size:9.5px;line-height:1.6;color:var(--orange);background:rgba(255,149,0,.1);border:1px solid rgba(255,149,0,.3);border-radius:3px;padding:0 4px;white-space:nowrap}
+.pref-empty{color:var(--dim)}
+.pref-dim{color:var(--dim);font-weight:400}
+/* 点数计费公式：折叠说明，避免占用概览空间 */
+.points-formula{margin-top:9px;font-size:11px;border-top:1px dashed var(--border);padding-top:7px}
+.points-formula summary{cursor:pointer;color:var(--accent);font-weight:600;width:max-content}
+.points-formula .pf-row{margin-top:5px;line-height:1.65;color:var(--dim)}
+.points-formula .pf-row b{color:var(--text)}

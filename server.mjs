@@ -10,14 +10,15 @@ import { initProductionDb, createProductionTracker, rangeFromTo, productionSumma
   productionProjects, productionAlerts, markAlertSeen, pruneProductionData, DEFAULT_COST_RATES,
   computeCosts, contextHealth, buildReportHTML, ALERT_KIND_LABEL, alertDetailText,
   sessionProjectLabels, sessionToolStats, sessionKey } from "./production.mjs";
-import { cnNow, cnDate, cnHalfHour, secondsUntilNextCnMidnight, cnWeekStartIso, cnWeekStartDate, cnDayStartIso, parseDateRange } from "./lib/time.mjs";
+import { cnNow, cnDate, cnHalfHour, secondsUntilNextCnMidnight, cnWeekStartIso, cnWeekStartDate, cnDayStartIso, periodStartDate, secondsUntilNextPeriodEnd, weekStartDateOf, monthStartDateOf, parseDateRange } from "./lib/time.mjs";
 import { parsePeakTimeMinutes, normalizePeakHours, isInPeakHours, formatPeakHoursSummary,
   BASE_GROUP_TOKEN, resolveEffectiveGroup, formatScheduleRuleSummary,
   normalizeScheduleGroups, normalizeScheduleRules, normalizeScheduleRule, normalizeScheduleGroupName,
   nextScheduleBoundary, msUntilNextBeijingMidnight, describeScheduleHealth, matchesScheduleRule,
   beijingDayOfWeek, GROUP_NAME_MAX, ALL_DAYS, DAY_LABELS } from "./lib/schedule.mjs";
 import { sanitizeJson } from "./lib/sanitize.mjs";
-import { QUOTA_RATE_MAX, normalizeQuotaRate, normalizeCacheReadQuotaRate, normalizeModelQuotaRates, lookupModelQuotaRate, currentQuotaRate, nextRateChangeHint, QUOTA_POOL_NAME_MAX, normalizeQuotaPoolName, canonicalJson, shortDigest, applyStickyReorder, buildPoolResolver, quotaExceededMessage, quotaErrorDetail, buildQuotaCore } from "./lib/quota.mjs";
+import { QUOTA_RATE_MAX, normalizeQuotaRate, normalizeCacheReadQuotaRate, normalizeModelQuotaRates, lookupModelQuotaRate, currentQuotaRate, currentPointRate, normalizePointModelRates, nextRateChangeHint, QUOTA_POOL_NAME_MAX, normalizeQuotaPoolName, canonicalJson, shortDigest, applyStickyReorder, buildPoolResolver, quotaExceededMessage, quotaErrorDetail, buildQuotaCore } from "./lib/quota.mjs";
+import { POINTS_UNIT, MAX_BUDGET_POINTS, POINT_PERIODS, normalizePointBudget, normalizeBillingFactor, effectiveBillingFactor, pointsToWeighted, weightedToPoints, computePointsUsage, pointsExceededMessage, pointsErrorDetail } from "./lib/points.mjs";
 import { CB_MAX_BACKOFF_FACTOR, CB_MAX_COOLDOWN_MS, CircuitBreaker } from "./lib/circuit.mjs";
 import { loadAssets } from "./lib/assets.mjs";
 import { wsAcceptUpgrade, wsRejectUpgrade, WsConn } from "./lib/ws-server.mjs";
@@ -101,6 +102,14 @@ const config = loadConfig();
 if (((config.productionTracking || {}).costPeakHours || []).length > 0) {
   console.log("[CONFIG] productionTracking.costPeakHours 已废弃:等值成本峰时段现复用各方案设置里的高峰时段,请到方案设置中配置");
 }
+// 点数预算是新的一层用户级预算，旧配置里没有这两个键；只在内存补默认值，不主动写盘。
+const pointSettingsRaw = config.pointSettings && typeof config.pointSettings === "object" ? config.pointSettings : {};
+config.pointSettings = {
+  defaultPeriod: POINT_PERIODS.includes(String(pointSettingsRaw.defaultPeriod || "")) ? String(pointSettingsRaw.defaultPeriod) : "month",
+  allowSelfSelect: pointSettingsRaw.allowSelfSelect !== false,
+};
+if (!config.pointBudgets || typeof config.pointBudgets !== "object" || Array.isArray(config.pointBudgets)) config.pointBudgets = {};
+
 const { port } = config;
 const dashboardPassword = config.dashboardPassword || "";
 const dataPath = path.join(__dirname, "data.json");
@@ -1483,6 +1492,14 @@ function getProfileNameBySuffix(suffix) {
 const { resolvePoolName, getPoolByName, getPoolForSuffix, getPoolSuffixes, listQuotaPools } =
   buildPoolResolver({ config, getProfileNameBySuffix, normalizeProfileSuffix, normalizeProfileProtocol });
 
+// 表单里“留空”表示不配置（点数倍率回落到 1.00），不能让它被 normalizeQuotaRate
+// 当成 0。null 会一路传到 runtime.currentPointRate 的 `v == null ? 1` 分支。
+function optionalQuotaRate(value) {
+  if (value === undefined || value === null) return null;
+  if (typeof value === "string" && value.trim() === "") return null;
+  return normalizeQuotaRate(value);
+}
+
 function listProfiles() {
   const group = Array.isArray(config.defaultProfileGroup) ? config.defaultProfileGroup : [];
   const responsesGroup = Array.isArray(config.responsesProfileGroup) ? config.responsesProfileGroup : [];
@@ -1492,6 +1509,8 @@ function listProfiles() {
     protocol: normalizeProfileProtocol(config.profiles[name].protocol),
     isDefault: !!config.profiles[name].isDefault,
     billingType: config.profiles[name].billingType || "on_demand",
+    // 管理页方案表单要回显「是否支持点数计费」；缺省视为开放（旧配置没有该字段）。
+    pointsEligible: config.profiles[name].pointsEligible !== false,
     upstream: config.profiles[name].upstream,
     responsesPath: config.profiles[name].responsesPath || "/v1/responses",
     // 用户管理表格给每个全局用户都渲染一行，保存时未填真实Key的行会落成
@@ -1510,6 +1529,10 @@ function listProfiles() {
     peakQuotaRate: normalizeQuotaRate(config.profiles[name].peakQuotaRate),
     offPeakQuotaRate: normalizeQuotaRate(config.profiles[name].offPeakQuotaRate),
     modelQuotaRates: normalizeModelQuotaRates(config.profiles[name].modelQuotaRates),
+    pointPeakRate: optionalQuotaRate(config.profiles[name].pointPeakRate),
+    pointOffPeakRate: optionalQuotaRate(config.profiles[name].pointOffPeakRate),
+    pointModelRates: normalizePointModelRates(config.profiles[name].pointModelRates),
+    pointsBillingFactor: normalizeBillingFactor(config.profiles[name].pointsBillingFactor),
     cacheReadQuotaRate: normalizeCacheReadQuotaRate(config.profiles[name].cacheReadQuotaRate),
     configured: !!config.profiles[name].upstream,
     inDefaultGroup: group.includes(name),
@@ -1563,6 +1586,9 @@ function createProfileRuntime(profileName, profile) {
     responsesPath: profile.responsesPath || "/v1/responses",
     isDefault: !!profile.isDefault,
     billingType: profile.billingType || "on_demand",
+    // 点数计费准入：默认 true（兼容存量方案），管理员可逐方案关闭。关闭后只影响
+    // 开启点数预算的成员；旧额度池模式成员不受影响。
+    pointsEligible: profile.pointsEligible !== false,
     quotaPool: resolvePoolName(profileName),
     upstream: profile.upstream,
     upstreamUrl,
@@ -1573,6 +1599,11 @@ function createProfileRuntime(profileName, profile) {
     peakQuotaRate: normalizeQuotaRate(profile.peakQuotaRate),
     offPeakQuotaRate: normalizeQuotaRate(profile.offPeakQuotaRate),
     modelQuotaRates: normalizeModelQuotaRates(profile.modelQuotaRates),
+    // 点数倍率独立于额度池倍率：留空 = 1.00（不是沿用额度池倍率）。
+    pointPeakRate: optionalQuotaRate(profile.pointPeakRate),
+    pointOffPeakRate: optionalQuotaRate(profile.pointOffPeakRate),
+    pointModelRates: normalizePointModelRates(profile.pointModelRates),
+    pointsBillingFactor: normalizeBillingFactor(profile.pointsBillingFactor),
     cacheReadQuotaRate: normalizeCacheReadQuotaRate(profile.cacheReadQuotaRate),
     peakModelAliases: normalizeModelAliases(profile.peakModelAliases || {}),
     globalUsers: { ...(config.users || {}) },
@@ -2280,6 +2311,8 @@ function noteFailoverServed(protocol, servedBy, userName, headName) {
 function getAvailableDefaultProfiles(apiKey, group) {
   const members = Array.isArray(group) ? group : (Array.isArray(config.defaultProfileGroup) ? config.defaultProfileGroup : []);
   const out = [];
+  // 点数模式下只把「开放点数计费」的方案交给候选；旧额度池模式成员不受此限制。
+  const pointsMode = pointsModeEnabled(resolveUserKey(apiKey, rt));
   for (const name of members) {
     const profile = config.profiles[name];
     if (!profile) continue;
@@ -2287,6 +2320,7 @@ function getAvailableDefaultProfiles(apiKey, group) {
     const runtime = runtimes[suffix];
     if (!runtime) continue;
     if (runtime.protocol !== "anthropic") continue;
+    if (pointsMode && runtime.pointsEligible === false) continue;
     if (isRateLimited(name)) continue;
     // isAvailable() (not status().state) so a profile whose cooldown has elapsed
     // is offered again — allowRequest() then performs the half-open transition.
@@ -2309,12 +2343,14 @@ function getAvailableDefaultProfiles(apiKey, group) {
 function getAvailableResponsesProfiles(apiKey, group) {
   const members = Array.isArray(group) ? group : (Array.isArray(config.responsesProfileGroup) ? config.responsesProfileGroup : []);
   const out = [];
+  const pointsMode = pointsModeEnabled(resolveUserKey(apiKey, rt));
   for (const name of members) {
     const profile = config.profiles[name];
     if (!profile) continue;
     const suffix = normalizeProfileSuffix(profile.suffix);
     const runtime = runtimes[suffix];
     if (!runtime || runtime.protocol !== "responses") continue;
+    if (pointsMode && runtime.pointsEligible === false) continue;
     if (isRateLimited(name)) continue;
     if (!runtime.breaker.isAvailable()) continue;
     // 同上：必须取 .allowed —— canUseProfile 恒返回对象，真值判定过滤不掉无权成员。
@@ -2332,11 +2368,14 @@ function getAvailableResponsesProfiles(apiKey, group) {
 // 对用户不可用（没给他配组头的 Key）时，组内其他成员有权就放行进门，候选构建会自动
 // 跳过无权成员；全组无权才在门口拒绝。成员遍历口径与上面两个过滤函数一致。
 function userHasUsableGroupProfile(apiKey, protocol, members) {
+  const pointsMode = pointsModeEnabled(resolveUserKey(apiKey, rt));
   for (const name of (Array.isArray(members) ? members : [])) {
     const profile = config.profiles[name];
     if (!profile) continue;
     const runtime = runtimes[normalizeProfileSuffix(profile.suffix)];
     if (!runtime || runtime.protocol !== protocol) continue;
+    // 点数模式下「有权」还不够：方案必须开放点数计费，否则门口放行后候选必空。
+    if (pointsMode && runtime.pointsEligible === false) continue;
     if (canUseProfile(apiKey, runtime).allowed) return true;
   }
   return false;
@@ -3086,7 +3125,8 @@ function getAccessibleProfiles(apiKey) {
   for (const profile of listProfiles()) {
     const runtime = runtimes[profile.suffix];
     if (runtime && canUseProfile(apiKey, runtime).allowed) {
-      out.push({ suffix: profile.suffix, name: profile.name, isDefault: profile.isDefault, protocol: profile.protocol });
+      out.push({ suffix: profile.suffix, name: profile.name, isDefault: profile.isDefault, protocol: profile.protocol,
+        pointsEligible: runtime.pointsEligible !== false });
     }
   }
   return out;
@@ -3185,19 +3225,26 @@ function sendOpenAiError(res, status, code, message, extraHeaders = {}) {
 // the responses pool so client probes never touch upstream billing endpoints.
 function handleLocalModelsRequest(req, res, inbound) {
   const apiKey = getApiKey(req);
+  const modelsUserKey = resolveUserKey(apiKey, rt);
+  const modelsPointsMode = pointsModeEnabled(modelsUserKey);
   let runtime = inbound.suffix ? runtimes[inbound.suffix] : null;
   let groupHasResponses = false;
   if (!inbound.suffix) {
-    // 顺着 Responses 组找第一个「这个 Key 能用」的方案，与 /v1/responses 的候选过滤同一
-    // 口径：组头对该成员无权时，请求路径会自动跳到后面有权的成员，探测口若死盯组头，
-    // Codex 在启动探测时就吃 401「Invalid API key」，根本走不到真正的请求。
+    // 手动首选是显式覆盖：即使它不在 Responses 自动组里，模型目录也应跟随真正的
+    // 请求落点，否则 Codex 的模型列表会和实际可用模型对不上。
+    const preferred = getPreferredProfileCandidate(apiKey, "responses");
+    if (preferred) runtime = preferred.runtime;
+    // 没有手动首选时，顺着 Responses 组找第一个「这个 Key 能用」的方案，与 /v1/responses
+    // 的候选过滤同一口径：组头对该成员无权时，请求路径会自动跳到后面有权的成员，探测口
+    // 若死盯组头，Codex 在启动探测时就吃 401「Invalid API key」，根本走不到真正的请求。
     const members = Array.isArray(config.responsesProfileGroup) ? config.responsesProfileGroup : [];
-    for (const name of members) {
+    for (const name of (runtime ? [] : members)) {
       const profile = config.profiles[name];
       if (!profile) continue;
       const candidate = runtimes[normalizeProfileSuffix(profile.suffix)];
       if (!candidate || candidate.protocol !== "responses") continue;
       groupHasResponses = true;
+      if (modelsPointsMode && candidate.pointsEligible === false) continue;
       if (canUseProfile(apiKey, candidate).allowed) { runtime = candidate; break; }
     }
   }
@@ -3215,6 +3262,10 @@ function handleLocalModelsRequest(req, res, inbound) {
   if (!canUseProfile(apiKey, runtime).allowed) {
     // 走到这里只剩后缀直连无权方案的口（默认入口上面已经选过可用成员）。
     sendOpenAiError(res, 401, "invalid_api_key", "Invalid API key for this profile.");
+    return;
+  }
+  if (modelsPointsMode && runtime.pointsEligible === false) {
+    sendOpenAiError(res, 403, "points_profile_not_allowed", "该方案未开放点数计费，不能通过点数预算使用。");
     return;
   }
   const ids = new Set((runtime.allowedModels || []).filter((m) => m && m !== "*"));
@@ -3338,7 +3389,18 @@ function recordUsage(apiKey, usage, model, suffix, _rt, session, client) {
   const billableInp = storeInp + Math.round(cacheInInput * cacheReadQuotaRate);
   const weighted = Math.round((billableInp + out) * rate);
 
-  const p = { profile: sfx, key, name: getUserName(key, runtime), inp: storeInp, out, cacheC, cacheR, m, tokenTotal: storeInp + out, weighted, today, hour, now: new Date().toISOString() };
+  // 点数计费是另一套价目：点数倍率独立于额度池倍率，再乘用户系数与方案系数。
+  // 非点数用户 billing=weighted，保证列不为空时与旧口径一致。系数与倍率都在
+  // 完成时刻冻结，之后改配置不影响这一行。
+  let billingWeighted = weighted;
+  const pointMode = pointsModeEnabled(key);
+  if (pointMode) {
+    const pointRate = currentPointRate(runtime, new Date(), m);
+    const factor = effectiveBillingFactor(getPointBudget(key).billingFactor, runtime?.pointsBillingFactor);
+    billingWeighted = Math.round((billableInp + out) * pointRate * factor);
+  }
+
+  const p = { profile: sfx, key, name: getUserName(key, runtime), inp: storeInp, out, cacheC, cacheR, m, tokenTotal: storeInp + out, weighted, billingWeighted, today, hour, now: new Date().toISOString() };
   const tx = db.transaction(() => {
     stmts.upsertUser.run(p);
     stmts.upsertDaily.run(p);
@@ -3352,6 +3414,15 @@ function recordUsage(apiKey, usage, model, suffix, _rt, session, client) {
     // 首条消息也推不出)时不落表 —— 否则所有人的无标识请求会挤进同一个假会话,比不记更糟。
     // 缺的这部分由接口的 unattributed 如实披露,不藏。
     if (session && session !== "nosession") stmts.upsertSession.run({ ...p, session, client: client || null });
+    // 点数用量按人落日/周/月三层桶；非点数用户不落，避免把额度池计权误当点数。
+    // billingWeighted 已在完成时刻按点数额率与系数冻结，后续统计直接读这张表。
+    if (pointMode) {
+      const updatedAt = Date.now();
+      const buckets = [["day", today], ["week", weekStartDateOf(today)], ["month", monthStartDateOf(today)]];
+      for (const [g, bucket] of buckets) {
+        stmts.upsertPointUsage.run({ key, g, bucket, billing: billingWeighted, updatedAt });
+      }
+    }
   });
   tx();
 }
@@ -3363,9 +3434,263 @@ function recordUsage(apiKey, usage, model, suffix, _rt, session, client) {
 const { pooledUsageForQuota, getPoolQuota, getUserPoolQuota, clearPooledUsageCache } =
   buildQuotaCore({ db, getPoolByName });
 
+function getPointBudget(userKey) {
+  const raw = config.pointBudgets && config.pointBudgets[userKey];
+  const budget = normalizePointBudget(raw);
+  // normalizePointBudget 对缺省周期的默认值是 day；没有显式写 period 的新预算
+  // 应跟随全局默认（默认 month），否则管理员只填预算就会意外变成日预算。
+  // 从未配置过的成员也走默认周期：管理端表格先显示 month，管理员打开开关保存时
+  // 不会因为「默认 day」而悄悄变成日预算。
+  if (!raw || (typeof raw === "object" && !POINT_PERIODS.includes(String(raw.period || "")))) {
+    budget.period = config.pointSettings?.defaultPeriod || "month";
+  }
+  return budget;
+}
+
+function pointsModeEnabled(userKey) {
+  return getPointBudget(userKey).enabled;
+}
+
+function checkPointBudget(apiKey, _rt) {
+  const runtime = _rt || rt;
+  const key = resolveUserKey(apiKey, runtime);
+  const budget = getPointBudget(key);
+  const today = cnDate();
+  let windowStart = periodStartDate(budget.period);
+  if (budget.startsAt && budget.startsAt > windowStart) windowStart = budget.startsAt;
+  let row = { used: 0, raw: 0, requests: 0 };
+  if (budget.enabled) {
+    row = stmts.sumUserWeightedRange.get(key, windowStart, today) || row;
+  }
+  const points = computePointsUsage({ budget, usedWeighted: row.used || 0, today });
+  return {
+    ...points,
+    key,
+    rawUsed: row.raw || 0,
+    requests: row.requests || 0,
+    retryAfterSeconds: budget.enabled ? secondsUntilNextPeriodEnd(budget.period) : 0,
+  };
+}
+
+// 首个「请求方案」是成员自己的手动首选。它只在成员可访问、协议匹配且该方案
+// 开放点数计费时生效；即使当前不在自动调度组，也允许作为显式覆盖参与请求。
+function getPreferredProfileSuffix(userKey, protocol) {
+  if (config.pointSettings && config.pointSettings.allowSelfSelect === false) return "";
+  if (!pointsModeEnabled(userKey)) return "";
+  const pref = stmts.getMemberProfilePreference.get(userKey);
+  if (!pref) return "";
+  const suffix = protocol === "responses" ? pref.preferred_responses : pref.preferred_anthropic;
+  return suffix || "";
+}
+
+// 把成员首选解析成候选。与 getAvailable*Profiles 不同：这里不受当前调度组限制，
+// 因为手动选择是显式覆盖「默认自动」。权限仍由分配关系、协议、pointsEligible 决定。
+function getPreferredProfileCandidate(apiKey, protocol) {
+  const key = resolveUserKey(apiKey, rt);
+  const suffix = getPreferredProfileSuffix(key, protocol);
+  if (!suffix) return null;
+  const runtime = runtimes[normalizeProfileSuffix(suffix)];
+  if (!runtime || runtime.protocol !== protocol) return null;
+  if (runtime.pointsEligible === false) return null;
+  if (!canUseProfile(apiKey, runtime).allowed) return null;
+  return { name: runtime.profileName, suffix: runtime.suffix || normalizeProfileSuffix(suffix), runtime };
+}
+
+function clearStickyForUser(userKey, protocol) {
+  const prefixes = protocol
+    ? [`${protocol}|${userKey}|`]
+    : [`anthropic|${userKey}|`, `responses|${userKey}|`];
+  for (const key of [...stickyBindings.keys()]) {
+    if (prefixes.some((p) => key.startsWith(p))) stickyBindings.delete(key);
+  }
+}
+
+function daysAgoDate(days) {
+  return new Date(Date.parse(cnDate() + "T00:00:00Z") - days * 86400000).toISOString().slice(0, 10);
+}
+
+// 成员方案卡里展示的 jx-* 模型映射。用默认映射 + 高峰映射的并集，
+// 这样平峰时段也能看到“高峰时会换成哪个真实模型”，不会因为当前时段而漏项。
+const MODEL_TIER = {
+  "jx-fable": { key: "fable", label: "最强级", rank: 0 },
+  "jx-opus": { key: "opus", label: "高级", rank: 1 },
+  "jx-sonnet": { key: "sonnet", label: "中级", rank: 2 },
+  "jx-haiku": { key: "haiku", label: "普通", rank: 3 },
+};
+function modelTier(alias) {
+  return MODEL_TIER[String(alias || "").toLowerCase()] || null;
+}
+function pointModelAliases(runtime) {
+  const defaults = (runtime && runtime.modelAliases) || {};
+  const peak = (runtime && runtime.peakModelAliases) || {};
+  const inPeak = isInPeakHours(runtime && runtime.peakHours);
+  const names = [...new Set([...Object.keys(defaults), ...Object.keys(peak)])]
+    .filter((alias) => /^jx-/i.test(alias))
+    .sort((a, b) => {
+      const ta = modelTier(a), tb = modelTier(b);
+      if (ta || tb) return (ta ? ta.rank : 99) - (tb ? tb.rank : 99);
+      return a.localeCompare(b);
+    });
+  return names.map((alias) => {
+    // 只下发当前时段实际会用的模型；高峰换模由服务端按当前时间切换，
+    // 不再把“高峰模型名”提前展示给成员。
+    const target = String((inPeak && peak[alias]) || defaults[alias] || peak[alias] || "");
+    const rate = currentPointRate(runtime, new Date(), target);
+    const tier = modelTier(alias);
+    return { alias, target, rate, inPeak,
+      tier: tier ? tier.key : "", tierLabel: tier ? tier.label : "" };
+  }).filter((m) => m.target);
+}
+
+function preferredPlanStatus(apiKey, plan, protocol) {
+  const runtime = runtimes[normalizeProfileSuffix(plan.suffix)];
+  if (!runtime) return { available: false, status: "missing", reason: "方案已删除", until: null };
+  if (runtime.protocol !== protocol) return { available: false, status: "protocol", reason: "协议不匹配", until: null };
+  if (runtime.pointsEligible === false) return { available: false, status: "not_allowed", reason: "未开放点数计费", until: null };
+  const access = canUseProfile(apiKey, runtime);
+  if (!access.allowed) return { available: false, status: "no_access", reason: "未分配该方案或 Key 已失效", until: null };
+  const rl = getRateLimitInfo(runtime.profileName);
+  if (rl) {
+    return { available: false, status: "rate_limited", until: new Date(rl.resumeAt).toISOString(),
+      reason: `限流中，预计 ${notifierApi.beijingTimeString(new Date(rl.resumeAt))} 恢复` };
+  }
+  const br = runtime.breaker && typeof runtime.breaker.status === "function" ? runtime.breaker.status() : null;
+  if (br && br.state === "OPEN") {
+    const secs = Math.max(0, Math.ceil((br.cooldownRemaining || 0) / 1000));
+    return { available: false, status: "breaker", until: new Date(Date.now() + secs * 1000).toISOString(),
+      reason: `熔断中，约 ${secs}s 后重试` };
+  }
+  let q = null;
+  try { q = checkTokenQuota(apiKey, plan.suffix, runtime); } catch { q = null; }
+  if (q && q.limit > 0 && !q.allowed) {
+    return { available: false, status: "quota", until: null,
+      reason: `额度已用尽（${q.used.toLocaleString("zh-CN")} / ${q.limit.toLocaleString("zh-CN")}，${q.source || "配额"}）`,
+      quota: { used: q.used, limit: q.limit, remaining: q.remaining, source: q.source } };
+  }
+  return { available: true, status: "ok", reason: "", until: null, quota: q ? { used: q.used, limit: q.limit, remaining: q.remaining, source: q.source } : null };
+}
+
+function buildPreferredProfiles(apiKey) {
+  const key = resolveUserKey(apiKey, rt);
+  const pref = stmts.getMemberProfilePreference.get(key) || {};
+  const accessible = getAccessibleProfiles(apiKey);
+  const pointsMode = pointsModeEnabled(key);
+  const out = { plans: { anthropic: [], responses: [] }, auto: { anthropic: null, responses: null } };
+  for (const protocol of ["anthropic", "responses"]) {
+    const suffix = protocol === "responses" ? pref.preferred_responses : pref.preferred_anthropic;
+    const profile = accessible.find((p) => p.suffix === suffix && p.protocol === protocol);
+    let list = [];
+    let group = null;
+    try {
+      group = resolveRequestGroup(protocol);
+      list = protocol === "responses"
+        ? getAvailableResponsesProfiles(apiKey, group.members)
+        : getAvailableDefaultProfiles(apiKey, group.members);
+    } catch {
+      list = [];
+      group = null;
+    }
+    const groupSet = new Set(group && Array.isArray(group.members) ? group.members : []);
+    const plans = accessible
+      .filter((p) => p.protocol === protocol && (!pointsMode || p.pointsEligible !== false))
+      .map((p) => {
+        const planRuntime = runtimes[normalizeProfileSuffix(p.suffix)];
+        const status = preferredPlanStatus(apiKey, p, protocol);
+        return {
+          suffix: p.suffix,
+          name: p.name,
+          active: status.available,
+          status: status.status,
+          reason: status.reason,
+          until: status.until,
+          quota: status.quota || null,
+          inGroup: groupSet.has(p.name),
+          isDefault: !!p.isDefault,
+          inPeak: isInPeakHours(planRuntime && planRuntime.peakHours),
+          modelAliases: pointModelAliases(planRuntime),
+        };
+      });
+    out.plans[protocol] = plans;
+    let selected = profile ? plans.find((p) => p.suffix === profile.suffix) || null : null;
+    // 已保存的首选可能在管理员改配置后变得不可选（关闭点数计费/删除/取消分配）；
+    // 即使它不在 plans 里，也要把真实原因带回前端，避免只显示笼统的“不可选”。
+    if (!selected && suffix) {
+      const known = listProfiles().find((p) => p.suffix === normalizeProfileSuffix(suffix));
+      const st = known ? preferredPlanStatus(apiKey, known, protocol)
+        : { available: false, status: "missing", reason: "方案已删除", until: null };
+      const knownRuntime = known ? runtimes[normalizeProfileSuffix(known.suffix)] : null;
+      selected = { suffix, name: known ? known.name : suffix, active: false,
+        status: st.status, reason: st.reason, until: st.until || null,
+        inPeak: isInPeakHours(knownRuntime && knownRuntime.peakHours) };
+    }
+    out[protocol] = selected
+      ? { suffix: selected.suffix, name: selected.name, active: !!selected.active,
+          status: selected.status || "missing", reason: selected.reason || "方案不可选",
+          until: selected.until || null, inPeak: !!selected.inPeak }
+      : { suffix: "", name: "", active: false, status: "", reason: "", until: null, inPeak: false };
+    // 「默认自动」的可见解释：当前生效组名 + 组内第一个可用方案。成员看到的是
+    // 调度结果，而不是一个凭空写死的默认方案。
+    out.auto[protocol] = {
+      groupName: group ? (group.groupName === BASE_GROUP_TOKEN ? "基础组" : (group.groupName || "")) : "",
+      source: group ? (group.source || "") : "",
+      available: list.length > 0,
+      headSuffix: list[0] ? list[0].suffix : "",
+      headName: list[0] ? list[0].name : "",
+      inPeak: list[0]?.runtime ? isInPeakHours(list[0].runtime.peakHours) : false,
+      candidates: list.map((c) => ({ suffix: c.suffix, name: c.name })),
+    };
+  }
+  return out;
+}
+
+function getPointBudgetsPayload() {
+  const today = cnDate();
+  const start30 = daysAgoDate(29);
+  const users = [];
+  for (const [key, gu] of Object.entries(config.users || {})) {
+    const budget = getPointBudget(key);
+    const points = checkPointBudget(key);
+    const last30 = stmts.sumUserWeightedRange.get(key, start30, today) || { used: 0, raw: 0, requests: 0 };
+    const last30dPoints = weightedToPoints(last30.used || 0);
+    const pref = stmts.getMemberProfilePreference.get(key) || {};
+    users.push({
+      key,
+      username: gu.username || "",
+      disabled: !!gu.disabled,
+      superUser: !!(gu.superUser || gu.admin),
+      budget,
+      usage: {
+        usedPoints: points.usedPoints,
+        usedWeighted: points.usedWeighted,
+        requests: points.requests,
+        last30dPoints,
+        suggestedMonthlyPoints: last30dPoints > 0 ? Math.max(1, Math.round(last30dPoints * 0.8)) : 0,
+      },
+      remainingPoints: budget.enabled ? points.remainingPoints : null,
+      allowed: budget.enabled ? points.allowed : true,
+      exhausted: budget.enabled ? points.exhausted : false,
+      pct: points.pct,
+      periodStart: points.periodStart,
+      periodEnd: points.periodEnd,
+      preferred: {
+        anthropic: pref.preferred_anthropic || "",
+        responses: pref.preferred_responses || "",
+      },
+      profiles: getAccessibleProfiles(key),
+    });
+  }
+  return {
+    unitTokens: POINTS_UNIT,
+    defaultPeriod: config.pointSettings?.defaultPeriod || "month",
+    allowSelfSelect: config.pointSettings?.allowSelfSelect !== false,
+    users,
+  };
+}
+
 function checkTokenQuota(apiKey, suffix, _rt, model = null) {
   const runtime = _rt || rt;
   const key = resolveUserKey(apiKey, runtime);
+  const pointsMode = pointsModeEnabled(key);
   const sfx = normalizeProfileSuffix(suffix) || runtime?.suffix || "";
   const today = cnDate();
   // Usage is summed over every profile in the pool: the allowance belongs to the
@@ -3414,16 +3739,17 @@ function checkTokenQuota(apiKey, suffix, _rt, model = null) {
     ? Math.min(...poolRts.map((r) => (r.cacheReadQuotaRate != null ? r.cacheReadQuotaRate : 0)))
     : 0;
 
-  // Per-user pool quota overrides the pool-wide quota
-  const userQuota = getUserPoolQuota(poolName, key);
+  // Per-user pool quota overrides the pool-wide quota. 点数模式先把「个人日配额」
+  // 让位给用户级周期预算，只保留池级上限做团队护栏。
+  const userQuota = pointsMode ? 0 : getUserPoolQuota(poolName, key);
   const poolQuota = getPoolQuota(poolName);
   const baseLimit = userQuota > 0 ? userQuota : poolQuota;
   const bonus = op.bonus > 0 ? op.bonus : 0;
   const shared = suffixes.length > 1;
-  const meta = { rawUsed, discounted, rate, rateIsDefault, inPeak, model, cacheRead, cacheInInput, cacheReadQuotaRate, pool: poolName, poolLabel, poolProfiles: suffixes, poolShared: shared };
+  const meta = { rawUsed, discounted, rate, rateIsDefault, inPeak, model, cacheRead, cacheInInput, cacheReadQuotaRate, pool: poolName, poolLabel, poolProfiles: suffixes, poolShared: shared, pointsMode };
 
   if (baseLimit <= 0) {
-    return { allowed: true, limit: 0, used, remaining: Infinity, source: "无限制", bonus: 0, resetApplied: !!baseline, ...meta };
+    return { allowed: true, limit: 0, used, remaining: Infinity, source: pointsMode ? "点数模式" : "无限制", bonus: 0, resetApplied: !!baseline, ...meta };
   }
 
   const limit = baseLimit + bonus;
@@ -3432,7 +3758,7 @@ function checkTokenQuota(apiKey, suffix, _rt, model = null) {
     limit,
     used,
     remaining: Math.max(0, limit - used),
-    source: userQuota > 0 ? "个人配额" : "额度池配额",
+    source: pointsMode ? "点数模式·团队池护栏" : userQuota > 0 ? "个人配额" : "额度池配额",
     bonus,
     resetApplied: !!baseline,
     ...meta,
@@ -3927,6 +4253,8 @@ function getPublicSettings() {
     activeProfile: getDefaultProfileName(),
     profiles: listProfiles(),
     quotaPools: listQuotaPools(),
+    pointSettings: { ...config.pointSettings },
+    pointBudgets: config.pointBudgets,
     defaultProfileGroup: Array.isArray(config.defaultProfileGroup) ? config.defaultProfileGroup : [],
     responsesProfileGroup: Array.isArray(config.responsesProfileGroup) ? config.responsesProfileGroup : [],
     selectedProfileSuffix: defaultSuffix,
@@ -4106,6 +4434,7 @@ const SETTINGS_DEPS = {
   normalizeQuotaRate,
   normalizeCacheReadQuotaRate,
   normalizeModelQuotaRates,
+  normalizeBillingFactor,
   QUOTA_POOL_NAME_MAX,
   normalizeQuotaPoolName,
   saveConfig,
@@ -4169,6 +4498,7 @@ const USAGE_DEPS = {
   normalizeQuotaRate,
   lookupModelQuotaRate,
   currentQuotaRate,
+  currentPointRate,
   nextRateChangeHint,
   totalUsageTokens,
   normalizeProfileSuffix,
@@ -4177,6 +4507,9 @@ const USAGE_DEPS = {
   getAccessibleProfiles,
   effectiveModelAliases,
   checkTokenQuota,
+  getUserPoints: checkPointBudget,
+  getPreferredProfiles: buildPreferredProfiles,
+  pointSelfSelectAllowed: () => config.pointSettings?.allowSelfSelect !== false,
   getCheckInStatus: memberRewardsApi.getCheckInStatus,
   getQuotaRequestStatus: memberRewardsApi.getQuotaRequestStatus,
   buildUsageHeatmap: memberRewardsApi.buildUsageHeatmap,
@@ -4234,6 +4567,7 @@ const PROXY_CORE_DEPS = {
   checkAndRecordRate,
   checkIpRateLimit,
   checkModelAllowed,
+  checkPointBudget,
   checkTokenQuota,
   classifyInboundPath,
   classifyRateLimit,
@@ -4245,11 +4579,15 @@ const PROXY_CORE_DEPS = {
   getAvailableDefaultProfiles,
   getAvailableResponsesProfiles,
   getClientIp,
+  getRateLimitInfo,
+  getPreferredProfileCandidate,
+  getPreferredProfileSuffix,
   getProfileInflight,
   getRealKey,
   getStickyProfile,
   getUserName,
   handleLocalModelsRequest,
+  isRateLimited,
   isSuperUser,
   markRateLimited,
   maskAuditKey,
@@ -4261,6 +4599,8 @@ const PROXY_CORE_DEPS = {
   notifierApi,
   parseRetryAfterMs,
   port,
+  pointsErrorDetail,
+  pointsExceededMessage,
   productionEnabled,
   productionTracker,
   quotaErrorDetail,
@@ -4829,6 +5169,193 @@ const server = http.createServer((req, res) => {
         config.restrictGroupSuffix = !!on;
         saveConfig(config);
         recordAdminAudit(req, "settings.restrict_suffix", "全局", on ? "开启限制直连（默认组仅允许 /v1、/v1/responses 入口）" : "关闭限制直连（默认组允许直连 /<suffix>/... 访问）");
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: true }));
+      } catch (err) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: err.message }));
+      }
+    }).catch(() => {
+      res.writeHead(413, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Request too large" }));
+    });
+    return;
+  }
+
+  // ─── 点数预算 API ───────────────────────────────────────────────────────────
+  // 与 /api/restrict-group-suffix 同范式：表单外 JSON 即时保存 + 自己的审计。
+  // 预算放在 config.pointBudgets（按完整虚拟 Key 键控），不走 applySettings 白名单。
+  if (req.method === "GET" && req.url === "/api/point-budgets") {
+    if (!checkAuth(req)) { res.writeHead(401); res.end("Unauthorized"); return; }
+    try {
+      const body = JSON.stringify(getPointBudgetsPayload());
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(body);
+    } catch (err) {
+      console.warn(`[POINTS] 生成点数预算列表失败: ${err.message}`);
+      res.writeHead(500, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "点数预算列表生成失败" }));
+    }
+    return;
+  }
+
+  if (req.method === "GET" && req.url.split("?")[0] === "/api/point-usage") {
+    if (!checkAuth(req)) { res.writeHead(401); res.end("Unauthorized"); return; }
+    try {
+      const u = new URL(req.url, "http://localhost");
+      const granularity = String(u.searchParams.get("granularity") || "day");
+      if (!["day", "week", "month"].includes(granularity)) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "granularity 必须是 day/week/month" }));
+        return;
+      }
+      const key = String(u.searchParams.get("key") || "");
+      const from = String(u.searchParams.get("from") || "0000-01-01");
+      const to = String(u.searchParams.get("to") || "9999-12-31");
+      const limit = Math.min(5000, Math.max(1, Number(u.searchParams.get("limit")) || 400));
+      const rows = key
+        ? stmts.pointUsageByUser.all(key, granularity, from, to, limit)
+        : stmts.pointUsageAll.all(granularity, from, to, limit);
+      const out = rows.map((r) => ({
+        key: r.user_key,
+        username: getUserName(r.user_key, rt),
+        granularity: r.granularity,
+        bucketStart: r.bucket_start,
+        points: weightedToPoints(r.billing_weighted_tokens),
+        billingWeightedTokens: r.billing_weighted_tokens,
+        requests: r.requests,
+        updatedAt: r.updated_at,
+      }));
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ unitTokens: POINTS_UNIT, granularity, from, to, rows: out }));
+    } catch (err) {
+      res.writeHead(500, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: err.message }));
+    }
+    return;
+  }
+
+  const parsePointBudgetFields = (input) => {
+    const budgetPoints = Number(input.budgetPoints);
+    if (!Number.isInteger(budgetPoints) || budgetPoints < 0 || budgetPoints > MAX_BUDGET_POINTS) {
+      throw new Error(`预算点数必须是 0..${MAX_BUDGET_POINTS} 的整数`);
+    }
+    const period = String(input.period || config.pointSettings?.defaultPeriod || "month");
+    if (!POINT_PERIODS.includes(period)) throw new Error("周期必须是 day/week/month");
+    const startsAt = String(input.startsAt || cnDate());
+    const startsAtMs = Date.parse(`${startsAt}T00:00:00Z`);
+    // 只做 Date.parse 不够：2026-02-30 会被规范成 3 月 2 日而不是 NaN，
+    // 必须再回写一次 ISO 日期，确保是真实存在的日历日。
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(startsAt) || Number.isNaN(startsAtMs)
+      || new Date(startsAtMs).toISOString().slice(0, 10) !== startsAt) {
+      throw new Error("startsAt 格式应为 YYYY-MM-DD");
+    }
+    if (startsAt > cnDate()) throw new Error("startsAt 不能晚于今天");
+    const note = typeof input.note === "string" ? input.note.trim().slice(0, 200) : "";
+    // 用户计费系数：只影响点数，0.1~10 两位小数。undefined 表示“本次没提交”，
+    // 批量接口靠它保留每个人原来的系数；单条保存会在下面补成 1.00。
+    const billingFactor = input.billingFactor === undefined ? null : normalizeBillingFactor(input.billingFactor);
+    // JSON 里一般就是布尔值；兼容手工调用时传来的 "false"/0，避免把「关闭」当成开启。
+    const enabled = !(input.enabled === false || input.enabled === "false" || input.enabled === 0 || input.enabled === "0");
+    return { enabled, budgetPoints, period, startsAt, note, billingFactor };
+  };
+
+  if (req.method === "POST" && req.url === "/api/point-budget/save") {
+    if (!checkAuth(req)) { res.writeHead(401); res.end("Unauthorized"); return; }
+    if (!checkCsrf(req)) { res.writeHead(403); res.end("CSRF validation failed"); return; }
+    readBody(req, 100_000).then((buf) => {
+      try {
+        const input = JSON.parse(buf.toString());
+        const key = String(input.key || "");
+        if (!Object.prototype.hasOwnProperty.call(config.users || {}, key)) throw new Error("成员不存在");
+        const next = parsePointBudgetFields(input);
+        if (!config.pointBudgets || typeof config.pointBudgets !== "object") config.pointBudgets = {};
+        const before = config.pointBudgets[key] || null;
+        // 没提交系数时保留该成员原值；新成员才落到 1.00。避免旧客户端/脚本一保存
+        // 就把运营系数悄悄清掉。
+        if (next.billingFactor == null) next.billingFactor = (before && before.billingFactor) ?? 1;
+        config.pointBudgets[key] = next;
+        try { saveConfig(config); }
+        catch (err) {
+          if (before) config.pointBudgets[key] = before; else delete config.pointBudgets[key];
+          throw err;
+        }
+        recordAdminAudit(req, "pointbudget.save", config.users[key].username || key,
+          `点数预算 ${before ? JSON.stringify(before) : "未设置"} → ${JSON.stringify(next)}，当前已用 ${checkPointBudget(key).usedPoints} 点`, "quota");
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: true, budget: next }));
+      } catch (err) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: err.message }));
+      }
+    }).catch(() => {
+      res.writeHead(413, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Request too large" }));
+    });
+    return;
+  }
+
+  if (req.method === "POST" && req.url === "/api/point-budget/bulk") {
+    if (!checkAuth(req)) { res.writeHead(401); res.end("Unauthorized"); return; }
+    if (!checkCsrf(req)) { res.writeHead(403); res.end("CSRF validation failed"); return; }
+    readBody(req, 200_000).then((buf) => {
+      try {
+        const input = JSON.parse(buf.toString());
+        const keys = Array.isArray(input.keys) ? [...new Set(input.keys.map(String))] : [];
+        if (!keys.length) throw new Error("keys 不能为空");
+        if (keys.length > 500) throw new Error("单次最多设置 500 人");
+        for (const key of keys) {
+          if (!Object.prototype.hasOwnProperty.call(config.users || {}, key)) throw new Error(`成员不存在: ${key}`);
+        }
+        const fields = parsePointBudgetFields(input);
+        if (!config.pointBudgets || typeof config.pointBudgets !== "object") config.pointBudgets = {};
+        const before = {};
+        for (const key of keys) before[key] = config.pointBudgets[key] || null;
+        for (const key of keys) {
+          config.pointBudgets[key] = {
+            ...fields,
+            billingFactor: fields.billingFactor ?? (before[key] && before[key].billingFactor) ?? 1,
+          };
+        }
+        try { saveConfig(config); }
+        catch (err) {
+          for (const key of keys) {
+            if (before[key]) config.pointBudgets[key] = before[key];
+            else delete config.pointBudgets[key];
+          }
+          throw err;
+        }
+        recordAdminAudit(req, "pointbudget.bulk", "全局",
+          `批量设置 ${keys.length} 人的点数预算: ${JSON.stringify(fields)}`, "quota");
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: true, count: keys.length }));
+      } catch (err) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: err.message }));
+      }
+    }).catch(() => {
+      res.writeHead(413, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Request too large" }));
+    });
+    return;
+  }
+
+  if (req.method === "POST" && req.url === "/api/point-budget/settings") {
+    if (!checkAuth(req)) { res.writeHead(401); res.end("Unauthorized"); return; }
+    if (!checkCsrf(req)) { res.writeHead(403); res.end("CSRF validation failed"); return; }
+    readBody(req, 10_000).then((buf) => {
+      try {
+        const input = JSON.parse(buf.toString());
+        if (typeof input.allowSelfSelect !== "boolean") throw new Error("allowSelfSelect 必须是布尔值");
+        if (!config.pointSettings || typeof config.pointSettings !== "object") {
+          config.pointSettings = { defaultPeriod: "month", allowSelfSelect: true };
+        }
+        const before = config.pointSettings.allowSelfSelect !== false;
+        config.pointSettings.allowSelfSelect = input.allowSelfSelect;
+        try { saveConfig(config); }
+        catch (err) { config.pointSettings.allowSelfSelect = before; throw err; }
+        recordAdminAudit(req, "pointbudget.settings", "全局",
+          `允许成员自选首选方案: ${before} → ${input.allowSelfSelect}`, "quota");
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ ok: true }));
       } catch (err) {
@@ -5639,11 +6166,17 @@ const server = http.createServer((req, res) => {
         prof.peakQuotaRate = normalizeQuotaRate(prof.peakQuotaRate);
         prof.offPeakQuotaRate = normalizeQuotaRate(prof.offPeakQuotaRate);
         prof.modelQuotaRates = normalizeModelQuotaRates(prof.modelQuotaRates || {});
+        prof.pointPeakRate = optionalQuotaRate(prof.pointPeakRate);
+        prof.pointOffPeakRate = optionalQuotaRate(prof.pointOffPeakRate);
+        prof.pointModelRates = normalizePointModelRates(prof.pointModelRates || {});
+        prof.pointsBillingFactor = normalizeBillingFactor(prof.pointsBillingFactor);
         prof.cacheReadQuotaRate = normalizeCacheReadQuotaRate(prof.cacheReadQuotaRate);
         prof.modelContextWindows = normalizeNumberMap(prof.modelContextWindows);
         prof.modelMultimodal = normalizeBooleanMap(prof.modelMultimodal);
         prof.imageBridge = normalizeImageBridge(prof.imageBridge);
         prof.billingType = ["coding_plan", "token_plan", "on_demand"].includes(prof.billingType) ? prof.billingType : "on_demand";
+        // 点数计费准入是新增的可选字段：旧方案代码没有它时默认开放，显式 false 才关闭。
+        prof.pointsEligible = prof.pointsEligible !== false;
         // 垃圾值会让运行期静默失效（createProfileRuntime 里直接归一化它），所以也过一遍。
         prof.toolPatternCompat = toolPatternApi.normalizeToolPatternCompat(prof.toolPatternCompat);
         // 表单字段优先，空则回退代码里的值；anthropic 方案上直接清掉，免得留一个
@@ -6668,6 +7201,11 @@ const server = http.createServer((req, res) => {
         const row = stmts.getQuotaRequest.get(id);
         if (!row) throw new Error(`申请 #${id} 不存在`);
         if (row.status !== "pending") throw new Error(`申请 #${row.id} 已处理过`);
+        if (pointsModeEnabled(row.user_key)) {
+          const e = new Error("该成员已启用点数预算，加量申请不适用；请改用「点数预算」调整本期预算");
+          e.statusCode = 409;
+          throw e;
+        }
         const validPools = memberRewardsApi.getUserPoolNames(row.user_key);
         if (!validPools.includes(pool)) throw new Error(`该成员不在额度池「${memberRewardsApi.poolLabelOf(pool)}」中（可发放：${validPools.map(memberRewardsApi.poolLabelOf).join("、") || "无"}）`);
         const baseLimit = getUserPoolQuota(pool, row.user_key) || getPoolQuota(pool);
@@ -6691,7 +7229,7 @@ const server = http.createServer((req, res) => {
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ ok: true }));
       } catch (err) {
-        res.writeHead(400, { "Content-Type": "application/json" });
+        res.writeHead(err.statusCode || 400, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ error: err.message }));
       }
     }).catch(() => { res.writeHead(413); res.end("Request too large"); });
@@ -7527,6 +8065,11 @@ const server = http.createServer((req, res) => {
     const apiKey = getApiKey(req);
     try {
       if (!hasGlobalUser(apiKey)) throw new Error("认证失败：请提供有效的虚拟Key");
+      if (pointsModeEnabled(resolveUserKey(apiKey, rt))) {
+        res.writeHead(409, { "Content-Type": "application/json; charset=utf-8" });
+        res.end(JSON.stringify({ error: "点数模式下签到不适用；点数预算由管理员调整，本期额度请联系管理员" }));
+        return;
+      }
       const result = memberRewardsApi.performCheckIn(apiKey, getClientIp(req));
       res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
       res.end(JSON.stringify(result));
@@ -7543,12 +8086,17 @@ const server = http.createServer((req, res) => {
     readBody(req, 10_000).then(buf => {
       try {
         if (!hasGlobalUser(apiKey)) throw new Error("认证失败：请提供有效的虚拟Key");
+        if (pointsModeEnabled(resolveUserKey(apiKey, rt))) {
+          const e = new Error("点数模式下加量申请不适用；点数预算由管理员调整，本期额度请联系管理员");
+          e.statusCode = 409;
+          throw e;
+        }
         const { reason, pool } = JSON.parse(buf.toString() || "{}");
         const result = memberRewardsApi.createQuotaRequest(apiKey, reason, pool, getClientIp(req));
         res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
         res.end(JSON.stringify(result));
       } catch (err) {
-        res.writeHead(400, { "Content-Type": "application/json; charset=utf-8" });
+        res.writeHead(err.statusCode || 400, { "Content-Type": "application/json; charset=utf-8" });
         res.end(JSON.stringify({ error: err.message }));
       }
     }).catch(() => { res.writeHead(413); res.end("Request too large"); });
@@ -7992,6 +8540,76 @@ const server = http.createServer((req, res) => {
         res.end(JSON.stringify({ ok: true, marked: count }));
       } catch (err) {
         res.writeHead(400, { "Content-Type": "application/json; charset=utf-8" });
+        res.end(JSON.stringify({ error: err.message }));
+      }
+    }).catch(() => { res.writeHead(413); res.end("Request too large"); });
+    return;
+  }
+
+  // 成员自选「请求方案」（软首选）。虚拟 Key 鉴权，只改自己；无 CSRF，沿用
+  // /api/checkin、/api/my-notify 的成员写接口口径。
+  if (req.method === "POST" && req.url.split("?")[0] === "/api/my-preferred-profile") {
+    const apiKey = getApiKey(req);
+    readBody(req, 10_000).then((buf) => {
+      try {
+        if (!hasGlobalUser(apiKey)) {
+          const e = new Error("认证失败：请提供有效的虚拟Key");
+          e.statusCode = 401;
+          throw e;
+        }
+        const key = resolveUserKey(apiKey, rt);
+        if (!pointsModeEnabled(key)) {
+          const e = new Error("当前未启用点数预算，无需选择首选方案");
+          e.statusCode = 409;
+          throw e;
+        }
+        if (config.pointSettings && config.pointSettings.allowSelfSelect === false) {
+          const e = new Error("管理员已关闭成员自选方案");
+          e.statusCode = 403;
+          throw e;
+        }
+        const input = JSON.parse(buf.toString() || "{}");
+        const protocol = String(input.protocol || "");
+        if (protocol !== "anthropic" && protocol !== "responses") {
+          const e = new Error("protocol 必须是 anthropic 或 responses");
+          e.statusCode = 400;
+          throw e;
+        }
+        const suffix = input.suffix ? String(input.suffix) : "";
+        const targetProfile = suffix
+          ? getAccessibleProfiles(apiKey).find((p) => p.suffix === suffix && p.protocol === protocol)
+          : null;
+        if (suffix && !targetProfile) {
+          const e = new Error("无权使用该方案");
+          e.statusCode = 403;
+          throw e;
+        }
+        if (suffix && targetProfile.pointsEligible === false) {
+          const e = new Error("该方案未开放点数计费，不能设为首选");
+          e.statusCode = 403;
+          throw e;
+        }
+        const before = stmts.getMemberProfilePreference.get(key) || {};
+        const nextAnth = protocol === "anthropic" ? suffix : (before.preferred_anthropic || "");
+        const nextResp = protocol === "responses" ? suffix : (before.preferred_responses || "");
+        stmts.upsertMemberProfilePreference.run({
+          key,
+          anth: nextAnth || null,
+          resp: nextResp || null,
+          updatedAt: Date.now(),
+        });
+        clearStickyForUser(key, protocol);
+        const beforeValue = protocol === "responses" ? (before.preferred_responses || "") : (before.preferred_anthropic || "");
+        recordAudit(getUserName(apiKey) || key, "profile_preference.save", key,
+          `${protocol} 首选方案: ${beforeValue || "自动"} → ${suffix || "自动"}`, getClientIp(req), "member");
+        res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+        res.end(JSON.stringify({
+          ok: true, protocol, suffix,
+          name: targetProfile ? targetProfile.name : "",
+          preferred: { anthropic: nextAnth, responses: nextResp },
+        }));
+      } catch (err) {
+        res.writeHead(err.statusCode || 400, { "Content-Type": "application/json; charset=utf-8" });
         res.end(JSON.stringify({ error: err.message }));
       }
     }).catch(() => { res.writeHead(413); res.end("Request too large"); });

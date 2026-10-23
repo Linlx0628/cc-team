@@ -11,6 +11,24 @@ const fmtT=n=>n.toLocaleString("zh-CN");
 // markup, so escape here rather than trusting them.
 const esc=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const fmtTk=n=>{if(n>=1e6)return(n/1e6).toFixed(1)+"M";if(n>=1e3)return(n/1e3).toFixed(1)+"k";return n.toString()};
+// ── 点数计费(1 点 = 10,000 计权 token)──
+// 预算/已用/派生字段都由服务端算好放在 body.points(lib/personal-usage.mjs),
+// 这里只负责显示与「倍率→点数」的换算,绝不自己推余额。points.enabled=false 时
+// 整块点数 UI 消失,页面回到原来的 token 配额口径。
+const POINT_UNIT=10000;
+const PERIOD_LABEL={day:'今日',week:'本周',month:'本月'};
+function pointsData(){return D&&D.points&&D.points.enabled?D.points:null}
+function pointsUnit(){const p=pointsData();return p&&p.unitTokens>0?p.unitTokens:POINT_UNIT}
+function isPointsMode(){return !!(pointsData()||(D&&D.quota&&D.quota.pointsMode))}
+function fmtP(n){const v=Math.round((Number(n)||0)*10)/10;return Number.isInteger(v)?fmtT(v):v.toFixed(1)}
+function fmtPeriod(p){
+  if(!p)return'';
+  const base=PERIOD_LABEL[p.period]||'本周期';
+  let s=p.periodStart&&p.periodEnd?base+'（'+p.periodStart+' ~ '+p.periodEnd+'）':base;
+  const starts=p.startsAt?String(p.startsAt).slice(0,10):'';
+  if(starts&&starts!==p.periodStart)s+=' · 自 '+starts+' 起算';
+  return s;
+}
 const COL=["#2f6e50","#4a6fa5","#c2604f","#c4a23a","#7a6bb0","#d4824a","#4a9ba8","#c47a99","#6ba368","#5a6bc4","#8a6db5","#5a9b8e"];
 // ── Daily check-in ──
 function fmtWan(n){if(n>=1e8)return(Math.round(n/1e8*10)/10)+'亿';if(n>=1e4)return(Math.round(n/1e4*10)/10)+'万';return String(n)}
@@ -20,6 +38,8 @@ function bonusTip(){const c=D&&D.checkin;return (c&&c.checkedInToday)?'今日临
 function renderCheckin(){
   const bar=document.getElementById('checkinBar'),c=D.checkin;
   if(!bar)return;
+  // 点数模式下签到加量没有意义(预算由管理员设定),整条隐藏,由点数卡承接提示。
+  if(isPointsMode()){bar.classList.remove('show');return}
   if(!c||!c.available||c.enabled===false){bar.classList.remove('show');return}
   bar.classList.add('show');
   const stats='<div class="ci-stats"><div><b>'+c.streak+'</b><span>连续签到</span></div><div><b>'+c.totalCheckIns+'</b><span>累计签到</span></div><div><b>'+fmtTk(c.totalTokens)+'</b><span>累计获得</span></div></div>';
@@ -57,6 +77,8 @@ function fmtQrTime(iso){const d=new Date(new Date(iso).getTime()+8*3600000);cons
 function renderQuotaRequest(){
   const btn=document.getElementById('qrBtn'),qr=D.quotaRequest;
   if(!btn)return;
+  // 点数模式下「申请加量」不适用:预算由管理员按周期设定,页面显示的是点数卡。
+  if(isPointsMode()){btn.style.display='none';return}
   if(!qr||!qr.available||qr.enabled===false){btn.style.display='none';return}
   btn.style.display='';
   btn.textContent=qr.todaySubmitted?'今日已申请':(qr.remaining>0?'申请加量':'申请 · 本周已满');
@@ -244,6 +266,8 @@ async function load(slim){
     renderChrome();
     renderProfileQuotas();
     renderRateCard();
+    renderPoints();
+    renderPreferred();
     // 图表与使用日历按容器宽度绘制:面板隐藏时宽度为 0,建图会得到一张空白图、
     // 日历会落到 9px 下限。所以各自只在所属面板可见时画,切过去时由 paintSection() 补画。
     if(SECTION==='overview')renderCalendar();
@@ -290,6 +314,26 @@ function rateFootnote(q){
 }
 function renderQNotice(q){
   const el=document.getElementById('qNotice');
+  if(!el)return;
+  // 点数模式优先:配额口径的加量/折算提示一律让位给点数,只有「团队池护栏」被顶到
+  // 临界(≥80%)时才补一条,因为池耗尽同样会挡住请求,不能因为改点数就不提示。
+  const p=pointsData();
+  if(p){
+    let html='';
+    if(p.exhausted){
+      html+='<div class="qnotice reset show"><span class="qi">点</span><div><b>本期点数已用完</b> — '
+        +'本期已用 <b>'+fmtP(p.usedPoints)+'</b> 点，预算 '+fmtP(p.budgetPoints)+' 点'
+        +(p.overPoints>0?'，已超出 <span class="hl">'+fmtP(p.overPoints)+'</span> 点':'')
+        +'。点数模式下请联系管理员调整预算，或改用倍率更低的模型。</div></div>';
+    }
+    if(q&&q.limit>0&&q.used/q.limit>=0.8){
+      html+='<div class="qnotice bonus show"><span class="qi">池</span><div><b>团队池护栏接近上限</b> — 团队池本期已用 '
+        +fmtTk(q.used)+' / '+fmtTk(q.limit)+'，剩余 '+fmtTk(q.remaining)
+        +'。个人点数仍按预算扣减，但池耗尽后将无法发起请求。</div></div>';
+    }
+    el.innerHTML=html;
+    return;
+  }
   let html='';
   if(q.limit>0&&q.bonus>0){
     const base=q.limit-q.bonus;
@@ -336,14 +380,20 @@ function renderProfileQuotas(){
   const box=document.getElementById('pqSection'),grid=document.getElementById('pqGrid'),hint=document.getElementById('pqHint');
   if(!box||!grid)return;
   const rows=Array.isArray(D.profileQuotas)?D.profileQuotas:[];
-  if(!rows.length){box.style.display='none';return}
-  box.style.display='';
+  const ptsOn=isPointsMode(),pu=pointsUnit();
+  // 点数模式下这张表只回答「团队池护栏还剩多少」,标题随之改名;池级上限全为 0
+  // (不限量)时它没有任何信息量,整块隐藏。
+  const h3=box.querySelector('h3');
+  if(h3&&h3.firstChild&&h3.firstChild.nodeType===3)h3.firstChild.nodeValue=ptsOn?'团队池护栏 ':'各方案配额 ';
   const limited=rows.filter(r=>r.limit>0);
+  if(!rows.length||(ptsOn&&!limited.length)){box.style.display='none';return}
+  box.style.display='';
   const tight=limited.filter(r=>r.pct>=80);
   if(hint){
     hint.innerHTML='共 '+rows.length+' 个额度池'
       +(limited.length?'，'+limited.length+' 个有配额':'，均无配额限制')
-      +(tight.length?' · <b style="color:'+(tight.some(r=>r.pct>=100)?'var(--red)':'var(--orange)')+'">'+tight.length+' 个已超 80%</b>':'');
+      +(tight.length?' · <b style="color:'+(tight.some(r=>r.pct>=100)?'var(--red)':'var(--orange)')+'">'+tight.length+' 个已超 80%</b>':'')
+      +(ptsOn?' · 点数按个人预算扣减，池上限仅作护栏':'');
   }
   grid.innerHTML=rows.map(r=>{
     const free=!(r.limit>0);
@@ -357,8 +407,8 @@ function renderProfileQuotas(){
     if(r.bonus>0)tags.push('<span class="tag" style="background:rgba(46,164,79,.12);color:var(--green)" title="'+bonusTip()+'">临时+'+fmtTk(r.bonus)+'</span>');
     if(r.resetApplied)tags.push('<span class="tag" title="管理员已重置今日用量，统计数据保留">已重置</span>');
     const nums=free
-      ? '<div class="pq-nums"><span>今日已用 <b>'+fmtT(r.used)+'</b> tokens</span> · <span>该方案无每日上限</span></div>'
-      : '<div class="pq-nums"><span>已用 <b>'+fmtT(r.used)+'</b> / '+fmtT(r.limit)+'</span> <span>（'+r.type+'）</span><br><span>剩余 <b>'+fmtT(r.remaining)+'</b></span>'
+      ? '<div class="pq-nums"><span>今日已用 <b>'+fmtT(r.used)+'</b> tokens'+(ptsOn?'（≈'+(r.used/pu).toFixed(1)+' 点）':'')+'</span> · <span>该方案无每日上限</span></div>'
+      : '<div class="pq-nums"><span>已用 <b>'+fmtT(r.used)+'</b>'+(ptsOn?'（≈'+(r.used/pu).toFixed(1)+' 点）':'')+' / '+fmtT(r.limit)+'</span> <span>（'+r.type+'）</span><br><span>剩余 <b>'+fmtT(r.remaining)+'</b></span>'
         +((r.rawUsed!=null&&r.rawUsed!==r.used)?' · <span>实际 '+fmtTk(r.rawUsed)+'</span> <span>'+(r.rawUsed>r.used?'已抵扣 '+fmtTk(r.rawUsed-r.used):'已加收 '+fmtTk(r.used-r.rawUsed))+'</span>':'')
         +(r.nextRateChange?'<br><span>'+r.nextRateChange.at+' 后转入'+(r.nextRateChange.toPeak?'高峰':'低谷')+' ×'+r.nextRateChange.rate+'</span>':'')
         +'</div>';
@@ -374,6 +424,162 @@ function renderProfileQuotas(){
       +'<div class="pq-tags">'+tags.join('')+'</div>'
       +'</div>';
   }).join('');
+}
+// ── 点数卡与首选方案 ──
+// 容器由 lib/pages.mjs 提供(#pointsCard/#pointsRemaining/#pointsBar/#pointsMeta/
+// #pointsDetail, #prefPlanCard/#prefPlanPicker)。全部取元素后判空,容器没就绪时
+// 静默跳过 —— 服务端与前端可以分开上线。
+function renderPoints(){
+  const card=document.getElementById('pointsCard');
+  if(!card)return;
+  const p=pointsData();
+  if(!p){card.style.display='none';return}
+  card.style.display='';
+  const remaining=document.getElementById('pointsRemaining');
+  if(remaining)remaining.textContent=fmtP(p.remainingPoints);
+  const meta=document.getElementById('pointsMeta');
+  if(meta)meta.textContent=fmtPeriod(p);
+  const pct=p.pct==null?(p.exhausted?100:0):Math.max(0,Math.min(100,p.pct));
+  const bar=document.getElementById('pointsBar');
+  if(bar){
+    bar.style.width=pct.toFixed(1)+'%';
+    bar.style.background=p.exhausted?'var(--red)':pct>=80?'var(--orange)':'var(--accent)';
+  }
+  const detail=document.getElementById('pointsDetail');
+  if(!detail)return;
+  let html='已用 <b>'+fmtP(p.usedPoints)+'</b> / '+fmtP(p.budgetPoints)+' 点'
+    +(p.budgetPoints>0?'（'+p.pct+'%）':'')
+    +(p.overPoints>0
+      ?' · <span style="color:var(--red);font-weight:600">已超出 '+fmtP(p.overPoints)+' 点</span>'
+      :' · 剩余 '+fmtP(p.remainingPoints)+' 点');
+  const lines=[];
+  if(p.exhausted)lines.push('<span style="color:var(--red)">本期点数已用完，请求会被拦截</span>');
+  else if(p.projectedExhaustDate)lines.push('按当前速度预计 <b>'+p.projectedExhaustDate+'</b> 用完');
+  if(p.avgDailyPoints>0)lines.push('日均 '+fmtP(p.avgDailyPoints)+' 点');
+  if(lines.length)html+='<br>'+lines.join(' · ');
+  if(!p.exhausted)html+='<br><span style="color:var(--dim)">点数模式下请联系管理员调整预算</span>';
+  detail.innerHTML=html;
+}
+let prefBound=false,prefSaving=false;
+function prefProtocolLabel(proto){return proto==='responses'?'OpenAI（Responses）':'Anthropic（Claude Code）'}
+// 概览里的方案选择器：按协议分组，每组一个「默认自动」行 + 紧凑的方案列表。
+// 「默认自动」不是写死的组头，而是服务端按方案组调度算出的当前落点。
+const PREF_TIERS=[
+  {key:'fable',alias:'jx-fable',label:'最强级'},
+  {key:'opus',alias:'jx-opus',label:'高级'},
+  {key:'sonnet',alias:'jx-sonnet',label:'中级'},
+  {key:'haiku',alias:'jx-haiku',label:'普通'},
+];
+function prefLimitHtml(reason,unavailable){
+  if(!unavailable)return '正常';
+  const txt=String(reason||'').trim();
+  // 限流/限额的恢复时间单独占第二行，避免把「操作」列挤出去。
+  const m=txt.match(/^(?:限流中|限额中)[，,]\s*(预计.*?恢复)$/);
+  if(m)return '<div>限额中</div><div class="pref-limit-sub">'+esc(m[1])+'</div>';
+  return esc(txt||'不可用');
+}
+function prefModelCell(plan,tier){
+  const m=(Array.isArray(plan.modelAliases)?plan.modelAliases:[]).find(x=>x.tier===tier.key);
+  if(!m||!m.target)return '<td class="pref-model"><span class="pref-empty">—</span></td>';
+  return '<td class="pref-model"><div class="pref-model-name" title="'+esc(m.target)+'">'+esc(m.target)+'</div>'
+    +'<div class="pref-model-rate'+(m.rate>1?' hot':m.rate<1?' cool':'')+'">×'+(m.rate==null?'1.00':Number(m.rate).toFixed(2))+'</div></td>';
+}
+function renderPreferred(){
+  const card=document.getElementById('prefPlanCard');
+  const host=document.getElementById('prefPlanPicker');
+  if(!card||!host)return;
+  const pp=(D&&D.preferredProfiles)||{};
+  if(pp.selfSelect===false){card.style.display='none';return}
+  card.style.display='';
+  if(!prefBound){prefBound=true;host.addEventListener('click',onPrefPick)}
+  const protocols=['anthropic','responses'];
+  const tierHeads=PREF_TIERS.map(t=>'<th class="pref-model"><span class="tier-badge tier-'+t.key+'">'+t.label+'</span> <code>'+t.alias+'</code><span class="pref-dim">（系数）</span></th>').join('');
+  host.innerHTML=protocols.map(proto=>{
+    const pref=pp[proto]||{suffix:'',name:'',active:false};
+    const plans=(pp.plans&&pp.plans[proto])||[];
+    const auto=(pp.auto&&pp.auto[proto])||null;
+    const autoOn=!pref.suffix;
+    const autoMeta=auto&&auto.available
+      ? (auto.groupName?('调度组：'+auto.groupName+' · 当前优先 '+auto.headName):('当前优先 '+auto.headName))
+      : '当前调度组没有开放点数计费的可用方案';
+    const autoPeak=!!(auto&&auto.inPeak);
+    const autoBtn=autoOn
+      ? '<button type="button" class="pref-pick" disabled>已选</button>'
+      : '<button type="button" class="pref-pick" data-proto="'+proto+'" data-suffix="" title="按方案组调度自动选择">选择</button>';
+    const rows=[];
+    rows.push('<tr class="pref-row pref-auto-row'+(autoOn?' on':'')+'"><td class="pref-name"><b>默认自动</b></td>'
+      +'<td colspan="6" class="pref-auto-meta">'+esc(autoMeta)
+      +(autoPeak?' <span class="pref-peak-inline">高峰期</span>':'')+'</td>'
+      +'<td class="pref-op">'+autoBtn+'</td></tr>');
+    plans.forEach(p=>{
+      const on=!!(pref.suffix&&pref.suffix===p.suffix);
+      const unavailable=p.active===false;
+      const reason=String(p.reason||'');
+      const state=unavailable?' err':(on?' on':'');
+      const why=unavailable
+        ? ('当前不可用：'+reason+'。该方案不可选中，请选择其他方案')
+        : '选择后新请求优先走该方案';
+      const peak=!!p.inPeak;
+      const btn=unavailable
+        ? '<button type="button" class="pref-pick" disabled title="'+esc(why)+'">不可选</button>'
+        : (on?'<button type="button" class="pref-pick" disabled>已选</button>'
+          :'<button type="button" class="pref-pick" data-proto="'+proto+'" data-suffix="'+esc(p.suffix)+'" title="'+esc(why)+'">选择</button>');
+      rows.push('<tr class="pref-row'+state+'">'
+        +'<td class="pref-name"><div class="pref-name-main">'+esc(p.name||p.suffix)+'</div>'
+        +'<div class="pref-name-sub">/'+esc(p.suffix)+(p.isDefault?' · 默认入口':'')+'</div></td>'
+        +'<td class="pref-peak-cell">'+(peak?'<span class="pref-peak-inline">高峰期</span>':'<span class="pref-empty">—</span>')+'</td>'
+        +PREF_TIERS.map(t=>prefModelCell(p,t)).join('')
+        +'<td class="pref-limit'+(unavailable?' err':'')+'" title="'+esc(reason)+'">'+prefLimitHtml(reason,unavailable)+'</td>'
+        +'<td class="pref-op">'+btn+'</td></tr>');
+    });
+    // 已保存首选被管理员关闭/删除时，保留一条红色提示，不能让它静默消失。
+    if(pref.suffix&&!plans.some(p=>p.suffix===pref.suffix)){
+      rows.push('<tr class="pref-row err"><td class="pref-name"><div class="pref-name-main">'+esc(pref.name||pref.suffix)+'</div><div class="pref-name-sub">/'+esc(pref.suffix)+'</div></td>'
+        +'<td colspan="6" class="pref-limit err">当前不可用：'+esc(pref.reason||'请重新选择')+'</td>'
+        +'<td class="pref-op"><button type="button" class="pref-pick" disabled>不可选</button></td></tr>');
+    }
+    return '<div class="pref-proto" data-proto="'+proto+'"><div class="pref-proto-hd"><b>'+prefProtocolLabel(proto)+'</b><span'+(autoOn?'':(pref.active===false?' style="color:var(--red)"':''))+'>'+(autoOn?'默认自动':(pref.active===false?'已指定 · 当前不可用':'已指定'))+'</span></div>'
+      +'<div class="pref-table-wrap"><table class="pref-table"><colgroup><col style="width:15%"><col style="width:7%"><col style="width:12%"><col style="width:12%"><col style="width:12%"><col style="width:12%"><col style="width:18%"><col style="width:9%"></colgroup>'
+      +'<thead><tr><th>方案名</th><th>高峰期</th>'+tierHeads+'<th>限额情况</th><th>操作</th></tr></thead><tbody>'+rows.join('')+'</tbody></table></div></div>';
+  }).join('');
+  if(prefSaving)host.querySelectorAll('button').forEach(b=>{b.disabled=true});
+}
+async function onPrefPick(ev){
+  const btn=ev.target.closest('button[data-proto][data-suffix]');
+  if(!btn||btn.disabled||prefSaving)return;
+  const protocol=btn.dataset.proto;
+  const suffix=btn.dataset.suffix||'';
+  if(protocol!=='anthropic'&&protocol!=='responses')return;
+  const picked=((D&&D.preferredProfiles&&D.preferredProfiles.plans&&D.preferredProfiles.plans[protocol])||[]).find(p=>p.suffix===suffix);
+  prefSaving=true;renderPreferred();
+  try{
+    const r=await fetch('/api/my-preferred-profile',{method:'POST',headers:{'Authorization':'Bearer '+VK,'Content-Type':'application/json'},body:JSON.stringify({protocol:protocol,suffix:suffix})});
+    const j=await r.json().catch(()=>({}));
+    if(!r.ok)throw new Error(j.error||'保存失败');
+    const savedName=j.name||suffix;
+    toast(suffix?(picked&&picked.active===false
+      ? '首选已保存：'+savedName+'；该方案当前不可用，请求会直接失败，不会自动切换'
+      : '首选方案已保存：'+savedName)
+      :'已恢复默认自动（按方案组调度）');
+    await load();
+  }catch(e){toast(e.message||'保存失败')}
+  finally{prefSaving=false;renderPreferred()}
+}
+// 模型表的「点数」列:只有点数模式才存在,服务端模板里的表头是静态的,所以这里
+// 自己增删表头单元格(幂等),避免 tbody 与 thead 列数错位。
+function syncPointsColumn(){
+  const head=document.querySelector('#modelTable thead tr');
+  if(!head)return false;
+  const on=isPointsMode();
+  let th=head.querySelector('th[data-points-col]');
+  if(on&&!th){
+    th=document.createElement('th');
+    th.className='n';th.dataset.pointsCol='1';th.textContent='点数';
+    th.title='点数计权（含点数倍率与系数）÷ '+fmtT(pointsUnit());
+    head.appendChild(th);
+  }
+  if(!on&&th)th.remove();
+  return on;
 }
 // ── 渲染分片 ──
 // 常驻部分:工具条(协议/方案/申请加量)、meta、通知条、KPI 卡、签到条。都不依赖面板宽度,
@@ -421,20 +627,25 @@ function renderModelTable(){
   // 区间求和依然精确 —— 只有措辞跟窗口变(今日 / 区间)。
   const scopeW=D.usageRange?'区间实际计权比例':'今日实际计权比例';
   const anyWeighted=models.some(([,d])=>d.weighted!=null&&d.weighted!==d.total);
-  if(!models.length){mt.innerHTML='<tr><td colspan="5" style="text-align:center;color:var(--dim)">暂无数据</td></tr>'}else{
+  const ptsOn=syncPointsColumn(),pu=pointsUnit();
+  if(!models.length){mt.innerHTML='<tr><td colspan="'+(ptsOn?6:5)+'" style="text-align:center;color:var(--dim)">暂无数据</td></tr>'}else{
     mt.innerHTML=models.map(([m,d])=>{
-      const raw=d.total||0,w=d.weighted!=null?d.weighted:raw;
+      const raw=d.total||0,w=d.weighted!=null?d.weighted:raw,bw=d.billingWeighted!=null?d.billingWeighted:w;
       const realised=raw>0?Math.round(w/raw*100)/100:null;
       const now=d.rate;
       // Show the realised ratio, and flag when the live rate differs from it (rate
       // changed today, or the day spanned a peak boundary).
-      const rateCell=realised==null?'<span style="color:var(--dim)">-</span>'
-        :'<span'+(realised!==1?' style="color:var(--accent)"':'')+' title="'+scopeW+(now!=null&&now!==realised?'；当前时段该模型为 ×'+now:'')+'">×'+realised+(now!=null&&now!==realised?' <span style="color:var(--dim);font-size:10px">(现 ×'+now+')</span>':'')+'</span>';
+      // 点数模式展示的是「点数倍率」（独立于额度池倍率）；非点数模式仍展示历史计权比例。
+      const rateCell=ptsOn
+        ? (now==null?'<span style="color:var(--dim)">-</span>':'<span title="当前点数倍率">×'+now+'</span>')
+        : (realised==null?'<span style="color:var(--dim)">-</span>'
+          :'<span'+(realised!==1?' style="color:var(--accent)"':'')+' title="'+scopeW+(now!=null&&now!==realised?'；当前时段该模型为 ×'+now:'')+'">×'+realised+(now!=null&&now!==realised?' <span style="color:var(--dim);font-size:10px">(现 ×'+now+')</span>':'')+'</span>');
       return '<tr><td style="color:var(--blue)">'+m+(d.rateIsDefault===false?' <span class="tag" style="font-size:9px">单独定价</span>':'')+'</td>'
         +'<td class="n">'+fmtT(d.requests)+'</td>'
         +'<td class="n" title="输入 '+fmtT(d.inputTokens||0)+' / 输出 '+fmtT(d.outputTokens||0)+'">'+fmtTk(raw)+'</td>'
         +'<td class="n">'+rateCell+'</td>'
-        +'<td class="n hl">'+fmtTk(w)+'</td></tr>';
+        +'<td class="n hl">'+fmtTk(w)+'</td>'
+        +(ptsOn?'<td class="n" style="color:var(--accent)" title="计费计权 '+fmtTk(bw)+' / '+fmtT(pu)+'">'+(bw/pu).toFixed(1)+'</td>':'')+'</tr>';
     }).join("");
   }
   const note=document.getElementById('modelTableNote');
@@ -445,6 +656,7 @@ function renderModelTable(){
   note.innerHTML=(anyWeighted
     ?'「实际 Token」是真实消耗，「计入配额」是按配额口径（各模型倍率；Responses/Codex 链路再剔除缓存命中）折算后从每日额度里扣掉的数额。倍率列为'+scopeW+'，跨高峰边界或期间调整过倍率时会落在两档之间。'
     :'当前没有倍率或缓存规则造成差异，实际消耗与计入配额相同。')
+    +(ptsOn?' 「点数」列 = 计入配额 ÷ '+fmtT(pu)+'（1 点 = '+fmtT(pu)+' 计权 token）。':'')
     +cacheClause;
 }
 // 客户端表:今天这些请求分别来自哪个 AI 客户端(Claude Code / Codex / ...)。
@@ -526,22 +738,42 @@ function renderRateCard(){
   const box=document.getElementById('rateCardBox'),body=document.getElementById('rateCardBody');
   if(!box||!body)return;
   const cards=D.rateCard?[D.rateCard]:(D.rateCards||[]);
-  const meaningful=cards.filter(c=>c&&c.rows.length&&(c.rows.some(r=>r.custom)||c.defaultPeak!==1||c.defaultOffPeak!==1));
+  const ptsOn=isPointsMode(),pu=pointsUnit();
+  const tabEl=document.getElementById('ratesTabLabel');
+  if(tabEl)tabEl.textContent=ptsOn?'点数价目表':'配额价目表';
+  // 点数用户即使全是默认 ×1.00 也要看到点数额率；旧配额模式仍只在有单独定价时展开。
+  const meaningful=cards.filter(c=>c&&c.rows.length&&(ptsOn||c.rows.some(r=>r.custom)||c.defaultPeak!==1||c.defaultOffPeak!==1));
   if(!meaningful.length){box.style.display='none';return}
   box.style.display='';
+  const nameEl=document.getElementById('rateCardName'),hintEl=document.getElementById('rateCardHint');
+  if(nameEl)nameEl.textContent=ptsOn?'点数价目表':'配额价目表';
+  if(hintEl)hintEl.textContent=ptsOn
+    ?'当前时段每个模型消耗多少点数；1 点 = '+fmtT(pu)+' 计费计权 token'
+    :'当前时段每个模型消耗 1 token 扣多少额度';
+  // 点数模式:多一列「每百万 token 约多少点」,把倍率直接翻译成用户预算的单位。
+  // 换算只依赖倍率(rate × 1e6 / unit),缓存命中不计入这列的估算,标注在表头上。
+  const colW=ptsOn?'18%;34%;12%;14%;22%':'20%;42%;16%;22%';
   body.innerHTML=meaningful.map(c=>{
     const rows=c.rows.map(r=>'<tr><td style="color:var(--blue)">'+r.alias+'</td>'
       +'<td style="color:var(--dim);font-size:11px;overflow:hidden;text-overflow:ellipsis">'+r.model+'</td>'
       +'<td class="n"'+(r.rate<1?' style="color:var(--green);font-weight:600"':r.rate>1?' style="color:var(--orange);font-weight:600"':'')+'>×'+r.rate+'</td>'
-      +'<td class="n" style="color:var(--dim);font-size:11px">'+(r.custom?'峰 ×'+r.peak+' / 谷 ×'+r.offPeak:'跟随默认')+'</td></tr>').join('');
+      +'<td class="n" style="color:var(--dim);font-size:11px">'+(r.custom?'峰 ×'+r.peak+' / 谷 ×'+r.offPeak:'跟随默认')+'</td>'
+      +(ptsOn?'<td class="n" style="font-weight:600" title="按当前倍率换算：1,000,000 × ×'+r.rate+' ÷ '+fmtT(pu)+' 点，未计缓存优惠">'+(r.rate*1000000/pu).toFixed(1)+'</td>':'')
+      +'</tr>').join('');
     return '<div style="margin-bottom:14px">'
       +'<div style="font-size:12px;font-weight:600;margin-bottom:6px">'+c.profile
       +' <span class="tag" style="background:rgba(0,0,0,.04);color:'+(c.inPeak?'var(--orange)':'var(--green)')+'">'+(c.inPeak?'高峰时段':'低谷时段')+'</span>'
       +' <span style="font-size:10px;color:var(--dim);font-weight:400">默认 ×'+(c.inPeak?c.defaultPeak:c.defaultOffPeak)+'</span></div>'
-      +'<table style="min-width:auto;table-layout:fixed;width:100%"><thead><tr><th style="width:20%">别名</th><th style="width:42%">实际模型</th><th class="n" style="width:16%">当前倍率</th><th class="n" style="width:22%">峰/谷</th></tr></thead><tbody>'+rows+'</tbody></table>'
+      +'<table style="min-width:auto;table-layout:fixed;width:100%"><thead><tr>'
+      +'<th style="width:'+colW.split(';')[0]+'">别名</th><th style="width:'+colW.split(';')[1]+'">实际模型</th>'
+      +'<th class="n" style="width:'+colW.split(';')[2]+'">'+(ptsOn?'当前点数倍率':'当前倍率')+'</th><th class="n" style="width:'+colW.split(';')[3]+'">峰/谷</th>'
+      +(ptsOn?'<th class="n" style="width:'+colW.split(';')[4]+'">约点数/百万 <span style="font-weight:400;color:var(--dim)">未计缓存</span></th>':'')
+      +'</tr></thead><tbody>'+rows+'</tbody></table>'
       +'</div>';
   }).join('')
-    +'<div class="note" style="font-size:11px;color:var(--dim)">倍率越低越省额度：×0.5 表示消耗 1000 token 只扣 500 额度。倍率随时段自动切换，调整只影响之后的请求。</div>';
+    +'<div class="note" style="font-size:11px;color:var(--dim)">倍数越低越省'+(ptsOn?'点数':'额度')+'：×0.5 表示消耗 1000 token 只扣 500 '+(ptsOn?'计权':'额度')+'。倍数随时段自动切换，调整只影响之后的请求。'
+    +(ptsOn?' 每 100 万 token 扣 ×'+ (1000000/pu) +' 倍率的点数（1 点 = '+fmtT(pu)+' 计权 token），缓存命中按页面原有规则折算。':'')
+    +'</div>';
 }
 let calRz;window.addEventListener('resize',function(){clearTimeout(calRz);calRz=setTimeout(function(){if(D&&SECTION==='overview')renderCalendar()},150)});
 // ── 产出画像(仅本人;拉 /api/production/me,接口不可用时整块隐藏)──

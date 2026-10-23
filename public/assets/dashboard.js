@@ -11,17 +11,18 @@ let DS="",DE="";
 // 抽成一处共用,以后无论怎么拆函数都不会再漏。
 const todayBJ=()=>new Date(Date.now()+8*36e5).toISOString().slice(0,10);
 let activeWorkspaceTab="overview";
+let POINT_DATA=null;
 // 菜单顺序,与侧栏按钮一一对应;id 由 setWorkspaceTab 按 'workspace-tab-'+s 硬拼 ——
 // 增删菜单必须与 lib/pages.mjs 的按钮和面板同时改,否则切换会静默失效。
-const SECTIONS=['overview','upstream','users','clients','detail','profiles','rates','errors','production','sessions','costs','review'];
+const SECTIONS=['overview','upstream','users','points','clients','detail','profiles','rates','planrates','errors','production','sessions','costs','review'];
 
 // ── 按菜单懒加载 ─────────────────────────────────────────────────────────────
 // 点哪个菜单才查哪个菜单的数据:别为了一张错误表去跑 dailyModels/dailyClients 那几张
 // 400 天宽表的全表扫描(实测这是 dashboard 最重的一块)。
 //   值 = /api/stats 的 section 名;null = 该菜单有自己的独立端点(产出/会话/成本/评审)。
 const SECTION_SOURCE={
-  overview:"overview", users:"users", clients:"clients", detail:"detail",
-  profiles:"profiles", rates:"rates", errors:"errors",
+  overview:"overview", users:"users", points:null, clients:"clients", detail:"detail",
+  profiles:"profiles", rates:"rates", planrates:"rates", errors:"errors",
   production:null, sessions:null, costs:null, review:null,
   upstream:null,     // 上游额度:独立端点(/api/upstream-quota),不搭 /api/stats 的车
 };
@@ -31,10 +32,12 @@ const sectionLoaded={};        // 菜单 → 是否已把它的数据拉进来�
 function renderSection(name){
   if(name==="overview")render();
   else if(name==="users")renderUsersPanel();
+  else if(name==="points")renderPointBalances();
   else if(name==="clients")renderClientBoard();
   else if(name==="detail")renderDetailPanel();
   else if(name==="profiles")renderProfilesPanel();
   else if(name==="rates")renderRateBoard();
+  else if(name==="planrates")renderPlanRateBoard();
   else if(name==="errors")renderErrorsPanel();
   renderMeta();
 }
@@ -53,6 +56,7 @@ async function ensureSection(name,{force=false}={}){
       if(name==="production")loadProduction();
       else if(name==="sessions")loadSessions();
       else if(name==="costs")loadCosts();
+      else if(name==="points")loadPointBalances();
     }
     return;
   }
@@ -316,92 +320,109 @@ function rateAliasChips(entries){
 // bar list of today's weighted quota by model (the number an admin is checking);
 // a collapsed detail table keeps the precise per (profile × model) peak/off-peak
 // rates for verifying overrides.
-function renderRateBoard(){
-  const body=document.getElementById("rateBoardBody"),
-        cards=document.getElementById("rateBoardCards"),
-        ctx=document.getElementById("rateBoardContext");
-  if(!cards||!body)return;
+function rateNum(v){return (v==null?1:Number(v)).toFixed(2)}
+function rateTone(v){const n=Number(v);return n>1?' hot':n<1?' cool':''}
+function rateAliasText(r){
+  const list=[...r.aliases,...r.peakAliases.map(a=>a+'(峰)')];
+  return list.length?list.join(' / '):'';
+}
+// 倍率页统一成「一行一个方案」的列表；协议分组，模型倍率按模型逐行排出。
+// mode=quota 显示额度池倍率；mode=point 显示点数倍率 + 方案系数。
+function renderRateList(hostId,ctxId,mode){
+  const host=document.getElementById(hostId),ctx=document.getElementById(ctxId);
+  if(!host)return;
   const rows=Array.isArray(D.modelRateBoard)?D.modelRateBoard:[];
-  const emptyMsg='暂无模型 — 先在设置页配置模型别名';
-  if(!rows.length){
-    body.innerHTML='<tr><td colspan="7" class="empty">'+emptyMsg+'</td></tr>';
-    cards.innerHTML='<div class="rate-empty">'+emptyMsg+'</div>';
-    if(ctx)ctx.textContent="";
-    return;
-  }
-  const customCount=rows.filter(r=>r.custom).length;
-  const totalRaw=rows.reduce((s,r)=>s+r.todayRaw,0),totalW=rows.reduce((s,r)=>s+r.todayWeighted,0);
-  // 顶部摘要（pill 行）：时段 + 单独定价数 + 今日综合倍率 + 实际→计入
-  if(ctx){
-    const inPeak=rows[0].inPeak;
-    const segColor=inPeak?'var(--orange)':'var(--green)';
-    const blended=totalRaw>0?Math.round(totalW/totalRaw*100)/100:null;
-    ctx.innerHTML='<span class="rate-pill"><i class="dot" style="background:'+segColor+'"></i><b style="color:'+segColor+'">'+(inPeak?'高峰时段':'低谷时段')+'</b></span>'
-      +'<span class="rate-pill">'+customCount+'/'+rows.length+' 单独定价</span>'
-      +(blended!=null?'<span class="rate-pill">今日综合 ×'+blended+'</span>':'')
-      +(blended!=null?'<span class="rate-pill">实际 '+fmtTk(totalRaw)+' → 计入 '+fmtTk(totalW)+'</span>':'');
-  }
-  // ① 主视图：按 model 聚合（同模型跨方案合并），按今日计入降序
-  const byModel=new Map();
-  for(const r of rows){
-    let m=byModel.get(r.model);
-    if(!m){m={model:r.model,todayWeighted:0,todayRaw:0,todayRequests:0,entries:[],custom:false};byModel.set(r.model,m);}
-    m.todayWeighted+=r.todayWeighted;m.todayRaw+=r.todayRaw;m.todayRequests+=r.todayRequests;
-    m.entries.push(r);if(r.custom)m.custom=true;
-  }
-  const models=[...byModel.values()].sort((a,b)=>b.todayWeighted-a.todayWeighted||b.todayRaw-a.todayRaw||a.model.localeCompare(b.model));
-  const maxW=Math.max(0,...models.map(m=>m.todayWeighted));
-  cards.innerHTML=models.map(m=>{
-    const hasTraffic=m.todayWeighted>0;
-    // Dominant profile today → its current effective rate drives the chip.
-    const dom=m.entries.sort((a,b)=>b.todayWeighted-a.todayWeighted)[0];
-    const rate=dom.rate;
-    const pct=maxW>0?Math.max(2,Math.round(m.todayWeighted/maxW*100)):0;
-    const profileTip=m.entries.map(r=>escH(r.profile)+'：峰×'+r.peak+' / 谷×'+r.offPeak+(r.custom?'（单独定价）':'')).join('　');
-    // Realised ratio can differ from the configured rate: the day may straddle a
-    // peak boundary, or a rate may have been changed mid-day. Flag it rather than
-    // hiding it — a mismatch is information, not an error.
-    const realised=m.todayRaw>0?Math.round(m.todayWeighted/m.todayRaw*100)/100:null;
-    const drift=realised!=null&&Math.abs(realised-rate)>0.001;
-    const rateCol=rate>1?'var(--orange)':rate<1?'var(--green)':'var(--text)';
-    const chip='<span class="rate-chip" style="color:'+rateCol+';border-color:'+rateCol+'" title="'+profileTip+'">'
-      +(rate===1?'×1':'×'+rate+'<i class="pk">'+(dom.inPeak||rows[0].inPeak?'峰':'谷')+'</i>')+'</span>';
-    const customTag=m.custom?' <span class="rate-tag">单独定价</span>':'';
-    const profTag=m.entries.length>1?' <span class="rate-profn">'+m.entries.length+' 方案</span>':'';
-    const driftNote=drift?'<span class="rate-drift" title="今日实际计权比例与当前倍率不同：跨了高峰边界或期间调整过倍率">实收 ×'+realised+'</span>':'';
-    return '<div class="rate-card'+(m.custom?' rate-custom':'')+(hasTraffic?'':' rate-zero')+'" title="'+profileTip+'">'
-      +'<div class="rate-bar"><i style="width:'+pct+'%"></i></div>'
-      +'<div class="rate-main">'
-        +'<div class="rate-topline"><b class="rate-name">'+escH(m.model)+'</b>'+customTag+profTag+driftNote+'</div>'
-        +'<div class="rate-alias">'+rateAliasChips(m.entries)+'</div>'
-      +'</div>'
-      +'<div class="rate-side">'
-        +'<div class="rate-nums"><span class="rate-today hl">'+(hasTraffic?fmtTk(m.todayWeighted):'–')+'</span><span class="rate-req">'+(hasTraffic?m.todayRequests+' 请求':'无今日用量')+'</span></div>'
-        +chip
-      +'</div>'
-      +'</div>';
-  }).join("");
-  // ② 配置明细表（可折叠，每 方案×模型 精确峰/谷）
-  body.innerHTML=rows.map(r=>{
-    const realised=r.todayRaw>0?Math.round(r.todayWeighted/r.todayRaw*100)/100:null;
-    const drift=realised!=null&&Math.abs(realised-r.rate)>0.001;
-    const rateCol=r.rate>1?'var(--orange)':r.rate<1?'var(--green)':'var(--text)';
-    const aliasText=[...r.aliases,...r.peakAliases.map(a=>a+'(峰)')].join(', ')||'<span style="color:var(--dim)">未被别名引用</span>';
-    const peakCell='<span'+(r.inPeak?' style="font-weight:650"':' style="color:var(--dim)"')+'>峰×'+r.peak+'</span>';
-    const offCell='<span'+(!r.inPeak?' style="font-weight:650"':' style="color:var(--dim)"')+'>谷×'+r.offPeak+'</span>';
-    return '<tr'+(r.custom?' style="background:rgba(47,110,80,.035)"':'')+'>'
-      +'<td><b>'+escH(r.model)+'</b>'+(r.custom?' <span class="rate-tag">单独定价</span>':'')+'</td>'
-      +'<td style="font-size:11px;color:var(--dim)">'+escH(r.profile)+'</td>'
-      +'<td style="font-size:11px;color:var(--blue);max-width:300px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="'+escH(aliasText.replace(/<[^>]*>/g,''))+'">'+aliasText+'</td>'
-      +'<td class="n"><b style="color:'+rateCol+'">×'+r.rate+'</b>'
-        +(drift?' <span style="font-size:9px;color:var(--dim)" title="今日实际计权比例与当前倍率不同：跨了高峰边界或期间调整过倍率">实收 ×'+realised+'</span>':'')
-        +'<div style="font-size:9px;color:var(--dim);margin-top:1px">'+peakCell+' / '+offCell+'</div>'
-      +'</td>'
-      +'<td class="n" style="color:var(--dim)">'+(r.todayRaw?fmtTk(r.todayRaw):'-')+'</td>'
-      +'<td class="n hl">'+(r.todayWeighted?fmtTk(r.todayWeighted):'-')+'</td>'
-      +'<td class="n">'+(r.todayRequests||'-')+'</td>'
+  if(!rows.length){host.innerHTML='<div class="rate-empty">暂无方案或模型配置 — 先在设置页配置方案与模型别名</div>';if(ctx)ctx.textContent='';return}
+  const inPeak=!!rows[0].inPeak;
+  const protoOrder=[['anthropic','Anthropic（Claude Code）'],['responses','OpenAI（Responses）']];
+  let planCount=0,modelCount=0;
+  const html=protoOrder.map(([proto,label])=>{
+    const group=rows.filter(r=>r.protocol===proto);
+    const plans=new Map();
+    for(const r of group){
+      if(!plans.has(r.profile))plans.set(r.profile,{profile:r.profile,suffix:r.suffix,rows:[],factor:r.planPointsFactor,todayRequests:0});
+      const p=plans.get(r.profile);p.rows.push(r);p.todayRequests+=r.todayRequests||0;
+    }
+    planCount+=plans.size;modelCount+=group.length;
+    const body=plans.size?[...plans.values()].sort((a,b)=>a.profile.localeCompare(b.profile,'zh')).map(p=>{
+      const models=p.rows.map(r=>{
+        const alias=rateAliasText(r);
+        const cur=mode==='point'?r.pointRate:r.rate;
+        const peak=mode==='point'?r.pointPeak:r.peak;
+        const off=mode==='point'?r.pointOffPeak:r.offPeak;
+        const custom=mode==='point'?r.pointCustom:r.custom;
+        const unset=mode==='point'&&!r.pointConfigured;
+        const peakTxt=peak==null?'未配置':'峰 ×'+rateNum(peak);
+        const offTxt=off==null?'未配置':'谷 ×'+rateNum(off);
+        return '<div class="rate-model-line">'
+          +'<div class="rate-model-head"><b class="rate-model-name" title="'+escH(r.model)+'">'+escH(r.model)+'</b>'
+            +(alias?'<span class="rate-model-alias" title="别名映射">'+escH(alias)+'</span>':'')
+            +(custom?'<span class="rate-tag">单独定价</span>':'')
+            +(unset?'<span class="rate-tag rate-tag-unset">未配置点数倍率</span>':'')
+          +'</div>'
+          +'<div class="rate-model-rates">'+peakTxt+'<i>/</i>'+offTxt+'<i>/</i>当前 <b class="rate-now'+rateTone(cur)+'">×'+rateNum(cur)+'</b></div>'
+        +'</div>';
+      }).join('');
+      const factor=mode==='point'?'<div class="rate-plan-factor">方案系数 ×'+rateNum(p.factor)+'</div>':'';
+      return '<tr><td class="rate-plan-cell"><b>'+escH(p.profile)+'</b><div class="rate-plan-suffix">/'+escH(p.suffix)+'</div>'+factor+'</td>'
+        +'<td class="rate-model-cell">'+models+'</td>'
+        +'<td class="n rate-req-cell">'+(p.todayRequests||'–')+'</td></tr>';
+    }).join(''):'<tr><td colspan="3" class="empty">该协议暂无方案</td></tr>';
+    return '<div class="rate-plan-group"><div class="rate-plan-title"><b>'+label+'</b><span>'+plans.size+' 个方案 · '+group.length+' 个模型配置</span></div>'
+      +'<table class="rate-plan-table"><thead><tr><th>方案</th><th>模型倍率（高峰 / 低谷 / 当前）</th><th class="n">今日请求</th></tr></thead><tbody>'+body+'</tbody></table></div>';
+  }).join('');
+  host.innerHTML=html;
+  if(ctx)ctx.innerHTML='<span class="rate-pill"><i class="dot" style="background:'+(inPeak?'var(--orange)':'var(--green)')+'"></i><b style="color:'+(inPeak?'var(--orange)':'var(--green)')+'">'+(inPeak?'高峰时段':'低谷时段')+'</b></span>'
+    +'<span class="rate-pill">'+planCount+' 个方案</span><span class="rate-pill">'+modelCount+' 个模型配置</span>'
+    +(mode==='point'?'<span class="rate-pill">点数倍率与配额模型倍率独立</span>':'');
+}
+function renderRateBoard(){renderRateList('rateBoardList','rateBoardContext','quota')}
+function renderPlanRateBoard(){renderRateList('planRateList','planRateContext','point')}
+// ── 点数余额（独立菜单）：直接复用管理员点数预算接口 ─────────────────────
+function pointPeriodLabel(p){return p==='day'?'日':p==='week'?'周':'月'}
+function loadPointBalances(){
+  const host=document.getElementById('pointBalanceBody'),ctx=document.getElementById('pointBalanceContext');
+  if(!host)return;
+  host.innerHTML='<tr><td colspan="10" class="empty">加载中…</td></tr>';
+  fetch('/api/point-budgets',{credentials:'same-origin'}).then(async r=>{
+    if(!r.ok)throw new Error(r.status===401?'需要管理员登录':'HTTP '+r.status);
+    return r.json();
+  }).then(data=>{POINT_DATA=data;renderPointBalances()}).catch(e=>{
+    host.innerHTML='<tr><td colspan="10" class="empty">'+escH(e.message||'加载失败')+'</td></tr>';
+    if(ctx)ctx.textContent='';
+  });
+}
+function renderPointBalances(){
+  const host=document.getElementById('pointBalanceBody'),ctx=document.getElementById('pointBalanceContext');
+  if(!host)return;
+  const users=Array.isArray(POINT_DATA&&POINT_DATA.users)?POINT_DATA.users:[];
+  if(!users.length){host.innerHTML='<tr><td colspan="10" class="empty">暂无成员</td></tr>';if(ctx)ctx.textContent='';return}
+  const enabled=users.filter(u=>u.budget&&u.budget.enabled);
+  const totalRemain=enabled.reduce((s,u)=>s+(Number(u.remainingPoints)||0),0);
+  if(ctx)ctx.innerHTML='<span class="rate-pill">'+enabled.length+' 人启用</span><span class="rate-pill">合计剩余 '+fmtT(totalRemain)+' 点</span>';
+  users.sort((a,b)=>((b.budget&&b.budget.enabled)?1:0)-((a.budget&&a.budget.enabled)?1:0)||String(a.username||'').localeCompare(String(b.username||''),'zh'));
+  host.innerHTML=users.map(u=>{
+    const b=u.budget||{},usg=u.usage||{};
+    const on=!!b.enabled;
+    const pct=on?Math.max(0,Math.min(100,Number(u.pct)||0)):0;
+    const exhausted=on&&pct>=100;
+    const state=u.disabled?'已禁用':!on?'未启用':exhausted?'已用尽':'正常';
+    const stateCls=u.disabled||exhausted?'color:var(--red)':!on?'color:var(--dim)': 'color:var(--green)';
+    const barCol=exhausted?'var(--red)':pct>=80?'var(--orange)':'var(--green)';
+    const pref=[u.preferred&&u.preferred.anthropic?'A: '+u.preferred.anthropic:'',u.preferred&&u.preferred.responses?'R: '+u.preferred.responses:''].filter(Boolean).join(' · ')||'自动';
+    return '<tr>'
+      +'<td><b>'+escH(u.username||u.key||'')+'</b></td>'
+      +'<td class="mono" title="'+escH(u.key||'')+'">'+escH(maskDetailKey(u.key||''))+'</td>'
+      +'<td style="'+stateCls+';font-weight:600">'+state+'</td>'
+      +'<td>'+pointPeriodLabel(b.period)+'</td>'
+      +'<td class="n">'+(on?fmtT(b.budgetPoints):'–')+'</td>'
+      +'<td class="n">'+(on?fmtT(usg.usedPoints):'–')+'</td>'
+      +'<td class="n hl">'+(on?fmtT(u.remainingPoints):'–')+'</td>'
+      +'<td><div class="pb-track"><i style="width:'+pct+'%;background:'+barCol+'"></i></div><span class="pb-pct">'+(on?pct+'%':'–')+'</span></td>'
+      +'<td class="pb-period">'+(on?escH((u.periodStart||'')+' ~ '+(u.periodEnd||'')):'–')+'</td>'
+      +'<td class="pb-pref">'+escH(pref)+'</td>'
       +'</tr>';
-  }).join("");
+  }).join('');
 }
 function maskDetailKey(key){const value=String(key||"");return value.length<=12?value:value.slice(0,8)+"****"+value.slice(-4)}
 // ── All-profiles quota columns ───────────────────────────────────────────────

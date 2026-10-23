@@ -364,3 +364,29 @@ td{padding:8px 12px;font-size:11px;border-bottom:1px solid #ecece8;white-space:n
 .pm-table .bar{background:var(--accent-soft);border-radius:3px;height:8px;overflow:hidden}
 .pm-table .bar i{display:block;height:100%;background:linear-gradient(90deg,#4d8a6d,#2f6e50);border-radius:3px}
 .pm-note{font-size:12px;color:var(--dim);margin-top:10px;line-height:1.7}
+/* 倍率页：一行一个方案，协议分组，模型倍率逐行展开 */
+.rate-plan-group{margin:0 0 18px}
+.rate-plan-title{display:flex;align-items:baseline;gap:10px;padding:9px 12px 7px;border-bottom:1px solid var(--border);font-size:12px}
+.rate-plan-title b{font-size:13px}.rate-plan-title span{font-size:10px;color:var(--dim)}
+.rate-plan-table{width:100%;table-layout:fixed}
+.rate-plan-table th{font-size:10px;color:var(--dim);font-weight:600;text-align:left;padding:6px 10px;border-bottom:1px solid var(--border);white-space:nowrap}
+.rate-plan-table td{padding:8px 10px;border-bottom:1px solid var(--border);vertical-align:top;font-size:11px}
+.rate-plan-table th:first-child,.rate-plan-table td:first-child{width:190px}
+.rate-plan-table th:last-child,.rate-plan-table td:last-child{width:82px}
+.rate-plan-cell b{font-size:12px}.rate-plan-suffix{font-size:10px;color:var(--dim);margin-top:2px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+.rate-plan-factor{display:inline-block;margin-top:4px;font-size:10px;color:var(--orange);border:1px solid var(--border);border-radius:999px;padding:0 6px}
+.rate-model-line{padding:5px 0;border-bottom:1px dashed var(--border)}
+.rate-model-line:first-child{padding-top:0}.rate-model-line:last-child{border-bottom:0;padding-bottom:0}
+.rate-model-head{display:flex;align-items:center;gap:6px;min-width:0}
+.rate-model-name{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:100%}
+.rate-model-alias{font-size:9px;color:var(--blue);font-family:ui-monospace,SFMono-Regular,Menlo,monospace;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.rate-model-rates{font-size:10px;color:var(--dim);margin-top:2px;display:flex;align-items:center;gap:6px;flex-wrap:wrap}
+.rate-model-rates i{font-style:normal;color:var(--dim2)}
+.rate-now{font-size:11px}.rate-now.hot{color:var(--orange)}.rate-now.cool{color:var(--green)}
+.rate-tag-unset{color:var(--dim);border-color:var(--border)}
+.rate-req-cell{color:var(--dim);font-size:10px}
+.pb-track{height:6px;background:var(--border);border-radius:999px;overflow:hidden;min-width:70px;display:inline-block;width:70px;vertical-align:middle}
+.pb-track i{display:block;height:100%;border-radius:999px}
+.pb-pct{font-size:10px;color:var(--dim);margin-left:5px;vertical-align:middle}
+.pb-period{font-size:10px;color:var(--dim);white-space:nowrap}
+.pb-pref{font-size:10px;color:var(--dim);max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}

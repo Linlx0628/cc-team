@@ -448,7 +448,9 @@ function renderPoints(){
   }
   const detail=document.getElementById('pointsDetail');
   if(!detail)return;
-  let html='已用 <b>'+fmtPts(p.usedPointsExact!=null?p.usedPointsExact:p.usedPoints)+'</b> / '+fmtP(p.budgetPoints)+' 点'
+  const budgetLabel=fmtP(p.baseBudgetPoints!=null?p.baseBudgetPoints:p.budgetPoints)
+    +(p.bonusPoints>0?' + 签到 '+fmtPts(p.bonusPoints):'');
+  let html='已用 <b>'+fmtPts(p.usedPointsExact!=null?p.usedPointsExact:p.usedPoints)+'</b> / '+budgetLabel+' 点'
     +(p.budgetPoints>0?'（'+p.pct+'%）':'')
     +(p.overPoints>0
       ?' · <span style="color:var(--red);font-weight:600">已超出 '+fmtPts(p.overPointsExact!=null?p.overPointsExact:p.overPoints)+' 点</span>'
@@ -460,6 +462,34 @@ function renderPoints(){
   if(lines.length)html+='<br>'+lines.join(' · ');
   if(!p.exhausted)html+='<br><span style="color:var(--dim)">点数模式下请联系管理员调整预算</span>';
   detail.innerHTML=html;
+  renderPointCheckin();
+}
+function renderPointCheckin(){
+  const wrap=document.getElementById('pointCheckinWrap');
+  const btn=document.getElementById('pointCheckinBtn');
+  const hint=document.getElementById('pointCheckinHint');
+  if(!wrap||!btn||!hint)return;
+  const c=D&&D.pointCheckin;
+  if(!c||c.available===false||c.enabled===false){wrap.style.display='none';return}
+  wrap.style.display='flex';
+  if(c.checkedInToday){
+    hint.textContent='今日已签到 +'+fmtPts(c.todayPoints)+' 点'+(c.streak>1?' · 连续 '+c.streak+' 天':'');
+    btn.disabled=true;btn.textContent='已签到';
+  }else{
+    hint.textContent='签到领 '+fmtPts(c.minPoints)+'~'+fmtPts(c.maxPoints)+' 点'+(c.streak>0?' · 连续 '+c.streak+' 天':'');
+    btn.disabled=false;btn.textContent='签到';
+  }
+}
+async function doPointCheckIn(){
+  const btn=document.getElementById('pointCheckinBtn');
+  if(btn)btn.disabled=true;
+  try{
+    const r=await fetch('/api/checkin',{method:'POST',headers:{'Authorization':'Bearer '+VK}});
+    const j=await r.json().catch(function(){return {}});
+    if(!r.ok)throw new Error(j.error||('签到失败 ('+r.status+')'));
+    toast('签到成功！获得 '+fmtPts(j.amount)+' 点，已计入本期预算');
+    await load();
+  }catch(e){toast(e.message||'签到失败');if(btn)btn.disabled=false}
 }
 let prefBound=false,prefSaving=false;
 function prefProtocolLabel(proto){return proto==='responses'?'OpenAI（Responses）':'Anthropic（Claude Code）'}

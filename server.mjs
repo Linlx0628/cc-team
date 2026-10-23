@@ -3459,13 +3459,22 @@ function checkPointBudget(apiKey, _rt) {
   let windowStart = periodStartDate(budget.period);
   if (budget.startsAt && budget.startsAt > windowStart) windowStart = budget.startsAt;
   let row = { used: 0, raw: 0, requests: 0 };
+  let bonus = { points: 0, weighted: 0 };
   if (budget.enabled) {
     row = stmts.sumUserWeightedRange.get(key, windowStart, today) || row;
+    bonus = stmts.sumPointCheckInPoints.get(key, windowStart, today) || bonus;
   }
-  const points = computePointsUsage({ budget, usedWeighted: row.used || 0, today });
+  const bonusPoints = bonus.points || 0;
+  const effectiveBudget = bonusPoints > 0
+    ? { ...budget, budgetPoints: budget.budgetPoints + bonusPoints }
+    : budget;
+  const points = computePointsUsage({ budget: effectiveBudget, usedWeighted: row.used || 0, today });
   return {
     ...points,
     key,
+    baseBudgetPoints: budget.budgetPoints,
+    bonusPoints,
+    bonusWeighted: bonus.weighted || 0,
     rawUsed: row.raw || 0,
     requests: row.requests || 0,
     retryAfterSeconds: budget.enabled ? secondsUntilNextPeriodEnd(budget.period) : 0,
@@ -3665,6 +3674,7 @@ function getPointBudgetsPayload() {
         usedWeighted: points.usedWeighted,
         requests: points.requests,
         last30dPoints,
+        bonusPoints: points.bonusPoints,
         suggestedMonthlyPoints: last30dPoints > 0 ? Math.max(1, Math.round(last30dPoints * 0.8)) : 0,
       },
       remainingPoints: budget.enabled ? points.remainingPoints : null,
@@ -4484,6 +4494,7 @@ const MEMBER_REWARDS_DEPS = {
   checkKeyExpired,
   getUserPoolQuota,
   getPoolQuota,
+  getPointBudget,
   recordAudit,
   maskAuditKey,
   notifierApi,
@@ -8068,12 +8079,10 @@ const server = http.createServer((req, res) => {
     const apiKey = getApiKey(req);
     try {
       if (!hasGlobalUser(apiKey)) throw new Error("认证失败：请提供有效的虚拟Key");
-      if (pointsModeEnabled(resolveUserKey(apiKey, rt))) {
-        res.writeHead(409, { "Content-Type": "application/json; charset=utf-8" });
-        res.end(JSON.stringify({ error: "点数模式下签到不适用；点数预算由管理员调整，本期额度请联系管理员" }));
-        return;
-      }
-      const result = memberRewardsApi.performCheckIn(apiKey, getClientIp(req));
+      const pointMode = pointsModeEnabled(resolveUserKey(apiKey, rt));
+      const result = pointMode
+        ? memberRewardsApi.performPointCheckIn(apiKey, getClientIp(req))
+        : memberRewardsApi.performCheckIn(apiKey, getClientIp(req));
       res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
       res.end(JSON.stringify(result));
     } catch (err) {
@@ -8634,6 +8643,7 @@ const server = http.createServer((req, res) => {
       // 可选自定义日期范围(用量分析面板的趋势/模型/客户端表);null = 都没给,走默认窗口。
       const usageRange = parseDateRange(url.searchParams.get("start"), url.searchParams.get("end"));
       const payload = usageApi.getPersonalUsageData(apiKey, profileSuffix, protocolParam, usageRange);
+      if (payload.points?.enabled) payload.pointCheckin = memberRewardsApi.getPointCheckInStatus(apiKey);
       res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
       // heatmap=0:30s 轮询瘦身 —— 370 天使用日历每次随载荷下发太浪费,前端首轮拉全量
       // 后本地缓存,轮询只刷今日格(由 today 数据驱动),日期范围变化时再拉全量。

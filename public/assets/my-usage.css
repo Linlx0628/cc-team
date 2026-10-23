@@ -108,6 +108,7 @@ table{width:100%;border-collapse:collapse;min-width:560px}th{text-align:left;pad
 .btn-checkin:hover:not(:disabled){background:#33332f}
 .btn-checkin:active:not(:disabled){transform:translateY(1px)}
 .btn-checkin:disabled{background:#deded8;color:#686863;cursor:default}
+.point-checkin-btn{padding:6px 14px;font-size:12px}
 /* ── Quota-request entry button + modal ── */
 .qr-open-btn{font-size:11.5px;font-weight:600;padding:8px 14px;border-radius:5px;border:1px solid var(--border-strong);background:var(--surface);color:var(--text);cursor:pointer}
 .qr-open-btn:hover{background:var(--accent-soft);border-color:var(--accent);color:var(--accent)}

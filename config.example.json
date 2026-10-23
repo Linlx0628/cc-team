@@ -65,6 +65,13 @@
     "circuitBreakerFailures": 5,
     "circuitBreakerCooldown": 30000
   },
+  "checkIn": {
+    "enabled": true,
+    "minTokens": 10000,
+    "maxTokens": 100000,
+    "pointMinPoints": 10,
+    "pointMaxPoints": 50
+  },
   "pointSettings": {
     "defaultPeriod": "month",
     "allowSelfSelect": true

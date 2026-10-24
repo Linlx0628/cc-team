@@ -956,7 +956,7 @@ function renderRequests(){
         +'<td style="max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="'+esc(r.model||'')+'">'+esc(r.model||'—')+'</td>'
         +'<td class="n">'+fmtT(r.inputTokens||0)+'</td>'
         +'<td class="n">'+fmtT(r.outputTokens||0)+'</td>'
-        +'<td class="n">'+fmtT(r.cacheReadTokens||0)+'</td>'
+        +'<td class="n">读 '+fmtT(r.cacheReadTokens||0)+'<div class="note" style="font-size:10px">写 '+fmtT(r.cacheCreationTokens||0)+'</div></td>'
         +'<td class="n">×'+Number(r.pointRate==null?1:r.pointRate).toFixed(2)+'</td>'
         +'<td class="n" style="font-weight:600">'+fmtPts(r.points||0)+' 点</td>'
         +'</tr>';

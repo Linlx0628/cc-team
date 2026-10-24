@@ -3475,16 +3475,29 @@ function checkPointBudget(apiKey, _rt) {
   let windowStart = periodStartDate(budget.period);
   if (budget.startsAt && budget.startsAt > windowStart) windowStart = budget.startsAt;
   let row = { used: 0, raw: 0, requests: 0 };
-  let bonus = { points: 0, weighted: 0 };
+  let checkin = { points: 0, weighted: 0 };
+  let temp = { points: 0, expiresAt: "" };
+  let periodOp = null;
   if (budget.enabled) {
     // 点数预算只认「点数模式」的请求：point_usage 由 recordUsage 在点数模式下写入。
     // 不能用 usage_daily.billing_weighted_tokens —— 非点数用户那列等于 weighted_tokens，
     // 成员中途开启点数时会把开启前的历史额度池用量算进本期点数（已实际出现过的错账）。
     const agg = stmts.sumPointUsageRange.get(key, windowStart, today) || {};
-    row = { used: agg.weighted || 0, raw: 0, requests: agg.requests || 0 };
-    bonus = stmts.sumPointCheckInPoints.get(key, windowStart, today) || bonus;
+    // 重置已用：只把「重置前已经发生的量」记成基线，不删除任何历史；同一周期
+    // 多次重置时写的是当前累计量（而非累加），这样第二次重置后已用会重新归零。
+    periodOp = stmts.getPointPeriodOp.get(key, windowStart) || null;
+    const baseline = Math.max(0, Number(periodOp && periodOp.reset_baseline_weighted) || 0);
+    row = {
+      used: Math.max(0, (agg.weighted || 0) - baseline),
+      raw: 0,
+      requests: agg.requests || 0,
+    };
+    checkin = stmts.sumPointCheckInPoints.get(key, windowStart, today) || checkin;
+    temp = stmts.sumActivePointGrants.get(key, today, today) || temp;
   }
-  const bonusPoints = bonus.points || 0;
+  const checkinPoints = Math.max(0, Number(checkin.points) || 0);
+  const tempPoints = Math.max(0, Number(temp.points) || 0);
+  const bonusPoints = checkinPoints + tempPoints;
   const effectiveBudget = bonusPoints > 0
     ? { ...budget, budgetPoints: budget.budgetPoints + bonusPoints }
     : budget;
@@ -3494,7 +3507,12 @@ function checkPointBudget(apiKey, _rt) {
     key,
     baseBudgetPoints: budget.budgetPoints,
     bonusPoints,
-    bonusWeighted: bonus.weighted || 0,
+    checkinPoints,
+    tempPoints,
+    tempExpiresAt: temp.expiresAt || "",
+    bonusWeighted: checkin.weighted || 0,
+    resetBaselineWeighted: periodOp ? (periodOp.reset_baseline_weighted || 0) : 0,
+    resetAt: periodOp ? periodOp.reset_at : null,
     rawUsed: row.raw || 0,
     requests: row.requests || 0,
     retryAfterSeconds: budget.enabled ? secondsUntilNextPeriodEnd(budget.period) : 0,
@@ -3682,6 +3700,7 @@ function getPointBudgetsPayload() {
     const last30 = stmts.sumPointUsageRange.get(key, start30, today) || { weighted: 0, requests: 0 };
     const last30dPoints = weightedToPoints(last30.weighted || 0);
     const pref = stmts.getMemberProfilePreference.get(key) || {};
+    const grants = stmts.pointGrantsByUser.all(key);
     users.push({
       key,
       username: gu.username || "",
@@ -3695,6 +3714,12 @@ function getPointBudgetsPayload() {
         requests: points.requests,
         last30dPoints,
         bonusPoints: points.bonusPoints,
+        checkinPoints: points.checkinPoints,
+        tempPoints: points.tempPoints,
+        tempExpiresAt: points.tempExpiresAt,
+        resetBaselineWeighted: points.resetBaselineWeighted,
+        resetAt: points.resetAt,
+        grants,
         suggestedMonthlyPoints: last30dPoints > 0 ? Math.max(1, Math.round(last30dPoints * 0.8)) : 0,
       },
       remainingPoints: budget.enabled ? points.remainingPoints : null,
@@ -5392,6 +5417,114 @@ const server = http.createServer((req, res) => {
           `允许成员自选首选方案: ${before} → ${input.allowSelfSelect}`, "quota");
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ ok: true }));
+      } catch (err) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: err.message }));
+      }
+    }).catch(() => {
+      res.writeHead(413, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Request too large" }));
+    });
+    return;
+  }
+
+  // ─── 点数临时加点 / 重置已用 ───────────────────────────────────────────────
+  const parseDateYmd = (value) => {
+    const text = String(value || "");
+    const ms = Date.parse(`${text}T00:00:00Z`);
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(text) || Number.isNaN(ms)
+      || new Date(ms).toISOString().slice(0, 10) !== text) {
+      throw new Error("日期格式应为 YYYY-MM-DD");
+    }
+    return text;
+  };
+
+  if (req.method === "POST" && req.url === "/api/point-budget/grant") {
+    if (!checkAuth(req)) { res.writeHead(401); res.end("Unauthorized"); return; }
+    if (!checkCsrf(req)) { res.writeHead(403); res.end("CSRF validation failed"); return; }
+    readBody(req, 10_000).then((buf) => {
+      try {
+        const input = JSON.parse(buf.toString());
+        const key = String(input.key || "");
+        if (!Object.prototype.hasOwnProperty.call(config.users || {}, key)) throw new Error("成员不存在");
+        const points = Number(input.points);
+        if (!Number.isInteger(points) || points < 1 || points > MAX_BUDGET_POINTS) {
+          throw new Error(`临时点数必须是 1..${MAX_BUDGET_POINTS} 的整数`);
+        }
+        const expiresAt = parseDateYmd(input.expiresAt);
+        if (expiresAt < cnDate()) throw new Error("有效期不能早于今天");
+        const note = typeof input.note === "string" ? input.note.trim().slice(0, 200) : "";
+        const createdAt = new Date().toISOString();
+        const info = stmts.insertPointGrant.run({
+          key, points, startsAt: cnDate(), expiresAt, note,
+          createdAt, createdBy: "admin",
+        });
+        recordAdminAudit(req, "pointbudget.grant", config.users[key].username || key,
+          `临时点数 +${points} 点，有效期至 ${expiresAt}${note ? "，备注: " + note : ""}`, "quota");
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: true, id: Number(info.lastInsertRowid) }));
+      } catch (err) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: err.message }));
+      }
+    }).catch(() => {
+      res.writeHead(413, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Request too large" }));
+    });
+    return;
+  }
+
+  if (req.method === "POST" && req.url === "/api/point-budget/grant/revoke") {
+    if (!checkAuth(req)) { res.writeHead(401); res.end("Unauthorized"); return; }
+    if (!checkCsrf(req)) { res.writeHead(403); res.end("CSRF validation failed"); return; }
+    readBody(req, 10_000).then((buf) => {
+      try {
+        const input = JSON.parse(buf.toString());
+        const key = String(input.key || "");
+        const id = Number(input.id);
+        if (!Object.prototype.hasOwnProperty.call(config.users || {}, key)) throw new Error("成员不存在");
+        if (!Number.isInteger(id) || id < 1) throw new Error("临时点数记录不存在");
+        const info = stmts.revokePointGrant.run({ id, key, revokedAt: new Date().toISOString() });
+        if (!info.changes) throw new Error("临时点数记录不存在或已撤销");
+        recordAdminAudit(req, "pointbudget.grant.revoke", config.users[key].username || key,
+          `撤销临时点数 #${id}`, "quota");
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: true }));
+      } catch (err) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: err.message }));
+      }
+    }).catch(() => {
+      res.writeHead(413, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Request too large" }));
+    });
+    return;
+  }
+
+  if (req.method === "POST" && req.url === "/api/point-budget/reset") {
+    if (!checkAuth(req)) { res.writeHead(401); res.end("Unauthorized"); return; }
+    if (!checkCsrf(req)) { res.writeHead(403); res.end("CSRF validation failed"); return; }
+    readBody(req, 10_000).then((buf) => {
+      try {
+        const input = JSON.parse(buf.toString());
+        const key = String(input.key || "");
+        if (!Object.prototype.hasOwnProperty.call(config.users || {}, key)) throw new Error("成员不存在");
+        if (!pointsModeEnabled(key)) throw new Error("该成员未启用点数预算");
+        const budget = getPointBudget(key);
+        const today = cnDate();
+        let windowStart = periodStartDate(budget.period);
+        if (budget.startsAt && budget.startsAt > windowStart) windowStart = budget.startsAt;
+        const agg = stmts.sumPointUsageRange.get(key, windowStart, today) || { weighted: 0 };
+        const baseline = Math.max(0, Number(agg.weighted) || 0);
+        const now = Date.now();
+        stmts.upsertPointPeriodOp.run({
+          key, periodStart: windowStart, baseline, resetAt: now, updatedAt: now,
+        });
+        recordAdminAudit(req, "pointbudget.reset", config.users[key].username || key,
+          `重置本期已用点数：基线 ${(baseline / POINTS_UNIT).toFixed(2)} 点（${baseline} 计权），周期 ${windowStart} 起`,
+          "quota");
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: true, resetBaselineWeighted: baseline, usedPoints: 0 }));
       } catch (err) {
         res.writeHead(400, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ error: err.message }));

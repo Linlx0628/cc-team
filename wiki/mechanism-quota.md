@@ -149,6 +149,7 @@ usedPoints    = round(usedWeighted / 10,000)   // 只用于展示
 - 点数是**用户级、跨方案**的：同一个成员从哪个方案入口用，扣的都是同一份预算。
 - 点数检查在候选方案循环**之前只做一次**；耗尽直接 `429 points_exceeded`，不会因为换一个方案就绕过。
 - 改预算立即生效；改点数倍率/系数只影响之后的请求，已经落库的 `billing_weighted_tokens` 不变。
+- 管理员还可以发**临时点数**（带到期日，计入本期预算）或**重置本期已用**（记基线，不删历史）；见下节。
 
 ### 周期与重置
 
@@ -181,6 +182,21 @@ usedPoints    = round(usedWeighted / 10,000)   // 只用于展示
 - 查询：`GET /api/point-usage?granularity=day|week|month&key=<完整Key>&from=YYYY-MM-DD&to=YYYY-MM-DD&limit=400`（管理员鉴权；不传 `key` 返回全部成员）。返回 `points` 已按 10,000 折算。
 - 这张表同时服务统计与**点数预算判定**：`checkPointBudget` 只聚合 `point_usage` 的 day 桶，避免把“非点数用户 billing=weighted”的历史额度池用量算进点数。`usage_daily` 仍只负责额度池判定。
 - 另有一张逐请求凭证表 `point_requests`：每个成功请求一条，字段只含方案、模型、输入/输出/缓存、额度池计权、点数计权、点数倍率和完成时间，不含 prompt/响应正文。它只用于成员核对“这次扣了多少点”，不参与预算判定；按 `id` 自增游标分页，90 天自动清理，单条写入与 `point_usage` 在同一个事务里完成，崩溃不会出现“汇总加了、明细没加”的半条账。
+
+### 临时点数与重置已用
+
+管理员在「点数预算」表格的操作列有两个按钮：
+
+| 操作 | 写入 | 判定方式 | 注意 |
+|---|---|---|---|
+| **临时点数** | `point_grants(user_key, points, starts_at, expires_at, note, revoked_at)` | 当天在 `[starts_at, expires_at]` 内的未撤销记录求和，加到本期预算 | 到期后自然失效，不需要定时任务；可撤销；不修改基础预算，也不结转 |
+| **重置已用** | `point_period_ops(user_key, period_start, reset_baseline_weighted, reset_at)` | `used = max(0, point_usage 本期累计 − reset_baseline_weighted)` | 只改判定基线，不删除 `point_usage` / `point_requests`；同一周期再次重置会写当前累计量，已用重新归零 |
+
+- 临时点数和签到一样是**本期加量**，不会写回 `config.pointBudgets`；周期结束后自动不再计入。
+- 临时点数默认 `starts_at = 今天`，`expires_at` 必须 ≥ 今天且按北京日期、含当天；例：`expires_at = 2026-10-31` 在 10-31 23:59 前有效。
+- 重置只影响「本期已用」和剩余/429 判定；成员请求明细仍保留重置前的记录，管理员审计也会记录基线。
+- 重置与临时点数都只对**已启用点数预算**的成员生效；对旧额度池成员无效。
+- 生产分析 SQL 见仓库 `docs/point-budget-analysis.sql`；它只读 `point_usage` / `point_grants` / `point_period_ops`，不会改数据。
 
 ### 点数倍率与计费系数
 
@@ -230,7 +246,7 @@ usedPoints    = round(usedWeighted / 10,000)   // 只用于展示
 | 成员未启用点数 | 完全走旧的「个人日配额优先 / 否则池日配额」 |
 
 - 点数模式下，该成员在池里的**个人日配额被忽略**；池级 `dailyTokenLimit` 仍生效。
-- 旧的签到/加量发放写的是「池 + 当日 bonus」，对点数预算不生效；一期对点数成员的签到、加量申请、管理员发放都返回 **409**，提示改用「点数预算」调整。池级护栏仍会看到当日 bonus。
+- 点数成员的「签到」改为发点数（直接加到本期预算）；「申请加量」仍返回 409，提示改用「点数预算」调整。池级护栏仍会看到旧的池签到/加量。
 
 ### 超限 429
 

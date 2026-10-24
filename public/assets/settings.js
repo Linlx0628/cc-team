@@ -649,7 +649,9 @@ function pbRowHtml(u){
     +   (zero?'<div style="color:var(--red);font-size:11px">所有请求将被拒绝</div>':'')
     +'</td>'
     +'<td class="n" title="本期剩余"'+(exhausted?' style="color:var(--red)"':'')+'>'+pbPoints(remaining)+' 点'
-    +   (exhausted&&!zero?'<div style="font-size:11px">本期已用完</div>':'')+'</td>'
+    +   (exhausted&&!zero?'<div style="font-size:11px">本期已用完</div>':'')
+    +   (usage.tempPoints>0?'<div style="font-size:10px;color:var(--accent)">临时 +'+pbPoints(usage.tempPoints)+' 点'+(usage.tempExpiresAt?'（至 '+h(usage.tempExpiresAt)+'）':'')+'</div>':'')
+    +   (usage.resetAt?'<div style="font-size:10px;color:var(--dim)">本期已重置</div>':'')+'</td>'
     +'<td class="n" style="white-space:nowrap">'+pbPoints(usage.last30dPoints)+' 点/30天'
     +   '<div style="font-size:10px;color:var(--dim)">'+pbPoints(usage.requests)+' 次</div></td>'
     +'<td class="n" style="white-space:nowrap">'+pbPoints(usage.suggestedMonthlyPoints)+' 点/月'
@@ -661,6 +663,10 @@ function pbRowHtml(u){
     +'</td>'
     +'<td style="white-space:nowrap">'
     +   '<button type="button" class="btn btn-primary btn-sm" onclick="savePointBudget(\''+h(key)+'\')">保存</button>'
+    +   '<div style="margin-top:4px;display:flex;gap:4px">'
+    +     '<button type="button" class="btn btn-outline btn-sm" onclick="pbGrantPoints(\''+h(key)+'\')">临时点数</button>'
+    +     '<button type="button" class="btn btn-outline btn-sm" onclick="pbResetUsed(\''+h(key)+'\')">重置已用</button>'
+    +   '</div>'
     +   '<span data-pb-msg style="margin-left:6px"></span>'
     +'</td>'
     +'</tr>';
@@ -782,6 +788,42 @@ async function savePointBudget(key){
   const ok='「'+(u.username||key)+'」的点数预算已保存';
   pbSetStatus(ok);
   toast(ok);
+}
+// 临时点数：只在本期预算上叠加，不修改基础预算；到期后自然失效。
+async function pbGrantPoints(key){
+  const u=pbUser(key);if(!u)return;
+  const points=prompt('给「'+(u.username||key)+'」增加多少临时点数？\n必须是正整数；到期后自动失效。','20');
+  if(points==null)return;
+  const n=pbNum(points);
+  if(!(n>0)||!Number.isInteger(n)){alert('临时点数必须是正整数');return}
+  const d=new Date(Date.now()+8*3600000+7*86400000).toISOString().slice(0,10);
+  const expiresAt=prompt('有效期至（YYYY-MM-DD，含当天）',d);
+  if(expiresAt==null)return;
+  const note=prompt('备注（可选）','')||'';
+  const res=await pbPostJson('/api/point-budget/grant',{key:key,points:n,expiresAt:expiresAt,note:note});
+  if(!res.ok){alert('增加失败: '+res.error);return}
+  await loadPointBudgets();
+  pbSetStatus('已给「'+(u.username||key)+'」增加 '+n+' 点临时点数，有效期至 '+expiresAt);
+  toast('临时点数已增加');
+}
+async function pbResetUsed(key){
+  const u=pbUser(key);if(!u)return;
+  if(!confirm('确认重置「'+(u.username||key)+'」本期已用点数？\n历史请求不会删除，只是从当前累计量重新起算。'))return;
+  const res=await pbPostJson('/api/point-budget/reset',{key:key});
+  if(!res.ok){alert('重置失败: '+res.error);return}
+  await loadPointBudgets();
+  pbSetStatus('已重置「'+(u.username||key)+'」本期已用点数');
+  toast('本期已用已重置');
+}
+async function pbPostJson(url,body){
+  body=Object.assign({_csrf:getCsrf()},body||{});
+  let r,data;
+  try{
+    r=await fetch(url,{method:'POST',headers:csrfHeaders({'Content-Type':'application/json'}),body:JSON.stringify(body)});
+    data=await r.json().catch(()=>({}));
+  }catch(err){return {ok:false,error:err.message}}
+  if(!r.ok||(data&&data.error))return {ok:false,error:(data&&data.error)||('HTTP '+r.status)};
+  return {ok:true,data:data};
 }
 function pbDirtyRows(){
   const out=[];

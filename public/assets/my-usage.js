@@ -448,8 +448,9 @@ function renderPoints(){
   }
   const detail=document.getElementById('pointsDetail');
   if(!detail)return;
-  const budgetLabel=fmtP(p.baseBudgetPoints!=null?p.baseBudgetPoints:p.budgetPoints)
-    +(p.bonusPoints>0?' + 签到 '+fmtPts(p.bonusPoints):'');
+  let budgetLabel=fmtP(p.baseBudgetPoints!=null?p.baseBudgetPoints:p.budgetPoints);
+  if(p.checkinPoints>0)budgetLabel+=' + 签到 '+fmtPts(p.checkinPoints);
+  if(p.tempPoints>0)budgetLabel+=' + 临时 '+fmtPts(p.tempPoints);
   let html='已用 <b>'+fmtPts(p.usedPointsExact!=null?p.usedPointsExact:p.usedPoints)+'</b> / '+budgetLabel+' 点'
     +(p.budgetPoints>0?'（'+p.pct+'%）':'')
     +(p.overPoints>0
@@ -459,6 +460,7 @@ function renderPoints(){
   if(p.exhausted)lines.push('<span style="color:var(--red)">本期点数已用完，请求会被拦截</span>');
   else if(p.projectedExhaustDate)lines.push('按当前速度预计 <b>'+p.projectedExhaustDate+'</b> 用完');
   if(p.avgDailyPoints>0)lines.push('日均 '+fmtPts(p.avgDailyPoints)+' 点');
+  if(p.tempPoints>0&&p.tempExpiresAt)lines.push('临时点数有效期至 <b>'+p.tempExpiresAt+'</b>');
   if(lines.length)html+='<br>'+lines.join(' · ');
   if(!p.exhausted)html+='<br><span style="color:var(--dim)">点数模式下请联系管理员调整预算</span>';
   detail.innerHTML=html;

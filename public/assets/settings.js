@@ -1283,9 +1283,13 @@ async function editProfile(n){
   updatePoolSummary();
   const pqr=document.getElementById('peakQuotaRateInput');if(pqr)pqr.value=(p.peakQuotaRate??1);
   const oqr=document.getElementById('offPeakQuotaRateInput');if(oqr)oqr.value=(p.offPeakQuotaRate??1);
+  const ppq=fm.querySelector('input[name="pointPeakRate"]');if(ppq)ppq.value=(p.pointPeakRate==null?'':p.pointPeakRate);
+  const poq=fm.querySelector('input[name="pointOffPeakRate"]');if(poq)poq.value=(p.pointOffPeakRate==null?'':p.pointOffPeakRate);
+  const pbf=fm.querySelector('input[name="pointsBillingFactor"]');if(pbf)pbf.value=(p.pointsBillingFactor??1);
   const cqr=document.getElementById('cacheReadQuotaRateInput');if(cqr)cqr.value=(p.cacheReadQuotaRate??0);
   // cacheReadQuotaRate only means something on Responses/Codex profiles (OpenAI
   // upstreams fold cache hits into input_tokens) — hide it on Anthropic profiles.
+  updatePointRateRowsHint();
   const cqF=document.getElementById('cacheReadQuotaField');if(cqF)cqF.style.display=(p.protocol==='responses')?'':'none';
   const cqN=document.getElementById('cacheReadQuotaNote');if(cqN)cqN.style.display=(p.protocol==='responses')?'':'none';
   // Responses outbound endpoint is Responses-profile-only (hidden on Anthropic).
@@ -1817,6 +1821,64 @@ function fillAllRateRows(){
         dof=Number(document.getElementById('offPeakQuotaRateInput').value);
   allRateModels().filter(m=>!have.has(m)).forEach(m=>addRateRow(m,Number.isFinite(dp)?dp:1,Number.isFinite(dof)?dof:1));
 }
+function pointRateRowEl(model,peak,off){
+  const div=document.createElement('div');div.className='alias-row rate';
+  div.innerHTML='<select name="pmr_model_0"></select>'
+    +'<input type="number" name="pmr_peak_0" min="0" max="+QUOTA_RATE_MAX+" step="0.05" value="'+(peak==null?'':peak)+'" placeholder="留空=1.00">'
+    +'<input type="number" name="pmr_off_0" min="0" max="+QUOTA_RATE_MAX+" step="0.05" value="'+(off==null?'':off)+'" placeholder="留空=1.00">'
+    +'<span class="rate-eff"></span>'
+    +'<button type="button" class="row-del" title="删除该行">×</button>';
+  div.querySelector('.row-del').onclick=()=>{div.remove();renumberRows('pmr');updatePointRateRowsHint()};
+  div.addEventListener('input',updatePointRateRowsHint);
+  refreshRateSelect(div.querySelector('select[name^="pmr_model_"]'),model);
+  return div;
+}
+function addPointRateRow(model,peak,off){
+  document.getElementById('pointRateRows').appendChild(pointRateRowEl(model||'',peak,off));
+  renumberRows('pmr');updatePointRateRowsHint();
+}
+function fillAllPointRateRows(){
+  const have=new Set([...document.querySelectorAll('#pointRateRows select[name^="pmr_model_"]')].map(s=>s.value).filter(Boolean));
+  allRateModels().filter(m=>!have.has(m)).forEach(m=>addPointRateRow(m,null,null));
+}
+function updatePointRateRowsHint(){
+  const el=document.getElementById('pointRateRowsHint');
+  if(!el)return;
+  const rows=[...document.querySelectorAll('#pointRateRows .alias-row')];
+  const peakEl=document.querySelector('input[name="pointPeakRate"]'),offEl=document.querySelector('input[name="pointOffPeakRate"]');
+  const rawPeak=peakEl&&peakEl.value.trim()!==''?Number(peakEl.value):1;
+  const rawOff=offEl&&offEl.value.trim()!==''?Number(offEl.value):1;
+  const dp=Number.isFinite(rawPeak)?rawPeak:1,dof=Number.isFinite(rawOff)?rawOff:1;
+  const inPeak=nowInPeakHours(collectPeakHours());
+  const priced=new Set();
+  rows.forEach(row=>{
+    const m=row.querySelector('select[name^="pmr_model_"]').value;
+    const p=row.querySelector('[name^="pmr_peak_"]').value,o=row.querySelector('[name^="pmr_off_"]').value;
+    const cell=row.querySelector('.rate-eff');
+    if(m)priced.add(m);
+    if(!m){cell.textContent='未选择模型';cell.style.color='var(--orange)';return}
+    const v=inPeak?p:o;
+    const eff=v===''?1:Number(v);
+    if(!Number.isFinite(eff)){cell.textContent='倍率无效 → 归一为 1.00';cell.style.color='var(--orange)';return}
+    cell.textContent='×'+eff+(inPeak?'（高峰）':'（低谷）');
+    cell.style.color='var(--dim)';
+  });
+  const dupes=rows.map(r=>r.querySelector('select[name^="pmr_model_"]').value).filter(Boolean)
+    .filter((m,i,arr)=>arr.indexOf(m)!==i);
+  if(dupes.length){el.innerHTML='<b style="color:var(--orange)">注意：模型 "'+h(dupes[0])+'" 配置了多行，保存时以最后一行为准</b>';el.style.color='var(--orange)';return}
+  const uncovered=allRateModels().filter(m=>!priced.has(m));
+  el.innerHTML=(rows.length?'已单独定价 '+priced.size+' 个模型。':'')
+    +'留空按 ×1.00。'
+    +(uncovered.length?'其余 '+uncovered.length+' 个模型走默认点数倍率（'+(inPeak?'高峰 ×'+dp:'低谷 ×'+dof)+'）：'+uncovered.map(m=>h(m)).join('、'):'全部模型均已单独定价。');
+  el.style.color='var(--dim)';
+}
+function renderPointRateRows(profile){
+  const wrap=document.getElementById('pointRateRows');
+  if(!wrap)return;
+  wrap.innerHTML='';
+  Object.entries(profile.pointModelRates||{}).forEach(([m,r])=>wrap.appendChild(pointRateRowEl(m,r.peak,r.offPeak)));
+  renumberRows('pmr');updatePointRateRowsHint();
+}
 function renderRateRows(profile){
   const wrap=document.getElementById('rateRows');
   if(!wrap)return;
@@ -1879,6 +1941,7 @@ function renderAliasRows(profile){
   });
   refreshBridgeSelect(profile);
   renderRateRows(profile);
+  renderPointRateRows(profile);
   updateAllowedTags();
 }
 // Rebuild the image-bridge helper-model dropdown from the profile's multimodal

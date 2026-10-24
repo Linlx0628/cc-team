@@ -8668,7 +8668,7 @@ const server = http.createServer((req, res) => {
       const before = Number.isSafeInteger(beforeRaw) && beforeRaw > 0 ? beforeRaw : Number.MAX_SAFE_INTEGER;
       if (!pointsModeEnabled(key)) {
         res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
-        res.end(JSON.stringify({ enabled: false, items: [], hasMore: false, nextBeforeId: null,
+        res.end(JSON.stringify({ enabled: false, items: [], hasMore: false, total: 0, nextBeforeId: null,
           summary: { points: 0, billingWeightedTokens: 0, requests: 0 }, range: { start, end } }));
         return;
       }
@@ -8676,6 +8676,7 @@ const server = http.createServer((req, res) => {
       const hasMore = rows.length > limit;
       const page = rows.slice(0, limit);
       const sum = stmts.sumPointUsageRange.get(key, start, end) || { weighted: 0, requests: 0 };
+      const total = (stmts.countPointRequests.get(key, start, end) || { n: 0 }).n || 0;
       const items = page.map((r) => {
         const points = Math.round((r.billing_weighted_tokens || 0) / 100) / 100;
         const runtime = runtimes[r.profile] || null;
@@ -8694,7 +8695,7 @@ const server = http.createServer((req, res) => {
       });
       res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
       res.end(JSON.stringify({
-        enabled: true, items, hasMore,
+        enabled: true, items, hasMore, total,
         nextBeforeId: page.length ? page[page.length - 1].id : null,
         summary: {
           points: Math.round((sum.weighted || 0) / 100) / 100,

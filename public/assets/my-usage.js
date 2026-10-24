@@ -911,7 +911,8 @@ document.addEventListener('visibilitychange',function(){if(!document.hidden)load
 
 // ── 请求点数明细（成员凭证）────────────────────────────────────────────────
 // 一请求一条，游标分页；不随 30 秒轮询刷新，避免用户正在翻页时列表跳动。
-const PR={items:[],next:null,hasMore:false,loaded:false,loading:false,error:''};
+const PR={items:[],loaded:false,loading:false,error:'',page:1,cursors:[null],total:0,totalPages:1};
+const PR_PAGE_SIZE=20;
 function prTime(ms){
   if(!ms)return '—';
   try{return new Date(ms).toLocaleString('zh-CN',{timeZone:'Asia/Shanghai',hour12:false})}catch(e){return '—'}
@@ -926,6 +927,10 @@ function prSetRange(range){
   if(s&&!s.value&&range.start)s.value=range.start;
   if(e&&!e.value&&range.end)e.value=range.end;
 }
+function prPages(){
+  const n=Math.max(1,Number(PR.total)||0);
+  return Math.max(1,Math.ceil(n/PR_PAGE_SIZE));
+}
 function renderRequestSummary(j){
   const box=document.getElementById('prSummary');if(!box)return;
   if(!j.enabled){
@@ -934,13 +939,14 @@ function renderRequestSummary(j){
   }
   const sm=j.summary||{};
   const sameDay=!!(j.range&&j.range.start&&j.range.start===j.range.end);
-  box.innerHTML='<div class="card"><div class="k">'+(sameDay?'当日合计':'区间合计')+'</div><div class="v">'+fmtPts(sm.points||0)+' <span style="font-size:12px;color:var(--dim)">点</span></div><div class="s">'+fmtT(sm.requests||0)+' 次请求 · 已加载 '+fmtT(PR.items.length)+' 条</div></div>'
+  const total=Number.isFinite(j.total)?j.total:(sm.requests||0);
+  box.innerHTML='<div class="card"><div class="k">'+(sameDay?'当日合计':'区间合计')+'</div><div class="v">'+fmtPts(sm.points||0)+' <span style="font-size:12px;color:var(--dim)">点</span></div><div class="s">'+fmtT(sm.requests||0)+' 次请求 · 共 '+fmtT(total)+' 条</div></div>'
     +'<div class="card"><div class="k">计费计权</div><div class="v">'+fmtWan(sm.billingWeightedTokens||0)+'</div><div class="s">已按点数倍率与系数折算</div></div>';
 }
 function renderRequests(){
   const body=document.getElementById('prTableBody');if(!body)return;
-  if(PR.error){body.innerHTML='<tr><td colspan="8" class="empty">'+esc(PR.error)+'</td></tr>';return}
-  if(!PR.items.length){
+  if(PR.error){body.innerHTML='<tr><td colspan="8" class="empty">'+esc(PR.error)+'</td></tr>'}
+  else if(!PR.items.length){
     body.innerHTML='<tr><td colspan="8" class="empty">'+(PR.loading?'加载中…':'暂无请求记录')+'</td></tr>';
   }else{
     body.innerHTML=PR.items.map(function(r){
@@ -956,29 +962,52 @@ function renderRequests(){
         +'</tr>';
     }).join('');
   }
-  const more=document.getElementById('prMore');
-  if(more)more.style.display=PR.hasMore?'':'none';
+  const totalPages=prPages();
+  if(PR.page>totalPages)PR.page=totalPages;
+  const info=document.getElementById('prPageInfo');
+  if(info)info.textContent='第 '+PR.page+' / '+totalPages+' 页 · 共 '+fmtT(PR.total||0)+' 条';
+  const prev=document.getElementById('prPrev'),next=document.getElementById('prNext');
+  if(prev)prev.disabled=PR.loading||PR.page<=1;
+  if(next)next.disabled=PR.loading||PR.page>=totalPages;
   const note=document.getElementById('prNote');
   if(note)note.textContent='只记录成功请求；失败/被拒请求不扣点也不入表。保留 90 天，按请求完成时间倒序。';
 }
-async function fetchRequests(reset){
+async function fetchRequests(mode){
   if(PR.loading)return;
-  if(reset){PR.items=[];PR.next=null;PR.hasMore=false;PR.loaded=false;PR.error=''}
+  mode=mode||'reset';
+  if(mode==='reset'){
+    PR.page=1;PR.cursors=[null];PR.items=[];PR.total=0;PR.totalPages=1;PR.loaded=false;PR.error='';
+  }else if(mode==='next'){
+    const totalPages=prPages();
+    if(PR.page>=totalPages)return;
+    const last=PR.items[PR.items.length-1];
+    if(!last)return;
+    PR.cursors[PR.page+1]=last.id;
+    PR.page+=1;
+  }else if(mode==='prev'){
+    if(PR.page<=1)return;
+    PR.page-=1;
+  }
   PR.loading=true;
   const r=prRange();
-  let qs='limit=30';
+  let qs='limit='+PR_PAGE_SIZE;
   if(r.start)qs+='&start='+encodeURIComponent(r.start);
   if(r.end)qs+='&end='+encodeURIComponent(r.end);
-  if(!reset&&PR.next)qs+='&beforeId='+encodeURIComponent(PR.next);
+  if(PR.cursors[PR.page])qs+='&beforeId='+encodeURIComponent(PR.cursors[PR.page]);
   try{
     const res=await fetch('/api/my-usage/requests?'+qs,{headers:{'Authorization':'Bearer '+VK}});
     const j=await res.json();
     if(!res.ok)throw new Error(j.error||('HTTP '+res.status));
     prSetRange(j.range);
-    PR.items=reset?j.items.slice():PR.items.concat(j.items||[]);
-    PR.next=j.nextBeforeId;PR.hasMore=!!j.hasMore;PR.loaded=true;PR.error='';
+    PR.items=(j.items||[]).slice();
+    PR.total=Number.isFinite(j.total)?j.total:((j.summary&&j.summary.requests)||0);
+    PR.totalPages=prPages();
+    PR.loaded=true;PR.error='';
     renderRequestSummary(j);
-  }catch(e){PR.error=e.message||'加载失败'}
+  }catch(e){
+    PR.error=e.message||'加载失败';
+    PR.items=[];
+  }
   PR.loading=false;
   renderRequests();
 }
@@ -987,13 +1016,15 @@ function ensureRequests(){
   // 默认只看当天；要看历史必须自己改日期后点“查询”。服务端默认同样是当天。
   const s=document.getElementById('prStart'),e=document.getElementById('prEnd');
   if(s&&!s.value){const t=new Date(Date.now()+8*3600*1000).toISOString().slice(0,10);s.value=t;if(e&&!e.value)e.value=t}
-  fetchRequests(true);
+  fetchRequests('reset');
 }
 (function bindRequestDetail(){
   const reload=document.getElementById('prReload');
-  if(reload)reload.addEventListener('click',function(){fetchRequests(true)});
-  const more=document.getElementById('prMore');
-  if(more)more.addEventListener('click',function(){fetchRequests(false)});
+  if(reload)reload.addEventListener('click',function(){fetchRequests('reset')});
+  const prev=document.getElementById('prPrev');
+  if(prev)prev.addEventListener('click',function(){fetchRequests('prev')});
+  const next=document.getElementById('prNext');
+  if(next)next.addEventListener('click',function(){fetchRequests('next')});
 })();
 
 // ── 面板切换 ──

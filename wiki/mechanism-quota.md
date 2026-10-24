@@ -180,6 +180,7 @@ usedPoints    = round(usedWeighted / 10,000)   // 只用于展示
 - 从启用后开始累计，**不回溯**启用前的历史；停用后已有行保留，便于回看。
 - 查询：`GET /api/point-usage?granularity=day|week|month&key=<完整Key>&from=YYYY-MM-DD&to=YYYY-MM-DD&limit=400`（管理员鉴权；不传 `key` 返回全部成员）。返回 `points` 已按 10,000 折算。
 - 这张表只服务统计，不参与点数预算判定；判定仍然实时聚合 `usage_daily.billing_weighted_tokens`，避免两套账。
+- 另有一张逐请求凭证表 `point_requests`：每个成功请求一条，字段只含方案、模型、输入/输出/缓存、额度池计权、点数计权、点数倍率和完成时间，不含 prompt/响应正文。它只用于成员核对“这次扣了多少点”，不参与预算判定；按 `id` 自增游标分页，90 天自动清理，单条写入与 `point_usage` 在同一个事务里完成，崩溃不会出现“汇总加了、明细没加”的半条账。
 
 ### 点数倍率与计费系数
 

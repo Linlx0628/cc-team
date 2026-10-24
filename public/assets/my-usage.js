@@ -909,14 +909,99 @@ setInterval(function(){if(!document.hidden)load(true)},30000);
 document.addEventListener('visibilitychange',function(){if(!document.hidden)load(true)});
 
 
+// ── 请求点数明细（成员凭证）────────────────────────────────────────────────
+// 一请求一条，游标分页；不随 30 秒轮询刷新，避免用户正在翻页时列表跳动。
+const PR={items:[],next:null,hasMore:false,loaded:false,loading:false,error:''};
+function prTime(ms){
+  if(!ms)return '—';
+  try{return new Date(ms).toLocaleString('zh-CN',{timeZone:'Asia/Shanghai',hour12:false})}catch(e){return '—'}
+}
+function prRange(){
+  const s=document.getElementById('prStart'),e=document.getElementById('prEnd');
+  return {start:s?s.value:'',end:e?e.value:''};
+}
+function prSetRange(range){
+  if(!range)return;
+  const s=document.getElementById('prStart'),e=document.getElementById('prEnd');
+  if(s&&!s.value&&range.start)s.value=range.start;
+  if(e&&!e.value&&range.end)e.value=range.end;
+}
+function renderRequestSummary(j){
+  const box=document.getElementById('prSummary');if(!box)return;
+  if(!j.enabled){
+    box.innerHTML='<div class="card"><div class="k">点数明细</div><div class="v" style="font-size:14px">未启用点数预算</div><div class="s">启用后每次请求会在这里留下扣点记录</div></div>';
+    return;
+  }
+  const sm=j.summary||{};
+  box.innerHTML='<div class="card"><div class="k">区间合计</div><div class="v">'+fmtPts(sm.points||0)+' <span style="font-size:12px;color:var(--dim)">点</span></div><div class="s">'+fmtT(sm.requests||0)+' 次请求 · 已加载 '+fmtT(PR.items.length)+' 条</div></div>'
+    +'<div class="card"><div class="k">计费计权</div><div class="v">'+fmtWan(sm.billingWeightedTokens||0)+'</div><div class="s">已按点数倍率与系数折算</div></div>';
+}
+function renderRequests(){
+  const body=document.getElementById('prTableBody');if(!body)return;
+  if(PR.error){body.innerHTML='<tr><td colspan="8" class="empty">'+esc(PR.error)+'</td></tr>';return}
+  if(!PR.items.length){
+    body.innerHTML='<tr><td colspan="8" class="empty">'+(PR.loading?'加载中…':'暂无请求记录')+'</td></tr>';
+  }else{
+    body.innerHTML=PR.items.map(function(r){
+      return '<tr>'
+        +'<td title="'+esc(r.day)+'">'+esc(prTime(r.at))+'</td>'
+        +'<td>'+esc(r.profileName||r.profile||'—')+'<div class="note" style="font-size:10px">/'+esc(r.profile||'')+'</div></td>'
+        +'<td style="max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="'+esc(r.model||'')+'">'+esc(r.model||'—')+'</td>'
+        +'<td class="n">'+fmtT(r.inputTokens||0)+'</td>'
+        +'<td class="n">'+fmtT(r.outputTokens||0)+'</td>'
+        +'<td class="n">'+fmtT(r.cacheReadTokens||0)+'</td>'
+        +'<td class="n">×'+Number(r.pointRate==null?1:r.pointRate).toFixed(2)+'</td>'
+        +'<td class="n" style="font-weight:600">'+fmtPts(r.points||0)+' 点</td>'
+        +'</tr>';
+    }).join('');
+  }
+  const more=document.getElementById('prMore');
+  if(more)more.style.display=PR.hasMore?'':'none';
+  const note=document.getElementById('prNote');
+  if(note)note.textContent='只记录成功请求；失败/被拒请求不扣点也不入表。保留 90 天，按请求完成时间倒序。';
+}
+async function fetchRequests(reset){
+  if(PR.loading)return;
+  if(reset){PR.items=[];PR.next=null;PR.hasMore=false;PR.loaded=false;PR.error=''}
+  PR.loading=true;
+  const r=prRange();
+  let qs='limit=30';
+  if(r.start)qs+='&start='+encodeURIComponent(r.start);
+  if(r.end)qs+='&end='+encodeURIComponent(r.end);
+  if(!reset&&PR.next)qs+='&beforeId='+encodeURIComponent(PR.next);
+  try{
+    const res=await fetch('/api/my-usage/requests?'+qs,{headers:{'Authorization':'Bearer '+VK}});
+    const j=await res.json();
+    if(!res.ok)throw new Error(j.error||('HTTP '+res.status));
+    prSetRange(j.range);
+    PR.items=reset?j.items.slice():PR.items.concat(j.items||[]);
+    PR.next=j.nextBeforeId;PR.hasMore=!!j.hasMore;PR.loaded=true;PR.error='';
+    renderRequestSummary(j);
+  }catch(e){PR.error=e.message||'加载失败'}
+  PR.loading=false;
+  renderRequests();
+}
+function ensureRequests(){
+  if(PR.loaded||PR.loading)return;
+  // 首次进入用当前点数周期作为默认窗口；服务端没拿到 start/end 也会回退到周期起点。
+  if(D&&D.points&&D.points.periodStart){const s=document.getElementById('prStart'),e=document.getElementById('prEnd');if(s&&!s.value)s.value=D.points.periodStart;if(e&&!e.value)e.value=D.points.periodEnd||D.points.periodStart}
+  fetchRequests(true);
+}
+(function bindRequestDetail(){
+  const reload=document.getElementById('prReload');
+  if(reload)reload.addEventListener('click',function(){fetchRequests(true)});
+  const more=document.getElementById('prMore');
+  if(more)more.addEventListener('click',function(){fetchRequests(false)});
+})();
+
 // ── 面板切换 ──
 // 菜单按功能划分:概览(含使用日历、各方案配额、产出画像)/ 配额价目表 /
-// 用量分析(图表、模型表、客户端用量、项目分布)/ 会话使用情况 / 团队排行榜 /
+// 用量分析(图表、模型表、客户端用量、项目分布)/ 请求明细(逐请求点数凭证)/ 会话使用情况 / 团队排行榜 /
 // 代码评审 / 通知设置 / 配置 Agent(Claude Code / Codex / MCP 三份 setup-guide
 // 内嵌分区合一,分区内用 agentTabs 子 Tab 切换)。
 // 顺序即导航顺序,id 由 setSection() 按 'mu-tab-'+s / 'mu-panel-'+s 硬拼 ——
 // 增删菜单必须与 lib/pages.mjs 的按钮和面板同时改,否则切换会静默失效。
-const SECTIONS=['overview','rates','analysis','sessions','leaderboard','review','notify','agent'];
+const SECTIONS=['overview','rates','analysis','requests','sessions','leaderboard','review','notify','agent'];
 function setSection(name,focus){
   if(SECTIONS.indexOf(name)<0)name='overview';
   SECTION=name;
@@ -943,6 +1028,8 @@ function paintSection(){
     ensureActivity();   // 项目分布与会话使用情况共用一份载荷,从哪个入口进来都拉它
   }else if(SECTION==='overview'){
     if(D)renderCalendar();
+  }else if(SECTION==='requests'){
+    ensureRequests();
   }else if(SECTION==='sessions'){
     ensureActivity();   // 已拉过是空操作;正在拉时 fetchActivity() 自己会早退
   }else if(SECTION==='leaderboard'){

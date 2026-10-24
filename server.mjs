@@ -3393,9 +3393,10 @@ function recordUsage(apiKey, usage, model, suffix, _rt, session, client) {
   // 非点数用户 billing=weighted，保证列不为空时与旧口径一致。系数与倍率都在
   // 完成时刻冻结，之后改配置不影响这一行。
   let billingWeighted = weighted;
+  let pointRate = 1;
   const pointMode = pointsModeEnabled(key);
   if (pointMode) {
-    const pointRate = currentPointRate(runtime, new Date(), m);
+    pointRate = currentPointRate(runtime, new Date(), m);
     const factor = effectiveBillingFactor(getPointBudget(key).billingFactor, runtime?.pointsBillingFactor);
     billingWeighted = Math.round((billableInp + out) * pointRate * factor);
   }
@@ -3422,6 +3423,13 @@ function recordUsage(apiKey, usage, model, suffix, _rt, session, client) {
       for (const [g, bucket] of buckets) {
         stmts.upsertPointUsage.run({ key, g, bucket, billing: billingWeighted, updatedAt });
       }
+      // 逐次请求凭证：只存计费元数据（不含 prompt/响应），供成员在“请求明细”核对。
+      // 与汇总桶同一事务写入；SQLite 单连接串行，不需要额外队列，崩溃也不会出现只写一半。
+      stmts.insertPointRequest.run({
+        key, day: today, createdAt: Date.now(), profile: sfx, model: m,
+        protocol: runtime?.protocol || "", client: client || "unknown",
+        inp: storeInp, out, cacheC, cacheR, weighted, billing: billingWeighted, pointRate,
+      });
     }
   });
   tx();
@@ -8625,6 +8633,76 @@ const server = http.createServer((req, res) => {
         res.end(JSON.stringify({ error: err.message }));
       }
     }).catch(() => { res.writeHead(413); res.end("Request too large"); });
+    return;
+  }
+
+  // 成员点数请求明细。分页用 id 游标（不用 OFFSET），查一条走
+  // idx_point_requests_user_id；汇总读 point_usage 的日桶，不扫明细表。
+  if (req.method === "GET" && req.url.split("?")[0] === "/api/my-usage/requests") {
+    const apiKey = getApiKey(req);
+    if (!hasGlobalUser(apiKey)) {
+      res.writeHead(401, { "Content-Type": "application/json; charset=utf-8" });
+      res.end(JSON.stringify({ error: "认证失败：请提供有效的虚拟Key (Authorization: Bearer jx-...)" }));
+      return;
+    }
+    try {
+      const key = resolveUserKey(apiKey, rt);
+      const budget = getPointBudget(key);
+      const url = new URL(req.url, "http://localhost");
+      const today = cnDate();
+      const start = url.searchParams.get("start") || periodStartDate(budget.period);
+      const end = url.searchParams.get("end") || today;
+      const dateRe = /^\d{4}-\d{2}-\d{2}$/;
+      if (!dateRe.test(start) || !dateRe.test(end) || start > end) {
+        res.writeHead(400, { "Content-Type": "application/json; charset=utf-8" });
+        res.end(JSON.stringify({ error: "start/end 需为 YYYY-MM-DD 且 start <= end" }));
+        return;
+      }
+      const limit = Math.max(1, Math.min(100, Number(url.searchParams.get("limit")) || 30));
+      const beforeRaw = Number(url.searchParams.get("beforeId"));
+      const before = Number.isSafeInteger(beforeRaw) && beforeRaw > 0 ? beforeRaw : Number.MAX_SAFE_INTEGER;
+      if (!pointsModeEnabled(key)) {
+        res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+        res.end(JSON.stringify({ enabled: false, items: [], hasMore: false, nextBeforeId: null,
+          summary: { points: 0, billingWeightedTokens: 0, requests: 0 }, range: { start, end } }));
+        return;
+      }
+      const rows = stmts.listPointRequests.all({ key, start, end, before, limit: limit + 1 });
+      const hasMore = rows.length > limit;
+      const page = rows.slice(0, limit);
+      const sum = stmts.sumPointUsageRange.get(key, start, end) || { weighted: 0, requests: 0 };
+      const items = page.map((r) => {
+        const points = Math.round((r.billing_weighted_tokens || 0) / 100) / 100;
+        const runtime = runtimes[r.profile] || null;
+        return {
+          id: r.id, at: r.created_at, day: r.day,
+          profile: r.profile, profileName: runtime ? runtime.profileName : r.profile,
+          model: r.model || "unknown", protocol: r.protocol || "",
+          client: r.client || "",
+          inputTokens: r.input_tokens || 0, outputTokens: r.output_tokens || 0,
+          cacheReadTokens: r.cache_read_tokens || 0, cacheCreationTokens: r.cache_creation_tokens || 0,
+          weightedTokens: r.weighted_tokens || 0,
+          billingWeightedTokens: r.billing_weighted_tokens || 0,
+          pointRate: r.point_rate == null ? 1 : r.point_rate,
+          points,
+        };
+      });
+      res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+      res.end(JSON.stringify({
+        enabled: true, items, hasMore,
+        nextBeforeId: page.length ? page[page.length - 1].id : null,
+        summary: {
+          points: Math.round((sum.weighted || 0) / 100) / 100,
+          billingWeightedTokens: sum.weighted || 0,
+          requests: sum.requests || 0,
+        },
+        range: { start, end },
+        retentionDays: 90,
+      }));
+    } catch (err) {
+      res.writeHead(500, { "Content-Type": "application/json; charset=utf-8" });
+      res.end(JSON.stringify({ error: err.message }));
+    }
     return;
   }
 

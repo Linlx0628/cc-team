@@ -1279,6 +1279,7 @@ async function editProfile(n){
   document.getElementById('suffixInput').value=p.suffix||'';
   document.getElementById('profileNameInput').value=p.name||'';
   renderAliasRows(p);
+  renderProfileSettingsKeys(p.suffix||'');
   const poolSel=document.getElementById('quotaPoolSelect');if(poolSel)poolSel.value=p.quotaPool||'__new__';
   updatePoolSummary();
   const pqr=document.getElementById('peakQuotaRateInput');if(pqr)pqr.value=(p.peakQuotaRate??1);
@@ -1538,6 +1539,23 @@ async function deleteGlobalUser(k){
   refreshProfileUserCounts();
   try{sessionStorage.setItem('tm_return_user_view','1')}catch(e){}
   toast('用户已删除');
+}
+function renderProfileSettingsKeys(suffix){
+  const body=document.getElementById('profileSettingsKeyBody');
+  if(!body)return;
+  const assignments=(SETTINGS.profileAssignments||{})[suffix]||{};
+  body.innerHTML=Object.entries(SETTINGS.globalUsers||{}).map(([k,v])=>{
+    const username=v&&v.username?v.username:'';
+    const globalDisabled=!!(v&&v.disabled);
+    const pu=assignments[k]||null;
+    const realKey=(pu&&pu.key)||'';
+    const profileDisabled=!!(pu&&pu.disabled);
+    return '<tr style="'+(globalDisabled?'opacity:0.4':'')+'">'
+      +'<td><code style="font-size:11px;color:var(--accent)">'+h(k)+'</code></td>'
+      +'<td>'+h(username||'—')+'</td>'
+      +'<td><input type="text" name="pu_rk_'+h(k)+'" value="'+h(realKey)+'" style="width:100%;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:4px 8px;border-radius:4px;font-size:12px;font-family:monospace" placeholder="真实 Key（必填）"></td>'
+      +'<td><label style="display:inline-flex;align-items:center;gap:4px;margin:0;cursor:pointer;white-space:nowrap"><input type="checkbox" name="pu_dis_'+h(k)+'" '+(profileDisabled?'checked':'')+' style="width:auto;accent-color:var(--orange)"><span style="font-size:11px;color:'+(profileDisabled?'var(--orange)':'var(--dim)')+'">'+(profileDisabled?'已禁用':'正常')+'</span></label></td></tr>';
+  }).join('');
 }
 function renderProfileUsers(suffix){
   const assignments=SETTINGS.profileAssignments[suffix]||{};

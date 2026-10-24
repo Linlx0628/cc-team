@@ -18,7 +18,7 @@ import { parsePeakTimeMinutes, normalizePeakHours, isInPeakHours, formatPeakHour
   beijingDayOfWeek, GROUP_NAME_MAX, ALL_DAYS, DAY_LABELS } from "./lib/schedule.mjs";
 import { sanitizeJson } from "./lib/sanitize.mjs";
 import { QUOTA_RATE_MAX, normalizeQuotaRate, normalizeCacheReadQuotaRate, normalizeModelQuotaRates, lookupModelQuotaRate, currentQuotaRate, currentPointRate, normalizePointModelRates, nextRateChangeHint, QUOTA_POOL_NAME_MAX, normalizeQuotaPoolName, canonicalJson, shortDigest, applyStickyReorder, buildPoolResolver, quotaExceededMessage, quotaErrorDetail, buildQuotaCore } from "./lib/quota.mjs";
-import { POINTS_UNIT, MAX_BUDGET_POINTS, POINT_PERIODS, normalizePointBudget, normalizeBillingFactor, effectiveBillingFactor, pointsToWeighted, weightedToPoints, computePointsUsage, pointsExceededMessage, pointsErrorDetail } from "./lib/points.mjs";
+import { POINTS_UNIT, MAX_BUDGET_POINTS, POINT_PERIODS, normalizePointBudget, normalizeBillingFactor, effectiveBillingFactor, pointsToWeighted, weightedToPoints, computePointsUsage, pointBillableInput, pointsExceededMessage, pointsErrorDetail } from "./lib/points.mjs";
 import { CB_MAX_BACKOFF_FACTOR, CB_MAX_COOLDOWN_MS, CircuitBreaker } from "./lib/circuit.mjs";
 import { loadAssets } from "./lib/assets.mjs";
 import { wsAcceptUpgrade, wsRejectUpgrade, WsConn } from "./lib/ws-server.mjs";
@@ -3401,8 +3401,12 @@ function recordUsage(apiKey, usage, model, suffix, _rt, session, client) {
   const pointMode = pointsModeEnabled(key);
   if (pointMode) {
     pointRate = currentPointRate(runtime, new Date(), m);
+    // 缓存只进点数：读按 0.1、写按 0.3 折算后再乘当前点数倍率；额度池 weighted 不受影响。
+    // Responses 的缓存读可能已含在 input_tokens 里，必须用剥离后的 cacheInInput，避免双算。
+    const pointCacheRead = runtime?.protocol === "responses" ? cacheInInput : cacheR;
+    const pointBillable = pointBillableInput(storeInp, pointCacheRead, cacheC);
     const factor = effectiveBillingFactor(getPointBudget(key).billingFactor, runtime?.pointsBillingFactor);
-    billingWeighted = Math.round((billableInp + out) * pointRate * factor);
+    billingWeighted = Math.round((pointBillable + out) * pointRate * factor);
   }
 
   const p = { profile: sfx, key, name: getUserName(key, runtime), inp: storeInp, out, cacheC, cacheR, m, tokenTotal: storeInp + out, weighted, billingWeighted, today, hour, now: new Date().toISOString() };

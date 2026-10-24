@@ -3477,7 +3477,11 @@ function checkPointBudget(apiKey, _rt) {
   let row = { used: 0, raw: 0, requests: 0 };
   let bonus = { points: 0, weighted: 0 };
   if (budget.enabled) {
-    row = stmts.sumUserWeightedRange.get(key, windowStart, today) || row;
+    // 点数预算只认「点数模式」的请求：point_usage 由 recordUsage 在点数模式下写入。
+    // 不能用 usage_daily.billing_weighted_tokens —— 非点数用户那列等于 weighted_tokens，
+    // 成员中途开启点数时会把开启前的历史额度池用量算进本期点数（已实际出现过的错账）。
+    const agg = stmts.sumPointUsageRange.get(key, windowStart, today) || {};
+    row = { used: agg.weighted || 0, raw: 0, requests: agg.requests || 0 };
     bonus = stmts.sumPointCheckInPoints.get(key, windowStart, today) || bonus;
   }
   const bonusPoints = bonus.points || 0;
@@ -3675,8 +3679,8 @@ function getPointBudgetsPayload() {
   for (const [key, gu] of Object.entries(config.users || {})) {
     const budget = getPointBudget(key);
     const points = checkPointBudget(key);
-    const last30 = stmts.sumUserWeightedRange.get(key, start30, today) || { used: 0, raw: 0, requests: 0 };
-    const last30dPoints = weightedToPoints(last30.used || 0);
+    const last30 = stmts.sumPointUsageRange.get(key, start30, today) || { weighted: 0, requests: 0 };
+    const last30dPoints = weightedToPoints(last30.weighted || 0);
     const pref = stmts.getMemberProfilePreference.get(key) || {};
     users.push({
       key,

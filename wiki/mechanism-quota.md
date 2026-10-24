@@ -127,15 +127,15 @@ weighted      = round((19000 + 2000) × 1.0) = 21000
 ```text
 periodStart   = 北京自然日 / 周一 / 自然月 1 日的 00:00 起点
 windowStart   = max(periodStart, startsAt || periodStart)
-billableBase  = 新鲜输入 + 输出（Responses 的缓存命中先按 cacheReadQuotaRate 折算）
+billableBase  = 新鲜输入 + 缓存读×0.1 + 缓存写×0.3 + 输出
 pointRate     = pointModelRates[实际模型]（有覆盖）
                 否则 pointPeakRate / pointOffPeakRate（留空 = 1.00）
 factor        = 用户 billingFactor × 方案 pointsBillingFactor
                 （单级 0.10~10.00，乘积封顶 100）
 billingWeighted = round(billableBase × pointRate × factor)
-usedWeighted  = SUM(COALESCE(usage_daily.billing_weighted_tokens,
-                             usage_daily.weighted_tokens))
-                WHERE user_key = 该成员 AND date BETWEEN windowStart AND 今天
+usedWeighted  = SUM(point_usage.billing_weighted_tokens)
+                WHERE user_key = 该成员 AND granularity='day'
+                  AND bucket_start BETWEEN windowStart AND 今天
 limitWeighted = budgetPoints × 10,000
 允许请求 ⇔ usedWeighted < limitWeighted
 
@@ -179,7 +179,7 @@ usedPoints    = round(usedWeighted / 10,000)   // 只用于展示
 - 只为启用点数的成员写入；未启用时不写，避免把额度池计权误当点数。
 - 从启用后开始累计，**不回溯**启用前的历史；停用后已有行保留，便于回看。
 - 查询：`GET /api/point-usage?granularity=day|week|month&key=<完整Key>&from=YYYY-MM-DD&to=YYYY-MM-DD&limit=400`（管理员鉴权；不传 `key` 返回全部成员）。返回 `points` 已按 10,000 折算。
-- 这张表只服务统计，不参与点数预算判定；判定仍然实时聚合 `usage_daily.billing_weighted_tokens`，避免两套账。
+- 这张表同时服务统计与**点数预算判定**：`checkPointBudget` 只聚合 `point_usage` 的 day 桶，避免把“非点数用户 billing=weighted”的历史额度池用量算进点数。`usage_daily` 仍只负责额度池判定。
 - 另有一张逐请求凭证表 `point_requests`：每个成功请求一条，字段只含方案、模型、输入/输出/缓存、额度池计权、点数计权、点数倍率和完成时间，不含 prompt/响应正文。它只用于成员核对“这次扣了多少点”，不参与预算判定；按 `id` 自增游标分页，90 天自动清理，单条写入与 `point_usage` 在同一个事务里完成，崩溃不会出现“汇总加了、明细没加”的半条账。
 
 ### 点数倍率与计费系数

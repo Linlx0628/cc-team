@@ -3033,11 +3033,15 @@ function previewList(values, fallback = "none") {
   return items.length > 8 ? `${shown}, ...` : shown;
 }
 
-function modelNotAllowedMessage(model, runtime) {
-  const allowed = (runtime?.allowedModels || []).join(", ") || "(空)";
-  const aliases = Object.keys(effectiveModelAliases(runtime || rt)).join(", ");
-  const aliasHint = aliases ? `，或该方案的别名: ${aliases}` : "";
-  return `Model "${model}" is not allowed on profile "${runtime?.profileName || "?"}". 允许的模型: ${allowed}${aliasHint}`;
+function modelNotAllowedMessage(model, runtime, originalModel) {
+  const name = runtime?.profileName || "当前方案";
+  const allowed = (runtime?.allowedModels || []).join("、") || "（空）";
+  const aliases = Object.keys(effectiveModelAliases(runtime || rt)).join("、");
+  const aliasHint = aliases ? `；该方案的别名：${aliases}` : "";
+  const requested = originalModel && originalModel !== model
+    ? `别名「${originalModel}」对应的模型「${model}」`
+    : `模型「${model}」`;
+  return `${requested}未在方案「${name}」启用。请切换到该方案已启用的模型：${allowed}${aliasHint}。`;
 }
 
 function generateVirtualKey(_rt) {

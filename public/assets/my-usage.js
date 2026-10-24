@@ -933,7 +933,8 @@ function renderRequestSummary(j){
     return;
   }
   const sm=j.summary||{};
-  box.innerHTML='<div class="card"><div class="k">区间合计</div><div class="v">'+fmtPts(sm.points||0)+' <span style="font-size:12px;color:var(--dim)">点</span></div><div class="s">'+fmtT(sm.requests||0)+' 次请求 · 已加载 '+fmtT(PR.items.length)+' 条</div></div>'
+  const sameDay=!!(j.range&&j.range.start&&j.range.start===j.range.end);
+  box.innerHTML='<div class="card"><div class="k">'+(sameDay?'当日合计':'区间合计')+'</div><div class="v">'+fmtPts(sm.points||0)+' <span style="font-size:12px;color:var(--dim)">点</span></div><div class="s">'+fmtT(sm.requests||0)+' 次请求 · 已加载 '+fmtT(PR.items.length)+' 条</div></div>'
     +'<div class="card"><div class="k">计费计权</div><div class="v">'+fmtWan(sm.billingWeightedTokens||0)+'</div><div class="s">已按点数倍率与系数折算</div></div>';
 }
 function renderRequests(){
@@ -983,8 +984,9 @@ async function fetchRequests(reset){
 }
 function ensureRequests(){
   if(PR.loaded||PR.loading)return;
-  // 首次进入用当前点数周期作为默认窗口；服务端没拿到 start/end 也会回退到周期起点。
-  if(D&&D.points&&D.points.periodStart){const s=document.getElementById('prStart'),e=document.getElementById('prEnd');if(s&&!s.value)s.value=D.points.periodStart;if(e&&!e.value)e.value=D.points.periodEnd||D.points.periodStart}
+  // 默认只看当天；要看历史必须自己改日期后点“查询”。服务端默认同样是当天。
+  const s=document.getElementById('prStart'),e=document.getElementById('prEnd');
+  if(s&&!s.value){const t=new Date(Date.now()+8*3600*1000).toISOString().slice(0,10);s.value=t;if(e&&!e.value)e.value=t}
   fetchRequests(true);
 }
 (function bindRequestDetail(){

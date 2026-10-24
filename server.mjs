@@ -8650,7 +8650,8 @@ const server = http.createServer((req, res) => {
       const budget = getPointBudget(key);
       const url = new URL(req.url, "http://localhost");
       const today = cnDate();
-      const start = url.searchParams.get("start") || periodStartDate(budget.period);
+      // 默认只看当天；其他日期必须显式传 start/end，避免成员一进页就拉整期数据。
+      const start = url.searchParams.get("start") || today;
       const end = url.searchParams.get("end") || today;
       const dateRe = /^\d{4}-\d{2}-\d{2}$/;
       if (!dateRe.test(start) || !dateRe.test(end) || start > end) {

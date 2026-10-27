@@ -138,3 +138,13 @@ td{padding:8px;border-bottom:1px solid #ecece8;font-size:12px}
 .sched-row.drop-before{box-shadow:0 -2px 0 0 var(--blue)}
 .sched-row.drop-after{box-shadow:0 2px 0 0 var(--blue)}
 .sched-grip{color:var(--dim2);letter-spacing:-2px;user-select:none;flex:none}
+/* 方案点数上限：这些控件原先取全局 9px 内边距 + 固定高度，文字会被上下裁掉；
+   统一压到和表格行内控件一致的 4px 内边距、32px 高度。 */
+#pointBudgetView select,
+#pointBudgetView input[type="number"],
+#pointBudgetView input[type="date"],
+#profilePointLimitBody select,
+#profilePointLimitBody input[type="number"],
+#profilePointLimitBody input[type="date"],
+#pplTotalPoints, #pplTotalPeriod, #pplTotalStarts,
+#pplBulkPoints, #pplBulkPeriod, #pplBulkStarts { padding:4px 8px; }

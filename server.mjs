@@ -18,7 +18,7 @@ import { parsePeakTimeMinutes, normalizePeakHours, isInPeakHours, formatPeakHour
   beijingDayOfWeek, GROUP_NAME_MAX, ALL_DAYS, DAY_LABELS } from "./lib/schedule.mjs";
 import { sanitizeJson } from "./lib/sanitize.mjs";
 import { QUOTA_RATE_MAX, normalizeQuotaRate, normalizeCacheReadQuotaRate, normalizeModelQuotaRates, lookupModelQuotaRate, currentQuotaRate, currentPointRate, normalizePointModelRates, nextRateChangeHint, QUOTA_POOL_NAME_MAX, normalizeQuotaPoolName, canonicalJson, shortDigest, applyStickyReorder, buildPoolResolver, quotaExceededMessage, quotaErrorDetail, buildQuotaCore } from "./lib/quota.mjs";
-import { POINTS_UNIT, MAX_BUDGET_POINTS, POINT_PERIODS, normalizePointBudget, normalizeBillingFactor, effectiveBillingFactor, pointsToWeighted, weightedToPoints, computePointsUsage, pointBillableInput, pointsExceededMessage, pointsErrorDetail } from "./lib/points.mjs";
+import { POINTS_UNIT, MAX_BUDGET_POINTS, POINT_PERIODS, normalizePointBudget, normalizeBillingFactor, effectiveBillingFactor, normalizeProfilePointLimit, pointsToWeighted, weightedToPoints, computePointsUsage, pointBillableInput, pointsExceededMessage, pointsErrorDetail, profilePointsExceededMessage, profilePointsErrorDetail } from "./lib/points.mjs";
 import { CB_MAX_BACKOFF_FACTOR, CB_MAX_COOLDOWN_MS, CircuitBreaker } from "./lib/circuit.mjs";
 import { loadAssets } from "./lib/assets.mjs";
 import { wsAcceptUpgrade, wsRejectUpgrade, WsConn } from "./lib/ws-server.mjs";
@@ -109,6 +109,7 @@ config.pointSettings = {
   allowSelfSelect: pointSettingsRaw.allowSelfSelect !== false,
 };
 if (!config.pointBudgets || typeof config.pointBudgets !== "object" || Array.isArray(config.pointBudgets)) config.pointBudgets = {};
+if (!config.profilePointLimits || typeof config.profilePointLimits !== "object" || Array.isArray(config.profilePointLimits)) config.profilePointLimits = {};
 
 const { port } = config;
 const dashboardPassword = config.dashboardPassword || "";
@@ -3519,6 +3520,92 @@ function checkPointBudget(apiKey, _rt) {
   };
 }
 
+
+// 方案级点数上限：只对启用点数预算的成员生效。billing_weighted_tokens 只由
+// 点数模式请求写入，所以新加的上限不会把额度池历史算进来。
+function getProfilePointLimitConfig(profileName) {
+  const raw = (config.profilePointLimits && config.profilePointLimits[profileName]) || {};
+  return {
+    total: normalizeProfilePointLimit(raw.total),
+    users: raw.users && typeof raw.users === "object" ? raw.users : {},
+  };
+}
+
+// 管理端「点数预算 → 方案点数上限」：一次返回所有方案的配置，便于集中设置。
+// 与方案设置页共用 config.profilePointLimits，不存在第二份数据。
+function profilePointLimitsPayload() {
+  return listProfiles().map((p) => {
+    const cfg = getProfilePointLimitConfig(p.name);
+    const users = {};
+    for (const key of Object.keys(config.users || {})) {
+      const limit = normalizeProfilePointLimit(cfg.users[key]);
+      if (limit.enabled) users[key] = limit;
+    }
+    return {
+      name: p.name,
+      suffix: p.suffix,
+      protocol: p.protocol,
+      pointsEligible: p.pointsEligible !== false,
+      total: cfg.total,
+      users,
+    };
+  });
+}
+
+function checkProfilePointLimit(apiKey, suffix, _rt) {
+  const runtime = _rt || runtimes[normalizeProfileSuffix(suffix)] || rt;
+  const key = resolveUserKey(apiKey, runtime);
+  const profileName = (runtime && runtime.profileName) || suffix || "";
+  const dbProfile = (runtime && runtime.suffix) || normalizeProfileSuffix(suffix) || profileName;
+  if (!pointsModeEnabled(key)) return { enabled: false, allowed: true, profile: profileName };
+  const cfg = getProfilePointLimitConfig(profileName);
+  const totalLimit = cfg.total;
+  const userLimit = normalizeProfilePointLimit(cfg.users[key]);
+  if (!totalLimit.enabled && !userLimit.enabled) {
+    return { enabled: false, allowed: true, profile: profileName, suffix };
+  }
+  const today = cnDate();
+  const windowStartOf = (limit) => {
+    let start = periodStartDate(limit.period);
+    if (limit.startsAt && limit.startsAt > start) start = limit.startsAt;
+    return start;
+  };
+  let total = null;
+  let user = null;
+  if (totalLimit.enabled) {
+    const start = windowStartOf(totalLimit);
+    const row = stmts.sumProfileBillingRange.get(dbProfile, start, today) || {};
+    const usage = computePointsUsage({
+      budget: { enabled: true, budgetPoints: totalLimit.points, period: totalLimit.period, startsAt: totalLimit.startsAt },
+      usedWeighted: row.used || 0,
+      today,
+    });
+    total = { ...usage, scope: "total", profile: profileName, profileKey: dbProfile, limitPoints: totalLimit.points, usedWeightedTokens: row.used || 0, requests: row.requests || 0 };
+  }
+  if (userLimit.enabled) {
+    const start = windowStartOf(userLimit);
+    const row = stmts.sumUserProfileBillingRange.get(key, dbProfile, start, today) || {};
+    const usage = computePointsUsage({
+      budget: { enabled: true, budgetPoints: userLimit.points, period: userLimit.period, startsAt: userLimit.startsAt },
+      usedWeighted: row.used || 0,
+      today,
+    });
+    user = { ...usage, scope: "user", profile: profileName, profileKey: dbProfile, limitPoints: userLimit.points, usedWeightedTokens: row.used || 0, requests: row.requests || 0 };
+  }
+  const blocking = user && user.exhausted ? "user" : (total && total.exhausted ? "total" : null);
+  const blockingLimit = blocking === "total" ? totalLimit : userLimit;
+  return {
+    enabled: true,
+    allowed: !blocking,
+    profile: profileName,
+    suffix,
+    total,
+    user,
+    blocking,
+    retryAfterSeconds: blocking ? secondsUntilNextPeriodEnd(blockingLimit.period) : 0,
+  };
+}
+
 // 首个「请求方案」是成员自己的手动首选。它只在成员可访问、协议匹配且该方案
 // 开放点数计费时生效；即使当前不在自动调度组，也允许作为显式覆盖参与请求。
 function getPreferredProfileSuffix(userKey, protocol) {
@@ -3589,6 +3676,24 @@ function pointModelAliases(runtime) {
   }).filter((m) => m.target);
 }
 
+function profilePointLimitView(ppl) {
+  if (!ppl || !ppl.enabled) return null;
+  const pack = (x) => x ? {
+    scope: x.scope,
+    usedPoints: x.usedPoints,
+    usedPointsExact: x.usedPointsExact,
+    limitPoints: x.limitPoints,
+    remainingPoints: x.remainingPoints,
+    remainingPointsExact: x.remainingPointsExact,
+    period: x.period,
+    periodStart: x.periodStart,
+    periodEnd: x.periodEnd,
+    exhausted: x.exhausted,
+    pct: x.pct,
+  } : null;
+  return { user: pack(ppl.user), total: pack(ppl.total), blocking: ppl.blocking || null };
+}
+
 function preferredPlanStatus(apiKey, plan, protocol) {
   const runtime = runtimes[normalizeProfileSuffix(plan.suffix)];
   if (!runtime) return { available: false, status: "missing", reason: "方案已删除", until: null };
@@ -3609,12 +3714,21 @@ function preferredPlanStatus(apiKey, plan, protocol) {
   }
   let q = null;
   try { q = checkTokenQuota(apiKey, plan.suffix, runtime); } catch { q = null; }
+  let ppl = null;
+  try { ppl = checkProfilePointLimit(apiKey, plan.suffix, runtime); } catch { ppl = null; }
+  const profilePoints = profilePointLimitView(ppl);
+  const quotaView = q ? { used: q.used, limit: q.limit, remaining: q.remaining, source: q.source } : null;
   if (q && q.limit > 0 && !q.allowed) {
     return { available: false, status: "quota", until: null,
       reason: `额度已用尽（${q.used.toLocaleString("zh-CN")} / ${q.limit.toLocaleString("zh-CN")}，${q.source || "配额"}）`,
-      quota: { used: q.used, limit: q.limit, remaining: q.remaining, source: q.source } };
+      quota: quotaView, profilePoints };
   }
-  return { available: true, status: "ok", reason: "", until: null, quota: q ? { used: q.used, limit: q.limit, remaining: q.remaining, source: q.source } : null };
+  if (ppl && ppl.enabled && !ppl.allowed) {
+    return { available: false, status: "profile_points", until: null,
+      reason: profilePointsExceededMessage(ppl).split("\n")[0],
+      profilePoints };
+  }
+  return { available: true, status: "ok", reason: "", until: null, quota: quotaView, profilePoints };
 }
 
 function buildPreferredProfiles(apiKey) {
@@ -3651,6 +3765,7 @@ function buildPreferredProfiles(apiKey) {
           reason: status.reason,
           until: status.until,
           quota: status.quota || null,
+          profilePoints: status.profilePoints || null,
           inGroup: groupSet.has(p.name),
           isDefault: !!p.isDefault,
           inPeak: isInPeakHours(planRuntime && planRuntime.peakHours),
@@ -3673,7 +3788,8 @@ function buildPreferredProfiles(apiKey) {
     out[protocol] = selected
       ? { suffix: selected.suffix, name: selected.name, active: !!selected.active,
           status: selected.status || "missing", reason: selected.reason || "方案不可选",
-          until: selected.until || null, inPeak: !!selected.inPeak }
+          until: selected.until || null, inPeak: !!selected.inPeak,
+          profilePoints: selected.profilePoints || null }
       : { suffix: "", name: "", active: false, status: "", reason: "", until: null, inPeak: false };
     // 「默认自动」的可见解释：当前生效组名 + 组内第一个可用方案。成员看到的是
     // 调度结果，而不是一个凭空写死的默认方案。
@@ -3741,6 +3857,7 @@ function getPointBudgetsPayload() {
     defaultPeriod: config.pointSettings?.defaultPeriod || "month",
     allowSelfSelect: config.pointSettings?.allowSelfSelect !== false,
     users,
+    profiles: profilePointLimitsPayload(),
   };
 }
 
@@ -4312,6 +4429,7 @@ function getPublicSettings() {
     quotaPools: listQuotaPools(),
     pointSettings: { ...config.pointSettings },
     pointBudgets: config.pointBudgets,
+    profilePointLimits: config.profilePointLimits,
     defaultProfileGroup: Array.isArray(config.defaultProfileGroup) ? config.defaultProfileGroup : [],
     responsesProfileGroup: Array.isArray(config.responsesProfileGroup) ? config.responsesProfileGroup : [],
     selectedProfileSuffix: defaultSuffix,
@@ -4492,6 +4610,8 @@ const SETTINGS_DEPS = {
   normalizeCacheReadQuotaRate,
   normalizeModelQuotaRates,
   normalizeBillingFactor,
+  normalizeProfilePointLimit,
+  cnDate,
   QUOTA_POOL_NAME_MAX,
   normalizeQuotaPoolName,
   saveConfig,
@@ -4626,6 +4746,7 @@ const PROXY_CORE_DEPS = {
   checkIpRateLimit,
   checkModelAllowed,
   checkPointBudget,
+  checkProfilePointLimit,
   checkTokenQuota,
   classifyInboundPath,
   classifyRateLimit,
@@ -4659,6 +4780,8 @@ const PROXY_CORE_DEPS = {
   port,
   pointsErrorDetail,
   pointsExceededMessage,
+  profilePointsErrorDetail,
+  profilePointsExceededMessage,
   productionEnabled,
   productionTracker,
   quotaErrorDetail,
@@ -5418,6 +5541,64 @@ const server = http.createServer((req, res) => {
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ ok: true }));
       } catch (err) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: err.message }));
+      }
+    }).catch(() => {
+      res.writeHead(413, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Request too large" }));
+    });
+    return;
+  }
+
+  if (req.method === "POST" && req.url === "/api/profile-point-limits/save") {
+    if (!checkAuth(req)) { res.writeHead(401); res.end("Unauthorized"); return; }
+    if (!checkCsrf(req)) { res.writeHead(403); res.end("CSRF validation failed"); return; }
+    readBody(req, 1_000_000).then((buf) => {
+      let before = null;
+      try {
+        const input = JSON.parse(buf.toString());
+        const src = input && input.profiles;
+        if (!src || typeof src !== "object" || Array.isArray(src)) throw new Error("profiles 必须是对象");
+        const next = {};
+        for (const [name, raw] of Object.entries(src)) {
+          if (!config.profiles || !Object.prototype.hasOwnProperty.call(config.profiles, name)) {
+            throw new Error(`方案不存在：${name}`);
+          }
+          const item = raw && typeof raw === "object" ? raw : {};
+          const t = item.total && typeof item.total === "object" ? item.total : {};
+          const total = normalizeProfilePointLimit({
+            enabled: t.enabled === true,
+            points: t.points,
+            period: t.period,
+            startsAt: t.startsAt || (t.enabled === true ? cnDate() : ""),
+          });
+          const users = {};
+          if (item.users && typeof item.users === "object") {
+            for (const [key, u] of Object.entries(item.users)) {
+              if (!Object.prototype.hasOwnProperty.call(config.users || {}, key)) {
+                throw new Error(`成员不存在：${key}`);
+              }
+              const n = normalizeProfilePointLimit({
+                enabled: u && u.enabled === true,
+                points: u && u.points,
+                period: u && u.period,
+                startsAt: (u && u.startsAt) || (u && u.enabled === true ? cnDate() : ""),
+              });
+              if (n.enabled) users[key] = n;
+            }
+          }
+          if (total.enabled || Object.keys(users).length) next[name] = { total, users };
+        }
+        before = config.profilePointLimits;
+        config.profilePointLimits = next;
+        try { saveConfig(config); } catch (err) { config.profilePointLimits = before; throw err; }
+        recordAdminAudit(req, "profilepoints.save", "全部方案",
+          `集中保存方案点数上限：${Object.keys(next).length} 个方案启用`, "quota");
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: true, profiles: profilePointLimitsPayload() }));
+      } catch (err) {
+        if (before) config.profilePointLimits = before;
         res.writeHead(400, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ error: err.message }));
       }

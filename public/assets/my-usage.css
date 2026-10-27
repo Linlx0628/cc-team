@@ -574,3 +574,15 @@ table{width:100%;border-collapse:collapse;min-width:560px}th{text-align:left;pad
 .points-formula summary{cursor:pointer;color:var(--accent);font-weight:600;width:max-content}
 .points-formula .pf-row{margin-top:5px;line-height:1.65;color:var(--dim)}
 .points-formula .pf-row b{color:var(--text)}
+.pref-limit-points{font-size:11px;color:var(--dim);line-height:1.45;margin-top:2px;white-space:normal}
+.pref-limit-points.err{color:var(--red)}
+.pref-points-row td{background:var(--surface-subtle,#f7f7f5);padding:2px 10px 7px}
+.pref-points-item{display:flex;align-items:center;gap:8px;font-size:11px;line-height:1.5;color:var(--dim);min-height:18px}
+.pref-points-label{color:var(--text);font-weight:600;flex:none}
+.pref-points-value{color:var(--text);font-variant-numeric:tabular-nums;flex:none}
+.pref-points-period{flex:none;color:var(--dim)}
+.pref-points-track{display:inline-block;width:160px;max-width:28vw;height:6px;border-radius:999px;background:var(--border,#e5e5e0);overflow:hidden;flex:none}
+.pref-points-track i{display:block;height:100%;background:var(--accent);border-radius:999px}
+.pref-points-item.err,.pref-points-item.err .pref-points-label,.pref-points-item.err .pref-points-value{color:var(--red)}
+.pref-points-item.err .pref-points-track i{background:var(--red)}
+.pref-points-state{color:var(--red);font-weight:600;flex:none}

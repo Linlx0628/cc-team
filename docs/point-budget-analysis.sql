@@ -70,21 +70,68 @@ SELECT
   ROUND(p.p90_daily_points, 2)     AS p90_daily_points,
   ROUND(s.max_daily_points, 2)     AS max_daily_points,
   ROUND(COALESCE(r.points_30d, 0), 1) AS last_30d_points,
-  -- 日预算：日均 × 1.2，且不低于 P90 日消耗
-  MAX(1, CAST(ROUND(MAX(s.avg_calendar_day * 1.2, p.p90_daily_points)) AS INTEGER)) AS suggested_daily_points,
-  -- 周预算：日预算 × 7（同样取日均与 P90 的较大值）
-  MAX(1, CAST(ROUND(MAX(s.avg_calendar_day * 7 * 1.2, p.p90_daily_points * 7)) AS INTEGER)) AS suggested_weekly_points,
-  -- 月预算：日预算 × 30
-  MAX(1, CAST(ROUND(MAX(s.avg_calendar_day * 30 * 1.2, p.p90_daily_points * 30)) AS INTEGER)) AS suggested_monthly_points
+  -- 建议值用“日历日均 × 1.2”，P90 仅作诊断列，不直接乘 30（活跃天数少时会严重高估）
+  MAX(1, CAST(ROUND(s.avg_calendar_day * 1.2) AS INTEGER)) AS suggested_daily_points,
+  MAX(1, CAST(ROUND(s.avg_calendar_day * 7 * 1.2) AS INTEGER)) AS suggested_weekly_points,
+  MAX(20, CAST(ROUND(s.avg_calendar_day * 30 * 1.2) AS INTEGER)) AS suggested_monthly_points
 FROM stats s
 LEFT JOIN p90 p      ON p.user_key = s.user_key
 LEFT JOIN recent30 r ON r.user_key = s.user_key
 ORDER BY s.total_points_90d DESC;
 
 -- ─────────────────────────────────────────────────────────────────────────────
--- 查询 2：没有 point_usage（或需要看“全部流量”）时的回退口径
--- 注意：会把非点数模式的额度池用量也折算成点数，只适合估算“如果全走点数需要多少”；
---       不能用来核对真实扣点。billing_weighted_tokens 可能为 NULL，回退 weighted_tokens。
+-- 查询 2a：生产库还没有 point_usage / billing_weighted_tokens 时，先用旧表估算
+-- 只读 usage_daily.weighted_tokens，不会因缺列报错。
+-- 注意：这里没有点数倍率、用户系数、方案系数，也没有过滤“是否点数模式”，
+--       得到的是“额度池计权 / 10000”的近似点数，只适合启用点数前做初始预算。
+-- ─────────────────────────────────────────────────────────────────────────────
+WITH bounds AS (
+  SELECT date('now', '+8 hours', '-1 day')  AS end_day,
+         date('now', '+8 hours', '-90 day') AS start_day
+),
+daily AS (
+  SELECT user_key, date AS day,
+         SUM(COALESCE(weighted_tokens,0)) / 10000.0 AS points
+  FROM usage_daily
+  WHERE date BETWEEN (SELECT start_day FROM bounds) AND (SELECT end_day FROM bounds)
+  GROUP BY user_key, date
+),
+stats AS (
+  SELECT user_key, COUNT(*) AS active_days, SUM(points) AS total_points_90d,
+         AVG(points) AS avg_active_day, MAX(points) AS max_daily_points,
+         SUM(points) / 90.0 AS avg_calendar_day
+  FROM daily GROUP BY user_key
+),
+ranked AS (
+  SELECT user_key, points,
+         ROW_NUMBER() OVER (PARTITION BY user_key ORDER BY points) AS rn,
+         COUNT(*)     OVER (PARTITION BY user_key)                   AS cnt
+  FROM daily
+),
+p90 AS (
+  SELECT user_key,
+         MAX(CASE WHEN rn >= cnt * 0.9 THEN points END) AS p90_daily_points
+  FROM ranked GROUP BY user_key
+)
+SELECT s.user_key,
+       COALESCE((SELECT u.name FROM users u WHERE u.user_key=s.user_key
+                 ORDER BY u.last_active DESC LIMIT 1), substr(s.user_key,1,12)) AS user_name,
+       s.active_days,
+       ROUND(s.total_points_90d,1) AS total_points_90d,
+       ROUND(s.avg_calendar_day,2) AS avg_daily_points,
+       ROUND(p.p90_daily_points,2) AS p90_daily_points,
+       ROUND(s.max_daily_points,2) AS max_daily_points,
+       MAX(1, CAST(ROUND(s.avg_calendar_day*1.2) AS INTEGER)) AS suggested_daily_points,
+       MAX(1, CAST(ROUND(s.avg_calendar_day*7*1.2) AS INTEGER)) AS suggested_weekly_points,
+       MAX(20, CAST(ROUND(s.avg_calendar_day*30*1.2) AS INTEGER)) AS suggested_monthly_points
+FROM stats s
+LEFT JOIN p90 p ON p.user_key = s.user_key
+ORDER BY s.total_points_90d DESC;
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 查询 2b：点数量表已存在、且想看“全部流量”的回退口径
+-- 注意：会把非点数模式的额度池用量也折算成点数；billing_weighted_tokens 可能为 NULL。
+-- 旧生产库没有 billing_weighted_tokens 列时不要跑这条，会报 no such column。
 -- ─────────────────────────────────────────────────────────────────────────────
 -- WITH bounds AS (
 --   SELECT date('now', '+8 hours', '-1 day')  AS end_day,
@@ -108,9 +155,9 @@ ORDER BY s.total_points_90d DESC;
 --        ROUND(total_points_90d, 1) AS total_points_90d,
 --        ROUND(avg_calendar_day, 2) AS avg_daily_points,
 --        ROUND(max_daily_points, 2) AS max_daily_points,
---        MAX(1, CAST(ROUND(MAX(avg_calendar_day * 1.2, max_daily_points)) AS INTEGER)) AS suggested_daily_points,
---        MAX(1, CAST(ROUND(MAX(avg_calendar_day * 7 * 1.2, max_daily_points * 7)) AS INTEGER)) AS suggested_weekly_points,
---        MAX(1, CAST(ROUND(MAX(avg_calendar_day * 30 * 1.2, max_daily_points * 30)) AS INTEGER)) AS suggested_monthly_points
+--        MAX(1, CAST(ROUND(avg_calendar_day * 1.2) AS INTEGER)) AS suggested_daily_points,
+--        MAX(1, CAST(ROUND(avg_calendar_day * 7 * 1.2) AS INTEGER)) AS suggested_weekly_points,
+--        MAX(20, CAST(ROUND(avg_calendar_day * 30 * 1.2) AS INTEGER)) AS suggested_monthly_points
 -- FROM stats
 -- ORDER BY total_points_90d DESC;
 

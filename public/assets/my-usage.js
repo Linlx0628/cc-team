@@ -503,10 +503,29 @@ const PREF_TIERS=[
   {key:'sonnet',alias:'jx-sonnet',label:'中级'},
   {key:'haiku',alias:'jx-haiku',label:'普通'},
 ];
+function prefPeriodLabel(p){return p==='day'?'按日':p==='week'?'按周':'按月'}
+function prefPointDetailHtml(pp){
+  if(!pp)return '';
+  const lines=[];
+  const pack=(x,label)=>{
+    if(!x)return;
+    const used=x.usedPointsExact!=null?x.usedPointsExact:x.usedPoints;
+    const pct=Math.max(0,Math.min(100,Number(x.pct)||0));
+    lines.push('<div class="pref-points-item'+(x.exhausted?' err':'')+'">'
+      +'<span class="pref-points-label">'+label+'</span>'
+      +'<span class="pref-points-value">'+esc(fmtPts(used))+' / '+esc(fmtPts(x.limitPoints))+' 点</span>'
+      +'<span class="pref-points-period">'+esc(prefPeriodLabel(x.period))+'</span>'
+      +'<span class="pref-points-track"><i style="width:'+pct+'%"></i></span>'
+      +(x.exhausted?'<span class="pref-points-state">已用尽</span>':'')
+      +'</div>');
+  };
+  pack(pp.user,'本方案点数');
+  pack(pp.total,'方案合计');
+  return lines.join('');
+}
 function prefLimitHtml(reason,unavailable){
   if(!unavailable)return '正常';
   const txt=String(reason||'').trim();
-  // 限流/限额的恢复时间单独占第二行，避免把「操作」列挤出去。
   const m=txt.match(/^(?:限流中|限额中)[，,]\s*(预计.*?恢复)$/);
   if(m)return '<div>限额中</div><div class="pref-limit-sub">'+esc(m[1])+'</div>';
   return esc(txt||'不可用');
@@ -564,6 +583,9 @@ function renderPreferred(){
         +PREF_TIERS.map(t=>prefModelCell(p,t)).join('')
         +'<td class="pref-limit'+(unavailable?' err':'')+'" title="'+esc(reason)+'">'+prefLimitHtml(reason,unavailable)+'</td>'
         +'<td class="pref-op">'+btn+'</td></tr>');
+      if(p.profilePoints){
+        rows.push('<tr class="pref-points-row"><td colspan="8">'+prefPointDetailHtml(p.profilePoints)+'</td></tr>');
+      }
     });
     // 已保存首选被管理员关闭/删除时，保留一条红色提示，不能让它静默消失。
     if(pref.suffix&&!plans.some(p=>p.suffix===pref.suffix)){

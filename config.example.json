@@ -116,5 +116,23 @@
     ],
     "apiKeys": [],
     "repos": []
+  },
+  "profilePointLimits": {
+    "GLM": {
+      "total": {
+        "enabled": false,
+        "points": 0,
+        "period": "month",
+        "startsAt": ""
+      },
+      "users": {
+        "jx-example-user": {
+          "enabled": true,
+          "points": 200,
+          "period": "week",
+          "startsAt": ""
+        }
+      }
+    }
   }
 }

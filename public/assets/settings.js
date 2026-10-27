@@ -535,7 +535,7 @@ async function deletePool(name){
 // data-points-mode="1"），本文件负责把它们禁用并挂「点数模式」徽标；池级上限是护栏，仍可编辑。
 // 所有 DOM 访问都判空：视图与端点是并行的另一条改动，任一未就绪时本页要安静降级
 // （表格里显示「接口未就绪」），绝不抛异常炸掉整个设置页。
-let PB={unitTokens:10000,defaultPeriod:'month',allowSelfSelect:false,users:[],loaded:false,error:''};
+let PB={unitTokens:10000,defaultPeriod:'month',allowSelfSelect:false,users:[],profiles:[],profileLimitUserKey:'',loaded:false,error:''};
 const PB_POINT_MAX=10000000;
 const PB_PERIODS=[['day','按日'],['week','按周'],['month','按月']];
 const PB_COLS=13;
@@ -703,6 +703,140 @@ function pbRenderGlobals(){
   const sw=document.getElementById('pbGlobalSwitch');
   if(sw&&sw.type==='checkbox')sw.checked=!!PB.allowSelfSelect;
 }
+function pbPeriodOpts(v){
+  return '<option value="day"'+(v==='day'?' selected':'')+'>按日</option>'
+    +'<option value="week"'+(v==='week'?' selected':'')+'>按周</option>'
+    +'<option value="month"'+(!v||v==='month'?' selected':'')+'>按月</option>';
+}
+function pbLimitCheckbox(attr,checked,label){
+  return '<label class="checkline" style="margin:0"><input class="cbx" type="checkbox" '+attr+' '+(checked?'checked':'')+'><span>'+label+'</span></label>';
+}
+function pbProfileLimitTotalRows(){
+  const list=Array.isArray(PB.profiles)?PB.profiles:[];
+  if(!list.length)return '<tr><td colspan="6" class="note">暂无方案</td></tr>';
+  return list.map(p=>{
+    const t=(p.total||{});
+    const name=h(p.name);
+    return '<tr data-pb-profile="'+name+'">'
+      +'<td><b>'+name+'</b><div style="font-size:11px;color:var(--dim)">'+(p.suffix?'/'+h(p.suffix):'')+(p.pointsEligible===false?' · 未开放点数':'')+'</div></td>'
+      +'<td>'+(p.protocol==='responses'?'OpenAI':'Anthropic')+'</td>'
+      +'<td>'+pbLimitCheckbox('data-pb-total-enabled',!!t.enabled,'启用')+'</td>'
+      +'<td><input type="number" data-pb-total-points value="'+(t.points||0)+'" min="0" max="10000000" step="1" style="width:110px;height:32px;box-sizing:border-box"></td>'
+      +'<td><select data-pb-total-period style="width:110px;height:32px;box-sizing:border-box">'+pbPeriodOpts(t.period)+'</select></td>'
+      +'<td><input type="date" data-pb-total-starts value="'+h(t.startsAt||'')+'" style="width:150px;height:32px;box-sizing:border-box"></td>'
+      +'</tr>';
+  }).join('');
+}
+function pbRenderProfileLimits(){
+  const body=document.getElementById('pbProfileLimitBody');
+  if(body)body.innerHTML=pbProfileLimitTotalRows();
+  const sel=document.getElementById('pbProfileLimitUserSel');
+  if(sel){
+    const prev=PB.profileLimitUserKey||sel.value||'';
+    sel.innerHTML=(PB.users||[]).map(u=>'<option value="'+h(u.key)+'">'+h(u.username||u.key)+' · '+h(u.key)+'</option>').join('');
+    if(prev&&Array.from(sel.options).some(o=>o.value===prev))sel.value=prev;
+    PB.profileLimitUserKey=sel.value||'';
+  }
+  pbRenderProfileLimitUserRows();
+}
+function pbCurrentProfileUserKey(){
+  const sel=document.getElementById('pbProfileLimitUserSel');
+  return (sel&&sel.value)||PB.profileLimitUserKey||'';
+}
+function pbCaptureProfileUserLimits(key){
+  if(!key)return;
+  const list=Array.isArray(PB.profiles)?PB.profiles:[];
+  document.querySelectorAll('#pbProfileUserLimitBody tr[data-pb-user-profile]').forEach(tr=>{
+    const name=tr.getAttribute('data-pb-user-profile');
+    const p=list.find(x=>x.name===name);
+    if(!p)return;
+    if(!p.users)p.users={};
+    const enabled=!!(tr.querySelector('[data-pb-user-enabled]')||{}).checked;
+    if(!enabled){delete p.users[key];return}
+    p.users[key]={
+      enabled:true,
+      points:pbNum((tr.querySelector('[data-pb-user-points]')||{}).value),
+      period:(tr.querySelector('[data-pb-user-period]')||{}).value||'month',
+      startsAt:(tr.querySelector('[data-pb-user-starts]')||{}).value||'',
+    };
+  });
+}
+function pbRenderProfileLimitUserRows(){
+  const key=pbCurrentProfileUserKey();
+  const body=document.getElementById('pbProfileUserLimitBody');
+  if(!body)return;
+  if(!key){body.innerHTML='<tr><td colspan="6" class="note">先选择成员</td></tr>';return}
+  const list=Array.isArray(PB.profiles)?PB.profiles:[];
+  body.innerHTML=list.map(p=>{
+    const row=(p.users||{})[key]||{};
+    const name=h(p.name);
+    return '<tr data-pb-user-profile="'+name+'">'
+      +'<td><b>'+name+'</b><div style="font-size:11px;color:var(--dim)">'+(p.suffix?'/'+h(p.suffix):'')+'</div></td>'
+      +'<td>'+(p.protocol==='responses'?'OpenAI':'Anthropic')+'</td>'
+      +'<td>'+pbLimitCheckbox('data-pb-user-enabled',!!row.enabled,'启用')+'</td>'
+      +'<td><input type="number" data-pb-user-points value="'+(row.points||0)+'" min="0" max="10000000" step="1" style="width:110px;height:32px;box-sizing:border-box"></td>'
+      +'<td><select data-pb-user-period style="width:110px;height:32px;box-sizing:border-box">'+pbPeriodOpts(row.period)+'</select></td>'
+      +'<td><input type="date" data-pb-user-starts value="'+h(row.startsAt||'')+'" style="width:150px;height:32px;box-sizing:border-box"></td>'
+      +'</tr>';
+  }).join('');
+}
+function pbOnProfileLimitUserChange(){
+  pbCaptureProfileUserLimits(PB.profileLimitUserKey);
+  PB.profileLimitUserKey=pbCurrentProfileUserKey();
+  pbRenderProfileLimitUserRows();
+}
+function pbFillAllProfileTotals(){
+  const points=(document.getElementById('pbTotalBulkPoints')||{}).value;
+  const period=(document.getElementById('pbTotalBulkPeriod')||{}).value||'month';
+  const starts=(document.getElementById('pbTotalBulkStarts')||{}).value||'';
+  const enabled=!!(document.getElementById('pbTotalBulkEnable')||{}).checked;
+  document.querySelectorAll('#pbProfileLimitBody tr[data-pb-profile]').forEach(tr=>{
+    const en=tr.querySelector('[data-pb-total-enabled]');if(en)en.checked=enabled;
+    const pts=tr.querySelector('[data-pb-total-points]');if(pts)pts.value=points;
+    const per=tr.querySelector('[data-pb-total-period]');if(per)per.value=period;
+    const st=tr.querySelector('[data-pb-total-starts]');if(st)st.value=starts;
+  });
+}
+function pbFillAllProfileUserLimits(){
+  const points=(document.getElementById('pbUserBulkPoints')||{}).value;
+  const period=(document.getElementById('pbUserBulkPeriod')||{}).value||'month';
+  const starts=(document.getElementById('pbUserBulkStarts')||{}).value||'';
+  const enabled=!!(document.getElementById('pbUserBulkEnable')||{}).checked;
+  document.querySelectorAll('#pbProfileUserLimitBody tr[data-pb-user-profile]').forEach(tr=>{
+    const en=tr.querySelector('[data-pb-user-enabled]');if(en)en.checked=enabled;
+    const pts=tr.querySelector('[data-pb-user-points]');if(pts)pts.value=points;
+    const per=tr.querySelector('[data-pb-user-period]');if(per)per.value=period;
+    const st=tr.querySelector('[data-pb-user-starts]');if(st)st.value=starts;
+  });
+}
+async function saveProfilePointLimits(){
+  pbCaptureProfileUserLimits(pbCurrentProfileUserKey());
+  const profiles={};
+  document.querySelectorAll('#pbProfileLimitBody tr[data-pb-profile]').forEach(tr=>{
+    const name=tr.getAttribute('data-pb-profile');
+    const old=(PB.profiles||[]).find(p=>p.name===name)||{};
+    const item={total:{
+      enabled:!!(tr.querySelector('[data-pb-total-enabled]')||{}).checked,
+      points:pbNum((tr.querySelector('[data-pb-total-points]')||{}).value),
+      period:(tr.querySelector('[data-pb-total-period]')||{}).value||'month',
+      startsAt:(tr.querySelector('[data-pb-total-starts]')||{}).value||'',
+    },users:Object.assign({},old.users||{})};
+    profiles[name]=item;
+  });
+  if(!confirm('保存所有方案的方案点数上限？\n保存后会和方案设置页同步；留空起始日表示从今天起算。'))return;
+  const status=document.getElementById('pbProfileLimitStatus');
+  if(status)status.textContent='保存中…';
+  const res=await pbPostJson('/api/profile-point-limits/save',{profiles:profiles});
+  if(!res.ok){if(status)status.textContent='保存失败：'+res.error;alert('保存失败: '+res.error);return}
+  if(Array.isArray(res.data&&res.data.profiles))PB.profiles=res.data.profiles;
+  else await loadPointBudgets();
+  await refreshSettingsState();
+  const cur=(SETTINGS.profiles||[]).find(p=>p.name===editingProfileName);
+  if(cur&&typeof renderProfilePointLimitRows==='function')renderProfilePointLimitRows(cur.suffix||'');
+  pbRenderProfileLimits();
+  if(status)status.textContent='已保存，方案设置页已同步';
+  toast('方案点数上限已保存');
+}
 function openPointBudgetView(){
   const form=document.getElementById('settingsForm');
   const view=document.getElementById('pointBudgetView');
@@ -713,7 +847,7 @@ function openPointBudgetView(){
   const nav=document.getElementById('pointBudgetNav');
   if(nav)nav.classList.add('active');
   pbRenderGlobals();
-  if(PB.loaded&&!PB.error)pbRenderTable();else loadPointBudgets();
+  if(PB.loaded&&!PB.error){pbRenderTable();pbRenderProfileLimits();}else loadPointBudgets();
 }
 async function loadPointBudgets(){
   const body=document.getElementById('pbTableBody');
@@ -736,9 +870,11 @@ async function loadPointBudgets(){
   PB.defaultPeriod=data.defaultPeriod||PB.defaultPeriod;
   PB.allowSelfSelect=!!data.allowSelfSelect;
   PB.users=Array.isArray(data.users)?data.users:[];
+  PB.profiles=Array.isArray(data.profiles)?data.profiles:[];
   PB.loaded=true;PB.error='';
   pbRenderGlobals();
   pbRenderTable();
+  pbRenderProfileLimits();
   return true;
 }
 // 单行写回的唯一出口：savePointBudget（带确认）与 saveAllPointBudgets（批量）共用。
@@ -1322,6 +1458,7 @@ async function editProfile(n){
   document.getElementById('profileNameInput').value=p.name||'';
   renderAliasRows(p);
   renderProfileSettingsKeys(p.suffix||'');
+  renderProfilePointLimitRows(p.suffix||'');
   const poolSel=document.getElementById('quotaPoolSelect');if(poolSel)poolSel.value=p.quotaPool||'__new__';
   updatePoolSummary();
   const pqr=document.getElementById('peakQuotaRateInput');if(pqr)pqr.value=(p.peakQuotaRate??1);
@@ -1339,6 +1476,10 @@ async function editProfile(n){
   const rpF=document.getElementById('responsesPathRow');if(rpF)rpF.style.display=(p.protocol==='responses')?'':'none';
   const rpI=document.getElementById('responsesPathInput');if(rpI)rpI.value=p.responsesPath||'/v1/responses';
   const bt=fm.querySelector('select[name="billingType"]');if(bt)bt.value=p.billingType||'on_demand';
+  // 这两个 checkbox 是「当前方案」的状态，切换方案时必须一起回填；否则会沿用
+  // 上一个方案的勾选状态，看起来像所有方案都被改了，实际只改了内存 DOM。
+  const pe=fm.querySelector('input[name="pointsEligible"]');
+  if(pe)pe.checked=p.pointsEligible!==false;
   renderPeakHoursRows(p.peakHours||[]);
   refreshBridgeSelect(p);
   document.querySelectorAll('.pl-item').forEach(el=>el.classList.remove('active'));
@@ -1598,6 +1739,62 @@ function renderProfileSettingsKeys(suffix){
       +'<td><input type="text" name="pu_rk_'+h(k)+'" value="'+h(realKey)+'" style="width:100%;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:4px 8px;border-radius:4px;font-size:12px;font-family:monospace" placeholder="真实 Key（必填）"></td>'
       +'<td><label style="display:inline-flex;align-items:center;gap:4px;margin:0;cursor:pointer;white-space:nowrap"><input type="checkbox" name="pu_dis_'+h(k)+'" '+(profileDisabled?'checked':'')+' style="width:auto;accent-color:var(--orange)"><span style="font-size:11px;color:'+(profileDisabled?'var(--orange)':'var(--dim)')+'">'+(profileDisabled?'已禁用':'正常')+'</span></label></td></tr>';
   }).join('');
+}
+function renderProfilePointLimitRows(suffix){
+  const body=document.getElementById('profilePointLimitBody');
+  if(!body)return;
+  const prof=(SETTINGS.profiles||[]).find(p=>(p.suffix||'')===suffix)||{};
+  const cfg=((SETTINGS.profilePointLimits||{})[prof.name])||{};
+  const total=cfg.total||{};
+  const users=cfg.users||{};
+  const set=(id,val)=>{const el=document.getElementById(id);if(el)el.value=val;};
+  const chk=document.getElementById('pplTotalEnabled');if(chk)chk.checked=!!total.enabled;
+  set('pplTotalPoints',total.points||0);
+  set('pplTotalStarts',total.startsAt||'');
+  const totalPeriod=document.getElementById('pplTotalPeriod');
+  if(totalPeriod)totalPeriod.value=total.period||'month';
+  const opts=(v)=>'<option value="day"'+(v==='day'?' selected':'')+'>日</option><option value="week"'+(v==='week'?' selected':'')+'>周</option><option value="month"'+(!v||v==='month'?' selected':'')+'>月</option>';
+  body.innerHTML=Object.entries(SETTINGS.globalUsers||{}).map(([k,u])=>{
+    const row=users[k]||{};
+    const username=u&&u.username?u.username:'—';
+    const globalDisabled=!!(u&&u.disabled);
+    return '<tr style="'+(globalDisabled?'opacity:0.45':'')+'">'
+      +'<td><code style="font-size:11px;color:var(--accent)">'+h(k)+'</code><div style="font-size:11px;color:var(--dim)">'+h(username)+'</div></td>'
+      +'<td><label class="checkline" style="margin:0"><input class="cbx" type="checkbox" name="ppl_'+h(k)+'_enabled" '+(row.enabled?'checked':'')+'><span>启用</span></label></td>'
+      +'<td><input type="number" name="ppl_'+h(k)+'_points" value="'+(row.points||0)+'" min="0" max="10000000" step="1" style="width:110px;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:4px 8px;border-radius:4px;font-size:12px"></td>'
+      +'<td><select name="ppl_'+h(k)+'_period" style="width:92px;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:4px 6px;border-radius:4px;font-size:12px">'+opts(row.period||'month')+'</select></td>'
+      +'<td><input type="date" name="ppl_'+h(k)+'_starts" value="'+h(row.startsAt||'')+'" style="width:140px;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:4px 8px;border-radius:4px;font-size:12px"></td>'
+      +'<td style="color:var(--dim);font-size:11px">'+(row.enabled?'已启用':'—')+'</td></tr>';
+  }).join('');
+}
+function fillAllProfilePointLimitRows(){
+  const pointsEl=document.getElementById('pplBulkPoints');
+  const periodEl=document.getElementById('pplBulkPeriod');
+  const startsEl=document.getElementById('pplBulkStarts');
+  const enableEl=document.getElementById('pplBulkEnable');
+  const points=pointsEl?String(pointsEl.value||'').trim():'';
+  if(points===''||Number(points)<0||!Number.isFinite(Number(points))){alert('请先填写有效的点数');return}
+  const period=periodEl?periodEl.value:'month';
+  const starts=startsEl?String(startsEl.value||''):'';
+  const enable=!!(enableEl&&enableEl.checked);
+  const rows=document.querySelectorAll('#profilePointLimitBody tr');
+  rows.forEach(tr=>{
+    const k=(tr.querySelector('input[name^="ppl_"]')||{}).name||'';
+    const m=k.match(/^ppl_(.+)_enabled$/);
+    if(!m)return;
+    const key=m[1];
+    const en=tr.querySelector('input[name="ppl_'+key+'_enabled"]');
+    const pts=tr.querySelector('input[name="ppl_'+key+'_points"]');
+    const per=tr.querySelector('select[name="ppl_'+key+'_period"]');
+    const st=tr.querySelector('input[name="ppl_'+key+'_starts"]');
+    if(en)en.checked=enable;
+    if(pts)pts.value=points;
+    if(per)per.value=period;
+    if(st)st.value=starts;
+    const status=tr.lastElementChild;
+    if(status)status.textContent=enable?'已启用':'—';
+  });
+  toast('已填入 '+rows.length+' 个成员，点「保存设置」后生效');
 }
 function renderProfileUsers(suffix){
   const assignments=SETTINGS.profileAssignments[suffix]||{};

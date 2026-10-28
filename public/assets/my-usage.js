@@ -634,9 +634,9 @@ function renderPreferred(){
         : (on?'<button type="button" class="pref-pick" disabled>已选</button>'
           :'<button type="button" class="pref-pick" data-proto="'+proto+'" data-suffix="'+esc(p.suffix)+'" title="'+esc(why)+'">选择</button>');
       rows.push('<tr class="pref-row'+state+'">'
-        +'<td class="pref-name"><div class="pref-name-main">'+esc(p.name||p.suffix)+'</div>'
-        +profileTagChips(p.tags)
-        +(p.isDefault?'<div class="pref-name-sub">默认入口</div>':'')+'</td>'
+        +'<td class="pref-name"><div class="pref-name-main">'+esc(p.name||p.suffix)
+        +(p.isDefault?'<span class="pref-default-inline">默认入口</span>':'')+'</div>'
+        +profileTagChips(p.tags)+'</td>'
         +'<td class="pref-peak-cell">'+(peak?'<span class="pref-peak-inline">高峰期</span>':'<span class="pref-empty">—</span>')+'</td>'
         +PREF_TIERS.map(t=>prefModelCell(p,t)).join('')
         +'<td class="pref-limit'+(unavailable?' err':'')+'" title="'+esc(reason)+'">'+prefLimitHtml(reason,unavailable)+'</td>'

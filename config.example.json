@@ -16,6 +16,7 @@
       },
       "dailyTokenLimit": 2000000,
       "pointsEligible": true,
+      "pointTags": ["推荐", "低价快用"],
       "peakHours": [
         {
           "start": "09:00",

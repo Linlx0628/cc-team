@@ -589,6 +589,10 @@ function prefModelCell(plan,tier){
   return '<td class="pref-model"><div class="pref-model-name" title="'+esc(m.target)+'">'+esc(m.target)+'</div>'
     +'<div class="pref-model-rate'+(m.rate>1?' hot':m.rate<1?' cool':'')+'">×'+(m.rate==null?'1.00':Number(m.rate).toFixed(2))+'</div></td>';
 }
+function profileTagChips(tags){
+  if(!Array.isArray(tags)||!tags.length)return '';
+  return '<div class="pref-tags">'+tags.map(t=>'<span class="ptag" data-tag="'+esc(t)+'">'+esc(t)+'</span>').join('')+'</div>';
+}
 function renderPreferred(){
   const card=document.getElementById('prefPlanCard');
   const host=document.getElementById('prefPlanPicker');
@@ -631,6 +635,7 @@ function renderPreferred(){
           :'<button type="button" class="pref-pick" data-proto="'+proto+'" data-suffix="'+esc(p.suffix)+'" title="'+esc(why)+'">选择</button>');
       rows.push('<tr class="pref-row'+state+'">'
         +'<td class="pref-name"><div class="pref-name-main">'+esc(p.name||p.suffix)+'</div>'
+        +profileTagChips(p.tags)
         +'<div class="pref-name-sub">/'+esc(p.suffix)+(p.isDefault?' · 默认入口':'')+'</div></td>'
         +'<td class="pref-peak-cell">'+(peak?'<span class="pref-peak-inline">高峰期</span>':'<span class="pref-empty">—</span>')+'</td>'
         +PREF_TIERS.map(t=>prefModelCell(p,t)).join('')
@@ -642,7 +647,7 @@ function renderPreferred(){
     });
     // 已保存首选被管理员关闭/删除时，保留一条红色提示，不能让它静默消失。
     if(pref.suffix&&!plans.some(p=>p.suffix===pref.suffix)){
-      rows.push('<tr class="pref-row err"><td class="pref-name"><div class="pref-name-main">'+esc(pref.name||pref.suffix)+'</div><div class="pref-name-sub">/'+esc(pref.suffix)+'</div></td>'
+      rows.push('<tr class="pref-row err"><td class="pref-name"><div class="pref-name-main">'+esc(pref.name||pref.suffix)+'</div>'+profileTagChips(pref.tags)+'<div class="pref-name-sub">/'+esc(pref.suffix)+'</div></td>'
         +'<td colspan="6" class="pref-limit err">当前不可用：'+esc(pref.reason||'请重新选择')+'</td>'
         +'<td class="pref-op"><button type="button" class="pref-pick" disabled>不可选</button></td></tr>');
     }

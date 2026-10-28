@@ -1494,6 +1494,8 @@ async function editProfile(n){
   // 上一个方案的勾选状态，看起来像所有方案都被改了，实际只改了内存 DOM。
   const pe=fm.querySelector('input[name="pointsEligible"]');
   if(pe)pe.checked=p.pointsEligible!==false;
+  const tags=Array.isArray(p.pointTags)?p.pointTags:[];
+  document.querySelectorAll('#pointTagPicker input[name="pointTag"]').forEach(cb=>{cb.checked=tags.indexOf(cb.value)>=0});
   renderPeakHoursRows(p.peakHours||[]);
   refreshBridgeSelect(p);
   document.querySelectorAll('.pl-item').forEach(el=>el.classList.remove('active'));

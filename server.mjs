@@ -32,6 +32,7 @@ import { createNotifications, initNotificationsDb } from "./lib/notifications.mj
 import { PassThrough } from "node:stream";
 import { EventEmitter } from "node:events";
 import { escHtml, escJs } from "./lib/html.mjs";
+import { normalizeProfileTags } from "./lib/profile-tags.mjs";
 import { settingsHtml, dashboardHtml, loginHtml, personalUsageLandingHtml, codexSetupHtml, personalUsageHtml } from "./lib/pages.mjs";
 import { buildCodexModelCatalog, buildCodexSetupScript, buildCodexSetupScriptWin } from "./lib/codex-setup-script.mjs";
 import { buildAnthropicSetupHints, buildClaudeSetupScript, buildClaudeSetupScriptWin } from "./lib/claude-setup-script.mjs";
@@ -1514,6 +1515,7 @@ function listProfiles() {
     billingType: config.profiles[name].billingType || "on_demand",
     // 管理页方案表单要回显「是否支持点数计费」；缺省视为开放（旧配置没有该字段）。
     pointsEligible: config.profiles[name].pointsEligible !== false,
+    pointTags: normalizeProfileTags(config.profiles[name].pointTags),
     upstream: config.profiles[name].upstream,
     responsesPath: config.profiles[name].responsesPath || "/v1/responses",
     // 用户管理表格给每个全局用户都渲染一行，保存时未填真实Key的行会落成
@@ -1592,6 +1594,7 @@ function createProfileRuntime(profileName, profile) {
     // 点数计费准入：默认 true（兼容存量方案），管理员可逐方案关闭。关闭后只影响
     // 开启点数预算的成员；旧额度池模式成员不受影响。
     pointsEligible: profile.pointsEligible !== false,
+    pointTags: normalizeProfileTags(profile.pointTags),
     quotaPool: resolvePoolName(profileName),
     upstream: profile.upstream,
     upstreamUrl,
@@ -3870,6 +3873,7 @@ function buildPreferredProfiles(apiKey) {
           inGroup: groupSet.has(p.name),
           isDefault: !!p.isDefault,
           inPeak: isInPeakHours(planRuntime && planRuntime.peakHours),
+          tags: normalizeProfileTags(planRuntime && planRuntime.pointTags),
           modelAliases: pointModelAliases(planRuntime),
         };
       });
@@ -3884,12 +3888,14 @@ function buildPreferredProfiles(apiKey) {
       const knownRuntime = known ? runtimes[normalizeProfileSuffix(known.suffix)] : null;
       selected = { suffix, name: known ? known.name : suffix, active: false,
         status: st.status, reason: st.reason, until: st.until || null,
-        inPeak: isInPeakHours(knownRuntime && knownRuntime.peakHours) };
+        inPeak: isInPeakHours(knownRuntime && knownRuntime.peakHours),
+        tags: normalizeProfileTags(knownRuntime && knownRuntime.pointTags) };
     }
     out[protocol] = selected
       ? { suffix: selected.suffix, name: selected.name, active: !!selected.active,
           status: selected.status || "missing", reason: selected.reason || "方案不可选",
           until: selected.until || null, inPeak: !!selected.inPeak,
+          tags: normalizeProfileTags(selected.tags),
           profilePoints: selected.profilePoints || null }
       : { suffix: "", name: "", active: false, status: "", reason: "", until: null, inPeak: false };
     // 「默认自动」的可见解释：当前生效组名 + 组内第一个可用方案。成员看到的是
@@ -4714,6 +4720,7 @@ const SETTINGS_DEPS = {
   normalizeModelQuotaRates,
   normalizeBillingFactor,
   normalizeProfilePointLimit,
+  normalizeProfileTags,
   cnDate,
   QUOTA_POOL_NAME_MAX,
   normalizeQuotaPoolName,
@@ -6641,6 +6648,7 @@ const server = http.createServer((req, res) => {
         prof.billingType = ["coding_plan", "token_plan", "on_demand"].includes(prof.billingType) ? prof.billingType : "on_demand";
         // 点数计费准入是新增的可选字段：旧方案代码没有它时默认开放，显式 false 才关闭。
         prof.pointsEligible = prof.pointsEligible !== false;
+        prof.pointTags = normalizeProfileTags(prof.pointTags);
         // 垃圾值会让运行期静默失效（createProfileRuntime 里直接归一化它），所以也过一遍。
         prof.toolPatternCompat = toolPatternApi.normalizeToolPatternCompat(prof.toolPatternCompat);
         // 表单字段优先，空则回退代码里的值；anthropic 方案上直接清掉，免得留一个

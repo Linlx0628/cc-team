@@ -1496,6 +1496,7 @@ async function editProfile(n){
   if(pe)pe.checked=p.pointsEligible!==false;
   const tags=Array.isArray(p.pointTags)?p.pointTags:[];
   document.querySelectorAll('#pointTagPicker input[name="pointTag"]').forEach(cb=>{cb.checked=tags.indexOf(cb.value)>=0});
+  updatePointTagLimit();
   renderPeakHoursRows(p.peakHours||[]);
   refreshBridgeSelect(p);
   document.querySelectorAll('.pl-item').forEach(el=>el.classList.remove('active'));
@@ -3529,3 +3530,15 @@ function openNotifyView(id){
   document.getElementById('notifyViewModal').classList.add('open');
 }
 function closeNotifyView(){document.getElementById('notifyViewModal').classList.remove('open')}
+
+function updatePointTagLimit(){
+  const boxes=Array.prototype.slice.call(document.querySelectorAll('#pointTagPicker input[name="pointTag"]'));
+  if(!boxes.length)return;
+  const picked=boxes.filter(b=>b.checked).length;
+  boxes.forEach(b=>{b.disabled=!b.checked&&picked>=3});
+  const hint=document.getElementById('pointTagHint');
+  if(hint)hint.textContent=picked>=3?'已选 3/3；要换标签请先取消一个':'最多选 3 个；并排显示在成员「请求方案」列表的方案名下方';
+}
+if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',()=>setTimeout(updatePointTagLimit,0));
+else setTimeout(updatePointTagLimit,0);
+

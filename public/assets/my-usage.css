@@ -605,8 +605,8 @@ table{width:100%;border-collapse:collapse;min-width:560px}th{text-align:left;pad
 @media(max-width:720px){.point-stats-grid{grid-template-columns:1fr}.pbar-wrap:nth-child(even) em{display:none}}
 
 /* 方案标签（管理端选择，成员端展示） */
-.pref-tags{display:flex;flex-wrap:wrap;gap:3px;margin-top:3px}
-.pref-tags .ptag{display:inline-flex;align-items:center;padding:0 6px;border-radius:999px;border:1px solid transparent;font-size:9px;line-height:1.7;font-weight:600;white-space:nowrap}
+.pref-tags{display:flex;flex-wrap:nowrap;gap:2px;margin-top:3px;max-width:100%;overflow:hidden}
+.pref-tags .ptag{display:inline-flex;align-items:center;padding:0 4px;border-radius:999px;border:1px solid transparent;font-size:8px;line-height:1.6;font-weight:600;white-space:nowrap;flex:0 0 auto}
 .ptag[data-tag="推荐"]{color:#0f7b4f;background:#e8f7ef;border-color:#b7e4cd}
 .ptag[data-tag="低价快用"]{color:#0f6b7b;background:#e6f6f8;border-color:#b8e2e8}
 .ptag[data-tag="很贵很强"]{color:#6b3fa0;background:#f1eaff;border-color:#d8c7f0}

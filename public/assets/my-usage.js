@@ -268,7 +268,9 @@ async function load(slim){
     renderProfileQuotas();
     renderRateCard();
     renderPoints();
+    renderPointStats();
     renderPreferred();
+    applyPointsDefaultTab();
     // 图表与使用日历按容器宽度绘制:面板隐藏时宽度为 0,建图会得到一张空白图、
     // 日历会落到 9px 下限。所以各自只在所属面板可见时画,切过去时由 paintSection() 补画。
     if(SECTION==='overview')renderCalendar();
@@ -465,6 +467,53 @@ function renderPoints(){
   if(!p.exhausted)html+='<br><span style="color:var(--dim)">点数模式下请联系管理员调整预算</span>';
   detail.innerHTML=html;
   renderPointCheckin();
+}
+function renderPointStats(){
+  const box=document.getElementById('pointStatsBox');
+  if(!box)return;
+  const s=D&&D.pointStats;
+  if(!s){box.style.display='none';return}
+  box.style.display='';
+  const cards=document.getElementById('pointStatsCards');
+  if(cards){
+    const items=[
+      ['近 30 天合计',fmtPts(s.totalPoints),'点'],
+      ['日均',fmtPts(s.avgDailyPoints),'点'],
+      ['今日',fmtPts(s.todayPoints),'点'],
+      ['活跃天数',s.activeDays,'天'],
+      ['单日最高',s.peakDay?fmtPts(s.peakDay.points):'0','点'],
+    ];
+    cards.innerHTML=items.map(function(x){return '<div class="pstat"><div class="pstat-l">'+x[0]+'</div><div class="pstat-v">'+esc(x[1])+'<small>'+x[2]+'</small></div></div>'}).join('');
+  }
+  const bars=document.getElementById('pointDailyBars');
+  if(bars){
+    const rows=(s.daily||[]);
+    const max=Math.max(0,...rows.map(function(r){return Number(r.points)||0}));
+    bars.innerHTML=rows.map(function(r){
+      const h=max>0?Math.max(2,Math.round((Number(r.points)||0)/max*100)):2;
+      const day=String(r.date||'').slice(5);
+      return '<span class="pbar-wrap" title="'+esc(r.date)+' · '+fmtPts(r.points)+' 点 · '+esc(r.requests)+' 次请求">'
+        +'<i class="pbar'+(Number(r.points)>0?' has':'')+'" style="height:'+h+'%"></i>'
+        +'<em>'+esc(day)+'</em></span>';
+    }).join('');
+  }
+  const fill=function(id,rows,labelKey){
+    const el=document.getElementById(id);
+    if(!el)return;
+    el.innerHTML=(rows&&rows.length)?rows.map(function(r){
+      const label=labelKey==='model'?((r.model||'未知')+(r.protocol?' · '+r.protocol:'')):(r.profileName||r.profile||'未知');
+      return '<tr><td title="'+esc(label)+'">'+esc(label)+'</td><td class="n">'+fmtPts(r.points)+'</td><td class="n">'+esc(r.requests)+'</td></tr>';
+    }).join(''):'<tr><td colspan="3" class="empty">暂无记录</td></tr>';
+  };
+  fill('pointTopProfiles',s.topProfiles,'profile');
+  fill('pointTopModels',s.topModels,'model');
+}
+function applyPointsDefaultTab(){
+  if(window.__pointsDefaultTab)return;
+  window.__pointsDefaultTab=true;
+  const enabled=!!(D&&D.points&&D.points.enabled);
+  document.querySelectorAll('[data-points-only]').forEach(function(el){el.style.display=enabled?'':'none'});
+  if(enabled&&SECTION==='overview')setSection('points',false);
 }
 function renderPointCheckin(){
   const wrap=document.getElementById('pointCheckinWrap');
@@ -711,7 +760,7 @@ function renderModelTable(){
   note.innerHTML=(anyWeighted
     ?'「实际 Token」是真实消耗，「计入配额」是按配额口径（各模型倍率；Responses/Codex 链路再剔除缓存命中）折算后从每日额度里扣掉的数额。倍率列为'+scopeW+'，跨高峰边界或期间调整过倍率时会落在两档之间。'
     :'当前没有倍率或缓存规则造成差异，实际消耗与计入配额相同。')
-    +(ptsOn?' 「点数」列 = 计入配额 ÷ '+fmtT(pu)+'（1 点 = '+fmtT(pu)+' 计权 token）。':'')
+    +(ptsOn?' 「点数」列 = 实际点数计权（含缓存计费、点数倍率与系数）÷ '+fmtT(pu)+'（1 点 = '+fmtT(pu)+' 计费计权 token）。':'')
     +cacheClause;
 }
 // 客户端表:今天这些请求分别来自哪个 AI 客户端(Claude Code / Codex / ...)。
@@ -738,6 +787,20 @@ function renderClientTable(){
     '客户端依据请求头（User-Agent / X-App / Originator）判定，可被伪造，仅供参考。'
     +(unknown?' <span style="white-space:nowrap">其中 '+fmtT(unknown[1].requests||0)+' 次请求未能识别调用方。</span>':'');
 }
+function renderPlanStats(){
+  const box=document.getElementById('planStatsBox'),tb=document.querySelector('#planStatsTable tbody');
+  if(!box||!tb)return;
+  const rows=D&&Array.isArray(D.profileStats)?D.profileStats:[];
+  if(!isPointsMode()||!rows.length){box.style.display='none';return}
+  box.style.display='';
+  tb.innerHTML=rows.map(r=>'<tr><td style="color:var(--blue)">'+esc(r.profileName||r.profile||'-')+'</td>'
+    +'<td class="n">'+fmtT(r.requests||0)+'</td>'
+    +'<td class="n" title="输入+输出">'+fmtTk(r.tokens||0)+'</td>'
+    +'<td class="n" style="color:var(--accent)">'+fmtPts(r.points||0)+'</td></tr>').join('');
+  const rng=D.usageRange?('范围 '+D.usageRange.start+' ~ '+D.usageRange.end):'本周';
+  document.getElementById('planStatsNote').textContent=rng+' · 只统计成功请求；点数为实际扣点。';
+}
+
 // 用量分析面板:两张 Chart.js 图按容器宽度绘制,面板隐藏时容器宽度是 0,建图会得到一张
 // 空白图。所以这一片只在面板可见时渲染,切过去时由 paintSection() 补画。
 // (使用日历已搬到概览,同理由 paintSection() 的 overview 分支补画。)
@@ -758,33 +821,36 @@ function renderAnalysisPane(){
   // 口径沿用 ioTokens(输入+输出,不含缓存),与本页 KPI 卡、模型表一致;改折线后它移到右轴,
   // dataset 的 "Token(输入+输出)" 是唯一的口径提示,不能换成含义含缓存的 "总 Token"。
   const hrs=halfHourLabels();
-  const hData=Array.from({length:48},()=>({req:0,tokens:0}));
+  const ptsOn=isPointsMode(),pu=pointsUnit(),ph=D.pointHourly||{};
+  const hData=Array.from({length:48},()=>({req:0,tokens:0,points:0}));
   for(const [i,h,w] of halfHourSlots(D.hourly)){
     hData[i].req+=(h.requests||0)*w;hData[i].tokens+=ioTokens(h)*w;
   }
+  for(let i=0;i<hrs.length;i++){const p=ph[hrs[i]];if(p)hData[i].points+=p.points||0}
   if(C.h){C.h.destroy();C.h=null}
   // 双 Y 轴:请求数是几十、Token 是几百万,同轴会把请求数压成贴地一条线,所以必须分开。
   // 两个轴的 title 块刻意不加 —— .chart-row .box canvas 限高 190px,轴标题会吃掉约 15% 的绘图区,
   // 而图例已经写明两个单位,信息没有损失。图例同样沿用本页的内联写法,不引 dashboard 的 trendLegend()。
-  if(hc)C.h=new Chart(hc,{type:"line",data:{labels:hrs,datasets:[{label:"请求数",data:hData.map(d=>d.req),borderColor:"#2f6e50",backgroundColor:"rgba(47,110,80,.12)",fill:true,tension:.28,pointRadius:0,pointHitRadius:10,pointBackgroundColor:"#2f6e50",pointHoverRadius:4,borderWidth:2,yAxisID:"y"},{label:"Token(输入+输出)",data:hData.map(d=>d.tokens),borderColor:"#181816",backgroundColor:"rgba(24,24,22,.08)",fill:true,tension:.28,pointRadius:0,pointHitRadius:10,pointBackgroundColor:"#181816",pointHoverRadius:4,borderWidth:2,yAxisID:"y1"}]},options:{responsive:true,maintainAspectRatio:false,interaction:{mode:"index",intersect:false},plugins:{legend:{labels:{color:"#686863",font:{size:10}}},tooltip:{callbacks:{label:ctx=>ctx.dataset.label+": "+fmtT(ctx.raw)}}},scales:{x:{ticks:{color:"#686863",font:{size:9},maxRotation:0,autoSkip:true,maxTicksLimit:12},grid:{display:false}},y:{type:"linear",position:"left",ticks:{color:"#2f6e50"},grid:{color:"rgba(24,24,22,.08)"}},y1:{type:"linear",position:"right",ticks:{color:"#181816",callback:v=>fmtTk(v)},grid:{drawOnChartArea:false}}}}});
+  if(hc)C.h=new Chart(hc,{type:"line",data:{labels:hrs,datasets:[{label:"请求数",data:hData.map(d=>d.req),borderColor:"#2f6e50",backgroundColor:"rgba(47,110,80,.12)",fill:true,tension:.28,pointRadius:0,pointHitRadius:10,pointBackgroundColor:"#2f6e50",pointHoverRadius:4,borderWidth:2,yAxisID:"y"},{label:"Token(输入+输出)",data:hData.map(d=>d.tokens),borderColor:"#181816",backgroundColor:"rgba(24,24,22,.08)",fill:true,tension:.28,pointRadius:0,pointHitRadius:10,pointBackgroundColor:"#181816",pointHoverRadius:4,borderWidth:2,yAxisID:"y1"}].concat(ptsOn?[{label:"点数",data:hData.map(d=>d.points),borderColor:"#c4a23a",backgroundColor:"rgba(196,162,58,.12)",fill:false,tension:.28,pointRadius:0,pointHitRadius:10,pointHoverRadius:4,borderWidth:2,yAxisID:"y2"}]:[])},options:{responsive:true,maintainAspectRatio:false,interaction:{mode:"index",intersect:false},plugins:{legend:{labels:{color:"#686863",font:{size:10}}},tooltip:{callbacks:{label:ctx=>ctx.dataset.label+": "+(ctx.dataset.label==="点数"?fmtPts(ctx.raw):fmtT(ctx.raw))}}},scales:{x:{ticks:{color:"#686863",font:{size:9},maxRotation:0,autoSkip:true,maxTicksLimit:12},grid:{display:false}},y:{type:"linear",position:"left",ticks:{color:"#2f6e50"},grid:{color:"rgba(24,24,22,.08)"}},y1:{type:"linear",position:"right",ticks:{color:"#181816",callback:v=>fmtTk(v)},grid:{drawOnChartArea:false}},y2:{type:"linear",position:"right",display:ptsOn,ticks:{color:"#c4a23a"},grid:{drawOnChartArea:false}}}}});
   // Trend chart —— 服务端恒给逐日序列;窗口跨度超过 92 天时按月合并再画,
   // 逐日点会密到没有可读性(月份标签保留 YYYY-MM 全串,与日的 MM-DD 区分开)。
   const trows=D.trend||[];
-  let tlabels=trows.map(d=>d.date.slice(5)),tdata=trows.map(d=>d.total);
+  let tlabels=trows.map(d=>d.date.slice(5)),tdata=trows.map(d=>d.total),tpoints=trows.map(d=>d.points||0);
   if(trows.length>1&&(Date.parse(trows[trows.length-1].date+'T00:00:00Z')-Date.parse(trows[0].date+'T00:00:00Z'))/DAY>92){
     const byMonth={};
     for(const r of trows){
       const k=r.date.slice(0,7);
-      if(!byMonth[k])byMonth[k]={total:0};
-      byMonth[k].total+=r.total;
+      if(!byMonth[k])byMonth[k]={total:0,points:0};
+      byMonth[k].total+=r.total;byMonth[k].points+=(r.points||0);
     }
     const months=Object.keys(byMonth).sort();
-    tlabels=months;tdata=months.map(k=>byMonth[k].total);
+    tlabels=months;tdata=months.map(k=>byMonth[k].total);tpoints=months.map(k=>byMonth[k].points);
   }
   if(C.t){C.t.destroy();C.t=null}
-  if(tc)C.t=new Chart(tc,{type:"line",data:{labels:tlabels,datasets:[{label:"总Token(含缓存)",data:tdata,borderColor:COL[0],backgroundColor:"rgba(47,110,80,.12)",fill:true,tension:.28,pointRadius:2,borderWidth:2}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{labels:{color:"#686863",font:{size:10}}}},scales:{x:{ticks:{color:"#686863"},grid:{display:false}},y:{ticks:{color:"#686863",callback:v=>fmtTk(v)},grid:{color:"rgba(24,24,22,.08)"}}}}});
+  if(tc)C.t=new Chart(tc,{type:"line",data:{labels:tlabels,datasets:[{label:"总Token(含缓存)",data:tdata,borderColor:COL[0],backgroundColor:"rgba(47,110,80,.12)",fill:true,tension:.28,pointRadius:2,borderWidth:2,yAxisID:"y"}].concat(ptsOn?[{label:"点数",data:tpoints,borderColor:"#c4a23a",backgroundColor:"rgba(196,162,58,.10)",fill:false,tension:.28,pointRadius:2,borderWidth:2,yAxisID:"y2"}]:[])},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{labels:{color:"#686863",font:{size:10}}},tooltip:{callbacks:{label:ctx=>ctx.dataset.label+": "+(ctx.dataset.label==="点数"?fmtPts(ctx.raw):fmtT(ctx.raw))}}},scales:{x:{ticks:{color:"#686863"},grid:{display:false}},y:{ticks:{color:"#686863",callback:v=>fmtTk(v)},grid:{color:"rgba(24,24,22,.08)"}},y2:{type:"linear",position:"right",display:ptsOn,ticks:{color:"#c4a23a"},grid:{drawOnChartArea:false}}}}});
   renderModelTable();
   renderClientTable();
+  renderPlanStats();
 }
 // Price list: what each alias costs right now. Answers "为什么额度掉这么快" before
 // the user spends, not after. Cheapest first — the cheap option should be the one
@@ -871,7 +937,7 @@ function initState(def){
   const b=presetBounds(def);
   return{def:def,preset:def,start:b.start,end:b.end};
 }
-const ANA=initState('today');   // 用量分析:/api/my-usage 的趋势 + 模型/客户端表
+const ANA=initState('week');   // 用量分析:/api/my-usage 的趋势 + 模型/客户端表
 const SESS=initState('week');   // 会话使用情况:/api/my-activity(项目分布随之)
 function presetBounds(p){
   const shifted=new Date(Date.now()+8*3600000);
@@ -1058,7 +1124,7 @@ function ensureRequests(){
 // 内嵌分区合一,分区内用 agentTabs 子 Tab 切换)。
 // 顺序即导航顺序,id 由 setSection() 按 'mu-tab-'+s / 'mu-panel-'+s 硬拼 ——
 // 增删菜单必须与 lib/pages.mjs 的按钮和面板同时改,否则切换会静默失效。
-const SECTIONS=['overview','rates','analysis','requests','sessions','leaderboard','review','notify','agent'];
+const SECTIONS=['overview','points','rates','analysis','requests','sessions','leaderboard','review','notify','agent'];
 function setSection(name,focus){
   if(SECTIONS.indexOf(name)<0)name='overview';
   SECTION=name;

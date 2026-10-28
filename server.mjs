@@ -10,7 +10,7 @@ import { initProductionDb, createProductionTracker, rangeFromTo, productionSumma
   productionProjects, productionAlerts, markAlertSeen, pruneProductionData, DEFAULT_COST_RATES,
   computeCosts, contextHealth, buildReportHTML, ALERT_KIND_LABEL, alertDetailText,
   sessionProjectLabels, sessionToolStats, sessionKey } from "./production.mjs";
-import { cnNow, cnDate, cnHalfHour, secondsUntilNextCnMidnight, cnWeekStartIso, cnWeekStartDate, cnDayStartIso, periodStartDate, secondsUntilNextPeriodEnd, weekStartDateOf, monthStartDateOf, parseDateRange } from "./lib/time.mjs";
+import { cnNow, cnDate, cnHalfHour, secondsUntilNextCnMidnight, cnWeekStartIso, cnWeekStartDate, cnDayStartIso, periodStartDate, secondsUntilNextPeriodEnd, addDaysToDate, weekStartDateOf, monthStartDateOf, parseDateRange } from "./lib/time.mjs";
 import { parsePeakTimeMinutes, normalizePeakHours, isInPeakHours, formatPeakHoursSummary,
   BASE_GROUP_TOKEN, resolveEffectiveGroup, formatScheduleRuleSummary,
   normalizeScheduleGroups, normalizeScheduleRules, normalizeScheduleRule, normalizeScheduleGroupName,
@@ -3608,6 +3608,88 @@ function checkProfilePointLimit(apiKey, suffix, _rt) {
 
 // 首个「请求方案」是成员自己的手动首选。它只在成员可访问、协议匹配且该方案
 // 开放点数计费时生效；即使当前不在自动调度组，也允许作为显式覆盖参与请求。
+function buildMemberPointStats(apiKey, points) {
+  const key = resolveUserKey(apiKey);
+  const today = cnDate();
+  const from = daysAgoDate(29);
+  const rows = stmts.pointUsageByUser.all(key, "day", from, today, 60) || [];
+  const byDate = new Map(rows.map((r) => [r.bucket_start, r]));
+  const daily = [];
+  let totalPoints = 0, activeDays = 0, peakDay = null;
+  for (let i = 0; i < 30; i++) {
+    const date = addDaysToDate(from, i);
+    const weighted = Number(byDate.get(date)?.billing_weighted_tokens || 0);
+    const p = Math.round((weighted / POINTS_UNIT) * 100) / 100;
+    if (p > 0) { activeDays++; totalPoints += p; }
+    if (!peakDay || p > peakDay.points) peakDay = { date, points: p };
+    daily.push({ date, points: p, requests: Number(byDate.get(date)?.requests || 0) });
+  }
+  totalPoints = Math.round(totalPoints * 100) / 100;
+  const mapRows = (list) => (list || []).map((r) => ({
+    profile: r.profile,
+    profileName: (runtimes[r.profile] && runtimes[r.profile].profileName) || r.profile,
+    model: r.model,
+    protocol: r.protocol,
+    points: Math.round((Number(r.weighted || 0) / POINTS_UNIT) * 100) / 100,
+    requests: Number(r.requests || 0),
+  }));
+  return {
+    days: 30, from, to: today, unitTokens: POINTS_UNIT,
+    daily,
+    totalPoints,
+    avgDailyPoints: Math.round((totalPoints / 30) * 100) / 100,
+    todayPoints: daily[daily.length - 1]?.points || 0,
+    activeDays,
+    peakDay: peakDay && peakDay.points > 0 ? peakDay : null,
+    topProfiles: mapRows(stmts.pointRequestsByProfile.all(key, from, today)),
+    topModels: mapRows(stmts.pointRequestsByModel.all(key, from, today)),
+    checkinPoints: points?.checkinPoints || 0,
+    tempPoints: points?.tempPoints || 0,
+  };
+}
+
+// 用量分析面板的点数曲线：小时图恒为今天，趋势图跟随选中区间（缺省近 7 天）。
+// point_requests 只含成功请求；不存在点数记录时返回全 0，不报错。
+function buildMemberPointSeries(apiKey, profileSuffix, range) {
+  const key = resolveUserKey(apiKey);
+  const profile = profileSuffix && profileSuffix !== "all" ? normalizeProfileSuffix(profileSuffix) : "";
+  const today = cnDate();
+  const hourly = {};
+  for (const r of stmts.pointHourlyRange.all({ key, day: today, profile }) || []) {
+    const slot = `${r.hh}:${r.mm}`;
+    hourly[slot] = {
+      points: Math.round((Number(r.weighted || 0) / POINTS_UNIT) * 100) / 100,
+      requests: Number(r.requests || 0),
+    };
+  }
+  const start = range ? range.start : addDaysToDate(today, -6);
+  const end = range ? range.end : today;
+  const daily = {};
+  for (const r of stmts.pointDailyRange.all({ key, start, end, profile }) || []) {
+    daily[r.day] = {
+      points: Math.round((Number(r.weighted || 0) / POINTS_UNIT) * 100) / 100,
+      requests: Number(r.requests || 0),
+    };
+  }
+  return { hourly, daily, from: start, to: end };
+}
+
+// 区间内按方案汇总 token / 点数，供用量分析里的「方案统计」表。
+function buildMemberPlanStats(apiKey, profileSuffix, range) {
+  const key = resolveUserKey(apiKey);
+  const profile = profileSuffix && profileSuffix !== "all" ? normalizeProfileSuffix(profileSuffix) : "";
+  const today = cnDate();
+  const start = range ? range.start : addDaysToDate(today, -6);
+  const end = range ? range.end : today;
+  return (stmts.pointPlanStats.all({ key, start, end, profile }) || []).map((r) => ({
+    profile: r.profile,
+    profileName: (runtimes[r.profile] && runtimes[r.profile].profileName) || r.profile,
+    tokens: Number(r.tokens || 0),
+    points: Math.round((Number(r.weighted || 0) / POINTS_UNIT) * 100) / 100,
+    requests: Number(r.requests || 0),
+  }));
+}
+
 function getPreferredProfileSuffix(userKey, protocol) {
   if (config.pointSettings && config.pointSettings.allowSelfSelect === false) return "";
   if (!pointsModeEnabled(userKey)) return "";
@@ -9049,7 +9131,14 @@ const server = http.createServer((req, res) => {
       // 可选自定义日期范围(用量分析面板的趋势/模型/客户端表);null = 都没给,走默认窗口。
       const usageRange = parseDateRange(url.searchParams.get("start"), url.searchParams.get("end"));
       const payload = usageApi.getPersonalUsageData(apiKey, profileSuffix, protocolParam, usageRange);
-      if (payload.points?.enabled) payload.pointCheckin = memberRewardsApi.getPointCheckInStatus(apiKey);
+      if (payload.points?.enabled) {
+        payload.pointCheckin = memberRewardsApi.getPointCheckInStatus(apiKey);
+        payload.pointStats = buildMemberPointStats(apiKey, payload.points);
+        const series = buildMemberPointSeries(apiKey, profileSuffix, usageRange);
+        payload.pointHourly = series.hourly;
+        for (const row of payload.trend || []) row.points = series.daily[row.date]?.points || 0;
+        payload.profileStats = buildMemberPlanStats(apiKey, profileSuffix, usageRange);
+      }
       res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
       // heatmap=0:30s 轮询瘦身 —— 370 天使用日历每次随载荷下发太浪费,前端首轮拉全量
       // 后本地缓存,轮询只刷今日格(由 today 数据驱动),日期范围变化时再拉全量。

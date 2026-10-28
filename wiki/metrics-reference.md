@@ -44,7 +44,30 @@
 
 ## 产出质量指标公式
 
-原始数据是**工具调用事件**（每次 Edit/Write/Bash 等记一行，含增删行数、成败、命令分类）。时间过滤按北京时间日期。
+原始数据是**工具调用事件**（每次编辑/写文件/跑命令等记一行，含增删行数、成败、命令分类）。时间过滤按北京时间日期。
+
+**文件工具识别口径**：网关同时服务多种客户端 CLI，各家对「编辑文件」的工具命名不同。统计时工具名统一转小写后**精确匹配**内置注册表，与客户端无关：
+
+| 客户端 | 识别为「文件工具」的名字 | 识别为「命令工具」的名字 |
+|---|---|---|
+| Claude Code | Edit / MultiEdit / Write / NotebookEdit | Bash |
+| deepseek-harness | edit / write / write_file / notebook_edit | bash / exec_command / pwsh / powershell / shell |
+| MiniMaxCode | edit / write（小写） | bash / pwsh |
+| Codex CLI / Desktop | apply_patch（补丁文本按内容识别，工具名不拘） | shell |
+
+- **补丁文本按内容识别**：只要工具入参里出现 `*** Begin Patch` 补丁（Codex 藏在 shell 命令里、或直填 `patch` / `input` 参数），就按补丁 +/- 行拆分成每文件一条记录——一段补丁改 3 个文件记 3 条事件
+- **新客户端接入**：若成员的 CLI 用了名单之外的编辑工具名（成员明细「工具活动」可见），管理员在 `config.productionTracking.fileTools` 加一条即可，**保存后即时生效、无需重启**，也可随时撤下：
+
+  ```json
+  "productionTracking": {
+    "fileTools": [
+      { "tool": "str_replace_editor", "filePathKeys": ["file_path"], "addKeys": ["new_str"], "delKeys": ["old_str"] }
+    ]
+  }
+  ```
+
+  `filePathKeys` 是入参里文件路径的候选键名；`addKeys` / `delKeys` 是新增/删除内容的键名（按行数折算）；省略 `addKeys` 时按 `content` 键取全量行数。工具名只允许字母、数字、下划线（配置接口按白名单校验）。
+- ⚠️ **成员净产出为 0 不一定是没干活**：客户端若用名单之外的编辑工具，编辑行数记不出来（工具调用次数仍照实统计）。到「产出质量 → 成员明细 → 工具活动」看调用分布即可判断，面板在该情形下会显示橙色提示。
 
 | 指标 | 公式 | 面板着色 |
 |---|---|---|
@@ -59,7 +82,7 @@
 
 **验证类 = 命令分类为 test 或 lint**：`pytest / vitest / jest / mocha / playwright / go test / cargo test`、`eslint / biome / prettier / flake8 / ruff / stylelint` 等。命令分类还有 build（make/webpack/vite build/tsc/npm run build…）与 git 两类。
 
-**行数记法**：Edit 按新旧串行数；MultiEdit 累加各段；Write 全量按新增；Codex 的 `*** Begin Patch` 按补丁 +/- 行拆分多文件。
+**行数记法**：edit 按新旧串行数（大小写无关）；MultiEdit 累加各段；write / write_file 全量按新增；NotebookEdit 只记事件不折行数；`*** Begin Patch` 按补丁 +/- 行拆分多文件；经 `fileTools` 扩展的工具按所配键名折算。
 
 **项目分布归并**：以会话为单位归项目——按路径带权找主导子树（根级最重子目录 ≥60% 则单一项目；≥20% 的多个子目录各成簇）；会话跨多项目时**整段记给权重最大的主项目**，跨项目文件数如实单列。榜单取新增行 Top 50。「零产出成员」= 区间内有输出 token 但无任何工具事件的成员。
 
@@ -74,6 +97,8 @@
 | 编辑失败爆发 | 最近 **30 分钟**内文件类事件 ≥ **10** 次 **且** 失败占比 **> 50%**（严格大于） | 冷却 30 分钟 |
 
 推送格式：【产出告警】类型 · 用户名 + 详情 + 北京时间；**管理员渠道与触发成员本人（其自助配置的渠道）各推一份**；推送侧另有每条 60 秒冷却。空转消耗**不含代码评审专用 Key**（`codeReview.providerKey`）——定时评审的用量无文件产出是预期行为。产出数据（工具事件/告警）保留 **90 天**。
+
+⚠️ 空转消耗判的是「最近 60 分钟有没有**被识别的**文件类事件」：成员的客户端若用[名单之外](#文件工具识别口径)的编辑工具，会一边真实改文件、一边被误报空转——把该工具名加进 `fileTools` 扩展即可根治。
 
 ## 等值成本计算
 

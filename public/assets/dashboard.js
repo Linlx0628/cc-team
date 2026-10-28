@@ -1016,7 +1016,9 @@ async function loadProduction(){
       fetch('/api/production/alerts?range='+range).then(r=>r.json()),
     ]);
     prodData=s;
-    document.getElementById('prodSummary').textContent='净产出 '+s.rows.reduce((x,r)=>x+r.net_lines,0).toLocaleString('zh-CN')+' 行 · '+s.rows.length+' 人有产出';
+    // 注意口径:rows = 有工具活动的成员(≥1 条任意工具事件),不等于「有产出」;
+    // 纯聊天成员不在此列,编辑工具不在识别口径内的成员净产出为 0。
+    document.getElementById('prodSummary').textContent='净产出 '+s.rows.reduce((x,r)=>x+r.net_lines,0).toLocaleString('zh-CN')+' 行 · '+s.rows.length+' 人有工具活动';
     const tb=document.querySelector('#prodTable tbody');
     // 阈值着色(参考区间,与成员个人页同口径):失败率 <10 绿/≥30 橙;重写率 <30 绿/≥80 橙;验证密度 =0 橙/0.1-0.8 绿;token/行与净产出不参与着色。
     tb.innerHTML=s.rows.map(r=>{
@@ -1051,11 +1053,19 @@ async function loadProdDetail(key,range){
     ||'<tr><td colspan="3" class="empty">无文件记录</td></tr>';
   const langChips=d.languages.map(l=>'<span class="chip">'+ph(l.ext||'其他')+'</span>').join('')
     ||'<span style="font-size:11px;color:var(--dim)">无</span>';
+  // 工具活动分布:该成员全部工具调用按名字聚合(灰字 = 非文件工具)。净产出为 0 时
+  // 在这里能直接看出「他的 CLI 用什么工具在干活」——是编辑工具不在识别口径内,还是真没改文件。
+  const tools=d.tools||[];
+  const toolCalls=tools.reduce((x,t)=>x+t.calls,0),fileEdits=tools.reduce((x,t)=>x+(t.file_edits||0),0);
+  const toolChips=tools.map(t=>'<span class="chip"'+(t.file_edits?'':' style="color:var(--dim)"')+' title="调用 '+t.calls+' 次'+(t.file_edits?',其中文件编辑 '+t.file_edits+' 次':'')+'">'+ph(t.tool)+'×'+t.calls+'</span>').join('')
+    ||'<span style="font-size:11px;color:var(--dim)">无</span>';
+  const zeroHint=(toolCalls>0&&!fileEdits)?'<div style="font-size:11px;color:var(--orange);margin:8px 0 3px">注意:有 '+toolCalls+' 次工具调用但无文件编辑:其客户端的编辑工具可能不在识别口径内(管理员可在 config.productionTracking.fileTools 扩展),或确实未改文件。</div>':'';
   el.innerHTML='<div style="font-weight:650;margin-bottom:4px">成员明细</div>'
     +'<div style="height:120px;margin-bottom:10px"><canvas id="prodDetailTrend"></canvas></div>'
     +'<div style="font-size:11px;color:var(--dim);font-weight:600;margin-bottom:2px">文件 Top</div>'
     +'<table style="min-width:0"><thead><tr><th>文件</th><th class="n">新增</th><th class="n">删除</th></tr></thead><tbody>'+fileRows+'</tbody></table>'
-    +'<div style="font-size:11px;color:var(--dim);font-weight:600;margin:8px 0 3px">语言</div><div>'+langChips+'</div>';
+    +'<div style="font-size:11px;color:var(--dim);font-weight:600;margin:8px 0 3px">语言</div><div>'+langChips+'</div>'
+    +'<div style="font-size:11px;color:var(--dim);font-weight:600;margin:8px 0 3px">工具活动</div><div>'+toolChips+'</div>'+zeroHint;
   if(prodDetailChart)prodDetailChart.destroy();
   prodDetailChart=new Chart(document.getElementById('prodDetailTrend'),{type:'line',
     data:{labels:d.days.map(x=>x.date.slice(5)),datasets:[{label:'日净产出',data:d.days.map(x=>(x.la||0)-(x.ld||0)),

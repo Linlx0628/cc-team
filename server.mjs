@@ -7506,6 +7506,18 @@ const server = http.createServer((req, res) => {
         const p = config.productionTracking || {};
         if (typeof body.productionTracking.enabled === "boolean") p.enabled = body.productionTracking.enabled;
         if (typeof body.productionTracking.storeFilePaths === "boolean") p.storeFilePaths = body.productionTracking.storeFilePaths;
+        // 文件工具扩展名单(可选):新客户端 CLI 的编辑工具不改代码即可纳入产出口径。
+        // 传数组则整体替换;只留工具名([a-zA-Z0-9_])与字符串键名数组,防垃圾键入 config。
+        if (Array.isArray(body.productionTracking.fileTools)) {
+          p.fileTools = body.productionTracking.fileTools
+            .filter(e => e && typeof e === "object" && /^[a-zA-Z0-9_]+$/.test(String(e.tool || "")))
+            .map(e => ({
+              tool: String(e.tool).toLowerCase(),
+              filePathKeys: Array.isArray(e.filePathKeys) ? e.filePathKeys.filter(k => typeof k === "string" && k) : [],
+              addKeys: Array.isArray(e.addKeys) ? e.addKeys.filter(k => typeof k === "string" && k) : [],
+              delKeys: Array.isArray(e.delKeys) ? e.delKeys.filter(k => typeof k === "string" && k) : [],
+            }));
+        }
         // 全局成本峰时段(costPeakHours)与项目名归并(projectAliases)已废弃:
         // 前者复用各方案的 peakHours,后者功能整体移除。旧 config 里的遗留键在此物理清除,
         // 读取侧无任何消费方,未保存前也天然被忽略。

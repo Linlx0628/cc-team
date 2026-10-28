@@ -1,7 +1,39 @@
 // production.mjs —— 文件头 + 本任务增量;后续任务在同文件追加
 const SCAN_LIMIT = 5000;
 const CURSOR_LIMIT = 500;
+// —— 文件/Shell 工具识别注册表(单一口径)——
+// 生产网关同时服务多个客户端 CLI,各家对「编辑文件」「跑命令」的工具命名不同:
+//   Claude Code:Edit / MultiEdit / Write / NotebookEdit / Bash(首字母大写)
+//   deepseek-harness、MiniMaxCode:edit / write / write_file / bash / pwsh(全小写)
+//   Codex 系:apply_patch —— 补丁文本可能藏在 shell 命令里,也可能直填 args.patch/args.input
+// 口径:工具名统一 toLowerCase 后**精确匹配**(非子串,避免误伤自定义工具);
+// 行数提取按归一化名字走统一 input 形状(harness/MiniMax 的 edit/write 字段与
+// Claude Code 同构:file_path/old_string/new_string/content)。FILE_TOOLS 保留导出
+// 仅为兼容旧引用;真正的口径源是 FILE_TOOL_SET + EXTRA_FILE_TOOLS。
 export const FILE_TOOLS = ["Edit", "MultiEdit", "Write", "NotebookEdit", "apply_patch"];
+const FILE_TOOL_SET = new Set(["edit", "multiedit", "write", "write_file", "notebookedit", "notebook_edit", "apply_patch"]);
+const SHELL_TOOL_SET = new Set(["bash", "exec_command", "pwsh", "powershell", "shell"]);
+// 管理员扩展(config.productionTracking.fileTools):[{ tool, filePathKeys, addKeys, delKeys }]
+// —— 新客户端 CLI 上线不改代码;EXTRA 命中后按给出的 input 键名取文件路径与行数。
+const EXTRA_FILE_TOOLS = new Map();   // 小写工具名 → { filePathKeys, addKeys, delKeys }
+export function registerFileTools(list) {
+  const incoming = (Array.isArray(list) ? list : []).filter(e => e && typeof e === "object");
+  for (const e of incoming) {
+    const name = String(e.tool || "").toLowerCase();
+    if (!/^[a-z0-9_]+$/.test(name)) continue;
+    const pick = v => (Array.isArray(v) ? v.filter(k => typeof k === "string" && k) : []);
+    EXTRA_FILE_TOOLS.set(name, { filePathKeys: pick(e.filePathKeys), addKeys: pick(e.addKeys), delKeys: pick(e.delKeys) });
+  }
+  if (incoming.length) { FILE_SQL_CACHE = null; CODE_FILE_SQL_CACHE = null; }
+  return incoming.length;
+}
+export function fileToolNames() { return [...FILE_TOOL_SET, ...EXTRA_FILE_TOOLS.keys()]; }
+export function isFileTool(name) { const n = String(name || "").toLowerCase(); return FILE_TOOL_SET.has(n) || EXTRA_FILE_TOOLS.has(n); }
+function isShellTool(name) { return SHELL_TOOL_SET.has(String(name || "").toLowerCase()); }
+// SQL 谓词:LOWER(tool) 精确匹配 —— 库里 tool 按客户端原样落库(历史行既有 Edit 也有
+// edit),归一化必须发生在 SQL 侧;构建结果按注册表变更缓存。
+let FILE_SQL_CACHE = null, CODE_FILE_SQL_CACHE = null;
+const fileToolSql = () => FILE_SQL_CACHE ??= "LOWER(tool) IN (" + fileToolNames().map(t => `'${t}'`).join(",") + ")";
 
 export function initProductionDb(db) {
   db.exec(`
@@ -46,7 +78,16 @@ export function createProductionTracker({ db, getConfig, log = console.log, now 
     setResult: db.prepare(`UPDATE tool_events SET outcome=@outcome, error_kind=@error_kind WHERE tool_id=@tool_id AND outcome='pending'`),
     setResultPrefix: db.prepare(`UPDATE tool_events SET outcome=@outcome, error_kind=@error_kind WHERE tool_id LIKE @prefix AND outcome='pending'`),
   };
+  let lastFileToolsJson = null;
   function parseAndStore(info, cfg) {
+    // 管理员改了 fileTools 扩展名单 → 整表重建注册表(SQL 谓词缓存随之失效)
+    const ftJson = Array.isArray(cfg.fileTools) && cfg.fileTools.length ? JSON.stringify(cfg.fileTools) : "";
+    if (ftJson !== lastFileToolsJson) {
+      lastFileToolsJson = ftJson;
+      for (const k of [...EXTRA_FILE_TOOLS.keys()]) EXTRA_FILE_TOOLS.delete(k);
+      if (ftJson) registerFileTools(cfg.fileTools);
+      FILE_SQL_CACHE = null; CODE_FILE_SQL_CACHE = null;
+    }
     const extract = info.protocol === "responses" ? extractResponsesEvents : extractAnthropicEvents;
     const prev = cursors.has(info.session) ? cursors.get(info.session) : 0;
     const { calls, results, cursor } = extract(info.parsed, prev);
@@ -60,8 +101,8 @@ export function createProductionTracker({ db, getConfig, log = console.log, now 
           profile: info.profile || null, session: info.session || null,
           tool_id: c.tool_id, tool: c.tool,
           file_path: storePaths ? (c.file_path || null) : null,
-          ext: c.ext || null, lines_add: c.tool === "apply_patch" || FILE_TOOLS.includes(c.tool) ? (c.lines_add | 0) : 0,
-          lines_del: c.tool === "apply_patch" || FILE_TOOLS.includes(c.tool) ? (c.lines_del | 0) : 0,
+          ext: c.ext || null, lines_add: isFileTool(c.tool) ? (c.lines_add | 0) : 0,
+          lines_del: isFileTool(c.tool) ? (c.lines_del | 0) : 0,
           cmd_class: c.cmd_class || null, model: info.model || null,
         });
       }
@@ -105,7 +146,7 @@ export function createProductionTracker({ db, getConfig, log = console.log, now 
     const idleExcluded = new Set(Array.isArray(cfg.idleExcludeUserKeys) ? cfg.idleExcludeUserKeys.filter(Boolean) : []);
     for (const u of hot) {
       if (idleExcluded.has(u.user_key)) continue;
-      const hasFiles = db.prepare(`SELECT COUNT(*) n FROM tool_events WHERE user_key=? AND ${FILE_SQL} AND time>=?`).get(u.user_key, cutoffHour).n;
+      const hasFiles = db.prepare(`SELECT COUNT(*) n FROM tool_events WHERE user_key=? AND ${fileToolSql()} AND time>=?`).get(u.user_key, cutoffHour).n;
       if (hasFiles) { idleEpisodes.delete(u.user_key); continue; }
       // 空转是一段**持续行为**,不是每过一个冷却期就值得再说一遍的新事实:同一轮空转
       // 只在开头告警一次,之后每次命中都静默续期;直到当事人产出文件类事件(回合结束),
@@ -126,7 +167,7 @@ export function createProductionTracker({ db, getConfig, log = console.log, now 
     }
     // 2) error_loop:窗口内同 error_kind 次数 ≥ loopCount;有成功文件编辑(进展)不上报;可配置剔除杂音 kind
     const cutoffLoop = new Date(now - cfg.loopWindowMinutes * 60_000).toISOString();
-    const progressed = new Set(db.prepare(`SELECT DISTINCT user_key FROM tool_events WHERE outcome='ok' AND ${FILE_SQL} AND time>=?`).all(cutoffLoop).map(r => r.user_key));
+    const progressed = new Set(db.prepare(`SELECT DISTINCT user_key FROM tool_events WHERE outcome='ok' AND ${fileToolSql()} AND time>=?`).all(cutoffLoop).map(r => r.user_key));
     const exKinds = Array.isArray(cfg.loopExcludedKinds) ? cfg.loopExcludedKinds.filter(k => k) : [];
     const exClause = exKinds.length ? ` AND error_kind NOT IN (${exKinds.map(() => "?").join(",")})` : "";
     const loops = db.prepare(`SELECT user_key, MAX(COALESCE(NULLIF(user_name,''),user_key)) user_name, error_kind, COUNT(*) c
@@ -143,7 +184,7 @@ export function createProductionTracker({ db, getConfig, log = console.log, now 
     const cutoffBurst = new Date(now - cfg.burstWindowMinutes * 60_000).toISOString();
     const bursts = db.prepare(`SELECT user_key, MAX(COALESCE(NULLIF(user_name,''),user_key)) user_name,
         COUNT(*) n, SUM(CASE WHEN outcome='error' THEN 1 ELSE 0 END) e
-      FROM tool_events WHERE ${FILE_SQL} AND time>=? GROUP BY user_key
+      FROM tool_events WHERE ${fileToolSql()} AND time>=? GROUP BY user_key
       HAVING n >= ? AND e * 1.0 / n > ?`).all(cutoffBurst, cfg.burstMinEdits, cfg.burstFailRate);
     for (const b of bursts) {
       if (recentAlert.get("edit_failure_burst", b.user_key, new Date(now - cfg.cooldownMinutes * 60_000).toISOString()).n) continue;
@@ -204,24 +245,71 @@ function toolResultToBackfill(b) {
   return { tool_id: id, outcome: "ok", error_kind: null };
 }
 
+function firstOf(obj, keys) {
+  if (!obj || typeof obj !== "object") return undefined;
+  for (const k of keys) if (obj[k] !== undefined) return obj[k];
+  return undefined;
+}
+
+// 从一次文件工具调用的 input 提取 1..n 条事件(apply_patch 一段补丁可改多个文件);
+// 不是文件工具、或补丁/字段都提不出内容时返回 null,由调用方落回通用事件分支。
+// tool_id 语义:普通调用 = 调用 id(与 tool_result 对得上);apply_patch 每文件一条,
+// 后缀 #idx(结果回填走前缀匹配,见 setResultPrefix)。
+function fileToolEvents(name, input, callId) {
+  const lower = String(name || "").toLowerCase();
+  const tool = String(name || "unknown");
+  // 补丁文本三处来源:Codex CLI 藏在 shell 命令里(command/cmd),新版直填 args.patch / args.input。
+  // 只认名字会漏掉 shell 内嵌的老形态,所以按内容识别,工具名不拘。
+  const patchText = [input.patch, input.input, commandText(input.command ?? input.cmd)]
+    .find(s => typeof s === "string" && s.includes("*** Begin Patch"));
+  if (lower === "apply_patch" || patchText) {
+    if (!patchText) return null;   // 名字叫 apply_patch 但没有可识别的补丁文本 → 交回退分支
+    return parseApplyPatch(patchText).map((f, idx) => ({
+      tool_id: `${callId}#${idx}`, tool: "apply_patch", file_path: f.file_path, ext: extOf(f.file_path),
+      lines_add: f.lines_add, lines_del: f.lines_del, cmd_class: null,
+    }));
+  }
+  const extra = EXTRA_FILE_TOOLS.get(lower);
+  const pathKeys = extra?.filePathKeys?.length ? extra.filePathKeys : ["file_path", "notebook_path", "path"];
+  const addKeys = extra?.addKeys?.length ? extra.addKeys : null;
+  const delKeys = extra?.delKeys?.length ? extra.delKeys : null;
+  let filePath, add = 0, del = 0;
+  switch (lower) {
+    case "edit":
+      filePath = firstOf(input, pathKeys);
+      add = lineCount(input.new_string); del = lineCount(input.old_string);
+      break;
+    case "multiedit":
+      filePath = firstOf(input, pathKeys);
+      for (const e of Array.isArray(input.edits) ? input.edits : []) { add += lineCount(e.new_string); del += lineCount(e.old_string); }
+      break;
+    case "write": case "write_file":
+      filePath = firstOf(input, pathKeys);
+      add = lineCount(addKeys ? firstOf(input, addKeys) : input.content);
+      break;
+    case "notebookedit": case "notebook_edit":
+      filePath = firstOf(input, pathKeys);   // 与既有口径一致:notebook 只记事件不折行数
+      break;
+    default:
+      if (!extra) return null;
+      filePath = firstOf(input, pathKeys);
+      add = lineCount(addKeys ? firstOf(input, addKeys) : null);
+      del = lineCount(delKeys ? firstOf(input, delKeys) : null);
+  }
+  if (!filePath && !add && !del) return null;
+  return [{ tool_id: callId, tool, file_path: filePath ?? null, ext: extOf(filePath), lines_add: add, lines_del: del, cmd_class: null }];
+}
+
 function toolUseToEvent(b) {
   const input = (b.input && typeof b.input === "object") ? b.input : {};
   const tool = String(b.name || "unknown");
-  const ev = { tool_id: String(b.id || ""), tool, file_path: null, ext: null, lines_add: 0, lines_del: 0, cmd_class: null };
-  if (tool === "Edit") {
-    ev.file_path = input.file_path; ev.lines_add = lineCount(input.new_string); ev.lines_del = lineCount(input.old_string);
-  } else if (tool === "MultiEdit") {
-    ev.file_path = input.file_path;
-    for (const e of Array.isArray(input.edits) ? input.edits : []) { ev.lines_add += lineCount(e.new_string); ev.lines_del += lineCount(e.old_string); }
-  } else if (tool === "Write") {
-    ev.file_path = input.file_path; ev.lines_add = lineCount(input.content);
-  } else if (tool === "NotebookEdit") {
-    ev.file_path = input.notebook_path;
-  } else if (tool === "Bash") {
-    ev.cmd_class = classifyCommand(input.command);
-  }
-  if (ev.file_path) ev.ext = extOf(ev.file_path);
-  return ev;
+  const fileEvents = fileToolEvents(tool, input, String(b.id || ""));
+  if (fileEvents) return fileEvents;
+  // 非文件工具:通用事件照记(工具分布、失败率仍要看它们);shell 词汇做命令分类
+  // —— 各家命名不同(bash/exec_command/pwsh…),统一归一后再判。
+  const shellCmd = isShellTool(tool) ? commandText(input.command ?? input.cmd) : "";
+  return [{ tool_id: String(b.id || ""), tool, file_path: null, ext: null, lines_add: 0, lines_del: 0,
+    cmd_class: shellCmd ? classifyCommand(shellCmd) : null }];
 }
 
 function scanStart(msgs, cursor) {
@@ -239,7 +327,7 @@ export function extractAnthropicEvents(parsed, cursor = 0) {
     if (!m || typeof m !== "object" || !Array.isArray(m.content)) continue;
     for (const b of m.content) {
       if (!b || typeof b !== "object") continue;
-      if (b.type === "tool_use") { const ev = toolUseToEvent(b); if (ev.tool_id) calls.push(ev); }
+      if (b.type === "tool_use") { calls.push(...toolUseToEvent(b).filter(e => e.tool_id)); }
       else if (b.type === "tool_result") { const r = toolResultToBackfill(b); if (r) results.push(r); }
     }
   }
@@ -280,18 +368,13 @@ export function extractResponsesEvents(parsed, cursor = 0) {
       const name = String(it.name || "unknown");
       let args = {};
       try { args = JSON.parse(it.arguments || "{}"); } catch {}
+      // 文件工具优先(含 apply_patch 补丁文本,老 shell 内嵌与直填 args.patch 两种形态都覆盖);
+      // 未命中再落通用事件分支 —— 工具名原样入库,shell 命令照旧做命令分类。
+      const fileEvents = fileToolEvents(name, args, callId);
+      if (fileEvents) { calls.push(...fileEvents); continue; }
       const cmd = commandText(args.command ?? args.cmd);
-      if (cmd.includes("*** Begin Patch")) {
-        const files = parseApplyPatch(cmd);
-        files.forEach((f, idx) => calls.push({
-          tool_id: `${callId}#${idx}`, tool: "apply_patch",
-          file_path: f.file_path, ext: extOf(f.file_path),
-          lines_add: f.lines_add, lines_del: f.lines_del, cmd_class: null,
-        }));
-      } else {
-        calls.push({ tool_id: callId, tool: name, file_path: null, ext: null, lines_add: 0, lines_del: 0,
-          cmd_class: cmd ? classifyCommand(cmd) : null });
-      }
+      calls.push({ tool_id: callId, tool: name, file_path: null, ext: null, lines_add: 0, lines_del: 0,
+        cmd_class: cmd ? classifyCommand(cmd) : null });
     } else if (it.type === "function_call_output") {
       const id = String(it.call_id || "");
       if (!id) continue;
@@ -317,8 +400,7 @@ export function rangeFromTo(range) {
   return { from: cnDateStr(Date.now() - (days - 1) * 86400000), to: cnDateStr() };
 }
 
-// 文件工具谓词从 FILE_TOOLS 派生——与落库侧单一口径,防漂移
-const FILE_SQL = "tool IN (" + FILE_TOOLS.map(t => `'${t}'`).join(",") + ")";
+// 文件工具谓词 fileToolSql() 见文件头注册表——与落库侧单一口径,防漂移。
 
 // 「文档类」扩展名:写这些文件不算代码产出(代码行数/代码质量/效率比口径)。
 // 列表刻意收窄,只收纯文档载体 —— .json/.yml 等配置与数据的边界模糊(锁文件、
@@ -326,24 +408,24 @@ const FILE_SQL = "tool IN (" + FILE_TOOLS.map(t => `'${t}'`).join(",") + ")";
 export const DOC_EXTS = [".md", ".markdown", ".txt", ".rst", ".adoc"];
 const DOC_EXTS_SQL = "(" + DOC_EXTS.map(e => `'${e}'`).join(",") + ")";
 
-// 代码口径 = 文件工具 且 非文档扩展名。与 FILE_SQL 的分工:
-//   · CODE_FILE_SQL —— 产出/排名口径(productionSummary、sessionToolStats):衡量「写了多少代码」
-//   · FILE_SQL     —— 活动口径(告警扫描):idle_burn/error_loop 判的是「是否在推进」,
-//                     写文档同样是推进,换口径会把纯文档作者误报成空转/循环
-// 两个常量并存是有意为之,别顺手统一。
+// 代码口径 = 文件工具 且 非文档扩展名。fileToolSql / codeFileSql 的分工:
+//   · codeFileSql() —— 产出/排名口径(productionSummary、sessionToolStats):衡量「写了多少代码」
+//   · fileToolSql() —— 活动口径(告警扫描):idle_burn/error_loop 判的是「是否在推进」,
+//                      写文档同样是推进,换口径会把纯文档作者误报成空转/循环
+// 两个函数并存是有意为之,别顺手统一。
 // ext IS NULL 按代码计:文件类事件 ext 为空的只有 Dockerfile/Makefile 这类无扩展名
 // 源文件,排除它们等于漏掉最典型的「改工程文件」;storePaths=false 不影响 ext 落库。
-const CODE_FILE_SQL = `(${FILE_SQL} AND (ext IS NULL OR ext NOT IN ${DOC_EXTS_SQL}))`;
+const codeFileSql = () => `(${fileToolSql()} AND (ext IS NULL OR ext NOT IN ${DOC_EXTS_SQL}))`;
 
 export function productionSummary(db, { from, to }) {
   const rows = db.prepare(`
     SELECT user_key, MAX(COALESCE(NULLIF(user_name,''), user_key)) AS user_name,
       COUNT(*) AS tool_calls,
-      SUM(CASE WHEN ${CODE_FILE_SQL} THEN 1 ELSE 0 END) AS edit_count,
-      SUM(CASE WHEN ${CODE_FILE_SQL} THEN lines_add ELSE 0 END) AS lines_add,
-      SUM(CASE WHEN ${CODE_FILE_SQL} THEN lines_del ELSE 0 END) AS lines_del,
-      COUNT(DISTINCT CASE WHEN ${CODE_FILE_SQL} THEN file_path END) AS files,
-      SUM(CASE WHEN ${CODE_FILE_SQL} AND outcome='error' THEN 1 ELSE 0 END) AS edit_errors,
+      SUM(CASE WHEN ${codeFileSql()} THEN 1 ELSE 0 END) AS edit_count,
+      SUM(CASE WHEN ${codeFileSql()} THEN lines_add ELSE 0 END) AS lines_add,
+      SUM(CASE WHEN ${codeFileSql()} THEN lines_del ELSE 0 END) AS lines_del,
+      COUNT(DISTINCT CASE WHEN ${codeFileSql()} THEN file_path END) AS files,
+      SUM(CASE WHEN ${codeFileSql()} AND outcome='error' THEN 1 ELSE 0 END) AS edit_errors,
       SUM(CASE WHEN cmd_class IN ('test','lint') THEN 1 ELSE 0 END) AS verify_runs
     FROM tool_events WHERE date(time,'+8 hours') BETWEEN ? AND ?
     GROUP BY user_key ORDER BY lines_add DESC`).all(from, to);
@@ -481,13 +563,13 @@ function singleFileLabel(fp) {
 // —— 那些手工建表的既有测试因此不受影响。
 export function clusterSessions(db, { from, to, userKey } = {}) {
   // 会话为归组单位:同会话文件集合共同推导项目;session NULL 归 '' 桶。权重 = Σ(lines_add+lines_del)
-  // 用代码口径(CODE_FILE_SQL):项目分布是「产出」指标,文档行不与代码混算;
+  // 用代码口径(codeFileSql()):项目分布是「产出」指标,文档行不与代码混算;
   // 文档的行权重同时影响簇的推导,剔除后标签归属只按代码文件算。
   const stmt = db.prepare(`
     SELECT session, file_path, user_key,
       SUM(lines_add) AS la, SUM(lines_del) AS ld, COUNT(*) AS edits
     FROM tool_events WHERE ${userKey ? "user_key=? AND " : ""}date(time,'+8 hours') BETWEEN ? AND ?
-      AND file_path IS NOT NULL AND ${CODE_FILE_SQL}
+      AND file_path IS NOT NULL AND ${codeFileSql()}
     GROUP BY session, file_path, user_key`);
   const rows = userKey ? stmt.all(userKey, from, to) : stmt.all(from, to);
   // 键是 (user_key, session) 而不是 session:正常部署里会话标识是客户端发的 UUID,
@@ -578,20 +660,28 @@ export function productionUserDetail(db, userKey, { from, to }) {
     SELECT ext, COUNT(*) edits, SUM(lines_add) la FROM tool_events
     WHERE user_key=? AND date(time,'+8 hours') BETWEEN ? AND ? AND ext IS NOT NULL
     GROUP BY ext ORDER BY la DESC LIMIT 10`).all(userKey, from, to);
-  return { days, files, languages };
+  // 工具活动分布:全部工具调用按名字聚合(file_edits = 其中落在文件口径里的次数)。
+  // 用途:净产出为 0 的成员在这里能直接看到「他的 CLI 用什么工具在干活」,
+  // 是口径未覆盖(工具名不在注册表)还是真的没改文件,一眼可辨。
+  const tools = db.prepare(`
+    SELECT tool, COUNT(*) calls, SUM(CASE WHEN ${codeFileSql()} THEN 1 ELSE 0 END) AS file_edits,
+      SUM(CASE WHEN ${codeFileSql()} THEN lines_add ELSE 0 END) AS lines_add
+    FROM tool_events WHERE user_key=? AND date(time,'+8 hours') BETWEEN ? AND ?
+    GROUP BY tool ORDER BY calls DESC LIMIT 12`).all(userKey, from, to);
+  return { days, files, languages, tools };
 }
 
 // —— Task 7: 告警查询/已读/90 天清理(API 任务消费)——
-// 会话 → 工具行为。与 productionSummary 同口径(同一个 CODE_FILE_SQL、同一个时间窗口),
+// 会话 → 工具行为。与 productionSummary 同口径(同一个 codeFileSql()、同一个时间窗口),
 // 差别只是分组键。usage_session 那边给出「烧了多少 token」,这边给出「做了什么」,
 // 两侧按 session 连接 —— extractSessionSignal 是同一个来源,键天然一致。
 export function sessionToolStats(db, { from, to, userKey } = {}) {
   const stmt = db.prepare(`
     SELECT user_key, session, COUNT(*) AS tool_calls,
-      SUM(CASE WHEN ${CODE_FILE_SQL} THEN 1 ELSE 0 END) AS edits,
-      SUM(CASE WHEN ${CODE_FILE_SQL} THEN lines_add ELSE 0 END) AS lines_add,
-      SUM(CASE WHEN ${CODE_FILE_SQL} THEN lines_del ELSE 0 END) AS lines_del,
-      COUNT(DISTINCT CASE WHEN ${CODE_FILE_SQL} THEN file_path END) AS files,
+      SUM(CASE WHEN ${codeFileSql()} THEN 1 ELSE 0 END) AS edits,
+      SUM(CASE WHEN ${codeFileSql()} THEN lines_add ELSE 0 END) AS lines_add,
+      SUM(CASE WHEN ${codeFileSql()} THEN lines_del ELSE 0 END) AS lines_del,
+      COUNT(DISTINCT CASE WHEN ${codeFileSql()} THEN file_path END) AS files,
       SUM(CASE WHEN outcome='error' THEN 1 ELSE 0 END) AS errors,
       MIN(time) AS first_time, MAX(time) AS last_time
     FROM tool_events WHERE ${userKey ? "user_key=? AND " : ""}date(time,'+8 hours') BETWEEN ? AND ?

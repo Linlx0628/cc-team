@@ -127,7 +127,7 @@ weighted      = round((19000 + 2000) × 1.0) = 21000
 ```text
 periodStart   = 北京自然日 / 周一 / 自然月 1 日的 00:00 起点
 windowStart   = max(periodStart, startsAt || periodStart)
-billableBase  = 新鲜输入 + 缓存读×0.1 + 缓存写×0.3 + 输出
+billableBase  = 新鲜输入 + 缓存读×方案缓存读系数 + 缓存写×方案缓存写系数 + 输出
 pointRate     = pointModelRates[实际模型]（有覆盖）
                 否则 pointPeakRate / pointOffPeakRate（留空 = 1.00）
 factor        = 用户 billingFactor × 方案 pointsBillingFactor
@@ -238,11 +238,11 @@ profileUsed  = SUM(usage_daily.billing_weighted_tokens)
 成员级再乘一个「用户计费系数」：`pointBudgets[完整Key].billingFactor`，默认 1.00。最终：
 
 ```text
-点数计费输入 = 新鲜输入 + 缓存读 × 0.1 + 缓存写 × 0.3
+点数计费输入 = 新鲜输入 + 缓存读 × 方案缓存读系数 + 缓存写 × 方案缓存写系数
 点数计权 = round((点数计费输入 + 输出) × 点数倍率 × 用户系数 × 方案系数)
 ```
 
-缓存权重是固定的 0.1 / 0.3，再跟随当前点数倍率：点数倍率 1.00 时缓存读按 0.10、缓存写按 0.30；倍率 2.00 时读 0.20、写 0.60。它们只影响点数，不改变额度池的 `weighted_tokens`。
+缓存系数默认读 0.1、写 0.3，可在方案设置里逐方案覆盖（留空用默认，0 表示不另收）；它再跟随当前点数倍率：点数倍率 1.00 时缓存读按 0.10、缓存写按 0.30；倍率 2.00 时读 0.20、写 0.60。只影响点数，不改变额度池的 `weighted_tokens`。
 
 - 单级系数范围 0.10~10.00，用户×方案乘积封顶 100。
 - 点数倍率/系数**只对启用点数预算的成员生效**；旧额度池成员完全不看这些字段。

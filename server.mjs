@@ -18,7 +18,7 @@ import { parsePeakTimeMinutes, normalizePeakHours, isInPeakHours, formatPeakHour
   beijingDayOfWeek, GROUP_NAME_MAX, ALL_DAYS, DAY_LABELS } from "./lib/schedule.mjs";
 import { sanitizeJson } from "./lib/sanitize.mjs";
 import { QUOTA_RATE_MAX, normalizeQuotaRate, normalizeCacheReadQuotaRate, normalizeModelQuotaRates, lookupModelQuotaRate, currentQuotaRate, currentPointRate, normalizePointModelRates, nextRateChangeHint, QUOTA_POOL_NAME_MAX, normalizeQuotaPoolName, canonicalJson, shortDigest, applyStickyReorder, buildPoolResolver, quotaExceededMessage, quotaErrorDetail, buildQuotaCore } from "./lib/quota.mjs";
-import { POINTS_UNIT, MAX_BUDGET_POINTS, POINT_PERIODS, normalizePointBudget, normalizeBillingFactor, effectiveBillingFactor, normalizeProfilePointLimit, pointsToWeighted, weightedToPoints, computePointsUsage, pointBillableInput, pointsExceededMessage, pointsErrorDetail, profilePointsExceededMessage, profilePointsErrorDetail } from "./lib/points.mjs";
+import { POINTS_UNIT, MAX_BUDGET_POINTS, POINT_PERIODS, normalizePointBudget, normalizeBillingFactor, effectiveBillingFactor, normalizeProfilePointLimit, normalizePointCacheFactor, pointsToWeighted, weightedToPoints, computePointsUsage, pointBillableInput, pointsExceededMessage, pointsErrorDetail, profilePointsExceededMessage, profilePointsErrorDetail } from "./lib/points.mjs";
 import { CB_MAX_BACKOFF_FACTOR, CB_MAX_COOLDOWN_MS, CircuitBreaker } from "./lib/circuit.mjs";
 import { loadAssets } from "./lib/assets.mjs";
 import { wsAcceptUpgrade, wsRejectUpgrade, WsConn } from "./lib/ws-server.mjs";
@@ -1501,6 +1501,12 @@ function optionalQuotaRate(value) {
   return normalizeQuotaRate(value);
 }
 
+function optionalCacheFactor(value) {
+  if (value === undefined || value === null) return null;
+  if (typeof value === "string" && value.trim() === "") return null;
+  return normalizePointCacheFactor(value, null);
+}
+
 function listProfiles() {
   const group = Array.isArray(config.defaultProfileGroup) ? config.defaultProfileGroup : [];
   const responsesGroup = Array.isArray(config.responsesProfileGroup) ? config.responsesProfileGroup : [];
@@ -1533,6 +1539,8 @@ function listProfiles() {
     pointPeakRate: optionalQuotaRate(config.profiles[name].pointPeakRate),
     pointOffPeakRate: optionalQuotaRate(config.profiles[name].pointOffPeakRate),
     pointModelRates: normalizePointModelRates(config.profiles[name].pointModelRates),
+    pointCacheReadFactor: optionalCacheFactor(config.profiles[name].pointCacheReadFactor),
+    pointCacheWriteFactor: optionalCacheFactor(config.profiles[name].pointCacheWriteFactor),
     pointsBillingFactor: normalizeBillingFactor(config.profiles[name].pointsBillingFactor),
     cacheReadQuotaRate: normalizeCacheReadQuotaRate(config.profiles[name].cacheReadQuotaRate),
     configured: !!config.profiles[name].upstream,
@@ -1604,6 +1612,8 @@ function createProfileRuntime(profileName, profile) {
     pointPeakRate: optionalQuotaRate(profile.pointPeakRate),
     pointOffPeakRate: optionalQuotaRate(profile.pointOffPeakRate),
     pointModelRates: normalizePointModelRates(profile.pointModelRates),
+    pointCacheReadFactor: optionalCacheFactor(profile.pointCacheReadFactor),
+    pointCacheWriteFactor: optionalCacheFactor(profile.pointCacheWriteFactor),
     pointsBillingFactor: normalizeBillingFactor(profile.pointsBillingFactor),
     cacheReadQuotaRate: normalizeCacheReadQuotaRate(profile.cacheReadQuotaRate),
     peakModelAliases: normalizeModelAliases(profile.peakModelAliases || {}),
@@ -3405,7 +3415,7 @@ function recordUsage(apiKey, usage, model, suffix, _rt, session, client) {
     // 缓存只进点数：读按 0.1、写按 0.3 折算后再乘当前点数倍率；额度池 weighted 不受影响。
     // Responses 的缓存读可能已含在 input_tokens 里，必须用剥离后的 cacheInInput，避免双算。
     const pointCacheRead = runtime?.protocol === "responses" ? cacheInInput : cacheR;
-    const pointBillable = pointBillableInput(storeInp, pointCacheRead, cacheC);
+    const pointBillable = pointBillableInput(storeInp, pointCacheRead, cacheC, runtime?.pointCacheReadFactor, runtime?.pointCacheWriteFactor);
     const factor = effectiveBillingFactor(getPointBudget(key).billingFactor, runtime?.pointsBillingFactor);
     billingWeighted = Math.round((pointBillable + out) * pointRate * factor);
   }
@@ -4692,6 +4702,7 @@ const SETTINGS_DEPS = {
   normalizeCacheReadQuotaRate,
   normalizeModelQuotaRates,
   normalizeBillingFactor,
+  normalizePointCacheFactor,
   normalizeProfilePointLimit,
   cnDate,
   QUOTA_POOL_NAME_MAX,
@@ -6599,6 +6610,8 @@ const server = http.createServer((req, res) => {
         prof.pointPeakRate = optionalQuotaRate(prof.pointPeakRate);
         prof.pointOffPeakRate = optionalQuotaRate(prof.pointOffPeakRate);
         prof.pointModelRates = normalizePointModelRates(prof.pointModelRates || {});
+        prof.pointCacheReadFactor = optionalCacheFactor(prof.pointCacheReadFactor);
+        prof.pointCacheWriteFactor = optionalCacheFactor(prof.pointCacheWriteFactor);
         prof.pointsBillingFactor = normalizeBillingFactor(prof.pointsBillingFactor);
         prof.cacheReadQuotaRate = normalizeCacheReadQuotaRate(prof.cacheReadQuotaRate);
         prof.modelContextWindows = normalizeNumberMap(prof.modelContextWindows);

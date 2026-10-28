@@ -31,8 +31,6 @@
       "modelQuotaRates": {},
       "pointPeakRate": null,
       "pointOffPeakRate": null,
-      "pointCacheReadFactor": null,
-      "pointCacheWriteFactor": null,
       "pointModelRates": {},
       "pointsBillingFactor": 1,
       "users": {

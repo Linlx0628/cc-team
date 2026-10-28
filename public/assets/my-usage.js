@@ -748,7 +748,7 @@ function renderModelTable(){
         +'<td class="n">'+fmtT(d.requests)+'</td>'
         +'<td class="n" title="输入 '+fmtT(d.inputTokens||0)+' / 输出 '+fmtT(d.outputTokens||0)+'">'+fmtTk(raw)+'</td>'
         +'<td class="n" title="缓存读取 token，按点数价目的 0.1 折算">'+fmtTk(d.cacheReadTokens||0)+'</td>'
-        +'<td class="n" title="缓存写入 token，按点数价目的 0.3 折算">'+fmtTk(d.cacheWriteTokens||0)+'</td>'
+        +'<td class="n" title="缓存写入 token，按点数价目的 0.01 折算">'+fmtTk(d.cacheWriteTokens||0)+'</td>'
         +'<td class="n">'+rateCell+'</td>'
         +'<td class="n hl">'+fmtTk(w)+'</td>'
         +(ptsOn?'<td class="n" style="color:var(--accent)" title="计费计权 '+fmtTk(bw)+' / '+fmtT(pu)+'">'+(bw/pu).toFixed(1)+'</td>':'')+'</tr>';
@@ -763,7 +763,7 @@ function renderModelTable(){
     ?'「实际 Token」是真实消耗，「计入配额」是按配额口径（各模型倍率；Responses/Codex 链路再剔除缓存命中）折算后从每日额度里扣掉的数额。倍率列为'+scopeW+'，跨高峰边界或期间调整过倍率时会落在两档之间。'
     :'当前没有倍率或缓存规则造成差异，实际消耗与计入配额相同。')
     +(ptsOn?' 「点数」列 = 实际点数计权（含缓存计费、点数倍率与系数）÷ '+fmtT(pu)+'（1 点 = '+fmtT(pu)+' 计费计权 token）。':'')
-    +' 缓存读/写列是 token 量；点数模式按缓存读×0.1、缓存写×0.3 折算后再乘点数倍率，所以缓存读很大时点数会明显高于「实际 Token」。'
+    +' 缓存读/写列是 token 量；点数模式按缓存读×0.1、缓存写×0.01 折算后再乘点数倍率，所以缓存读很大时点数会明显高于「实际 Token」。'
     +cacheClause;
 }
 // 客户端表:今天这些请求分别来自哪个 AI 客户端(Claude Code / Codex / ...)。

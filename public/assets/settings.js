@@ -1466,8 +1466,6 @@ async function editProfile(n){
   const ppq=fm.querySelector('input[name="pointPeakRate"]');if(ppq)ppq.value=(p.pointPeakRate==null?'':p.pointPeakRate);
   const poq=fm.querySelector('input[name="pointOffPeakRate"]');if(poq)poq.value=(p.pointOffPeakRate==null?'':p.pointOffPeakRate);
   const pbf=fm.querySelector('input[name="pointsBillingFactor"]');if(pbf)pbf.value=(p.pointsBillingFactor??1);
-  const pcrf=fm.querySelector('input[name="pointCacheReadFactor"]');if(pcrf)pcrf.value=(p.pointCacheReadFactor==null?'':p.pointCacheReadFactor);
-  const pcwf=fm.querySelector('input[name="pointCacheWriteFactor"]');if(pcwf)pcwf.value=(p.pointCacheWriteFactor==null?'':p.pointCacheWriteFactor);
   const cqr=document.getElementById('cacheReadQuotaRateInput');if(cqr)cqr.value=(p.cacheReadQuotaRate??0);
   // cacheReadQuotaRate only means something on Responses/Codex profiles (OpenAI
   // upstreams fold cache hits into input_tokens) — hide it on Anthropic profiles.

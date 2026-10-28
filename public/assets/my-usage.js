@@ -732,7 +732,7 @@ function renderModelTable(){
   const scopeW=D.usageRange?'区间实际计权比例':'今日实际计权比例';
   const anyWeighted=models.some(([,d])=>d.weighted!=null&&d.weighted!==d.total);
   const ptsOn=syncPointsColumn(),pu=pointsUnit();
-  if(!models.length){mt.innerHTML='<tr><td colspan="'+(ptsOn?8:7)+'" style="text-align:center;color:var(--dim)">暂无数据</td></tr>'}else{
+  if(!models.length){mt.innerHTML='<tr><td colspan="'+(ptsOn?9:8)+'" style="text-align:center;color:var(--dim)">暂无数据</td></tr>'}else{
     mt.innerHTML=models.map(([m,d])=>{
       const raw=d.total||0,w=d.weighted!=null?d.weighted:raw,bw=d.billingWeighted!=null?d.billingWeighted:w;
       const realised=raw>0?Math.round(w/raw*100)/100:null;
@@ -744,7 +744,8 @@ function renderModelTable(){
         ? (now==null?'<span style="color:var(--dim)">-</span>':'<span title="当前点数倍率">×'+now+'</span>')
         : (realised==null?'<span style="color:var(--dim)">-</span>'
           :'<span'+(realised!==1?' style="color:var(--accent)"':'')+' title="'+scopeW+(now!=null&&now!==realised?'；当前时段该模型为 ×'+now:'')+'">×'+realised+(now!=null&&now!==realised?' <span style="color:var(--dim);font-size:10px">(现 ×'+now+')</span>':'')+'</span>');
-      return '<tr><td style="color:var(--blue)">'+m+(d.rateIsDefault===false?' <span class="tag" style="font-size:9px">单独定价</span>':'')+'</td>'
+      return '<tr><td style="color:var(--blue)">'+(d.profile||'-')+'</td>'
+        +'<td style="color:var(--blue)">'+(d.model||m)+(d.rateIsDefault===false?' <span class="tag" style="font-size:9px">单独定价</span>':'')+'</td>'
         +'<td class="n">'+fmtT(d.requests)+'</td>'
         +'<td class="n" title="输入 '+fmtT(d.inputTokens||0)+' / 输出 '+fmtT(d.outputTokens||0)+'">'+fmtTk(raw)+'</td>'
         +'<td class="n" title="缓存读取 token，按点数价目的 0.1 折算">'+fmtTk(d.cacheReadTokens||0)+'</td>'

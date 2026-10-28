@@ -724,6 +724,11 @@ function renderChrome(){
 }
 // 配额相关两片都是纯 innerHTML,没有几何依赖,面板隐藏时渲染也不会画错 ——
 // 所以它们跟着 30 秒轮询刷新,不走「切过去才画」那套(两个渲染函数各自见名)。
+function cacheFactorVals(){
+  const p=(typeof pointsData==='function'?pointsData():null)||{};
+  const r=Number(p.cacheReadFactor),w=Number(p.cacheWriteFactor);
+  return {read:Number.isFinite(r)?r:0.1,write:Number.isFinite(w)?w:0.01};
+}
 function renderModelTable(){
   // Model table. Two token columns side by side is the whole point: "实际" is what
   // the user spent, "计入配额" is what it cost them. The per-row multiplier is the
@@ -735,7 +740,7 @@ function renderModelTable(){
   // 区间求和依然精确 —— 只有措辞跟窗口变(今日 / 区间)。
   const scopeW=D.usageRange?'区间实际计权比例':'今日实际计权比例';
   const anyWeighted=models.some(([,d])=>d.weighted!=null&&d.weighted!==d.total);
-  const ptsOn=syncPointsColumn(),pu=pointsUnit();
+  const ptsOn=syncPointsColumn(),pu=pointsUnit(),cf=cacheFactorVals();
   if(!models.length){mt.innerHTML='<tr><td colspan="'+(ptsOn?9:8)+'" style="text-align:center;color:var(--dim)">暂无数据</td></tr>'}else{
     mt.innerHTML=models.map(([m,d])=>{
       const raw=d.total||0,w=d.weighted!=null?d.weighted:raw,bw=d.billingWeighted!=null?d.billingWeighted:w;
@@ -752,8 +757,8 @@ function renderModelTable(){
         +'<td style="color:var(--blue)">'+(d.model||m)+(d.rateIsDefault===false?' <span class="tag" style="font-size:9px">单独定价</span>':'')+'</td>'
         +'<td class="n">'+fmtT(d.requests)+'</td>'
         +'<td class="n" title="输入 '+fmtT(d.inputTokens||0)+' / 输出 '+fmtT(d.outputTokens||0)+'">'+fmtTk(raw)+'</td>'
-        +'<td class="n" title="缓存读取 token，按点数价目的 0.1 折算">'+fmtTk(d.cacheReadTokens||0)+'</td>'
-        +'<td class="n" title="缓存写入 token，按点数价目的 0.01 折算">'+fmtTk(d.cacheWriteTokens||0)+'</td>'
+        +'<td class="n" title="缓存读取 token，按点数价目的 '+cf.read+' 折算">'+fmtTk(d.cacheReadTokens||0)+'</td>'
+        +'<td class="n" title="缓存写入 token，按点数价目的 '+cf.write+' 折算">'+fmtTk(d.cacheWriteTokens||0)+'</td>'
         +'<td class="n">'+rateCell+'</td>'
         +'<td class="n hl">'+fmtTk(w)+'</td>'
         +(ptsOn?'<td class="n" style="color:var(--accent)" title="计费计权 '+fmtTk(bw)+' / '+fmtT(pu)+'">'+(bw/pu).toFixed(1)+'</td>':'')+'</tr>';
@@ -768,7 +773,7 @@ function renderModelTable(){
     ?'「实际 Token」是真实消耗，「计入配额」是按配额口径（各模型倍率；Responses/Codex 链路再剔除缓存命中）折算后从每日额度里扣掉的数额。倍率列为'+scopeW+'，跨高峰边界或期间调整过倍率时会落在两档之间。'
     :'当前没有倍率或缓存规则造成差异，实际消耗与计入配额相同。')
     +(ptsOn?' 「点数」列 = 实际点数计权（含缓存计费、点数倍率与系数）÷ '+fmtT(pu)+'（1 点 = '+fmtT(pu)+' 计费计权 token）。':'')
-    +' 缓存读/写列是 token 量；点数模式按缓存读×0.1、缓存写×0.01 折算后再乘点数倍率，所以缓存读很大时点数会明显高于「实际 Token」。'
+    +' 缓存读/写列是 token 量；点数模式按缓存读×'+cf.read+'、缓存写×'+cf.write+' 折算后再乘点数倍率，所以缓存读很大时点数会明显高于「实际 Token」。'
     +cacheClause;
 }
 // 客户端表:今天这些请求分别来自哪个 AI 客户端(Claude Code / Codex / ...)。

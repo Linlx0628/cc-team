@@ -438,6 +438,10 @@ function renderPoints(){
   const p=pointsData();
   if(!p){card.style.display='none';return}
   card.style.display='';
+  const pfR=document.getElementById('pfCacheRead');
+  if(pfR)pfR.textContent=Number.isFinite(Number(p.cacheReadFactor))?p.cacheReadFactor:0.1;
+  const pfW=document.getElementById('pfCacheWrite');
+  if(pfW)pfW.textContent=Number.isFinite(Number(p.cacheWriteFactor))?p.cacheWriteFactor:0.01;
   const remaining=document.getElementById('pointsRemaining');
   if(remaining)remaining.textContent=fmtPts(p.remainingPointsExact!=null?p.remainingPointsExact:p.remainingPoints);
   const meta=document.getElementById('pointsMeta');

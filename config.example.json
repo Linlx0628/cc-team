@@ -74,7 +74,9 @@
   },
   "pointSettings": {
     "defaultPeriod": "month",
-    "allowSelfSelect": true
+    "allowSelfSelect": true,
+    "cacheReadFactor": 0.1,
+    "cacheWriteFactor": 0.01
   },
   "pointBudgets": {
     "jx-example-user": {

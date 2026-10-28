@@ -702,6 +702,10 @@ function pbRenderSummary(){
 function pbRenderGlobals(){
   const sw=document.getElementById('pbGlobalSwitch');
   if(sw&&sw.type==='checkbox')sw.checked=!!PB.allowSelfSelect;
+  const cr=document.getElementById('pbCacheReadFactor');
+  if(cr)cr.value=Number.isFinite(PB.cacheReadFactor)?PB.cacheReadFactor:0.1;
+  const cw=document.getElementById('pbCacheWriteFactor');
+  if(cw)cw.value=Number.isFinite(PB.cacheWriteFactor)?PB.cacheWriteFactor:0.01;
 }
 function pbPeriodOpts(v){
   return '<option value="day"'+(v==='day'?' selected':'')+'>按日</option>'
@@ -869,6 +873,8 @@ async function loadPointBudgets(){
   PB.unitTokens=Number(data.unitTokens)||PB.unitTokens;
   PB.defaultPeriod=data.defaultPeriod||PB.defaultPeriod;
   PB.allowSelfSelect=!!data.allowSelfSelect;
+  PB.cacheReadFactor=Number(data.cacheReadFactor);
+  PB.cacheWriteFactor=Number(data.cacheWriteFactor);
   PB.users=Array.isArray(data.users)?data.users:[];
   PB.profiles=Array.isArray(data.profiles)?data.profiles:[];
   PB.loaded=true;PB.error='';
@@ -1053,10 +1059,16 @@ async function savePointBudgetBulk(){
 async function savePointBudgetSettings(){
   const sw=document.getElementById('pbGlobalSwitch');
   const on=!!(sw&&sw.type==='checkbox'&&sw.checked);
+  const crEl=document.getElementById('pbCacheReadFactor'),cwEl=document.getElementById('pbCacheWriteFactor');
+  const read=crEl&&crEl.value!==''?Number(crEl.value):(Number.isFinite(PB.cacheReadFactor)?PB.cacheReadFactor:0.1);
+  const write=cwEl&&cwEl.value!==''?Number(cwEl.value):(Number.isFinite(PB.cacheWriteFactor)?PB.cacheWriteFactor:0.01);
+  if(!Number.isFinite(read)||read<0||read>1||!Number.isFinite(write)||write<0||write>1){
+    pbSetStatus('缓存系数必须在 0~1 之间',true);return;
+  }
   let ok=false,why='';
   try{
     const r=await fetch('/api/point-budget/settings',{method:'POST',headers:csrfHeaders({'Content-Type':'application/json'}),
-      body:JSON.stringify({allowSelfSelect:on,_csrf:getCsrf()})});
+      body:JSON.stringify({allowSelfSelect:on,cacheReadFactor:read,cacheWriteFactor:write,_csrf:getCsrf()})});
     const data=await r.json().catch(()=>({}));
     ok=r.ok&&!(data&&data.error);
     why=(data&&data.error)||('HTTP '+r.status);
@@ -1080,7 +1092,9 @@ async function savePointBudgetSettings(){
     return;
   }
   PB.allowSelfSelect=on;
-  const msg=on?'已允许成员在「我的用量」里自选首选方案':'已禁止成员自选首选方案';
+  PB.cacheReadFactor=read;
+  PB.cacheWriteFactor=write;
+  const msg='已保存全局设置：'+(on?'允许成员自选首选方案':'禁止成员自选首选方案')+'；缓存读 ×'+read+'、缓存写 ×'+write;
   pbSetStatus(msg);
   toast(msg);
 }

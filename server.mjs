@@ -18,7 +18,7 @@ import { parsePeakTimeMinutes, normalizePeakHours, isInPeakHours, formatPeakHour
   beijingDayOfWeek, GROUP_NAME_MAX, ALL_DAYS, DAY_LABELS } from "./lib/schedule.mjs";
 import { sanitizeJson } from "./lib/sanitize.mjs";
 import { QUOTA_RATE_MAX, normalizeQuotaRate, normalizeCacheReadQuotaRate, normalizeModelQuotaRates, lookupModelQuotaRate, currentQuotaRate, currentPointRate, normalizePointModelRates, nextRateChangeHint, QUOTA_POOL_NAME_MAX, normalizeQuotaPoolName, canonicalJson, shortDigest, applyStickyReorder, buildPoolResolver, quotaExceededMessage, quotaErrorDetail, buildQuotaCore } from "./lib/quota.mjs";
-import { POINTS_UNIT, MAX_BUDGET_POINTS, POINT_PERIODS, normalizePointBudget, normalizeBillingFactor, effectiveBillingFactor, normalizeProfilePointLimit, pointsToWeighted, weightedToPoints, computePointsUsage, pointBillableInput, pointsExceededMessage, pointsErrorDetail, profilePointsExceededMessage, profilePointsErrorDetail } from "./lib/points.mjs";
+import { POINTS_UNIT, POINT_CACHE_READ_FACTOR, POINT_CACHE_WRITE_FACTOR, MAX_BUDGET_POINTS, POINT_PERIODS, normalizePointBudget, normalizeBillingFactor, effectiveBillingFactor, normalizeProfilePointLimit, pointsToWeighted, weightedToPoints, computePointsUsage, pointBillableInput, pointsExceededMessage, pointsErrorDetail, profilePointsExceededMessage, profilePointsErrorDetail } from "./lib/points.mjs";
 import { CB_MAX_BACKOFF_FACTOR, CB_MAX_COOLDOWN_MS, CircuitBreaker } from "./lib/circuit.mjs";
 import { loadAssets } from "./lib/assets.mjs";
 import { wsAcceptUpgrade, wsRejectUpgrade, WsConn } from "./lib/ws-server.mjs";
@@ -107,6 +107,8 @@ const pointSettingsRaw = config.pointSettings && typeof config.pointSettings ===
 config.pointSettings = {
   defaultPeriod: POINT_PERIODS.includes(String(pointSettingsRaw.defaultPeriod || "")) ? String(pointSettingsRaw.defaultPeriod) : "month",
   allowSelfSelect: pointSettingsRaw.allowSelfSelect !== false,
+  cacheReadFactor: normalizeGlobalCacheFactor(pointSettingsRaw.cacheReadFactor, POINT_CACHE_READ_FACTOR),
+  cacheWriteFactor: normalizeGlobalCacheFactor(pointSettingsRaw.cacheWriteFactor, POINT_CACHE_WRITE_FACTOR),
 };
 if (!config.pointBudgets || typeof config.pointBudgets !== "object" || Array.isArray(config.pointBudgets)) config.pointBudgets = {};
 if (!config.profilePointLimits || typeof config.profilePointLimits !== "object" || Array.isArray(config.profilePointLimits)) config.profilePointLimits = {};
@@ -3405,7 +3407,8 @@ function recordUsage(apiKey, usage, model, suffix, _rt, session, client) {
     // 缓存只进点数：读按 0.1、写按 0.01 折算后再乘当前点数倍率；额度池 weighted 不受影响。
     // Responses 的缓存读可能已含在 input_tokens 里，必须用剥离后的 cacheInInput，避免双算。
     const pointCacheRead = runtime?.protocol === "responses" ? cacheInInput : cacheR;
-    const pointBillable = pointBillableInput(storeInp, pointCacheRead, cacheC);
+    const pointCacheSettings = getPointCacheSettings();
+    const pointBillable = pointBillableInput(storeInp, pointCacheRead, cacheC, pointCacheSettings.read, pointCacheSettings.write);
     const factor = effectiveBillingFactor(getPointBudget(key).billingFactor, runtime?.pointsBillingFactor);
     billingWeighted = Math.round((pointBillable + out) * pointRate * factor);
   }
@@ -3450,6 +3453,20 @@ function recordUsage(apiKey, usage, model, suffix, _rt, session, client) {
 // distinct pool size, not one per call.
 const { pooledUsageForQuota, getPoolQuota, getUserPoolQuota, clearPooledUsageCache } =
   buildQuotaCore({ db, getPoolByName });
+
+function normalizeGlobalCacheFactor(value, fallback) {
+  if (value === null || value === undefined || String(value).trim() === "") return fallback;
+  const n = Number(value);
+  if (!Number.isFinite(n) || n < 0) return fallback;
+  return Math.round(Math.min(1, n) * 100) / 100;
+}
+function getPointCacheSettings() {
+  const s = config.pointSettings || {};
+  return {
+    read: normalizeGlobalCacheFactor(s.cacheReadFactor, POINT_CACHE_READ_FACTOR),
+    write: normalizeGlobalCacheFactor(s.cacheWriteFactor, POINT_CACHE_WRITE_FACTOR),
+  };
+}
 
 function getPointBudget(userKey) {
   const raw = config.pointBudgets && config.pointBudgets[userKey];
@@ -3517,6 +3534,8 @@ function checkPointBudget(apiKey, _rt) {
     rawUsed: row.raw || 0,
     requests: row.requests || 0,
     retryAfterSeconds: budget.enabled ? secondsUntilNextPeriodEnd(budget.period) : 0,
+    cacheReadFactor: getPointCacheSettings().read,
+    cacheWriteFactor: getPointCacheSettings().write,
   };
 }
 
@@ -3938,6 +3957,8 @@ function getPointBudgetsPayload() {
     unitTokens: POINTS_UNIT,
     defaultPeriod: config.pointSettings?.defaultPeriod || "month",
     allowSelfSelect: config.pointSettings?.allowSelfSelect !== false,
+    cacheReadFactor: getPointCacheSettings().read,
+    cacheWriteFactor: getPointCacheSettings().write,
     users,
     profiles: profilePointLimitsPayload(),
   };
@@ -5614,12 +5635,25 @@ const server = http.createServer((req, res) => {
         if (!config.pointSettings || typeof config.pointSettings !== "object") {
           config.pointSettings = { defaultPeriod: "month", allowSelfSelect: true };
         }
-        const before = config.pointSettings.allowSelfSelect !== false;
+        const before = {
+          allowSelfSelect: config.pointSettings.allowSelfSelect !== false,
+          cacheReadFactor: getPointCacheSettings().read,
+          cacheWriteFactor: getPointCacheSettings().write,
+        };
+        const nextRead = normalizeGlobalCacheFactor(input.cacheReadFactor, before.cacheReadFactor);
+        const nextWrite = normalizeGlobalCacheFactor(input.cacheWriteFactor, before.cacheWriteFactor);
         config.pointSettings.allowSelfSelect = input.allowSelfSelect;
+        config.pointSettings.cacheReadFactor = nextRead;
+        config.pointSettings.cacheWriteFactor = nextWrite;
         try { saveConfig(config); }
-        catch (err) { config.pointSettings.allowSelfSelect = before; throw err; }
+        catch (err) {
+          config.pointSettings.allowSelfSelect = before.allowSelfSelect;
+          config.pointSettings.cacheReadFactor = before.cacheReadFactor;
+          config.pointSettings.cacheWriteFactor = before.cacheWriteFactor;
+          throw err;
+        }
         recordAdminAudit(req, "pointbudget.settings", "全局",
-          `允许成员自选首选方案: ${before} → ${input.allowSelfSelect}`, "quota");
+          `允许成员自选首选方案: ${before.allowSelfSelect} → ${input.allowSelfSelect}；缓存系数: 读 ${before.cacheReadFactor}→${nextRead} / 写 ${before.cacheWriteFactor}→${nextWrite}`, "quota");
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ ok: true }));
       } catch (err) {

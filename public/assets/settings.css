@@ -150,8 +150,8 @@ td{padding:8px;border-bottom:1px solid #ecece8;font-size:12px}
 #pplBulkPoints, #pplBulkPeriod, #pplBulkStarts { padding:4px 8px; }
 
 /* 方案标签：多选，展示在成员「请求方案」列表方案名下方 */
-.tag-picker{display:flex;flex-wrap:wrap;gap:6px;margin-top:6px}
-.tag-pick{display:inline-flex;align-items:center;gap:5px;padding:4px 7px;border:1px solid var(--border);border-radius:6px;cursor:pointer;background:var(--bg)}
+.tag-picker{display:flex;flex-wrap:wrap;align-items:flex-start;gap:6px;margin-top:6px}
+.tag-pick{display:inline-flex;align-items:center;gap:5px;padding:4px 7px;margin:0;border:1px solid var(--border);border-radius:6px;cursor:pointer;background:var(--bg);align-self:flex-start}
 .tag-pick input{width:auto;margin:0;flex:0 0 auto}
 .ptag{display:inline-flex;align-items:center;padding:1px 7px;border-radius:999px;border:1px solid transparent;font-size:10px;line-height:1.6;font-weight:600;white-space:nowrap}
 .ptag[data-tag="推荐"]{color:#0f7b4f;background:#e8f7ef;border-color:#b7e4cd}

@@ -3356,7 +3356,7 @@ function usageHasTokens(usage = {}) {
 // session 由代理主路径透传(proxy-core 的 extractSessionSignal),只用于会话维度的记账,
 // 不参与任何路由或配额判断。省略时为 undefined,即不落 usage_session。
 // client 同理(proxy-core 的 extractClientSignal),只用于客户端维度的记账。
-function recordUsage(apiKey, usage, model, suffix, _rt, session, client) {
+function recordUsage(apiKey, usage, model, suffix, _rt, session, client, turnKind) {
   const runtime = _rt || runtimes[normalizeProfileSuffix(suffix)] || rt;
   const sfx = normalizeProfileSuffix(suffix) || runtime?.suffix || getDefaultProfileSuffix();
   const key = resolveUserKey(apiKey, runtime);
@@ -3443,6 +3443,7 @@ function recordUsage(apiKey, usage, model, suffix, _rt, session, client) {
       stmts.insertPointRequest.run({
         key, day: today, createdAt: Date.now(), profile: sfx, model: m,
         protocol: runtime?.protocol || "", client: client || "unknown",
+        turnKind: turnKind || "",
         inp: storeInp, out, cacheC, cacheR, weighted, billing: billingWeighted, pointRate,
       });
     }
@@ -9146,6 +9147,7 @@ const server = http.createServer((req, res) => {
           profile: r.profile, profileName: runtime ? runtime.profileName : r.profile,
           model: r.model || "unknown", protocol: r.protocol || "",
           client: r.client || "",
+          turnKind: r.turn_kind || "",
           inputTokens: r.input_tokens || 0, outputTokens: r.output_tokens || 0,
           cacheReadTokens: r.cache_read_tokens || 0, cacheCreationTokens: r.cache_creation_tokens || 0,
           weightedTokens: r.weighted_tokens || 0,

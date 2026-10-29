@@ -1050,15 +1050,39 @@ function renderRequestSummary(j){
   box.innerHTML='<div class="card"><div class="k">'+(sameDay?'当日合计':'区间合计')+'</div><div class="v">'+fmtPts(sm.points||0)+' <span style="font-size:12px;color:var(--dim)">点</span></div><div class="s">'+fmtT(sm.requests||0)+' 次请求 · 共 '+fmtT(total)+' 条</div></div>'
     +'<div class="card"><div class="k">计费计权</div><div class="v">'+fmtWan(sm.billingWeightedTokens||0)+'</div><div class="s">已按点数倍率与系数折算</div></div>';
 }
+// 类型徽章：该次 API 调用是谁引发的。Agent 客户端里用户发一条消息，客户端会在
+// 后台连续调多次 API（工具调用循环）——末条消息是工具结果回传的行是循环后续调用，
+// 是用户自然输入的行才是用户提问。历史记录/无法判定的形态显示「未知」。
+function prKindBadge(kind){
+  if(kind==='user')return '<span style="display:inline-block;padding:1px 8px;border-radius:999px;font-size:11px;font-weight:600;color:#1d4ed8;background:#dbeafe;white-space:nowrap" title="本行由你的输入直接引发（请求末条是用户消息）">用户提问</span>';
+  if(kind==='tool')return '<span style="display:inline-block;padding:1px 8px;border-radius:999px;font-size:11px;font-weight:600;color:#9a3412;background:#ffedd5;white-space:nowrap" title="本行由工具调用循环引发（请求末条是工具结果回传）">工具调用</span>';
+  return '<span style="display:inline-block;padding:1px 8px;border-radius:999px;font-size:11px;font-weight:600;color:#6b7280;background:#f3f4f6;white-space:nowrap" title="无法判定：功能上线前的历史记录，或请求形态不适用">未知</span>';
+}
+// 客户端徽章：按请求头识别的发起客户端着色（依据请求头判定，可被伪造，仅供参考）。
+// 词汇来自 extractClientSignal:originator 头 / UA 首个 product token / x-app，兜底 unknown。
+function prClientBadge(client){
+  const raw=String(client||'');
+  const c=raw.toLowerCase();
+  let label,color,bg;
+  if(c.startsWith('claude-cli')||c.startsWith('claude-code')){label='Claude Code';color='#1d4ed8';bg='#dbeafe';}
+  else if(c.startsWith('codex')){label='Codex';color='#047857';bg='#d1fae5';}
+  else if(c.startsWith('minimax')){label='MiniMax';color='#0f766e';bg='#ccfbf1';}
+  else if(c.startsWith('deepseek')){label='DeepSeek';color='#b45309';bg='#fef3c7';}
+  else if(!c||c==='unknown'){label='未识别';color='#6b7280';bg='#f3f4f6';}
+  else{label=raw.slice(0,24);color='#4b5563';bg='#eef2f7';}
+  return '<span style="display:inline-block;padding:1px 8px;border-radius:999px;font-size:11px;font-weight:600;color:'+color+';background:'+bg+';white-space:nowrap" title="发起工具: '+esc(raw||'unknown')+'（依据请求头判定，可被伪造）">'+esc(label)+'</span>';
+}
 function renderRequests(){
   const body=document.getElementById('prTableBody');if(!body)return;
-  if(PR.error){body.innerHTML='<tr><td colspan="8" class="empty">'+esc(PR.error)+'</td></tr>'}
+  if(PR.error){body.innerHTML='<tr><td colspan="10" class="empty">'+esc(PR.error)+'</td></tr>'}
   else if(!PR.items.length){
-    body.innerHTML='<tr><td colspan="8" class="empty">'+(PR.loading?'加载中…':'暂无请求记录')+'</td></tr>';
+    body.innerHTML='<tr><td colspan="10" class="empty">'+(PR.loading?'加载中…':'暂无请求记录')+'</td></tr>';
   }else{
     body.innerHTML=PR.items.map(function(r){
       return '<tr>'
         +'<td title="'+esc(r.day)+'">'+esc(prTime(r.at))+'</td>'
+        +'<td>'+prKindBadge(r.turnKind)+'</td>'
+        +'<td>'+prClientBadge(r.client)+'</td>'
         +'<td>'+esc(r.profileName||r.profile||'—')+'<div class="note" style="font-size:10px">/'+esc(r.profile||'')+'</div></td>'
         +'<td style="max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="'+esc(r.model||'')+'">'+esc(r.model||'—')+'</td>'
         +'<td class="n">'+fmtT(r.inputTokens||0)+'</td>'

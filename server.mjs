@@ -4631,6 +4631,7 @@ const VISION_DEPS = {
   config,
   getRealKeyFromProfile,
   sendUpstream,
+  getRuntimeByProfileName,
   get stmts() { return stmts; },
 };
 const visionApi = createVisionBridge(VISION_DEPS);
@@ -6724,6 +6725,8 @@ const server = http.createServer((req, res) => {
             }
           }
         }
+        // 全局图片识别专用方案（字符串方案名；"" 或 null = 清除，跟随成员方案）
+        if (updates.imageBridgeProfile !== undefined) formData.imageBridgeProfile = updates.imageBridgeProfile;
         const apiAuditSnap = settingsApi.settingsAuditSnapshot();
         settingsApi.applySettings(formData);
         const apiAuditDiff = settingsApi.settingsAuditDiff(apiAuditSnap, settingsApi.settingsAuditSnapshot());

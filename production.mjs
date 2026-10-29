@@ -5,14 +5,17 @@ const CURSOR_LIMIT = 500;
 // 生产网关同时服务多个客户端 CLI,各家对「编辑文件」「跑命令」的工具命名不同:
 //   Claude Code:Edit / MultiEdit / Write / NotebookEdit / Bash(首字母大写)
 //   deepseek-harness、MiniMaxCode:edit / write / write_file / bash / pwsh(全小写)
-//   Codex 系:apply_patch —— 补丁文本可能藏在 shell 命令里,也可能直填 args.patch/args.input
+//   Codex 系:apply_patch —— 补丁文本可能藏在 shell 命令里,也可能直填 args.patch/args.input;
+//   新版 Codex(CLI/Desktop)把 apply_patch 定义为 freeform custom tool,调用以 custom_tool_call
+//   项下发(input 是补丁原文,非 JSON);unified exec 的 exec_command/write_stdin 与 OpenAI
+//   内建 local_shell(local_shell_call 项)都是命令工具。
 // 口径:工具名统一 toLowerCase 后**精确匹配**(非子串,避免误伤自定义工具);
 // 行数提取按归一化名字走统一 input 形状(harness/MiniMax 的 edit/write 字段与
 // Claude Code 同构:file_path/old_string/new_string/content)。FILE_TOOLS 保留导出
 // 仅为兼容旧引用;真正的口径源是 FILE_TOOL_SET + EXTRA_FILE_TOOLS。
 export const FILE_TOOLS = ["Edit", "MultiEdit", "Write", "NotebookEdit", "apply_patch"];
 const FILE_TOOL_SET = new Set(["edit", "multiedit", "write", "write_file", "notebookedit", "notebook_edit", "apply_patch"]);
-const SHELL_TOOL_SET = new Set(["bash", "exec_command", "pwsh", "powershell", "shell"]);
+const SHELL_TOOL_SET = new Set(["bash", "exec_command", "pwsh", "powershell", "shell", "write_stdin", "local_shell", "unified_exec"]);
 // 管理员扩展(config.productionTracking.fileTools):[{ tool, filePathKeys, addKeys, delKeys }]
 // —— 新客户端 CLI 上线不改代码;EXTRA 命中后按给出的 input 键名取文件路径与行数。
 const EXTRA_FILE_TOOLS = new Map();   // 小写工具名 → { filePathKeys, addKeys, delKeys }
@@ -362,12 +365,14 @@ export function extractResponsesEvents(parsed, cursor = 0) {
   for (let i = start; i < items.length; i++) {
     const it = items[i];
     if (!it || typeof it !== "object") continue;
-    if (it.type === "function_call") {
+    if (it.type === "function_call" || it.type === "local_shell_call") {
       const callId = String(it.call_id || it.id || "");
       if (!callId) continue;
-      const name = String(it.name || "unknown");
+      // local_shell_call(OpenAI 内建 local_shell):命令在 action.command 里,名字不是 function 的 name。
+      const name = it.type === "local_shell_call" ? "local_shell" : String(it.name || "unknown");
       let args = {};
       try { args = JSON.parse(it.arguments || "{}"); } catch {}
+      if (it.type === "local_shell_call") args = (it.action && typeof it.action === "object") ? it.action : {};
       // 文件工具优先(含 apply_patch 补丁文本,老 shell 内嵌与直填 args.patch 两种形态都覆盖);
       // 未命中再落通用事件分支 —— 工具名原样入库,shell 命令照旧做命令分类。
       const fileEvents = fileToolEvents(name, args, callId);
@@ -375,7 +380,18 @@ export function extractResponsesEvents(parsed, cursor = 0) {
       const cmd = commandText(args.command ?? args.cmd);
       calls.push({ tool_id: callId, tool: name, file_path: null, ext: null, lines_add: 0, lines_del: 0,
         cmd_class: cmd ? classifyCommand(cmd) : null });
-    } else if (it.type === "function_call_output") {
+    } else if (it.type === "custom_tool_call") {
+      // Codex 新版把 apply_patch 定义为 freeform custom tool:input 是补丁原文(非 JSON),
+      // 但里面必有 *** Begin Patch,复用内容识别提取多文件事件。
+      const callId = String(it.call_id || it.id || "");
+      if (!callId) continue;
+      const name = String(it.name || "unknown");
+      const fileEvents = fileToolEvents(name, { input: it.input }, callId);
+      if (fileEvents) { calls.push(...fileEvents); continue; }
+      const txt = typeof it.input === "string" ? it.input : "";
+      calls.push({ tool_id: callId, tool: name, file_path: null, ext: null, lines_add: 0, lines_del: 0,
+        cmd_class: txt ? classifyCommand(txt) : null });
+    } else if (it.type === "function_call_output" || it.type === "custom_tool_call_output" || it.type === "local_shell_call_output") {
       const id = String(it.call_id || "");
       if (!id) continue;
       let exitCode = 0, outText = "";
@@ -385,6 +401,12 @@ export function extractResponsesEvents(parsed, cursor = 0) {
         exitCode = Number.isFinite(Number(rawExit)) ? Number(rawExit) : 0;
         outText = String(o.output || "");
       } catch { outText = String(it.output || ""); }
+      // custom/local tool 的 output 是纯文本,没有结构化 exit_code:命中明显失败措辞才判失败,
+      // 避免把正常输出里提到 "error" 的场景误报成失败。function_call_output 维持结构化口径不变。
+      if (it.type !== "function_call_output" && exitCode === 0
+        && /(exit code:?\s*[1-9])|(apply.?patch[^\n]*(error|failed?))|^(error|failed)\b/im.test(outText)) {
+        exitCode = 1;
+      }
       if (exitCode !== 0) results.push({ tool_id: id, outcome: "error", error_kind: classifyError(`Exit code ${exitCode}\n${outText}`) });
       else results.push({ tool_id: id, outcome: "ok", error_kind: null });
     }

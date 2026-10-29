@@ -51,11 +51,12 @@
 | 客户端 | 识别为「文件工具」的名字 | 识别为「命令工具」的名字 |
 |---|---|---|
 | Claude Code | Edit / MultiEdit / Write / NotebookEdit | Bash |
-| deepseek-harness | edit / write / write_file / notebook_edit | bash / exec_command / pwsh / powershell / shell |
+| deepseek-harness | edit / write / write_file / notebook_edit | bash / exec_command / pwsh / powershell / shell / write_stdin |
 | MiniMaxCode | edit / write（小写） | bash / pwsh |
-| Codex CLI / Desktop | apply_patch（补丁文本按内容识别，工具名不拘） | shell |
+| Codex CLI / Desktop | apply_patch（补丁文本按内容识别，工具名不拘） | shell / exec_command / write_stdin / local_shell / unified_exec |
 
 - **补丁文本按内容识别**：只要工具入参里出现 `*** Begin Patch` 补丁（Codex 藏在 shell 命令里、或直填 `patch` / `input` 参数），就按补丁 +/- 行拆分成每文件一条记录——一段补丁改 3 个文件记 3 条事件
+- **Codex Desktop 的补丁走 `custom_tool_call`**：新版 Codex 把 apply_patch 定义为自由文本工具，调用项类型是 `custom_tool_call`（不是 `function_call`），补丁原文在 `input` 字段——已按内容识别计入产出；`local_shell_call`（OpenAI 内建 local_shell）按命令工具记录。这曾是 Codex Desktop 成员净产出恒 0 的原因（2026-10-29 修复）
 - **新客户端接入**：若成员的 CLI 用了名单之外的编辑工具名（成员明细「工具活动」可见），管理员在 `config.productionTracking.fileTools` 加一条即可，**保存后即时生效、无需重启**，也可随时撤下：
 
   ```json

@@ -423,6 +423,7 @@ table{width:100%;border-collapse:collapse;min-width:560px}th{text-align:left;pad
 .mu-btn-primary:hover{background:#33332f}
 .mu-btn-outline{background:var(--surface);border-color:var(--border);color:var(--text)}
 .mu-btn-outline:hover{background:var(--surface-subtle);border-color:var(--border-strong)}
+.mu-btn:disabled{opacity:.62;cursor:wait}
 /* 评审状态标签:取值照本页既有的 .qr-badge(状态标签范式),不再指望 dashboard.css 的 .pill */
 .mr-pill{display:inline-block;font-size:10px;padding:2px 7px;border-radius:4px;font-weight:600;border:1px solid transparent;white-space:nowrap}
 .mr-pill-ok{background:var(--accent-soft);color:var(--green)}

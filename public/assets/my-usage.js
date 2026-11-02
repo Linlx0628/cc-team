@@ -1178,6 +1178,29 @@ function setSection(name,focus){
   if(focus){const b=document.getElementById('mu-tab-'+name);if(b)b.focus()}
   paintSection();
 }
+// 手动刷新:只刷新当前菜单。概览/点数/价目表/用量分析共用 /api/my-usage 主载荷,
+// 其余菜单各有自己的接口;不要把「刷新当前」做成整页重载,否则会丢筛选条件和滚动位置。
+async function refreshMyUsageSection(){
+  if(SECTION==='requests'){await fetchRequests('reset');return}
+  if(SECTION==='sessions'){await fetchActivity();return}
+  if(SECTION==='leaderboard'){await fetchLeaderboard();return}
+  if(SECTION==='review'){await fetchMyReview();loadReviewBadge();return}
+  if(SECTION==='notify'){await loadMyNotify();return}
+  // 概览要用 370 天日历,必须拉全量;其余共用主载荷的菜单走 slim,少传几十 KB 日历。
+  await load(SECTION!=='overview');
+}
+async function manualMyRefresh(btn){
+  if(!btn||btn.disabled)return;
+  const label=btn.textContent;
+  btn.disabled=true;btn.textContent='刷新中…';
+  try{await refreshMyUsageSection();toast('已刷新')}
+  catch(e){toast('刷新失败: '+((e&&e.message)||e))}
+  finally{btn.disabled=false;btn.textContent=label}
+}
+(function bindMyManualRefresh(){
+  const btn=document.getElementById('myManualRefreshBtn');
+  if(btn)btn.addEventListener('click',function(){manualMyRefresh(btn)});
+})();
 // 切到「用量分析」/「概览」才补画:隐藏期间容器宽度为 0,提前建图/排日历都会画错。
 // 日历现在挂在概览里,所以两个分支都要有 —— 少了 overview 这一支,切回概览会看到一张
 // 按 0 宽排出来、被压到 9px 下限的日历。
@@ -1646,8 +1669,9 @@ const MN={prefs:null,loading:false};
 function ensureMyNotify(){if(!MN.prefs&&!MN.loading)loadMyNotify()}
 function mnStatus(text,cls){const el=document.getElementById('mnStatus');if(el){el.textContent=text||'';el.className='mn-status '+(cls||'')}}
 function loadMyNotify(){
+  if(MN.loading)return Promise.resolve();
   MN.loading=true;
-  fetch('/api/my-notify',{headers:{'Authorization':'Bearer '+VK}}).then(function(r){return r.json()}).then(function(d){
+  return fetch('/api/my-notify',{headers:{'Authorization':'Bearer '+VK}}).then(function(r){return r.json()}).then(function(d){
     MN.prefs=d.prefs||{};MN.loading=false;renderMyNotify(d.hasSmtp);
   }).catch(function(){MN.loading=false;mnStatus('加载失败','error')});
 }
@@ -1746,8 +1770,9 @@ function mrParseCommits(json){try{const a=JSON.parse(json||'[]');return Array.is
   if(el)el.addEventListener('input',function(){if(MR.data)renderMyReview()});
 })();
 function fetchMyReview(){
+  if(MR.loading)return Promise.resolve();
   MR.loading=true;
-  fetch('/api/my-review?limit=20',{headers:{'Authorization':'Bearer '+VK}}).then(function(r){return r.json()}).then(function(d){
+  return fetch('/api/my-review?limit=20',{headers:{'Authorization':'Bearer '+VK}}).then(function(r){return r.json()}).then(function(d){
     MR.data=d||{repos:[],runs:[]};MR.loading=false;renderMyReview();
   }).catch(function(){MR.loading=false;const n=document.getElementById('mrNote');if(n)n.textContent='加载失败';});
 }

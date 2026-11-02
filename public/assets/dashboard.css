@@ -45,6 +45,7 @@ body{padding:0;overflow:hidden;height:100vh}
 .controls a,.controls button{flex-shrink:0;white-space:nowrap}
 .controls select,.controls a,.controls button{font-size:12px;background:var(--surface);color:var(--text);border:1px solid var(--border);border-radius:5px;padding:7px 10px;cursor:pointer;text-decoration:none;line-height:1.3}
 .controls select:hover,.controls a:hover,.controls button:hover{border-color:var(--border-strong);background:var(--surface-subtle)}
+.controls button:disabled{opacity:.62;cursor:wait}
 .controls .ar-on{border-color:#bdd0c3;color:var(--green);background:var(--accent-soft)}.controls .ar-off{color:var(--dim)}
 .metric-strip{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:8px;min-height:68px;flex:none}
 .card{background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:10px 13px;min-height:68px;display:flex;flex-direction:column;justify-content:center}

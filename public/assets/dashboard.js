@@ -53,11 +53,11 @@ async function ensureSection(name,{force=false}={}){
     if(name==="upstream"){window.UQ&&window.UQ.load();return}
     if(force||!sectionLoaded[name]){
       sectionLoaded[name]=true;
-      if(name==="production")loadProduction();
-      else if(name==="concurrency")loadConcurrency();
-      else if(name==="sessions")loadSessions();
-      else if(name==="costs")loadCosts();
-      else if(name==="points")loadPointBalances();
+      if(name==="production")await loadProduction();
+      else if(name==="concurrency")await loadConcurrency();
+      else if(name==="sessions")await loadSessions();
+      else if(name==="costs")await loadCosts();
+      else if(name==="points")await loadPointBalances();
     }
     return;
   }
@@ -77,13 +77,14 @@ async function ensureSection(name,{force=false}={}){
 }
 
 // 自动刷新/手动刷新:只重拉当前菜单的那份数据
-function refreshCurrent(){
+async function refreshCurrent(){
   updateProdIdleBadge(); // 空转角标随自动刷新同频更新(不管当前在哪个菜单)
   // 代码评审有自己的加载器(在 code-review.js 里),它单独暴露了两个钩子
-  if(activeWorkspaceTab==="review"){window.crReload&&window.crReload();return}
+  if(activeWorkspaceTab==="review"){await Promise.resolve(window.crReload&&window.crReload());return}
   // 并发监控有自己的 5s/30s 轮询,不再叠一次 30s 全局刷新
-  if(activeWorkspaceTab==="concurrency"){loadConcurrency();return}
-  ensureSection(activeWorkspaceTab,{force:true});
+  if(activeWorkspaceTab==="concurrency"){await loadConcurrency();return}
+  if(activeWorkspaceTab==="upstream"){await Promise.resolve(window.UQ&&window.UQ.refresh());return}
+  await ensureSection(activeWorkspaceTab,{force:true});
 }
 
 // 方案/协议变了 → 每个 section 的载荷都是按它过滤的,已加载的统统作废
@@ -388,7 +389,7 @@ function loadPointBalances(){
   const host=document.getElementById('pointBalanceBody'),ctx=document.getElementById('pointBalanceContext');
   if(!host)return;
   host.innerHTML='<tr><td colspan="10" class="empty">加载中…</td></tr>';
-  fetch('/api/point-budgets',{credentials:'same-origin'}).then(async r=>{
+  return fetch('/api/point-budgets',{credentials:'same-origin'}).then(async r=>{
     if(!r.ok)throw new Error(r.status===401?'需要管理员登录':'HTTP '+r.status);
     return r.json();
   }).then(data=>{POINT_DATA=data;renderPointBalances()}).catch(e=>{
@@ -1556,6 +1557,17 @@ document.querySelectorAll("#planModelWindowSeg button").forEach(b=>b.addEventLis
   document.querySelectorAll("#planModelWindowSeg button").forEach(x=>x.classList.toggle("on",x===b));
   pmLoad();
 }));
+
+// 手动刷新:只刷新当前菜单。按钮进入 busy 态,避免连点叠加请求。
+async function manualRefresh(btn, fn){
+  if(!btn||btn.disabled)return;
+  const label=btn.textContent;
+  btn.disabled=true;btn.textContent="刷新中…";
+  try{await fn();toast("已刷新")}
+  catch(e){toast("刷新失败: "+((e&&e.message)||e))}
+  finally{btn.disabled=false;btn.textContent=label}
+}
+document.getElementById("manualRefreshBtn").addEventListener("click",function(){manualRefresh(this,refreshCurrent)});
 
 // 轮询治理:页面隐藏/最小化时暂停 30s 自动刷新(后台标签挂一天不再持续打满出网),
 // 切回可见时立即刷一次。

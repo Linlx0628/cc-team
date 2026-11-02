@@ -254,6 +254,26 @@ function firstOf(obj, keys) {
   return undefined;
 }
 
+// custom_tool_call 的 input 在 Codex 各版本里可能是三种形态:
+//   1) freeform 原文(补丁/shell 文本)      —— 0.145+ / 0.164 实测
+//   2) JSON 字符串(部分 harness 封装一层) —— 先 JSON.parse
+//   3) 已经是对象({ patch } / { input } / { command })
+// 统一成对象交给 fileToolEvents;原文形态包成 { input },命令行取原文时仍能命中 patchText。
+function customToolInput(raw) {
+  if (typeof raw === "string") {
+    const text = raw.trim();
+    if (text.startsWith("{")) {
+      try {
+        const parsed = JSON.parse(text);
+        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) return parsed;
+      } catch { /* 不是 JSON,按 freeform 原文处理 */ }
+    }
+    return { input: raw };
+  }
+  if (raw && typeof raw === "object" && !Array.isArray(raw)) return raw;
+  return { input: raw };
+}
+
 // 从一次文件工具调用的 input 提取 1..n 条事件(apply_patch 一段补丁可改多个文件);
 // 不是文件工具、或补丁/字段都提不出内容时返回 null,由调用方落回通用事件分支。
 // tool_id 语义:普通调用 = 调用 id(与 tool_result 对得上);apply_patch 每文件一条,
@@ -386,9 +406,10 @@ export function extractResponsesEvents(parsed, cursor = 0) {
       const callId = String(it.call_id || it.id || "");
       if (!callId) continue;
       const name = String(it.name || "unknown");
-      const fileEvents = fileToolEvents(name, { input: it.input }, callId);
+      const input = customToolInput(it.input);
+      const fileEvents = fileToolEvents(name, input, callId);
       if (fileEvents) { calls.push(...fileEvents); continue; }
-      const txt = typeof it.input === "string" ? it.input : "";
+      const txt = typeof it.input === "string" ? it.input : commandText(input.command ?? input.cmd);
       calls.push({ tool_id: callId, tool: name, file_path: null, ext: null, lines_add: 0, lines_del: 0,
         cmd_class: txt ? classifyCommand(txt) : null });
     } else if (it.type === "function_call_output" || it.type === "custom_tool_call_output" || it.type === "local_shell_call_output") {

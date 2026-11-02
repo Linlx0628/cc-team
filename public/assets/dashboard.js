@@ -14,14 +14,14 @@ let activeWorkspaceTab="overview";
 let POINT_DATA=null;
 // 菜单顺序,与侧栏按钮一一对应;id 由 setWorkspaceTab 按 'workspace-tab-'+s 硬拼 ——
 // 增删菜单必须与 lib/pages.mjs 的按钮和面板同时改,否则切换会静默失效。
-const SECTIONS=['overview','upstream','users','points','clients','detail','profiles','rates','planrates','errors','production','sessions','costs','review'];
+const SECTIONS=['overview','concurrency','upstream','users','points','clients','detail','profiles','rates','planrates','errors','production','sessions','costs','review'];
 
 // ── 按菜单懒加载 ─────────────────────────────────────────────────────────────
 // 点哪个菜单才查哪个菜单的数据:别为了一张错误表去跑 dailyModels/dailyClients 那几张
 // 400 天宽表的全表扫描(实测这是 dashboard 最重的一块)。
 //   值 = /api/stats 的 section 名;null = 该菜单有自己的独立端点(产出/会话/成本/评审)。
 const SECTION_SOURCE={
-  overview:"overview", users:"users", points:null, clients:"clients", detail:"detail",
+  overview:"overview", concurrency:null, users:"users", points:null, clients:"clients", detail:"detail",
   profiles:"profiles", rates:"rates", planrates:"rates", errors:"errors",
   production:null, sessions:null, costs:null, review:null,
   upstream:null,     // 上游额度:独立端点(/api/upstream-quota),不搭 /api/stats 的车
@@ -54,6 +54,7 @@ async function ensureSection(name,{force=false}={}){
     if(force||!sectionLoaded[name]){
       sectionLoaded[name]=true;
       if(name==="production")loadProduction();
+      else if(name==="concurrency")loadConcurrency();
       else if(name==="sessions")loadSessions();
       else if(name==="costs")loadCosts();
       else if(name==="points")loadPointBalances();
@@ -80,6 +81,8 @@ function refreshCurrent(){
   updateProdIdleBadge(); // 空转角标随自动刷新同频更新(不管当前在哪个菜单)
   // 代码评审有自己的加载器(在 code-review.js 里),它单独暴露了两个钩子
   if(activeWorkspaceTab==="review"){window.crReload&&window.crReload();return}
+  // 并发监控有自己的 5s/30s 轮询,不再叠一次 30s 全局刷新
+  if(activeWorkspaceTab==="concurrency"){loadConcurrency();return}
   ensureSection(activeWorkspaceTab,{force:true});
 }
 
@@ -224,7 +227,7 @@ function egressCard(){const e=D.egress;if(!e)return"";return'<div class="card" t
 let chartResizeFrame=0;
 function doughnutLegend(){const compact=innerWidth<1280;return{position:"bottom",labels:{color:"#686863",font:{size:compact?10:11},padding:compact?6:10,boxWidth:compact?16:24}}}
 function trendLegend(){const compact=innerWidth<=820;return{labels:{color:"#686863",font:{size:compact?9:11},padding:compact?6:10,boxWidth:compact?16:40}}}
-function scheduleChartResize(){cancelAnimationFrame(chartResizeFrame);chartResizeFrame=requestAnimationFrame(()=>{for(const chart of[C.p,C.m]){if(chart){chart.options.plugins.legend={display:false};chart.update("none")}}for(const chart of[C.t,C.hm,C.pr]){if(chart){chart.options.plugins.legend=trendLegend();chart.update("none")}}Object.values(C).forEach(chart=>chart&&chart.resize())})}
+function scheduleChartResize(){cancelAnimationFrame(chartResizeFrame);chartResizeFrame=requestAnimationFrame(()=>{for(const chart of[C.p,C.m]){if(chart){chart.options.plugins.legend={display:false};chart.update("none")}}for(const chart of[C.t,C.hm,C.pr]){if(chart){chart.options.plugins.legend=trendLegend();chart.update("none")}}Object.values(C).forEach(chart=>chart&&chart.resize());if(concChart)concChart.resize()})}
 function setWorkspaceTab(tab,focus){
   if(SECTIONS.indexOf(tab)<0)tab="overview";
   activeWorkspaceTab=tab;
@@ -1004,6 +1007,103 @@ function resetChartFilters(){P="day";MT="tokens";USR="all";DS="";DE="";PROTO="";
   nav.addEventListener("keydown",handleWorkspaceTabKeydown);
 })();
 document.getElementById("clearErrors").addEventListener("click",async()=>{if(confirm("确定清除所有错误记录？")){const csrf=(document.cookie.match(/tm_csrf=([^;]+)/)||[])[1]||'';await fetch("/api/clear-errors",{method:"POST",headers:{"x-csrf-token":csrf}});toast('错误记录已清除');errPage=1;load()}});
+// ── 并发监控 tab(懒加载 + 秒级 5s / 分钟级 30s 刷新)──
+const CONC_RANGES={
+  second:[["5m","近 5 分钟"],["30m","近 30 分钟"],["2h","近 2 小时"]],
+  minute:[["30m","近 30 分钟"],["2h","近 2 小时"],["today","今日"],["7d","近 7 天"],["30d","近 30 天"]],
+};
+let concState={gran:"second",range:"5m"},concData=null,concChart=null,concLoading=false,concTimer=null;
+function concRangeOptions(){
+  const sel=document.getElementById("concRange");if(!sel)return;
+  const list=CONC_RANGES[concState.gran]||CONC_RANGES.second;
+  if(!list.some(x=>x[0]===concState.range))concState.range=list[0][0];
+  sel.innerHTML=list.map(x=>'<option value="'+x[0]+'">'+x[1]+'</option>').join("");
+  sel.value=concState.range;
+}
+function concSwitchGran(g){
+  if(concState.gran===g)return;
+  concState.gran=g;
+  document.querySelectorAll("#concGran button").forEach(b=>b.classList.toggle("on",b.dataset.g===g));
+  concRangeOptions();
+  loadConcurrency();
+}
+function concRangeChanged(v){concState.range=v;loadConcurrency();}
+function concScheduleRefresh(){
+  clearTimeout(concTimer);
+  if(activeWorkspaceTab!=="concurrency"||document.hidden||!autoRefresh)return;
+  concTimer=setTimeout(()=>loadConcurrency({silent:true}),concState.gran==="second"?5000:30000);
+}
+async function loadConcurrency(){
+  if(concLoading)return;
+  concLoading=true;clearTimeout(concTimer);
+  try{
+    const qs=new URLSearchParams({granularity:concState.gran,window:concState.range});
+    const r=await fetch("/api/concurrency?"+qs);
+    const d=await r.json();
+    if(d.error)throw new Error(d.error);
+    concData=d;renderConcurrency(d);
+  }catch(e){
+    const el=document.getElementById("concSummary");if(el)el.textContent="加载失败: "+e.message;
+  }finally{
+    concLoading=false;concScheduleRefresh();
+  }
+}
+function concClock(t,gran){
+  const d=new Date(t+8*3600000),p=n=>String(n).padStart(2,"0");
+  return p(d.getUTCMonth()+1)+"-"+p(d.getUTCDate())+" "+p(d.getUTCHours())+":"+p(d.getUTCMinutes())+(gran==="second"?":"+p(d.getUTCSeconds()):"");
+}
+function concShortLabel(t,gran,bucketMs){
+  const d=new Date(t+8*3600000),p=n=>String(n).padStart(2,"0");
+  if(gran==="second")return bucketMs>=60000?p(d.getUTCMonth()+1)+"-"+p(d.getUTCDate())+" "+p(d.getUTCHours())+":"+p(d.getUTCMinutes()):p(d.getUTCHours())+":"+p(d.getUTCMinutes())+":"+p(d.getUTCSeconds());
+  return p(d.getUTCMonth()+1)+"-"+p(d.getUTCDate())+" "+p(d.getUTCHours())+":"+p(d.getUTCMinutes());
+}
+function concDownsample(points,max=900){
+  if(!Array.isArray(points)||points.length<=max)return points||[];
+  const step=Math.ceil(points.length/max),out=[];
+  for(let i=0;i<points.length;i+=step){
+    const part=points.slice(i,i+step);
+    const activeMs=part.reduce((x,p)=>x+(p.activeMs||0),0);
+    const denomMs=part.reduce((x,p)=>x+(p.denomMs||0),0);
+    out.push({t:part[0].t,activeMs,denomMs,avg:denomMs>0?activeMs/denomMs:0,
+      peak:Math.max(...part.map(p=>p.peak||0)),requests:part.reduce((x,p)=>x+(p.requests||0),0)});
+  }
+  return out;
+}
+function renderConcurrency(d){
+  const s=d.summary||{};
+  document.getElementById("concSummary").textContent=
+    (d.from?new Date(d.from).toLocaleString("zh-CN"):"")+" 至 "+(d.to?new Date(d.to).toLocaleString("zh-CN"):"")+
+    " · "+(d.granularity==="second"?"秒级":"分钟级");
+  document.getElementById("concCards").innerHTML=
+    '<div class="card"><div class="l">当前并发</div><div class="v">'+fmtT(d.current||0)+'</div></div>'+
+    '<div class="card" title="窗口内所有在途请求的持续时长 ÷ 窗口时长"><div class="l">平均并发</div><div class="v">'+(Number(s.avg)||0).toFixed(2)+'</div></div>'+
+    '<div class="card" title="同一时刻的最大在途请求数"><div class="l">峰值并发</div><div class="v">'+fmtT(s.peak||0)+'</div></div>'+
+    '<div class="card" title="窗口内开始的请求数"><div class="l">窗口请求</div><div class="v">'+fmtT(s.requests||0)+'</div></div>';
+  const bucket=d.bucketMs>=1000?(Math.round(d.bucketMs/1000)+" 秒"):"1 秒";
+  document.getElementById("concNote").textContent="聚合 "+bucket+(d.granularity==="second"?" · 秒级保留最近 6 小时":" · 分钟级保留最近 30 天");
+  const pts=concDownsample(d.points||[]);
+  if(concChart)concChart.destroy();
+  concChart=new Chart(document.getElementById("concurrencyChart"),{type:"line",
+    data:{labels:pts.map(p=>concShortLabel(p.t,d.granularity,d.bucketMs)),datasets:[
+      {label:"平均并发",data:pts.map(p=>Number(p.avg)||0),borderColor:"#2f6e50",backgroundColor:"rgba(47,110,80,.12)",fill:true,tension:.25,pointRadius:0,borderWidth:2},
+      {label:"峰值并发",data:pts.map(p=>p.peak||0),borderColor:"#c2604f",backgroundColor:"transparent",borderDash:[4,3],fill:false,tension:.15,pointRadius:0,borderWidth:1.5},
+    ]},
+    options:{responsive:true,maintainAspectRatio:false,interaction:{mode:"index",intersect:false},
+      plugins:{legend:{display:true,labels:{boxWidth:16,font:{size:10}}},
+        tooltip:{callbacks:{title:items=>items[0]?items[0].label:"",
+          label:ctx=>ctx.dataset.label+": "+(ctx.datasetIndex===0?Number(ctx.raw).toFixed(2):ctx.raw),
+          afterBody:items=>{const p=pts[items[0]&&items[0].dataIndex];return p?["请求数: "+fmtT(p.requests||0),"聚合窗口: "+Math.round((p.denomMs||0)/1000)+" 秒"]:[];}}}},
+      scales:{x:{ticks:{color:"#686863",font:{size:9},maxRotation:0,autoSkip:true,maxTicksLimit:12},grid:{display:false}},
+        y:{beginAtZero:true,ticks:{color:"#686863",precision:0},grid:{color:"rgba(24,24,22,.08)"},title:{display:true,text:"在途请求数",color:"#686863",font:{size:10}}}}}});
+  const top=(d.points||[]).slice().sort((a,b)=>(b.peak-a.peak)||(b.avg-a.avg)).slice(0,8);
+  document.querySelector("#concTopTable tbody").innerHTML=top.map(p=>
+    '<tr><td>'+ph(concClock(p.t,d.granularity))+'</td><td class="n">'+fmtT(p.peak||0)+'</td><td class="n">'+(Number(p.avg)||0).toFixed(2)+'</td><td class="n">'+fmtT(p.requests||0)+'</td></tr>').join("")
+    ||'<tr><td colspan="4" class="empty">该窗口无并发数据</td></tr>';
+}
+document.getElementById("concGran").addEventListener("click",e=>{const b=e.target.closest("button[data-g]");if(b)concSwitchGran(b.dataset.g)});
+document.getElementById("concRange").addEventListener("change",e=>concRangeChanged(e.target.value));
+concRangeOptions();
+
 // ── 产出质量 tab(懒加载:首次切到该 tab 才拉数据)──
 const ph=escH;
 let prodData=null,prodLoaded=false,prodDetailChart=null;

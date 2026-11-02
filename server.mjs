@@ -10,6 +10,7 @@ import { initProductionDb, createProductionTracker, rangeFromTo, productionSumma
   productionProjects, productionAlerts, markAlertSeen, pruneProductionData, DEFAULT_COST_RATES,
   computeCosts, contextHealth, buildReportHTML, ALERT_KIND_LABEL, alertDetailText,
   sessionProjectLabels, sessionToolStats, sessionKey } from "./production.mjs";
+import { initConcurrencyDb, createConcurrencyTracker, backfillConcurrencyFromRequestLogs } from "./lib/concurrency.mjs";
 import { cnNow, cnDate, cnHalfHour, secondsUntilNextCnMidnight, cnWeekStartIso, cnWeekStartDate, cnDayStartIso, periodStartDate, secondsUntilNextPeriodEnd, addDaysToDate, weekStartDateOf, monthStartDateOf, parseDateRange } from "./lib/time.mjs";
 import { parsePeakTimeMinutes, normalizePeakHours, isInPeakHours, formatPeakHoursSummary,
   BASE_GROUP_TOKEN, resolveEffectiveGroup, formatScheduleRuleSummary,
@@ -2457,6 +2458,7 @@ function loadProfileSnapshot(suffix, wideFloor) {
 
 ({ db, stmts } = persistenceApi.initDb());
 initProductionDb(db);   // 产出质量表(tool_events / production_alerts),先于 tracker 建语句
+initConcurrencyDb(db);  // 并发分钟表;秒级数据只在内存,不落库
 // 代码评审表(runs / comments / repo_state);功能默认关闭,建表无害。
 // backup 回调只在**游标表换主键那次破坏性重建**时被调用一次(不在重启时白白拷库)。
 initCodeReviewDb(db, { backup: () => backupDatabaseSync("code-review-cursor-per-branch") });
@@ -2474,6 +2476,9 @@ const planExportApi = createPlanExportManager({
 });
 function productionEnabled() { return (config.productionTracking || {}).enabled !== false; }
 const productionTracker = createProductionTracker({ db, getConfig: () => config.productionTracking || {}, log: console.log });
+// 并发观测同样是纯旁路:请求开始/结束各改一个内存计数,30 秒批量落一次分钟表。
+// 不做逐请求 SQLite 写,也不解析请求体,代理热路径只多两次函数调用。
+const concurrencyTracker = createConcurrencyTracker({ db, log: console.log });
 
 // 代码评审(可选功能):OCR 适配层 + 编排层。默认关闭;开启后由管理员在设置页配仓库。
 // 依赖注入照既有规矩:db/stmts 用 getter(它们在 initDb 阶段才就位),其余按值传。
@@ -4237,6 +4242,28 @@ function maskAuditKey(key) {
 // stores conversation content — same privacy boundary as the rest of the system.
 const REQUEST_LOG_DIR = path.join(__dirname, "logs");
 const REQUEST_LOG_RETENTION_DAYS = 30;
+// 并发分钟历史从已有请求日志回填。延迟 5 秒、逐文件流式读、后台进行:
+// 首屏/代理请求不会被这次扫描拖慢。默认回填 7 天(足够覆盖「近 7 天」)，
+// 更早的分钟数据随服务运行自然积累;config.concurrency.backfillDays 可调 1–30。
+{
+  const configured = Number((config.concurrency || {}).backfillDays);
+  const days = Math.max(1, Math.min(30, Number.isFinite(configured) && configured > 0 ? configured : 7));
+  const timer = setTimeout(() => {
+    backfillConcurrencyFromRequestLogs(concurrencyTracker, { dir: REQUEST_LOG_DIR, days, log: console.log })
+      .then(r => {
+        if (r.files) console.log(`[concurrency] 回填完成: ${r.files} 个日志文件 / ${r.intervals} 条请求 / ${r.minutes} 个分钟桶`);
+      })
+      .catch(err => console.log(`[concurrency] 回填失败(不影响代理): ${err.message}`));
+  }, 5000);
+  timer.unref?.();
+  // 启动那一分钟在第一次回填时仍是「当前分钟」被跳过;75 秒后再补一次今日日志,
+  // 把这一分钟补齐。只读一个文件,开销很小。
+  const timer2 = setTimeout(() => {
+    backfillConcurrencyFromRequestLogs(concurrencyTracker, { dir: REQUEST_LOG_DIR, days: 1, log: console.log })
+      .catch(err => console.log(`[concurrency] 补回填失败(不影响代理): ${err.message}`));
+  }, 75_000);
+  timer2.unref?.();
+}
 let requestLogStream = null;
 let requestLogDate = null;
 let requestLogBroken = false;
@@ -4308,10 +4335,15 @@ function reseedEgressFromTodayLog() {
 // starts with the fields known at clientState creation and is enriched later by
 // the readBody callback (model / source / serving profile / usage).
 function attachRequestLogger(res, clientState, reqLog) {
+  // 并发旁路:进入代理即 +1,响应 finish/close 即 -1。try/catch 保证观测故障
+  // 永远不会影响真实请求;两个钩子与下面的 logged 守卫一样只执行一次。
+  try { concurrencyTracker.noteStart(reqLog.start); } catch {}
   let logged = false;
   const write = (aborted) => {
     if (logged) return;
     logged = true;
+    const ended = Date.now();
+    try { concurrencyTracker.noteEnd(ended); } catch {}
     const usage = clientState.lastUsage;
     const eg = clientState.egress;
     if (eg) egressMeter.noteRequest(eg.up, eg.dn, eg.att);
@@ -4338,7 +4370,7 @@ function attachRequestLogger(res, clientState, reqLog) {
       cacheC: usage ? (usage.usage.cache_creation_input_tokens || 0) : 0,
       cacheR: usage ? (usage.usage.cache_read_input_tokens || 0) : 0,
       status: res.statusCode || 0,
-      ms: Date.now() - reqLog.start,
+      ms: ended - reqLog.start,
       aborted: aborted === true,
       // 出网观测(纯追加字段,旧解析器无影响):upB=发上游请求体字节(含重试累计),
       // dnB=回传客户端应用层字节(不含响应头),att=上游上传次数(>1 即存在重试/failover 放大)。
@@ -7346,6 +7378,40 @@ const server = http.createServer((req, res) => {
   }
 
   // ── 产出质量与洞察(管理 API + 报告导出)──
+  // 并发监控:秒级走内存事件环,分钟级读 concurrency_minute。两端都只读,
+  // 不触发请求日志扫描;历史回填在启动后后台完成。
+  if (req.method === "GET" && req.url.split("?")[0] === "/api/concurrency") {
+    if (!checkAuth(req)) { res.writeHead(401); res.end("Unauthorized"); return; }
+    try {
+      const u = new URL(req.url, "http://localhost");
+      const granularity = u.searchParams.get("granularity") === "minute" ? "minute" : "second";
+      const requested = u.searchParams.get("window") || (granularity === "second" ? "5m" : "2h");
+      const windowMs = { "5m": 5 * 60_000, "30m": 30 * 60_000, "2h": 2 * 3600_000,
+        "7d": 7 * 86400_000, "30d": 30 * 86400_000 };
+      const nowMs = Date.now();
+      let from;
+      if (requested === "today") {
+        const shifted = new Date(nowMs + 8 * 3600_000);
+        from = Date.UTC(shifted.getUTCFullYear(), shifted.getUTCMonth(), shifted.getUTCDate()) - 8 * 3600_000;
+      } else {
+        // 秒级最多回看 6 小时(内存事件环),分钟级最多 30 天。
+        const max = granularity === "second" ? 6 * 3600_000 : 30 * 86400_000;
+        from = nowMs - Math.min(windowMs[requested] || (granularity === "second" ? 5 * 60_000 : 2 * 3600_000), max);
+      }
+      const data = granularity === "minute"
+        ? concurrencyTracker.snapshotMinute(from, nowMs)
+        : concurrencyTracker.snapshotSecond(from, nowMs);
+      data.window = requested;
+      data.secondRetentionHours = 6;
+      data.minuteRetentionDays = 30;
+      res.writeHead(200, { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" });
+      res.end(JSON.stringify(data));
+    } catch (err) {
+      res.writeHead(500, { "Content-Type": "application/json; charset=utf-8" });
+      res.end(JSON.stringify({ error: err.message }));
+    }
+    return;
+  }
   if (req.method === "GET" && req.url.startsWith("/api/production/summary")) {
     if (!checkAuth(req)) { res.writeHead(401); res.end("Unauthorized"); return; }
     try {

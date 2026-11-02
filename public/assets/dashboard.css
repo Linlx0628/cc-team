@@ -88,6 +88,13 @@ body{padding:0;overflow:hidden;height:100vh}
    -inner 撑满 pane,高度上限交给 -scroll(原来的 62vh 封顶改为吃满一屏)。 */
 .workspace-panel-inner{display:flex;flex-direction:column;flex:1;min-height:0;min-width:0;background:var(--surface);border:1px solid var(--border);border-radius:6px;overflow:hidden}
 .workspace-panel-head{min-height:36px;padding:7px 12px;display:flex;align-items:center;gap:9px;border-bottom:1px solid var(--border);font-size:12px;flex-wrap:wrap;flex:none}.workspace-panel-head strong{font-weight:650}.workspace-panel-summary{font-size:10px;color:var(--dim);margin-left:auto}.workspace-panel-scroll{flex:1;min-height:0;overflow:auto}
+/* 并发监控:图表吃满剩余高度,顶部筛选与指标卡不参与滚动 */
+.conc-body{display:flex;flex-direction:column;gap:8px;flex:1;min-height:0;overflow:auto;padding:10px 12px 12px}
+.conc-cards{grid-template-columns:repeat(4,minmax(0,1fr));margin:0}
+.conc-chart{flex:1;min-height:320px}
+.conc-top-panel{flex:none;max-height:250px}
+.conc-top-panel .workspace-panel-scroll{max-height:190px}
+@media(max-width:820px){.conc-cards{grid-template-columns:repeat(2,minmax(0,1fr))}.conc-chart{min-height:280px}}
 .workspace-tab-count{display:inline-block;margin-left:auto;color:var(--dim);font-size:10px;font-variant-numeric:tabular-nums;padding-left:6px}.nav-btn.active .workspace-tab-count{color:var(--accent)}
 /* 菜单红色数字角标:目前用于「产出质量」的未读空转告警数(空转不外发通知,只在这里提示) */
 .nav-badge{display:inline-flex;align-items:center;justify-content:center;margin-left:auto;min-width:18px;height:18px;padding:0 5px;border-radius:9px;background:var(--red);color:#fbfbf8;font-size:10.5px;font-weight:700;font-variant-numeric:tabular-nums;line-height:1}.nav-badge[hidden]{display:none}

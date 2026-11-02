@@ -1012,7 +1012,7 @@ const CONC_RANGES={
   second:[["5m","近 5 分钟"],["30m","近 30 分钟"],["2h","近 2 小时"]],
   minute:[["30m","近 30 分钟"],["2h","近 2 小时"],["today","今日"],["7d","近 7 天"],["30d","近 30 天"]],
 };
-let concState={gran:"second",range:"5m"},concData=null,concChart=null,concLoading=false,concTimer=null;
+let concState={gran:"second",range:"5m"},concData=null,concChart=null,concLoading=false,concPending=false,concTimer=null;
 function concRangeOptions(){
   const sel=document.getElementById("concRange");if(!sel)return;
   const list=CONC_RANGES[concState.gran]||CONC_RANGES.second;
@@ -1034,7 +1034,7 @@ function concScheduleRefresh(){
   concTimer=setTimeout(()=>loadConcurrency({silent:true}),concState.gran==="second"?5000:30000);
 }
 async function loadConcurrency(){
-  if(concLoading)return;
+  if(concLoading){concPending=true;return}
   concLoading=true;clearTimeout(concTimer);
   try{
     const qs=new URLSearchParams({granularity:concState.gran,window:concState.range});
@@ -1045,7 +1045,9 @@ async function loadConcurrency(){
   }catch(e){
     const el=document.getElementById("concSummary");if(el)el.textContent="加载失败: "+e.message;
   }finally{
-    concLoading=false;concScheduleRefresh();
+    concLoading=false;
+    if(concPending){concPending=false;loadConcurrency();return}
+    concScheduleRefresh();
   }
 }
 function concClock(t,gran){

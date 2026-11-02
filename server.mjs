@@ -4259,7 +4259,7 @@ const REQUEST_LOG_RETENTION_DAYS = 30;
   // 启动那一分钟在第一次回填时仍是「当前分钟」被跳过;75 秒后再补一次今日日志,
   // 把这一分钟补齐。只读一个文件,开销很小。
   const timer2 = setTimeout(() => {
-    backfillConcurrencyFromRequestLogs(concurrencyTracker, { dir: REQUEST_LOG_DIR, days: 1, log: console.log })
+    backfillConcurrencyFromRequestLogs(concurrencyTracker, { dir: REQUEST_LOG_DIR, days: 1, log: console.log, seedSeconds: false })
       .catch(err => console.log(`[concurrency] 补回填失败(不影响代理): ${err.message}`));
   }, 75_000);
   timer2.unref?.();

@@ -77,6 +77,7 @@ async function ensureSection(name,{force=false}={}){
 
 // 自动刷新/手动刷新:只重拉当前菜单的那份数据
 function refreshCurrent(){
+  updateProdIdleBadge(); // 空转角标随自动刷新同频更新(不管当前在哪个菜单)
   // 代码评审有自己的加载器(在 code-review.js 里),它单独暴露了两个钩子
   if(activeWorkspaceTab==="review"){window.crReload&&window.crReload();return}
   ensureSection(activeWorkspaceTab,{force:true});
@@ -1077,7 +1078,18 @@ async function loadProdDetail(key,range){
 async function markProdAlerts(){
   const csrf=(document.cookie.match(/tm_csrf=([^;]+)/)||[])[1]||'';
   await fetch('/api/production/alerts/seen',{method:'POST',headers:{'Content-Type':'application/json','x-csrf-token':csrf},body:JSON.stringify({id:0})});
+  updateProdIdleBadge();
   loadProduction();
+}
+// 空转消耗不外发通知(邮件/推送都不发),「产出质量」菜单上的红色角标是唯一主动提示:
+// 显示未读(seen=0)的 idle_burn 数量,点进面板「全部已读」后归零。
+async function updateProdIdleBadge(){
+  const b=document.getElementById('prodIdleBadge');
+  if(!b)return;
+  try{
+    const r=await fetch('/api/production/alerts/unread').then(r=>r.json());
+    if(r&&r.idle>0){b.textContent=r.idle;b.hidden=false}else b.hidden=true;
+  }catch(e){/* 拉取失败静默:面板内告警列表仍是完整数据源 */}
 }
 // 指标口径速览:点击「指标口径」展开/收起一行小字
 document.getElementById('prodMetricHelp').addEventListener('click',()=>{const b=document.getElementById('prodMetricHelpBody');b.style.display=(b.style.display==='none'?'':'none')});
@@ -1452,4 +1464,4 @@ function startAutoRefresh(){
 document.addEventListener('visibilitychange',()=>{if(!document.hidden&&autoRefresh)refreshCurrent()});
 document.getElementById("autoRefreshBtn").addEventListener("click",()=>{autoRefresh=!autoRefresh;const btn=document.getElementById("autoRefreshBtn");btn.textContent="自动刷新: "+(autoRefresh?"开":"关");btn.className=autoRefresh?"ar-on":"ar-off"});
 window.addEventListener("resize",scheduleChartResize);
-setWorkspaceTab('overview',false);ensureSection('overview');startAutoRefresh();
+setWorkspaceTab('overview',false);ensureSection('overview');startAutoRefresh();updateProdIdleBadge();

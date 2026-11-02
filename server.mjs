@@ -2921,9 +2921,14 @@ function triggerReviewForKey(apiKey, repoName) {
   return { status: 200, body: { ok: true, results }, results, actor };
 }
 
-// 产出质量:60s 告警扫描 + 过期清理(unref 不阻止进程退出);告警经既有通知渠道 webhook 推送。
+// 产出质量:60s 告警扫描 + 过期清理(unref 不阻止进程退出);错误循环/失败爆发经既有
+// 通知渠道推送,空转消耗只落库(见下方 IDLE_PUSH_DISABLED_KINDS)。
 const prodNotifyCooldown = new Map();
+// 空转消耗不外发(邮件/webhook/成员拷贝一律不发):告警仍照常落库,由「产出质量」
+// 菜单上的红色角标提示未读数量,进面板看列表。错误循环/编辑失败爆发照旧两路推送。
+const IDLE_PUSH_DISABLED_KINDS = new Set(["idle_burn"]);
 function pushProductionAlert(a) {
+  if (IDLE_PUSH_DISABLED_KINDS.has(a.kind)) return;
   const cfg = config.notifier || {};
   if (!cfg.enabled) return;
   const key = a.kind + ":" + a.user_key;
@@ -7393,6 +7398,20 @@ const server = http.createServer((req, res) => {
         console.log(`[production-api] 响应已开始但出错: ${err.message}`);
         if (!res.writableEnded) res.end();
       }
+    }
+    return;
+  }
+  // 未读空转数量:供「产出质量」菜单角标轮询。空转已不外发通知,这是它唯一的主动提示位。
+  // 注意:本路由必须位于下方宽匹配的 /api/production/alerts 之前,否则会被它先吞掉。
+  if (req.method === "GET" && req.url.startsWith("/api/production/alerts/unread")) {
+    if (!checkAuth(req)) { res.writeHead(401); res.end("Unauthorized"); return; }
+    try {
+      const n = db.prepare(`SELECT COUNT(*) n FROM production_alerts WHERE kind='idle_burn' AND seen=0`).get().n;
+      res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+      res.end(JSON.stringify({ idle: n }));
+    } catch (err) {
+      res.writeHead(500, { "Content-Type": "application/json; charset=utf-8" });
+      res.end(JSON.stringify({ error: err.message }));
     }
     return;
   }

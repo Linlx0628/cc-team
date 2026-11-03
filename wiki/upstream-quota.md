@@ -34,6 +34,7 @@
 | 余额 | Sub2API（**可加多个站点**） | 钱包/订阅剩余额度；或 5 小时 / 1 天 / 7 天三个 Key 级窗口 | 站点发的 API Key（**必须选方案**，地址与密钥都由方案带出） | 站点自带 `GET /v1/usage`（开源网关） |
 | 余额 | NewAPI（**可加多个站点**） | 剩余额度（`quota ÷ quota_per_unit`）、累计请求 | 控制台生成的**系统访问令牌** + 数字用户 ID | 站点管理面 `GET /api/user/self`（开源网关，one-api 衍生） |
 | 余额 | 硅基流动 SiliconFlow | **可用余额**（现金 + 代金券合计）+ 每张代金券的剩余 / 面额 / 有效期（CNY） | 控制台会话令牌（`__SF_auth.session-token`）+ 账号 ID（`x-subject-id`） | 控制台 walletd 接口（`/api/v1/subject/profile` + `/api/v1/subject/wallets?stage=3`，私有 experimental）。官方 `GET /v1/user/info` **已于 2026 年初下线**（410 + code 20092），见下节 |
+| 余额 | 小米 MiMo 开放平台 | 账户余额（现金 + 赠送，CNY） | 控制台 Cookie 整段（`userId` + 三段 `api-platform_*`） | 控制台内部接口 `GET /api/v1/balance`（私有 experimental，见[下节](#小米-mimo-开放平台官方没有余额接口直接读控制台的)） |
 | Plan | 腾讯云 TokenHub Coding Plan | 5 小时 / 每周 / 每订阅月用量 | — | 官方只在控制台展示，无 API |
 | Plan | 阿里云百炼 Coding Plan | 5 小时 / 每周 / 计费月三个窗口的已用额度（**接口不给单位，数字原样显示**）；套餐名 / 状态 / 到期 / 剩余天数 | 控制台令牌（与「阿里云百炼 Token Plan」**共用同一份**，卡片页脚「一键获取令牌」；留空时自动读本机 `~/.bailian/config.json`）+ `AccessKey ID` / `Secret`（**可选**：留空也能查；填了就能在没有令牌 / 令牌过期时自动换取，可复用「阿里云账户余额」那份） | 百炼控制台网关（`zeldaEasy.bailian-commerce.codingPlan.queryCodingPlanInstanceInfoV2`，私有 experimental，见[下节](#阿里云百炼-coding-plan同一个控制台令牌读三个窗口)） |
 | Plan | 腾讯 CodeBuddy | 套餐与用量 | — | 官方只在网页展示 |
@@ -68,14 +69,14 @@
 - **套餐额度框的配色**：不看顶部「告警阈值」，固定按 **80%** 分界 —— 框内最紧的那个窗口**低于 80% 整块走蓝**（虚线框 / 进度条 / 大号百分比），**80% 及以上整块走红**；框里没有百分比时（上游只给绝对值）按蓝色画
 - **同名窗口自动区分**：智谱的周窗口有 tokens 与额度两条，会显示成「每周窗口（tokens）」与「每周窗口（额度）」，不会出现两个同名标题配两个不同百分比
 - **页脚**：`更新于 / 缓存于 N 分钟前`（缓存时说明数字来自上次的好数据）、凭据来源（如「自动 · DeepSeek / 张三」，只说方式**不显示密钥**）、控制台与文档链接
-- 面板标题栏右侧摘要：`1 个需要关注 · 共 20 个平台 · 更新于 11:45`（有需要关注的平台时，文字前面会点一颗红点）。这里的「平台数」= 20 个内置平台 + 你自己加的中转站点（每个站点算一个，Sub2API / NewAPI 类型的空站点不算）
+- 面板标题栏右侧摘要：`1 个需要关注 · 共 21 个平台 · 更新于 11:45`（有需要关注的平台时，文字前面会点一颗红点）。这里的「平台数」= 21 个内置平台 + 你自己加的中转站点（每个站点算一个，Sub2API / NewAPI 类型的空站点不算）
 - 单张卡片的 `↻` 只重查这一个平台并就地替换那张卡（整面板不重排、滚动位置不跳）；标题栏「**刷新全部**」强制重查所有已开平台
 
 ## 控制台入口
 
 卡片页脚、小字行里的「控制台」、设置页那一行的「打开控制台」，点下去都是**在新标签页打开对方官网**（浏览器原生行为，中键 / ⌘+点击同样走浏览器）。
 
-- ⚠️ **为什么不做内嵌抽屉**：2026-10-14 逐个看过 16 个入口的安全响应头，**8 个明确拒绝被嵌**（`X-Frame-Options: DENY / SAMEORIGIN` 或 CSP `frame-ancestors`）：DeepSeek、OpenRouter、智谱 BigModel、Claude、OpenCode、OpenAI Platform、硅基流动、阿里云百炼控制台。剩下 8 个（腾讯云 TokenHub / 费用中心、腾讯 CodeBuddy、火山引擎、阿里云用户中心、阶跃星辰、月之暗面、MiniMax）技术上能嵌，但浏览器**不把第三方 Cookie 交给 iframe**，进去多半还要重新登录一次——比直接开新标签更麻烦，所以本工具不做内嵌。
+- ⚠️ **为什么不做内嵌抽屉**：2026-10-14 逐个看过（2026-11-03 补测小米 MiMo）共 17 个入口的安全响应头，**8 个明确拒绝被嵌**（`X-Frame-Options: DENY / SAMEORIGIN` 或 CSP `frame-ancestors`）：DeepSeek、OpenRouter、智谱 BigModel、Claude、OpenCode、OpenAI Platform、硅基流动、阿里云百炼控制台。剩下 9 个（腾讯云 TokenHub / 费用中心、腾讯 CodeBuddy、火山引擎、阿里云用户中心、阶跃星辰、月之暗面、MiniMax、小米 MiMo）技术上能嵌，但浏览器**不把第三方 Cookie 交给 iframe**，进去多半还要重新登录一次——比直接开新标签更麻烦，所以本工具不做内嵌。
 - 「控制台」只对**有官方控制台地址**的平台出现；没有地址的平台（例如中转站站点）这一格会省略。
 
 ## 参数（设置页 → 上游额度 → 顶部「高级」折叠）
@@ -400,6 +401,49 @@ header: x-subject-id: <账号 ID>        # 缺了服务端回 400 validate error
 
 ⚠️ 这两个接口是**控制台内部接口**（社区逆向，官方随时可能改），所以归为 experimental；接口一变就把这个平台的开关关掉。
 
+### 小米 MiMo 开放平台：官方没有余额接口，直接读控制台的
+
+小米 MiMo 开放平台（platform.xiaomimimo.com）没有公开的余额 API，API Key 侧也没有；控制台「余额」页（`/console/balance`）自己调的是一个内部接口，面板就直接调它：
+
+```text
+GET https://platform.xiaomimimo.com/api/v1/balance
+cookie: userId=<数字账号ID>; api-platform_serviceToken=…; api-platform_slh=…; api-platform_ph=…
+其它请求头: referer: https://platform.xiaomimimo.com/console/balance · x-timezone: Asia/Shanghai
+```
+
+成功返回（HTTP 200）长这样：
+
+```json
+{"code":0,"message":"","data":{
+  "balance":"29.97","giftBalance":"29.97","cashBalance":"0.00","frozenBalance":"0.00",
+  "overdraftLimit":"0.00","remainingOverdraftLimit":"0.00","currency":"CNY","newUserGiftReceived":true}}
+```
+
+**卡片怎么读**：
+
+| 卡片上看到 | 来自 | 例 |
+|---|---|---|
+| **账户余额**（大号金额） | `data.balance`（上游直接给合计，不用自己加） | `¥29.97` |
+| 说明行 | 现金 `cashBalance` · 赠送 `giftBalance`，另有数时再追加「冻结 `frozenBalance`」「可透支额度剩 `remainingOverdraftLimit`」 | 「现金 ¥0.00 · 赠送 ¥29.97」 |
+
+金额都是**十进制字符串、单位就是元**（不需要像腾讯云那样除以 100）；口径上 `balance = cashBalance + giftBalance`（实测 29.97 = 0 + 29.97）。正常账号 `overdraftLimit` / `frozenBalance` 都是 0，说明行里就不出现。
+
+**怎么拿凭据**（浏览器里一次，30 秒）：
+
+1. 登录 [platform.xiaomimimo.com](https://platform.xiaomimimo.com/console/balance) → `F12` → **Network** → 随便点一个请求；
+2. 在请求头里找到 **`Cookie:` 那一整行**，整段复制（不要只挑其中一段）；
+3. 设置页 → 上游额度 → **小米 MiMo 开放平台** → 「控制台 Cookie」格整段粘进去 → 顶部「保存全部」→ 点卡片上的刷新。
+
+面板发送时只挑出其中**四段必需项**（`userId` + `api-platform_serviceToken` + `api-platform_slh` + `api-platform_ph`），其余段（`xiaomichatbot_*` 之类）**不会转发**。四段**缺一不可**：实测只带三段 `api-platform_*` 而没有 `userId`，服务端回 `HTTP 401` + 一个跳小米账号登录页的 `loginUrl`。粘的 Cookie 缺哪段，面板会在**本地**直接提示「Cookie 里缺 …（四段实测缺一不可）」，不会拿不完整的 Cookie 去打上游、再让你看一个误导性的 401。
+
+⚠️ **会话会过期**：这份 Cookie 就是控制台登录态，过期后接口回 `HTTP 401` + `loginUrl`，卡片提示「控制台登录态已失效或 Cookie 不全：重新登录控制台，整段复制 Cookie 请求头」——重新登录、再粘一份新的即可。
+
+⚠️ 登录态 Cookie **权限比 API Key 大**（等于你浏览器里的账号会话），只填在本机设置页里，别分享给别人；和其它凭据一样以**明文**存在 `config.json` 的 `upstreamQuota` 里。
+
+⚠️ 这是**控制台内部接口**（逆向所得，官方随时可能改），所以归为 experimental；接口一变就把这个平台的开关关掉。另外实测它的响应**可能带短期缓存**（同一份凭据偶尔会短暂拿到上一个成功响应），刚充值 / 扣款后数字没变的话等几分钟再刷新。
+
+目前只接了**余额**；MiMo 的套餐（TokenPlan）官方同样没有接口，暂无对接计划。
+
 ## 数字示例：平台差异导致的显示差异
 
 | 平台返回 | 面板显示 |
@@ -418,6 +462,7 @@ header: x-subject-id: <账号 ID>        # 缺了服务端回 400 validate error
 | NewAPI `quota: 250000`（`quota_per_unit: 500000`） | 大号金额 `$0.50`（额度 ÷ 每单位额度）；note 里给用户、用户组、累计请求与折算基准 |
 | NewAPI `/api/status` 读不到 | 按配置里的「每单位额度」折算，仍没有就按上游默认 `500000 = 1 美元`，并挂一条提示 |
 | OpenCode Go `usage.rolling.percent: 12.5` | 窗口行大号 `12.5%` + 进度条；`status: "rate-limited"` 的那一行标注「已达本窗口上限」 |
+| 小米 MiMo `balance:"29.97"`（十进制字符串，元） | 大号金额 `¥29.97`，下面一行「现金 ¥0.00 · 赠送 ¥29.97」（现金 / 赠送来自 `cashBalance` / `giftBalance`） |
 | 百炼 Token Plan 个人版 `per1MonthPercentage: 0.0027` | 窗口行大号 **`0.27%`**（上游给的是 **0–1 的比例**，换算成百分数；控制台页面同一个数字）+「重置 11-15 00:00」 |
 | 百炼 Token Plan 个人版 `{per1MonthPercentage: null}`（不限量） | **不出百分比行**，只留一条「控制台没有给出月额度上限（可能不限量）」，不会显示成 0% |
 | 百炼 Harness 权益 `totalQuota: 1000, availableQuota: 250` | 一行「权益名（如「网页解析 MCP」）75% · 剩 250 / 共 1000 次」+「权益至 <日期>」；**标签只显示用户看得懂的名字**，接口里的权益 code（`tokenplan_harness…`）不摆到卡片上；权益还在发放（没配对到）时只出标题与一条「发放中」说明 |
@@ -442,6 +487,8 @@ header: x-subject-id: <账号 ID>        # 缺了服务端回 400 validate error
 | 硅基流动提示「未配置「控制台会话令牌」/「账号 ID」」 | 两格都要填：Cookie 里的 `__SF_auth.session-token` + 请求头 `x-subject-id`（见上节「怎么拿凭据」） |
 | 硅基流动 `HTTP 401` / 「控制台令牌可能已过期」 | 控制台会话过期了：重新登录控制台，复制一份新的 `__SF_auth.session-token` 粘回去 |
 | 硅基流动 `HTTP 400` + `invalid parameter: SubjectId` | `x-subject-id` 填错或没填（不是用户名，是控制台请求头里那串短 ID） |
+| 小米 MiMo 提示「未配置「控制台 Cookie」」或「Cookie 里缺 …（四段实测缺一不可）」 | 粘的不是整段：重新按上节「怎么拿凭据」整段复制 Cookie 请求头（必须含 `userId` + 三段 `api-platform_*`），面板只校验这四段、发送时也只转发这四段 |
+| 小米 MiMo `HTTP 401`（+ `loginUrl` 跳小米账号登录页） | 控制台登录态过期：重新登录 platform.xiaomimimo.com，整段复制一份新的 Cookie 粘回去 |
 | Sub2API 报 `HTTP 404` / `HTTP 401` | 站点地址或 Key 不对：确认「方案」选的是这个中转站，或直接在「接入点覆盖」里填站点根地址（**不要带 `/v1`**） |
 | NewAPI 报 `无权进行此操作，未登录且未提供 access token` | 填的不是控制台生成的**系统访问令牌**（`sk-` 中转 Key 不行），或该站要求带 `New-Api-User` 数字用户 ID |
 | NewAPI 报 `没有 quota / used_quota` | 令牌有效但用户 ID 不对（读到的是空用户对象），核对控制台个人信息里的数字 ID |
@@ -451,7 +498,7 @@ header: x-subject-id: <账号 ID>        # 缺了服务端回 400 validate error
 
 ## 加一个新平台
 
-- 上表里的 20 个内置平台**开箱即用**，选中就能查；中转站（Sub2API / NewAPI）可以按上面的办法加任意多个站点。
+- 上表里的 21 个内置平台**开箱即用**，选中就能查；中转站（Sub2API / NewAPI）可以按上面的办法加任意多个站点。
 - 上表之外、又只有 HTTP 接口的平台：目前面板里**没有**「自己填字段」的通用接口了（该功能已按需求下线）。要接只能改代码 —— 在 `lib/upstream-quota.mjs` 的 provider 定义里加一条（写请求、解析、字段、文档链接），重启后就会出现在设置页里。
 
 ## 相关页面

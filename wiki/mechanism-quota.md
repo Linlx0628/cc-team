@@ -465,6 +465,7 @@ newQuota ≤ userQuota → 放弃
 | 腾讯云 `20097 hour\|week\|month allocated quota exceeded` | **上游**套餐 | 等对应窗口重置（5 小时滑动 / 每周一 00:00 / 订阅月到期时刻）；本站按套餐耗尽处理 |
 | 阿里云百炼 `usage allocated quota exceeded`（含 hour / week / month） | **上游**套餐 | 同上 |
 | 阿里云百炼 Token Plan 个人版 `429 insufficient_quota: Your token-plan quota has been exhausted.` | **上游** Token Plan 月额度 | 等订阅月重置（重置时刻看「上游额度」页那张卡的「重置」），或让账号买用量包 / 升档；本站按套餐耗尽处理 |
+| 阶跃星辰 Step Plan `429 {"error":{"message":"you have no left credit for step plan","type":"rate_limited"}}`（官方 `credit_limit_exceeded` / `member_project_credit_limit_exceeded` 同） | **上游** 套餐额度（与「请求速率超限」共用 429，只能按正文区分） | 等套餐额度重置；本站按套餐耗尽处理，**自动切到组内下一个方案**，不会原地重试后把 429 甩给用户 |
 | 上游 `tpm rate limit exceeded`、智谱业务码 `1302` / `1305` | **上游**频率限流 | 瞬时突发，**不算**套餐耗尽，不触发方案暂停 |
 
 > ⚠️ 上游额度的查询结果**只用于展示与告警**，不参与路由决策——不会因为「某个上游余额为 0」就自动跳过某个候选方案。

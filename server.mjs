@@ -2106,7 +2106,11 @@ function classifyRateLimit(statusCode, text, headers) {
   // 火山/英文站 AccountQuotaExceeded("You have exceeded the 5-hour usage quota." —— 错误码
   // 无空格、语序相反,所以 "quota exceeded" 与 "usage limit" 都盖不住)。频率类在上一步已排除,
   // 所以这里出现 "usage quota" 只可能是套餐级。
-  const looksLikePlanLimit = /"code"\s*:\s*1(310|311|113)|使用上限|usage limit|usage quota|plan limit|额度已耗尽|quota exceeded|AccountQuotaExceeded|AllocationQuota|free allocated quota/i.test(body);
+  // 阶跃星辰 Step Plan:套餐额度耗尽时 429 正文是 "you have no left credit for step plan"
+  // (既没有 reset 时刻,也没有 usage quota 字样);官方错误码里 project_credit_limit_exceeded /
+  // member_project_credit_limit_exceeded 同样与「请求速率超限」共用 429,只能靠正文标识区分。
+  // 这些必须走 failover 换下一个方案,而不是原地重试后把 429 甩给用户。
+  const looksLikePlanLimit = /"code"\s*:\s*1(310|311|113)|使用上限|usage limit|usage quota|plan limit|额度已耗尽|quota exceeded|AccountQuotaExceeded|AllocationQuota|free allocated quota|no left credit|credit_limit_exceeded|credit limit exceeded|insufficient credit|额度不足|余额不足/i.test(body);
   if (!looksLikePlanLimit) return null;
   // 正文里的精确恢复时刻优先于 Retry-After(5 小时级的窗口,响应头那种分钟级估值差太远)。
   const resetAt = parseRateLimitResetEn(body);
